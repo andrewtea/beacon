@@ -7,6 +7,10 @@
 // the next id runs out while the app is open, and when the page is looked at
 // again. An app that is closed runs nothing, so an id that runs out then stays
 // in storage until the app is next opened.
+//
+// What is shown and what is stored are kept apart. A tap is off the list
+// (`tapsSnapshot`) from the moment it runs out, whether or not storage let it
+// be deleted.
 
 export type KeptTap = {
   id: string
@@ -25,6 +29,13 @@ const MOST = 20
 type Listener = () => void
 const listeners = new Set<Listener>()
 let cache: { raw: string | null; taps: KeptTap[] } | null = null
+// The list as it is shown: the stored taps that have not run out, and the
+// moment the next of them does, until which the list is the same array.
+let shown: { of: KeptTap[]; taps: KeptTap[]; until: number } | null = null
+
+function notify(): void {
+  for (const listener of listeners) listener()
+}
 
 function isKept(value: unknown): value is KeptTap {
   if (typeof value !== 'object' || value === null) return false
@@ -67,7 +78,7 @@ function write(taps: KeptTap[]): boolean {
     return false
   }
   cache = null
-  for (const listener of listeners) listener()
+  notify()
   return true
 }
 
@@ -98,38 +109,54 @@ export function pruneTaps(
   return write(kept) ? 'deleted' : 'failed'
 }
 
-/** How long until the next kept tap runs out, or null when none is kept. */
-function untilNextExpiry(now: number): number | null {
-  const ends = read().map((tap) => Date.parse(tap.at) + KEPT_MS - now)
-  return ends.length === 0 ? null : Math.max(0, Math.min(...ends))
+/** When the first of `taps` runs out, or Infinity when there is none. */
+function firstEnd(taps: KeptTap[]): number {
+  return Math.min(...taps.map((tap) => Date.parse(tap.at) + KEPT_MS))
 }
 
 /**
- * Keeps storage swept for as long as the app is open: now, at the moment each
+ * Keeps the taps swept for as long as the app is open: now, at the moment each
  * kept tap runs out, whenever the page is shown again, since a phone holds a
  * hidden page's timers back, and when another tab of the app changes what is
  * kept. Answers with how to stop.
+ *
+ * A tap that runs out is taken off the list that is shown at that moment, by
+ * telling whoever shows it, whether or not storage let it be deleted. One that
+ * storage would not delete is waited for by no timer: the next timer is for the
+ * next tap that has not run out, and the delete is tried again then, when the
+ * page is next looked at, and when the list next changes.
  */
 export function sweepTaps(): () => void {
   let timer: ReturnType<typeof setTimeout> | undefined
   const plan = () => {
     clearTimeout(timer)
-    const wait = untilNextExpiry(Date.now())
+    const now = Date.now()
+    // Only the taps that have not run out are waited for.
+    const end = firstEnd(current(read(), now))
     // A millisecond past the end, so the tap has run out when the timer fires.
-    if (wait !== null) timer = setTimeout(sweep, wait + 1)
+    if (Number.isFinite(end)) timer = setTimeout(sweep, end - now + 1)
   }
+  let sweeping = false
   const sweep = () => {
-    clearTimeout(timer)
-    // A sweep that deletes something writes, and the write plans the next one.
-    // One that storage refused plans nothing: the tap that ran out is still
-    // there, and a timer would find it again every millisecond. It is tried
-    // again when the page is next looked at or the list next changes.
-    if (pruneTaps() === 'nothing') plan()
+    // Told of its own doing, a sweep does nothing more.
+    if (sweeping) return
+    sweeping = true
+    try {
+      // A sweep that deletes something writes, and the write tells the
+      // listeners. One that could not delete tells them itself: the list that
+      // is shown has changed all the same.
+      if (pruneTaps() === 'failed') notify()
+    } finally {
+      sweeping = false
+    }
+    plan()
   }
   const seen = () => {
     if (document.visibilityState === 'visible') sweep()
   }
-  const stopListening = subscribeTaps(plan)
+  // A change to the list, from this tab or another, is swept as well: what
+  // another tab wrote can hold a tap that has run out.
+  const stopListening = subscribeTaps(sweep)
   document.addEventListener('visibilitychange', seen)
   sweep()
   return () => {
@@ -151,7 +178,7 @@ export function forgetTap(id: string): void {
 function onStorage(event: StorageEvent): void {
   if (event.key !== null && event.key !== KEY) return
   cache = null
-  for (const listener of listeners) listener()
+  notify()
 }
 
 /** Be told when the kept taps change, in this tab or another. */
@@ -164,8 +191,16 @@ export function subscribeTaps(listener: Listener): () => void {
   }
 }
 
-/** The stored list as it is, for `useSyncExternalStore`: the same array while
- * nothing changed. */
-export function tapsSnapshot(): KeptTap[] {
-  return read()
+/**
+ * The taps to show, for `useSyncExternalStore`: those in storage that the
+ * server still answers for. It is the same array until storage changes or one
+ * of them runs out, and `sweepTaps` tells the listeners when one does.
+ */
+export function tapsSnapshot(now: number = Date.now()): KeptTap[] {
+  const stored = read()
+  if (shown === null || shown.of !== stored || now >= shown.until) {
+    const taps = current(stored, now)
+    shown = { of: stored, taps, until: firstEnd(taps) }
+  }
+  return shown.taps
 }

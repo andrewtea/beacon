@@ -1,4 +1,5 @@
 import {
+  act,
   fireEvent,
   render,
   screen,
@@ -12,7 +13,7 @@ import { IncidentCard } from './components/IncidentCard.tsx'
 import { Sources } from './components/Provenance.tsx'
 import { OPEN_MS } from './lib/cadence.ts'
 import { drawPhoto } from './lib/photo.ts'
-import { keepTap, keptTaps } from './lib/tapStore.ts'
+import { keepTap, keptTaps, sweepTaps } from './lib/tapStore.ts'
 import {
   FIRE_TAP,
   fireAnswer,
@@ -22,6 +23,7 @@ import {
   quietAnswer,
 } from './test/fixtures.ts'
 import { MOCK_HEALTH, serve } from './test/server.ts'
+import { Home } from './views/Home.tsx'
 
 vi.mock('./lib/recorder.ts', () => ({
   CLIP_SECONDS: 5,
@@ -141,6 +143,101 @@ test('stops taking taps when the server stops answering, and takes them again wh
   await vi.advanceTimersByTimeAsync(5_100)
   await waitFor(() => expect(button).toBeEnabled())
   expect(screen.queryByText(/invented/i)).not.toBeInTheDocument()
+})
+
+test('a tap that was waiting when the server’s mode changed is called off, and sends nothing', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true })
+  let health: () => Response = () => Response.json(MOCK_HEALTH)
+  const asked = serve({
+    'GET /api/health': () => health(),
+    'POST /api/taps': () => Response.json(receipt(FIRE_TAP), { status: 201 }),
+  })
+  // The phone says where it is only when it is let.
+  let found: PositionCallback = () => undefined
+  vi.stubGlobal('navigator', {
+    ...navigator,
+    geolocation: {
+      getCurrentPosition: (callback: PositionCallback) => (found = callback),
+    },
+  })
+  const here = {
+    coords: { latitude: 37.776412, longitude: -122.424391, accuracy: 8 },
+  } as GeolocationPosition
+  const posts = () =>
+    asked.filter((request) => request.key === 'POST /api/taps')
+  render(<App />)
+  const button = screen.getByRole('button', { name: ASK })
+  await waitFor(() => expect(button).toBeEnabled())
+
+  // Pressed while the server said it runs on the invented scenario.
+  click(button)
+  expect(await screen.findByText('Finding where you are…')).toBeInTheDocument()
+
+  // Before the phone answers, the server is found to be on real sources.
+  health = () => Response.json({ ...MOCK_HEALTH, mode: 'live' })
+  await vi.advanceTimersByTimeAsync(30_100)
+  await waitFor(() =>
+    expect(screen.queryByText(/invented/i)).not.toBeInTheDocument(),
+  )
+  // The tap is called off: the button is as it was before it was pressed.
+  expect(screen.queryByText('Finding where you are…')).not.toBeInTheDocument()
+  await waitFor(() => expect(button).toBeEnabled())
+
+  // The phone answers now. Nothing is sent to the server the tap was not for.
+  found(here)
+  await vi.advanceTimersByTimeAsync(1_000)
+  expect(posts()).toEqual([])
+  expect(keptTaps()).toEqual([])
+  expect(window.location.hash).not.toContain('tap')
+
+  // The same when the mode stops being known while a tap waits.
+  click(button)
+  expect(await screen.findByText('Finding where you are…')).toBeInTheDocument()
+  health = () => Response.json({ detail: 'Down.' }, { status: 503 })
+  await vi.advanceTimersByTimeAsync(30_100)
+  await waitFor(() => expect(button).toBeDisabled())
+  found(here)
+  await vi.advanceTimersByTimeAsync(1_000)
+  expect(posts()).toEqual([])
+})
+
+test('a tap that ran out is taken off the list at that moment, though storage will not delete it', async () => {
+  // The button's view alone, with the sweep the app starts: nothing else draws
+  // the view again, so the list changes only if it is told that a tap ran out.
+  vi.useFakeTimers()
+  // Three quarters of a minute left of the 23 hours.
+  const at = new Date(Date.now() - 23 * 60 * 60 * 1000 + 45_000).toISOString()
+  keepTap({ id: QUIET_TAP, at, photo: false, clip: false })
+  const refused = vi
+    .spyOn(Storage.prototype, 'setItem')
+    .mockImplementation(() => {
+      throw new DOMException('Full.', 'QuotaExceededError')
+    })
+  const stop = sweepTaps()
+  try {
+    render(<Home mode="mock" />)
+    const list = screen.getByRole('region', { name: 'Your taps' })
+    expect(within(list).getAllByRole('link')).toHaveLength(1)
+
+    await act(() => vi.advanceTimersByTimeAsync(44_000))
+    expect(screen.getByRole('region', { name: 'Your taps' })).toBe(list)
+    expect(refused).not.toHaveBeenCalled()
+    await act(() => vi.advanceTimersByTimeAsync(2_000))
+
+    expect(
+      screen.queryByRole('region', { name: 'Your taps' }),
+    ).not.toBeInTheDocument()
+    expect(document.querySelector(`a[href*="${QUIET_TAP}"]`)).toBeNull()
+    // Storage was asked once, at the moment the tap ran out, and still has it.
+    expect(refused).toHaveBeenCalledTimes(1)
+    expect(window.localStorage.getItem('beacon.taps.v1')).toContain(QUIET_TAP)
+    // And not again on a timer.
+    await act(() => vi.advanceTimersByTimeAsync(10_000))
+    expect(refused).toHaveBeenCalledTimes(1)
+  } finally {
+    stop()
+    refused.mockRestore()
+  }
 })
 
 test('sends a tap, keeps its id on the device, and shows the incident it was matched to', async () => {

@@ -14,6 +14,7 @@ import {
   pruneTaps,
   subscribeTaps,
   sweepTaps,
+  tapsSnapshot,
 } from './tapStore.ts'
 import { encodeWav, toBase64 } from './wav.ts'
 
@@ -204,9 +205,17 @@ test('an open app deletes each tap from storage at the moment it runs out', () =
   vi.advanceTimersByTime(2_000)
   expect(stored()).toEqual(['new'])
 
-  // A tap kept while the app is open is swept in its turn.
-  keepTap(tap('later', KEPT_MS - 5_000))
-  vi.advanceTimersByTime(6_000)
+  // A tap kept while the app is open, with five seconds left, is swept in its
+  // turn.
+  keepTap({
+    id: 'later',
+    at: new Date(Date.now() - KEPT_MS + 5_000).toISOString(),
+    photo: false,
+    clip: false,
+  })
+  vi.advanceTimersByTime(4_000)
+  expect(stored()).toEqual(['later', 'new'])
+  vi.advanceTimersByTime(2_000)
   expect(stored()).toEqual(['new'])
 
   stop()
@@ -244,6 +253,7 @@ test('storage that refuses a write is not asked again every millisecond', () => 
   expect(refused).toHaveBeenCalledTimes(1)
   // The tap that ran out is not shown, though it could not be deleted.
   expect(keptTaps()).toEqual([])
+  expect(tapsSnapshot()).toEqual([])
   // Looking at the page again is one more try, which storage now takes.
   refused.mockRestore()
   document.dispatchEvent(new Event('visibilitychange'))
@@ -293,6 +303,31 @@ test('a tap kept or forgotten in another tab is known here, and is swept here wh
   expect(told).toHaveBeenCalledTimes(1)
   unsubscribe()
   stop()
+})
+
+test('the list that is shown is the same list until a tap runs out, and then is without it', () => {
+  const now = Date.parse('2026-11-26T12:00:00Z')
+  const tap = (id: string, left: number) => ({
+    id,
+    at: new Date(now - KEPT_MS + left).toISOString(),
+    photo: false,
+    clip: false,
+  })
+  window.localStorage.setItem(
+    'beacon.taps.v1',
+    JSON.stringify([tap('long', 3_600_000), tap('short', 60_000)]),
+  )
+
+  const first = tapsSnapshot(now)
+  expect(first.map((kept) => kept.id)).toEqual(['long', 'short'])
+  // The same array while nothing changed, which is what React asks of it.
+  expect(tapsSnapshot(now + 59_000)).toBe(first)
+
+  const after = tapsSnapshot(now + 60_000)
+  expect(after.map((kept) => kept.id)).toEqual(['long'])
+  expect(tapsSnapshot(now + 61_000)).toBe(after)
+  // Storage was not touched: showing is not deleting.
+  expect(stored()).toEqual(['long', 'short'])
 })
 
 test('a path of a tap’s own routes is written to a log without the tap’s id', () => {
@@ -384,4 +419,52 @@ test('a tap called off while the recorder is being set up lets go of the microph
   expect(stop).toHaveBeenCalled()
   await expect(recording).rejects.toMatchObject({ name: 'AbortError' })
   expect(closed).toHaveBeenCalled()
+})
+
+test('a recorder that will not start ends the recording and lets go of the microphone', async () => {
+  const { stop } = microphone()
+  vi.stubGlobal(
+    'AudioWorkletNode',
+    class {
+      port = {}
+    },
+  )
+  const closed = vi.fn(async () => undefined)
+  vi.stubGlobal(
+    'AudioContext',
+    class {
+      sampleRate = 48_000
+      audioWorklet = { addModule: async () => undefined }
+      createMediaStreamSource = () => ({ connect: () => undefined })
+      // The browser refuses to start the context.
+      resume = () =>
+        Promise.reject(new DOMException('Closed.', 'InvalidStateError'))
+      close = closed
+    },
+  )
+  URL.createObjectURL ??= () => 'blob:beacon'
+  URL.revokeObjectURL ??= () => undefined
+  // The test runs in Node, which is where a rejection nobody handled is told.
+  const node = (
+    globalThis as unknown as {
+      process: Record<'on' | 'off', (event: string, told: () => void) => void>
+    }
+  ).process
+  const unhandled = vi.fn()
+  node.on('unhandledRejection', unhandled)
+
+  try {
+    // The refusal is the recording's failure, in a sentence, and not an error
+    // nobody was waiting for.
+    await expect(recordClip(1)).rejects.toThrow(
+      'Beacon could not record a clip.',
+    )
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  } finally {
+    node.off('unhandledRejection', unhandled)
+  }
+
+  expect(stop).toHaveBeenCalled()
+  expect(closed).toHaveBeenCalled()
+  expect(unhandled).not.toHaveBeenCalled()
 })

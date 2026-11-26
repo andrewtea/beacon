@@ -98,11 +98,17 @@ export async function recordClip(
       }
     })
     source.connect(node)
-    void context.resume()
-    await unlessCalledOff(recorded)
+    // Starting the context is waited for with the samples, so that a context
+    // that will not start ends the recording, and lets go of the microphone,
+    // as a timeout or a tap that is called off does.
+    await unlessCalledOff(Promise.all([context.resume(), recorded]))
     return encodeWav(samples, rate)
   } catch (error) {
-    if (error instanceof ClipError || error instanceof DOMException) throw error
+    // A tap that was called off is its caller's own doing, and theirs to tell
+    // apart. Anything else the browser raised is a clip that was not recorded.
+    if (error instanceof ClipError) throw error
+    if (error instanceof DOMException && error.name === 'AbortError')
+      throw error
     throw new ClipError('Beacon could not record a clip.')
   } finally {
     letGo()

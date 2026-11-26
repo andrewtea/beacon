@@ -1,10 +1,4 @@
-import {
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from 'react'
+import { useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { ApiError } from '../api/http.ts'
 import type { Mode } from '../api/incidents.ts'
 import { sendTap, type TapBody } from '../api/taps.ts'
@@ -14,7 +8,6 @@ import { drawPhoto, PhotoError } from '../lib/photo.ts'
 import { CLIP_SECONDS, ClipError, recordClip } from '../lib/recorder.ts'
 import { href, navigate } from '../lib/router.ts'
 import {
-  current,
   forgetTap,
   keepTap,
   subscribeTaps,
@@ -52,8 +45,8 @@ function reason(error: unknown): string {
 
 /** The taps this device sent that the server still answers for. */
 function YourTaps() {
-  const stored = useSyncExternalStore(subscribeTaps, tapsSnapshot)
-  const taps = useMemo(() => current(stored), [stored])
+  // Off the list from the moment a tap runs out: see `tapsSnapshot`.
+  const taps = useSyncExternalStore(subscribeTaps, tapsSnapshot)
   if (taps.length === 0) return null
   return (
     <section className="panel your-taps" aria-labelledby="taps-heading">
@@ -98,8 +91,20 @@ export function Home({ mode }: { mode: Mode | null }) {
   const [drawing, setDrawing] = useState(false)
   const sending = useRef<AbortController | null>(null)
   const picker = useRef<HTMLInputElement | null>(null)
-  // A tap that is on its way when the view is left is called off.
-  useEffect(() => () => sending.current?.abort(), [])
+  // A tap that is on its way is called off when the view is left, and when
+  // what the server says of its mode changes, to another mode or to not known:
+  // a tap goes to the server its sender was told of when they pressed, or it
+  // does not go. What they added to it stays chosen, for a tap they make once
+  // the mode is known again and shown. A layout effect, so that it is done as
+  // the change is drawn and not a frame after.
+  useLayoutEffect(
+    () => () => {
+      sending.current?.abort()
+      sending.current = null
+      setPhase({ kind: 'idle' })
+    },
+    [mode],
+  )
 
   const busy = drawing ? 'Reading the picture…' : BUSY[phase.kind]
   // Whether the server runs on real sources or on the invented scenario is known
@@ -111,6 +116,12 @@ export function Home({ mode }: { mode: Mode | null }) {
     if (busy !== null || !ready) return
     const controller = new AbortController()
     sending.current = controller
+    // Asked after every wait: a tap that was called off while it waited for
+    // the phone's place, the microphone, or a photo's bytes sends nothing.
+    const unlessCalledOff = () => {
+      if (controller.signal.aborted)
+        throw new DOMException('Aborted', 'AbortError')
+    }
     try {
       // The sound is recorded while the phone finds where it is: a siren does
       // not wait.
@@ -119,11 +130,14 @@ export function Home({ mode }: { mode: Mode | null }) {
         from ?? locate(),
         withClip ? recordClip(CLIP_SECONDS, controller.signal) : null,
       ])
+      unlessCalledOff()
       setPhase({ kind: 'sending' })
       const body: TapBody = { location: place }
       if (clip !== null) body.clip = toBase64(clip)
-      if (photo !== null)
+      if (photo !== null) {
         body.photo = toBase64(new Uint8Array(await photo.arrayBuffer()))
+        unlessCalledOff()
+      }
       const receipt = await sendTap(body, controller.signal)
       keepTap({
         id: receipt.id,
