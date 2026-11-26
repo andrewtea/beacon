@@ -147,6 +147,9 @@ class Incident:
     point: Point | None
     # Where the point is from: the list of blocks, or a closure 511 lists on its street.
     point_from: Literal["blocks", "closure"] | None
+    # The row a point from a closure was taken from, with 511's credit, which goes
+    # wherever the point is shown. None for a point from the list of blocks.
+    point_source: Source | None
     streets: tuple[str, ...]
     units: tuple[str, ...]
     alarm: int | None

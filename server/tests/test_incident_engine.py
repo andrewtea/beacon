@@ -313,6 +313,30 @@ def test_the_routes_answer_from_one_reading(tmp_path: Path) -> None:
     assert again == first
 
 
+def test_a_point_taken_from_511_goes_with_511s_credit_in_both_routes(tmp_path: Path) -> None:
+    rows = Rows(mock_store(tmp_path))
+    rows.radio(0, "fire", "working", units=("E36",), street="Hayes St", block=400)
+    closure = rows.traffic(2)
+    # 511 stops listing the closure, so no signal and no open line carries its credit.
+    rows.change(6, closure)
+    app = create_app()
+    app.state.incidents = Engine(rows.store, NO_BLOCKS, clock=lambda: at(8))
+    client = TestClient(app)
+
+    (summary,) = client.get("/api/incidents").json()["incidents"]
+    one = client.get(f"/api/incidents/{summary['id']}").json()["incident"]
+
+    assert summary["signals"] == []
+    for shown in (summary, one):
+        assert shown["point"] == {"lat": HAYES.lat, "lon": HAYES.lon}
+        assert shown["point_from"] == "closure"
+        assert shown["point_source"]["evidence_id"] == closure.id
+        assert shown["point_source"]["credit"] == {
+            "text": "data provided by 511.org",
+            "url": "https://511.org",
+        }
+
+
 def test_an_alert_older_than_the_horizon_is_still_ended_by_what_replaced_it(tmp_path: Path) -> None:
     rows = Rows(mock_store(tmp_path))
     # Issued a day ago for two days, replaced fourteen hours ago: both rows are
@@ -361,6 +385,8 @@ def test_the_routes_list_incidents_and_give_one_with_a_source_on_every_line(stor
     assert "timeline" not in summary
     assert (summary["open"], summary["alarm"], summary["stand_in"]) == (True, 3, True)
     assert summary["point"] == {"lat": FIRE.lat, "lon": FIRE.lon}
+    # The point is from the list of blocks, which is nobody's to credit.
+    assert (summary["point_from"], summary["point_source"]) == ("blocks", None)
 
     answer = client.get(f"/api/incidents/{summary['id']}").json()
     fire = answer["incident"]

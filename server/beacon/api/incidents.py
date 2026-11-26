@@ -107,6 +107,10 @@ class IncidentSummary(_Read):
     place: str | None
     point: PointOut | None
     point_from: str | None
+    # For a point taken from a 511 closure, the row it is from, with the credit
+    # 511's data agreement requires beside anything shown from it. Show the credit
+    # with the point. Null for a point from the list of blocks.
+    point_source: SourceOut | None
     streets: list[str]
     units: list[str]
     alarm: int | None

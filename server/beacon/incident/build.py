@@ -32,8 +32,9 @@ A medical response gets none of these. It is its crews and its block.
 
 An incident's point is the middle of its block when somebody listed the block
 (`beacon.incident.places`), else the point of a version of a 511 event that lists a
-road of its as closed, else nothing. With no point it is matched to nothing by
-distance.
+road of its as closed, else nothing. A point taken from 511 goes with the row it is
+from (`Incident.point_source`), which carries 511's credit wherever the point is
+shown. With no point it is matched to nothing by distance.
 
 The wording here is where the product's rules about words are kept:
 
@@ -157,6 +158,13 @@ _NOTICE_WORDS = {
     "advisory": "an advisory",
     "press_release": "a press release",
 }
+# The same, for more than one of a type.
+_NOTICES_WORDS = {
+    "evacuation_order": "evacuation orders",
+    "evacuation_warning": "evacuation warnings",
+    "shelter_in_place": "shelter-in-place orders",
+    "all_clear": "all-clears",
+}
 _READING = "This is Beacon's reading of the document. Read the document for what it says."
 # Which hazards a notice can be about for it to be about an incident of a category.
 _HAZARDS: dict[str, set[str]] = {
@@ -241,6 +249,8 @@ def _incident(
     taps_more = aircraft_more = False
     point = blocks.point(group.street, group.block)
     point_from = "blocks" if point is not None else None
+    # The row a point that is not from the list of blocks was taken from.
+    point_row: Evidence | None = None
     streets = _streets(group)
     start = group.opened_at - BEFORE
     # Once the radio has cleared it, what happens at its place is no longer taken
@@ -269,7 +279,7 @@ def _incident(
                 if row.point is not None and _closed_roads(row) & set(streets)
             ]
             if point is None and closed:
-                point, point_from = closed[-1].point, "closure"
+                point, point_from, point_row = closed[-1].point, "closure", closed[-1]
         alerts, revisions = _alerts_at(by_kind.get("alert", []), point, start, end)
         notices = _notices_for(group, by_kind.get("notice", []), streets, press, start)
         changes = _changes(by_kind, closures, alerts)
@@ -282,12 +292,12 @@ def _incident(
         # A later message that updates or cancels one of them is a line of the
         # timeline, which says that and no more. It is not listed as an alert for
         # this place: its own area or time may not be this incident's.
-        entries += [_revision_entry(revision) for revision in revisions]
+        entries += [_revision_entry(revision, direct) for revision, direct in revisions]
         entries += [_change_entry(change) for change in changes]
         for notice in notices:
             entries.append(_notice_entry(notice, streets))
             official.append(_official_notice(notice, now))
-        members += [*alerts, *revisions, *changes, *notices]
+        members += [*alerts, *(revision for revision, _ in revisions), *changes, *notices]
         if point is not None and nearby is not None:
             until = min(end, now)
             found, taps_more = nearby("tap", point, TAP_M, start, until)
@@ -303,7 +313,9 @@ def _incident(
                 members += track.rows
             if near_taps:
                 entries.append(_taps_entry(near_taps, taps_more))
-        signals = _signals(group, official, closures, states, track_list, near_taps, taps_more)
+        signals = _signals(
+            group, official, closures, states, track_list, near_taps, taps_more, streets, point
+        )
     entries.sort(key=lambda entry: entry.at)
     in_force = any(item.state == "in_force" for item in official)
     updated_at = max(entry.at for entry in entries)
@@ -319,6 +331,7 @@ def _incident(
         place=place,
         point=point,
         point_from=point_from,  # type: ignore[arg-type]
+        point_source=None if point_row is None else source_of(point_row),
         streets=streets,
         units=tuple(sorted(group.named, key=_unit_order)),
         alarm=group.alarm,
@@ -470,24 +483,40 @@ def _alert_entry(row: Evidence, states: dict[int, Standing]) -> Entry:
     )
 
 
-def _revision_entry(row: Evidence) -> Entry:
-    """The line for a later message that updates or cancels an alert of this place.
-    It says that the alert was updated or cancelled, and links the message. The
+def _revision_entry(row: Evidence, direct: bool) -> Entry:
+    """The line for a later message that updates or cancels an alert of this place,
+    or a message that had revised one. It says that and links the message. The
     message's own words, its span, and how it stands are left out: it can be drawn
-    for another area, and then none of them is about this place."""
+    for another area, and then none of them is about this place.
+
+    `direct` says the message names an alert that applied here. One that names
+    only an earlier revision is about a message of which that is not known, so it
+    is not said to have cancelled or updated anything that applied here."""
     cancel = row.data.get("message_type") == "Cancel"
+    did = "cancelled" if cancel else "updated"
+    if direct and cancel:
+        text = "A later message cancelled an alert that applied here."
+    elif direct:
+        text = (
+            "A later message updated an alert that applied here. The later message "
+            "can be for another area: Beacon does not say that it applies here."
+        )
+    else:
+        text = (
+            f"A later message {did} a message that had revised an alert that applied "
+            f"here. Beacon does not say that the message it {did} applied here."
+        )
     return Entry(
         at=row.occurred_at,
         kind="alert",
-        text="A later message cancelled an alert that applied here."
-        if cancel
-        else "A later message updated an alert that applied here. The later message "
-        "can be for another area: Beacon does not say that it applies here.",
+        text=text,
         confidence=row.confidence,
         sources=(source_of(row),),
         details={
             "message_type": row.data.get("message_type"),
             "revises": [ref for ref in row.data.get("replaces") or [] if isinstance(ref, str)],
+            # Whether one of those is an alert that applied here itself.
+            "revises_alert_here": direct,
         },
     )
 
@@ -631,6 +660,8 @@ def _signals(
     track_list: Sequence[Track],
     near_taps: Sequence[Evidence],
     taps_more: bool,
+    streets: Sequence[str],
+    point: Point | None,
 ) -> list[Signal]:
     signals: list[Signal] = []
 
@@ -664,23 +695,21 @@ def _signals(
     notices = [item for item in official if item.kind == "notice" and item.state == "published"]
     orders = [item for item in notices if item.type in ORDERS - {"all_clear"}]
     if orders:
-        # An all-clear published after an order is said beside it, and is not taken
-        # to lift it: the order and the all-clear can be about different blocks.
-        clears = [
-            item
-            for item in notices
-            if item.type == "all_clear" and item.issued_at >= orders[0].issued_at
-        ]
-        after = (
-            "An all-clear was published after it. Beacon does not work out what the "
-            "all-clear covers: the documents say. "
+        # Each notice is named as the type it is: a warning is not an order. An
+        # all-clear is said beside them and is not taken to lift any of them, nor
+        # said to have come before or after: the order and the all-clear can be
+        # about different blocks, and which holds is in the documents.
+        clears = [item for item in notices if item.type == "all_clear"]
+        also = (
+            f"{_published(clears, also=True)} Beacon does not work out what an "
+            "all-clear covers, or which notice holds: the documents say. "
             if clears
             else ""
         )
         signals.append(
             _signal(
                 "official_order",
-                f"An authority published an order. {after}{_READING}",
+                f"{_published(orders)} {also}{_READING}",
                 [item.source for item in (*orders, *clears)],
             )
         )
@@ -693,10 +722,22 @@ def _signals(
                 [item.source for item in alerts],
             )
         )
+    # The version that is in force has to close a road of the incident's, or to
+    # close a road and be near its point. An event is the incident's by any of its
+    # versions, and the one in force can be about another road by now.
     closed = [
         versions[-1]
         for versions in closures
-        if versions[-1].data.get("closure") is True and states[versions[-1].id].in_force
+        if states[versions[-1].id].in_force
+        and (
+            _closed_roads(versions[-1]) & set(streets)
+            or (
+                versions[-1].data.get("closure") is True
+                and point is not None
+                and versions[-1].point is not None
+                and versions[-1].point.distance_m(point) <= CLOSURE_M
+            )
+        )
     ]
     if closed:
         signals.append(_signal("closure", "511 lists a road closed.", of(closed)))
@@ -777,7 +818,7 @@ def _track_sources(track: Track) -> list[Source]:
 
 def _alerts_at(
     alerts: Sequence[Evidence], point: Point | None, start: datetime, end: datetime
-) -> tuple[list[Evidence], list[Evidence]]:
+) -> tuple[list[Evidence], list[tuple[Evidence, bool]]]:
     """The alert messages that apply to `point` while the incident was going on,
     and the later messages that update or cancel them.
 
@@ -785,7 +826,8 @@ def _alerts_at(
     out, and its span touches the incident's. Being near the middle of an area is
     not being in it. A message that revises one of those and is not itself one of
     them is handed back apart: that it revised the alert belongs on the timeline,
-    and whether it applies here itself is not known."""
+    and whether it applies here itself is not known. With each goes whether it
+    names an alert that applied here, or only a message that revised one."""
     if point is None:
         return [], []
     found: list[Evidence] = []
@@ -796,16 +838,18 @@ def _alerts_at(
             continue
         if row.occurred_at <= end and (row.until is None or row.until >= start):
             found.append(row)
-    refs = {row.ref for row in found}
-    revisions: list[Evidence] = []
+    here = {row.ref for row in found}
+    chain = set(here)
+    revisions: list[tuple[Evidence, bool]] = []
     # In the order they were sent, so a revision of a revision is found too.
     for row in sorted(alerts, key=_order):
         named = row.data.get("replaces")
-        if "change" in row.data or row.ref in refs or not isinstance(named, list):
+        if "change" in row.data or row.ref in chain or not isinstance(named, list):
             continue
-        if refs & {ref for ref in named if isinstance(ref, str)}:
-            revisions.append(row)
-            refs.add(row.ref)
+        refs = {ref for ref in named if isinstance(ref, str)}
+        if refs & chain:
+            revisions.append((row, bool(refs & here)))
+            chain.add(row.ref)
     return sorted(found, key=_order), revisions
 
 
@@ -948,6 +992,22 @@ def _taps_source(at: datetime) -> Source:
         # A person's tap is nobody's stand-in.
         stand_in=False,
     )
+
+
+def _published(notices: Sequence[Official], *, also: bool = False) -> str:
+    """A sentence that says which notices were published, each named as the type
+    it is and counted, in the order their types were first published."""
+    counts: dict[str, int] = {}
+    for item in notices:
+        counts[item.type] = counts.get(item.type, 0) + 1
+    named = [
+        _NOTICE_WORDS[kind] if count == 1 else f"{count} {_NOTICES_WORDS[kind]}"
+        for kind, count in counts.items()
+    ]
+    listed = named[0] if len(named) == 1 else f"{', '.join(named[:-1])} and {named[-1]}"
+    verb = "was" if len(notices) == 1 else "were"
+    end = "published by an authority" if len(notices) == 1 else "published, each by an authority"
+    return f"{listed[0].upper()}{listed[1:]} {verb} {'also ' if also else ''}{end}."
 
 
 def _taps_words(count: int, more: bool) -> str:

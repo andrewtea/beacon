@@ -207,8 +207,8 @@ def test_an_all_clear_is_published_beside_the_order_and_is_not_said_to_lift_it(r
     order = rows.notice(5, "evacuation_order")
     (signal,) = incidents(rows, 10)[0].signals
     assert signal.text == (
-        "An authority published an order. This is Beacon's reading of the document. "
-        "Read the document for what it says."
+        "An evacuation order was published by an authority. This is Beacon's reading "
+        "of the document. Read the document for what it says."
     )
 
     clear = rows.notice(40, "all_clear")
@@ -221,8 +221,8 @@ def test_an_all_clear_is_published_beside_the_order_and_is_not_said_to_lift_it(r
     # The order is still a signal, and the all-clear is said beside it.
     (signal,) = incident.signals
     assert signal.kind == "official_order"
-    assert "An all-clear was published after it." in signal.text
-    assert "Beacon does not work out what the all-clear covers" in signal.text
+    assert "An all-clear was also published by an authority." in signal.text
+    assert "Beacon does not work out what an all-clear covers" in signal.text
     assert [source.evidence_id for source in signal.sources] == [order.id, clear.id]
     assert "lift" not in repr(incident)
 
@@ -319,15 +319,41 @@ def test_a_closure_gives_the_point_only_where_it_lists_the_incidents_own_road_cl
     # the road it closes is another, and its point is that road's.
     rows.traffic(2, point=FAR, roads=(("Hayes St", False), ("Lincoln Way", True)))
     (incident,) = incidents(rows, 3, NO_BLOCKS)
-    assert (incident.point, incident.point_from) == (None, None)
+    assert (incident.point, incident.point_from, incident.point_source) == (None, None, None)
     assert len(incident.timeline) == 2
+    # A road closed somewhere else is no closure at this incident.
+    assert incident.signals == ()
 
-    # A version that closes Hayes St says where the incident is. A later one in
-    # which Hayes St is open again and another road is closed does not move it.
-    rows.traffic(4, created=2)
+    # A version that closes Hayes St says where the incident is, and is a signal.
+    closing = rows.traffic(4, created=2)
+    (incident,) = incidents(rows, 5, NO_BLOCKS)
+    assert [signal.kind for signal in incident.signals] == ["closure"]
+
+    # A later one in which Hayes St is open again and another road is closed does
+    # not move the incident, and is no closure at it. The point is still 511's,
+    # and goes with 511's credit when no line beside it carries one.
     rows.traffic(6, created=2, point=FAR, roads=(("Hayes St", False), ("Lincoln Way", True)))
     (incident,) = incidents(rows, 7, NO_BLOCKS)
     assert (incident.point, incident.point_from) == (HAYES, "closure")
+    assert incident.signals == ()
+    assert incident.point_source is not None
+    assert (incident.point_source.evidence_id, incident.point_source.credit) == (
+        closing.id,
+        CREDIT_511,
+    )
+
+
+def test_a_closure_near_the_point_on_a_road_no_call_named_is_a_signal(rows: Rows) -> None:
+    fire(rows)
+    rows.traffic(2, road="Ivy St", point=Point(HAYES.lat + 0.001, HAYES.lon))
+    # Slow traffic near the point, with no road closed, is none.
+    rows.traffic(3, "511.org/2", road="Linden St", closed=False)
+
+    (incident,) = incidents(rows, 5)
+
+    assert (incident.point_from, incident.point_source) == ("blocks", None)
+    assert [signal.kind for signal in incident.signals] == ["closure"]
+    assert len(incident.signals[0].sources) == 1
 
 
 def test_a_circling_helicopter_is_a_line_and_a_signal_and_a_high_airliner_is_neither(
@@ -469,16 +495,45 @@ def test_a_notice_that_names_no_street_is_nobodys_unless_it_is_a_press_release(
     assert [signal.kind for signal in incident.signals] == ["official_order"]
 
 
-def test_an_all_clear_before_an_order_is_not_said_beside_it(rows: Rows) -> None:
+def test_notices_are_not_said_to_have_come_one_after_another(rows: Rows) -> None:
     fire(rows)
-    rows.notice(5, "all_clear")
-    order = rows.notice(20, "evacuation_order")
+    # An order, an all-clear, and a second order, the last two at the same minute:
+    # which came into effect when, and which holds, is in the documents.
+    first = rows.notice(5, "evacuation_order")
+    clear = rows.notice(20, "all_clear")
+    second = rows.notice(20, "evacuation_order")
 
     (incident,) = incidents(rows, 30)
 
     (signal,) = incident.signals
-    assert "all-clear" not in signal.text
-    assert [source.evidence_id for source in signal.sources] == [order.id]
+    assert signal.text == (
+        "2 evacuation orders were published, each by an authority. An all-clear was "
+        "also published by an authority. Beacon does not work out what an all-clear "
+        "covers, or which notice holds: the documents say. This is Beacon's reading "
+        "of the document. Read the document for what it says."
+    )
+    for word in ("after", "before", "later", "then", "lift"):
+        assert word not in signal.text
+    assert [source.evidence_id for source in signal.sources] == [first.id, second.id, clear.id]
+
+
+def test_a_warning_is_named_as_a_warning_and_never_as_an_order(rows: Rows) -> None:
+    fire(rows)
+    warning = rows.notice(5, "evacuation_warning")
+    (signal,) = incidents(rows, 10)[0].signals
+    assert signal.text == (
+        "An evacuation warning was published by an authority. This is Beacon's "
+        "reading of the document. Read the document for what it says."
+    )
+    assert "order" not in signal.text
+
+    rows.notice(6, "shelter_in_place")
+    (signal,) = incidents(rows, 10)[0].signals
+    assert signal.text.startswith(
+        "An evacuation warning and a shelter-in-place order were published, each by "
+        "an authority. This is"
+    )
+    assert signal.sources[0].evidence_id == warning.id
 
 
 def test_a_signal_carries_its_sources_its_confidence_and_what_its_source_requires(
@@ -557,6 +612,21 @@ def test_an_incident_the_radio_cleared_takes_nothing_more_from_its_place(rows: R
     ]
 
 
+def test_a_cancellation_of_an_alert_of_the_place_says_so(rows: Rows) -> None:
+    fire(rows)
+    first = rows.alert(1, "first")
+    cancel = rows.alert(8, "gone", message_type="Cancel", replaces=("first",), point=None)
+
+    (incident,) = incidents(rows, 10)
+
+    assert [(item.source.evidence_id, item.state, item.ended_by) for item in incident.official] == [
+        (first.id, "cancelled", cancel.id)
+    ]
+    line = incident.timeline[-1]
+    assert line.text == "A later message cancelled an alert that applied here."
+    assert line.details["revises_alert_here"] is True
+
+
 def test_one_low_position_is_one_sighting_and_no_more_is_said_of_it(rows: Rows) -> None:
     fire(rows)
     rows.aircraft(2, HAYES, icao24="once01", altitude_m=250)
@@ -597,10 +667,23 @@ def test_a_later_message_about_an_alert_is_a_line_and_not_an_alert_for_the_place
         "A later message updated an alert that applied here. The later message can "
         "be for another area: Beacon does not say that it applies here."
     )
-    assert updated.details == {"message_type": "Update", "revises": ["first"]}
+    assert updated.details == {
+        "message_type": "Update",
+        "revises": ["first"],
+        "revises_alert_here": True,
+    }
     assert (updated.sources[0].evidence_id, updated.confidence) == (second.id, "official")
-    assert cancelled.text == "A later message cancelled an alert that applied here."
-    assert cancelled.details == {"message_type": "Cancel", "revises": ["second"]}
+    # The cancellation names the update, which was drawn for somewhere else: it is
+    # not said to have cancelled an alert that applied here.
+    assert cancelled.text == (
+        "A later message cancelled a message that had revised an alert that applied "
+        "here. Beacon does not say that the message it cancelled applied here."
+    )
+    assert cancelled.details == {
+        "message_type": "Cancel",
+        "revises": ["second"],
+        "revises_alert_here": False,
+    }
     shown = repr(incident)
     for word in ("Headline of second", "Instruction of second", "Headline of third", "in_force"):
         assert word not in shown
