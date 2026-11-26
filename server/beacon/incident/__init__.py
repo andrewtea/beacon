@@ -18,7 +18,7 @@ from beacon.incident.aircraft import Track, tracks
 from beacon.incident.build import build_incidents, incident_id, source_of, weakest
 from beacon.incident.calls import IDLE, CallGroup, group_calls
 from beacon.incident.engine import HORIZON, Engine, Snapshot
-from beacon.incident.inforce import Standing, lifted, standings
+from beacon.incident.inforce import Standing, standings
 from beacon.incident.model import (
     CONFIDENCE_RANK,
     Credit,
@@ -53,7 +53,6 @@ __all__ = [
     "build_incidents",
     "group_calls",
     "incident_id",
-    "lifted",
     "open_engine",
     "read_blocks",
     "source_of",

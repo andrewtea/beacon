@@ -172,6 +172,42 @@ def test_an_intersection_is_one_place_whichever_street_is_named_first(rows: Rows
     assert (len(alarm.rows), alarm.cross_street) == (1, "Laguna St")
 
 
+def test_a_corner_named_by_its_other_street_with_a_block_is_the_same_corner(rows: Rows) -> None:
+    rows.radio(
+        0, "collision", "dispatched", units=("E1",), street="Hayes St", cross_street="Gough St"
+    )
+    # The same corner, named by its other street and with that street's block.
+    rows.radio(
+        2,
+        "collision",
+        "on_scene",
+        units=("T3",),
+        street="Gough St",
+        block=300,
+        cross_street="Hayes St",
+    )
+    # A call on the incident's own street gives the block of that street.
+    rows.radio(
+        4,
+        "collision",
+        "working",
+        units=("E1",),
+        street="Hayes St",
+        block=400,
+        cross_street="Gough St",
+    )
+
+    (collision,) = groups(rows)
+
+    assert len(collision.rows) == 3
+    # The block of Gough St is not taken for a block of Hayes St.
+    assert (collision.street, collision.block, collision.cross_street) == (
+        "Hayes St",
+        400,
+        "Gough St",
+    )
+
+
 def test_a_unit_named_on_a_second_incident_has_left_the_first(rows: Rows) -> None:
     rows.radio(0, "fire", "working", units=("E1", "E2"), street="Hayes St", block=400)
     rows.radio(5, "alarm", "dispatched", units=("E9",), street="Irving St", block=1900)

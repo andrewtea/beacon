@@ -14,7 +14,8 @@ What is attached, and why it is taken to belong:
   while the incident was going on. Being near the middle of an alert's area is not
   being in it, and a city-wide alert, which has no area of its own, is about the
   city and not about this incident. A later message that updates or cancels such an
-  alert is a line of the timeline.
+  alert is a line of the timeline that says only that: the later message can be
+  drawn for another area, so none of its words is shown and it is given no standing.
 - **A notice** that names one of the incident's streets and was published while it
   was going on or in the hours after. A press release keeps no streets, so it is
   attached when exactly one incident of its hazard is in its time; any other notice
@@ -30,8 +31,9 @@ because an all-clear and a press release come after.
 A medical response gets none of these. It is its crews and its block.
 
 An incident's point is the middle of its block when somebody listed the block
-(`beacon.incident.places`), else the middle of an event in which 511 lists a road of
-its as closed, else nothing. With no point it is matched to nothing by distance.
+(`beacon.incident.places`), else the point of a version of a 511 event that lists a
+road of its as closed, else nothing. With no point it is matched to nothing by
+distance.
 
 The wording here is where the product's rules about words are kept:
 
@@ -44,7 +46,9 @@ The wording here is where the product's rules about words are kept:
   `Official.incomplete`: the original is where to read it.
 - A notice is written as a document of its type that was published, with its link.
   Its words are a model's reading, and none of them is shown here: the redaction
-  pass has to read them first.
+  pass has to read them first. An order and an all-clear are each a document that
+  was published. Which order an all-clear lifts, and where, is not worked out: a
+  notice's row keeps streets and no blocks, so that is read in the documents.
 - That a source stopped listing something is written as what Beacon saw, not as an
   all-clear.
 - Everything from 511 carries the credit its data agreement requires.
@@ -58,7 +62,7 @@ from typing import Any
 from beacon.evidence import Confidence, Evidence, Kind, Point
 from beacon.incident.aircraft import NEAR_M, Track, tracks
 from beacon.incident.calls import IDLE, CallGroup, group_calls
-from beacon.incident.inforce import Standing, lifted, notice_streets, standings
+from beacon.incident.inforce import Standing, notice_streets, standings
 from beacon.incident.model import (
     CONFIDENCE_RANK,
     Credit,
@@ -256,11 +260,15 @@ def _incident(
             if not (named or near):
                 continue
             closures.append(versions)
-            # Only a version that lists a road as closed says where the incident is.
+            # Only a version that lists a road of the incident's as closed says
+            # where the incident is. Another version of the event can be about
+            # another road, or about this one when it is open again.
             closed = [
-                row for row in versions if row.data.get("closure") is True and row.point is not None
+                row
+                for row in versions
+                if row.point is not None and _closed_roads(row) & set(streets)
             ]
-            if point is None and named and closed:
+            if point is None and closed:
                 point, point_from = closed[-1].point, "closure"
         alerts, revisions = _alerts_at(by_kind.get("alert", []), point, start, end)
         notices = _notices_for(group, by_kind.get("notice", []), streets, press, start)
@@ -272,14 +280,13 @@ def _incident(
             entries.append(_alert_entry(alert, states))
             official.append(_official_alert(alert, states[alert.id]))
         # A later message that updates or cancels one of them is a line of the
-        # timeline. It is not listed as an alert for this place: its own area or
-        # time may not be this incident's.
-        entries += [_alert_entry(revision, states) for revision in revisions]
+        # timeline, which says that and no more. It is not listed as an alert for
+        # this place: its own area or time may not be this incident's.
+        entries += [_revision_entry(revision) for revision in revisions]
         entries += [_change_entry(change) for change in changes]
-        ended = lifted(notices)
         for notice in notices:
             entries.append(_notice_entry(notice, streets))
-            official.append(_official_notice(notice, ended.get(notice.id), now))
+            official.append(_official_notice(notice, now))
         members += [*alerts, *revisions, *changes, *notices]
         if point is not None and nearby is not None:
             until = min(end, now)
@@ -463,6 +470,28 @@ def _alert_entry(row: Evidence, states: dict[int, Standing]) -> Entry:
     )
 
 
+def _revision_entry(row: Evidence) -> Entry:
+    """The line for a later message that updates or cancels an alert of this place.
+    It says that the alert was updated or cancelled, and links the message. The
+    message's own words, its span, and how it stands are left out: it can be drawn
+    for another area, and then none of them is about this place."""
+    cancel = row.data.get("message_type") == "Cancel"
+    return Entry(
+        at=row.occurred_at,
+        kind="alert",
+        text="A later message cancelled an alert that applied here."
+        if cancel
+        else "A later message updated an alert that applied here. The later message "
+        "can be for another area: Beacon does not say that it applies here.",
+        confidence=row.confidence,
+        sources=(source_of(row),),
+        details={
+            "message_type": row.data.get("message_type"),
+            "revises": [ref for ref in row.data.get("replaces") or [] if isinstance(ref, str)],
+        },
+    )
+
+
 def _change_entry(row: Evidence) -> Entry:
     words = _NOT_LISTED if row.data.get("change") == "not_listed" else _LISTED_AGAIN
     return Entry(
@@ -519,17 +548,15 @@ def _official_alert(row: Evidence, standing: Standing) -> Official:
     )
 
 
-def _official_notice(row: Evidence, lifted_by: Evidence | None, now: datetime) -> Official:
-    state = "published"
-    if lifted_by is not None:
-        state = "lifted"
-    elif row.until is not None and row.until <= now:
-        state = "ended"
+def _official_notice(row: Evidence, now: datetime) -> Official:
+    # A notice is a document that was published, and stays one. Nothing here says
+    # that an all-clear lifts an order: which order, and where, is in the documents.
+    ended = row.until is not None and row.until <= now
     return Official(
         kind="notice",
         type=str(row.data.get("notice_type")),
-        state=state,  # type: ignore[arg-type]
-        ended_by=None if lifted_by is None else lifted_by.id,
+        state="ended" if ended else "published",
+        ended_by=None,
         issued_at=row.occurred_at,
         until=row.until,
         # A notice's issuer, title, areas, instruction, and summary are words a
@@ -556,14 +583,12 @@ def _aircraft_entry(track: Track) -> Entry:
     else:
         did = "was seen low nearby"
     height = "" if track.lowest_m is None else f", as low as {round(track.lowest_m)} m"
-    ends = {track.rows[0].id: track.rows[0], track.rows[-1].id: track.rows[-1]}
     return Entry(
         at=track.first_seen,
         kind="aircraft",
         text=f"{what}{name} {did}{height}.",
         confidence=weakest([row.confidence for row in track.rows]),
-        # The first and the last position stand for the track.
-        sources=tuple(source_of(row) for row in ends.values()),
+        sources=tuple(_track_sources(track)),
         details={
             "icao24": track.icao24,
             "callsign": track.callsign,
@@ -636,19 +661,27 @@ def _signals(
         signals.append(
             _signal("many_units", f"{len(group.named)} units named on the radio.", of(naming))
         )
-    orders = [
-        item
-        for item in official
-        if item.kind == "notice"
-        and item.type in ORDERS - {"all_clear"}
-        and item.state == "published"
-    ]
+    notices = [item for item in official if item.kind == "notice" and item.state == "published"]
+    orders = [item for item in notices if item.type in ORDERS - {"all_clear"}]
     if orders:
+        # An all-clear published after an order is said beside it, and is not taken
+        # to lift it: the order and the all-clear can be about different blocks.
+        clears = [
+            item
+            for item in notices
+            if item.type == "all_clear" and item.issued_at >= orders[0].issued_at
+        ]
+        after = (
+            "An all-clear was published after it. Beacon does not work out what the "
+            "all-clear covers: the documents say. "
+            if clears
+            else ""
+        )
         signals.append(
             _signal(
                 "official_order",
-                "An authority published an order that no notice Beacon has read lifts. " + _READING,
-                [item.source for item in orders],
+                f"An authority published an order. {after}{_READING}",
+                [item.source for item in (*orders, *clears)],
             )
         )
     alerts = [item for item in official if item.kind == "alert" and item.state == "in_force"]
@@ -673,7 +706,7 @@ def _signals(
             _signal(
                 "aircraft_circling",
                 "An aircraft circled nearby.",
-                of([track.rows[0] for track in circling]),
+                [source for track in circling for source in _track_sources(track)],
             )
         )
     if len(near_taps) >= MANY_TAPS:
@@ -721,6 +754,27 @@ def _roads(versions: Sequence[Evidence]) -> set[str]:
     return named
 
 
+def _closed_roads(row: Evidence) -> set[str]:
+    """The roads one version of an event lists as closed, each in the form Beacon
+    keeps a street in."""
+    named: set[str] = set()
+    for road in row.data.get("roads") or []:
+        if isinstance(road, dict) and road.get("closed") is True:
+            street = clean_street(road.get("name"))
+            if street is not None:
+                named.add(street)
+    return named
+
+
+def _track_sources(track: Track) -> list[Source]:
+    """The rows that stand for a track: its first and its last position, and the
+    one of its positions that is trusted least, so that whatever rests on the
+    track is trusted no more than a source it names."""
+    least = max(track.rows, key=lambda row: CONFIDENCE_RANK.index(row.confidence))
+    chosen = {row.id: row for row in (track.rows[0], least, track.rows[-1])}
+    return [source_of(row) for row in sorted(chosen.values(), key=_order)]
+
+
 def _alerts_at(
     alerts: Sequence[Evidence], point: Point | None, start: datetime, end: datetime
 ) -> tuple[list[Evidence], list[Evidence]]:
@@ -729,8 +783,9 @@ def _alerts_at(
 
     A message applies when the area it was drawn for holds the point, holes left
     out, and its span touches the incident's. Being near the middle of an area is
-    not being in it. A message that revises one of those is handed back apart: it
-    belongs on the timeline, and whether it applies here itself is not known."""
+    not being in it. A message that revises one of those and is not itself one of
+    them is handed back apart: that it revised the alert belongs on the timeline,
+    and whether it applies here itself is not known."""
     if point is None:
         return [], []
     found: list[Evidence] = []

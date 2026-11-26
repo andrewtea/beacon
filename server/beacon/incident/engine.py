@@ -115,8 +115,10 @@ class Engine:
         """The incidents as of now, from one state of the store. The same reading
         is handed out again while the store has no new row and it is not yet
         `FRESH` old."""
-        now = self._clock()
         with self._working:
+            # The time is read by the one that holds the lock, so readings are made
+            # in the order of their times and a later one never has an earlier time.
+            now = self._clock()
             last = self._store.last_id()
             made = self._made
             if (

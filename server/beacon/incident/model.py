@@ -29,7 +29,7 @@ SignalKind = Literal[
     "taps",
 ]
 OfficialState = Literal[
-    "in_force", "replaced", "cancelled", "not_listed", "ended", "unknown", "published", "lifted"
+    "in_force", "replaced", "cancelled", "not_listed", "ended", "unknown", "published"
 ]
 
 
@@ -89,12 +89,14 @@ class Official:
     # An alert's event, as the authority named it (`Shelter In Place Warning`), or a
     # notice's type (`evacuation_order`).
     type: str
-    # `published` is a notice that no other notice Beacon has read lifts. Beacon
-    # does not say such an order is in force: it has only read the document.
-    # `unknown` is an alert that may have been ended by a row that was not read.
+    # `published` is a notice: a document that was published, and of which Beacon
+    # says no more. It does not say that an order is in force, and it does not say
+    # that an all-clear lifts one: a notice is `ended` only when it ran to the time
+    # its own document gave. `unknown` is an alert that may have been ended by a row
+    # that was not read.
     state: OfficialState
-    # The row that ended it, when one did: an update, a cancellation, the row that
-    # says it is no longer listed, or the all-clear Beacon reads as lifting it.
+    # The row that ended an alert, when one did: an update, a cancellation, or the
+    # row that says it is no longer listed. None for a notice.
     ended_by: int | None
     issued_at: datetime
     until: datetime | None

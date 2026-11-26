@@ -123,13 +123,14 @@ class CallGroup:
         it is the same block or the same intersection, 1 when nothing it says
         speaks against it, and 0 when it is somewhere else.
 
-        An intersection is the same one whichever of its streets is named first.
-        Two calls on one street are somewhere else when they give different
-        blocks, or give no block and different cross streets."""
-        if (
-            call.cross_street is not None
-            and call.block is None
-            and (self.street, self.cross_street) == (call.cross_street, call.street)
+        An intersection is the same one whichever of its streets is named first,
+        and whether or not a block is given with it: a block is counted along the
+        street it is given with, so the two ways of naming one corner give two
+        numbers. Two calls on one street are somewhere else when they give
+        different blocks, or give no block and different cross streets."""
+        if call.cross_street is not None and (self.street, self.cross_street) == (
+            call.cross_street,
+            call.street,
         ):
             return 2
         if self.street != call.street:
@@ -145,6 +146,9 @@ class CallGroup:
         if call.street is not None and self.street is None:
             self.street = call.street
         if self.street == call.street:
+            # A block belongs to the street it was given with. A call that names
+            # this corner by its other street gives a block of that street, which
+            # is not taken for a block of this one.
             self.block = self.block if self.block is not None else call.block
             self.cross_street = self.cross_street or call.cross_street
         if not self.medical:

@@ -18,13 +18,11 @@ The caller hands over every row that can end one of the others. The row that end
 message is later than the message and can be anywhere, so it is searched for with no
 distance filter and no upper bound on its age, as `AGENTS.md` says.
 
-A notice is lifted only by another notice. `lifted` says which all-clear Beacon
-reads as lifting which order, among notices already matched to one incident: an
-earlier order about the same hazard that names a street the all-clear names too.
-Two notices that name no street in common are about different places as far as
-Beacon can tell, and the order stays as it was. Both
-are a model's readings of documents, so the result is how Beacon reads them and
-never an instruction: an all-clear can have exceptions that only the document gives.
+Nothing here says which order an all-clear lifts. A notice row keeps the streets a
+document names and no blocks, so two notices that name one street can be about
+places a mile apart, and an all-clear can leave part of an order standing in a
+sentence only the document has. An order and an all-clear are each shown as a
+document that was published, and what the all-clear covers is read in the document.
 """
 
 import itertools
@@ -39,9 +37,6 @@ from beacon.radio.vocabulary import clean_street
 State = Literal[
     "in_force", "replaced", "cancelled", "not_listed", "ended", "cancellation", "unknown"
 ]
-
-# The types of notice an all-clear can lift.
-_LIFTED_BY_ALL_CLEAR = frozenset({"evacuation_order", "evacuation_warning", "shelter_in_place"})
 
 
 @dataclass(frozen=True)
@@ -87,25 +82,6 @@ def standings(rows: Iterable[Evidence], now: datetime) -> dict[int, Standing]:
         for earlier, later in itertools.pairwise(event):
             found[earlier.id] = Standing("replaced", later)
         found[event[-1].id] = _listed(event[-1], changes) or Standing("in_force")
-    return found
-
-
-def lifted(notices: Sequence[Evidence]) -> dict[int, Evidence]:
-    """Which all-clear Beacon reads as lifting which order, among the notices of
-    one incident: the id of each order's row, and the all-clear's row. An all-clear
-    lifts the orders about the same hazard that were published before it and name
-    a street it names too."""
-    found: dict[int, Evidence] = {}
-    ordered = sorted(notices, key=_order)
-    for place, notice in enumerate(ordered):
-        if notice.data.get("notice_type") != "all_clear":
-            continue
-        streets = set(notice_streets(notice))
-        for earlier in ordered[:place]:
-            lifts = earlier.data.get("notice_type") in _LIFTED_BY_ALL_CLEAR
-            same_hazard = earlier.data.get("hazard") == notice.data.get("hazard")
-            if lifts and same_hazard and streets & set(notice_streets(earlier)):
-                found.setdefault(earlier.id, notice)
     return found
 
 

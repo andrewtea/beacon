@@ -124,7 +124,9 @@ class Rows:
         point: Point | None = HAYES,
         closed: bool = True,
         headline: str | None = None,
+        roads: tuple[tuple[str, bool], ...] | None = None,
     ) -> Evidence:
+        listed = ((road, closed),) if roads is None else roads
         return self._add(
             kind="traffic",
             source="511",
@@ -136,8 +138,8 @@ class Rows:
                 "event_id": event_id,
                 "headline": headline or f"Activity on {road}",
                 "created": at(minute if created is None else created).isoformat(),
-                "roads": [{"name": road, "closed": closed}],
-                "closure": closed,
+                "roads": [{"name": name, "closed": shut} for name, shut in listed],
+                "closure": any(shut for _, shut in listed),
             },
         )
 
@@ -203,13 +205,14 @@ class Rows:
         icao24: str = "abc123",
         altitude_m: float = 300.0,
         category: str | None = "rotorcraft",
+        confidence: str = "high",
     ) -> Evidence:
         return self._add(
             kind="aircraft",
             source="opensky",
             ref=f"{icao24}@{at(minute).timestamp()}",
             occurred_at=at(minute),
-            confidence="high",
+            confidence=confidence,
             point=point,
             data={
                 "icao24": icao24,

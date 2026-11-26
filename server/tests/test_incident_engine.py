@@ -1,6 +1,7 @@
 """The engine on the mock scenario, and the routes that read it."""
 
-from datetime import timedelta
+import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -88,7 +89,7 @@ def test_the_mock_scenario_is_one_fire_two_medical_responses_and_an_alarm(story:
     assert [(item.kind, item.type, item.state) for item in fire.official] == [
         ("alert", "Shelter In Place Warning", "replaced"),
         ("alert", "Shelter In Place Warning", "not_listed"),
-        ("notice", "evacuation_order", "lifted"),
+        ("notice", "evacuation_order", "published"),
         ("notice", "all_clear", "published"),
         ("notice", "press_release", "published"),
     ]
@@ -127,11 +128,13 @@ def test_the_fire_grows_and_its_signals_with_it(story: Story) -> None:
         "closure",
         "aircraft_circling",
     ]
-    # The all-clear lifts the order, and the warning is no longer listed.
+    # The warning is no longer listed. An all-clear was published, and the order
+    # is still a signal: what the all-clear covers is in the documents.
     assert signals(75) == [
         "alarm",
         "evacuation_on_radio",
         "many_units",
+        "official_order",
         "closure",
         "aircraft_circling",
     ]
@@ -163,6 +166,34 @@ def test_the_engine_reads_again_when_a_row_is_stored_and_not_before(tmp_path: Pa
     engine.incidents()
     assert len(searched) > asked
     assert not engine.partial
+
+
+def test_a_reading_takes_its_time_while_no_other_reading_can_be_made(tmp_path: Path) -> None:
+    rows = Rows(mock_store(tmp_path))
+    rows.radio(0, "fire", "working", units=("E36",), street="Irving St", block=1900)
+    times = iter([at(1), at(2)])
+    second: list[threading.Thread] = []
+    waited: list[bool] = []
+    read: list[datetime] = []
+
+    def clock() -> datetime:
+        if not second:
+            # While the first reading has its time and has not yet been made, a
+            # second one is asked for. It has to wait, or it would be made first
+            # with the later time and the first would then put the engine back.
+            second.append(threading.Thread(target=lambda: read.append(engine.snapshot().as_of)))
+            second[0].start()
+            second[0].join(0.3)
+            waited.append(second[0].is_alive())
+        return next(times)
+
+    engine = Engine(rows.store, NO_BLOCKS, clock=clock)
+
+    first = engine.snapshot().as_of
+    second[0].join(5)
+
+    assert waited == [True]
+    assert (first, read) == (at(1), [at(2)])
 
 
 def test_a_flood_of_taps_crowds_no_call_out_of_what_the_engine_reads(

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from beacon.incident import lifted, standings
+from beacon.incident import standings
 from tests.incident_rows import Rows, at, mock_store
 
 
@@ -70,15 +70,3 @@ def test_only_the_latest_version_of_a_traffic_event_can_be_in_force(rows: Rows) 
     assert states(rows, 90)[second.ref][0] == "not_listed"
     # A change is about the version it names, and the other event is untouched.
     assert states(rows, 90)[other.ref] == ("in_force", None)
-
-
-def test_an_all_clear_lifts_the_earlier_orders_of_its_hazard_and_nothing_else(rows: Rows) -> None:
-    order = rows.notice(19, "evacuation_order")
-    smoke = rows.notice(20, "shelter_in_place", hazard="smoke")
-    closure = rows.notice(21, "road_closure")
-    clear = rows.notice(74, "all_clear")
-    later = rows.notice(80, "evacuation_order")
-
-    found = lifted([order, smoke, closure, clear, later])
-
-    assert {row_id: by.id for row_id, by in found.items()} == {order.id: clear.id}
