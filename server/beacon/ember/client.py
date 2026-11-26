@@ -584,8 +584,10 @@ class EmberClient:
         spending stop and the scope's budget, never in place of them. A live call is
         refused, with CallLimitError and before its paid request, when the most it
         can cost (no cache hits, every output token used) is more than the limit,
-        and any call is when the limit is zero or less. A client with a pacer holds
-        each attempt to it.
+        and any call is when the limit is zero or less. A call with a limit sends
+        its paid request once: a client with a pacer does not try it again after a
+        429, which is raised as the EmberCallError it is, because the attempt that
+        was refused may have been billed and the limit has no room counted for two.
         A client with a pacer raises RateLimitHoldError when the API asks for a wait
         longer than the pacer makes, to the call that was told so and to every call
         after it until the wait has passed.
@@ -749,13 +751,18 @@ class EmberClient:
                 # Only a rate limit is waited out. Any other failure may have been
                 # billed and may fail the same way again. A wait too long to sit
                 # through is raised by `back_off` as a RateLimitHoldError.
-                if (
-                    self._pacer is not None
-                    and error.status_code == _RATE_LIMITED
-                    and self._pacer.back_off(attempt, error.retry_after)
-                ):
-                    attempt += 1
-                    continue
+                if self._pacer is not None and error.status_code == _RATE_LIMITED:
+                    # The cooldown starts for every thread, whatever comes of this call.
+                    again = self._pacer.back_off(attempt, error.retry_after)
+                    # A call held to a limit pays for one attempt. The request that
+                    # was answered 429 keeps what was held back for it in the ledger
+                    # and has no accounting its caller could take off the limit, so
+                    # a second paid request under the same limit could take the
+                    # caller past its cap. A count of tokens that was refused cost
+                    # nothing, and is asked for again.
+                    if again and (limit_nanousd is None or counting):
+                        attempt += 1
+                        continue
                 if sent is None or not counting:
                     raise
             # A later attempt ended before its paid request: it was refused, or

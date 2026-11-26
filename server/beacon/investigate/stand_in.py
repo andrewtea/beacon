@@ -3,6 +3,7 @@
 It is a responder for `EmberClient.fake`. It reads the requests `investigate_tap`
 sends and plays the investigator by rule: it asks what is near, takes as its lead
 the incident that is going on with the most signals, and of those the nearest,
+among the ones near enough to be matched by their place when there are any,
 checks the lead's official sources, the aircraft, the other taps, and the clip or
 photo when there is one, and answers with the grounds its own reading of the tools'
 answers gives, or with "unconfirmed" when that gives none. It decides on crisis mode
@@ -43,8 +44,10 @@ def stand_in_investigator(body: Mapping[str, Any]) -> Mapping[str, Any]:
         for incident in answer.get("incidents") or []
         if isinstance(incident, dict) and isinstance(incident.get("id"), str)
     ]
-    # They come nearest first, and `max` keeps the first of those that tie.
-    lead = max(incidents, key=_weight, default=None)
+    # An incident near enough to be matched by its place is taken before any that
+    # is not, whatever signals a farther one has. They come nearest first, and
+    # `max` keeps the first of those that tie.
+    lead = max([i for i in incidents if _near(i)] or incidents, key=_weight, default=None)
     looked = any("taps" in answer for answer in returned)
     if lead is None:
         if not looked and "nearby_taps" in offered:
@@ -62,11 +65,10 @@ def stand_in_investigator(body: Mapping[str, Any]) -> Mapping[str, Any]:
     heard = {tag for answer in returned for tag in answer.get("heard") or []}
     seen = {tag for answer in returned for tag in answer.get("seen") or []}
     taps = max((answer.get("taps") or 0 for answer in returned if "taps" in answer), default=0)
-    distance = lead.get("distance_m")
     grounds = [
         ground
         for ground, holds in (
-            ("near", isinstance(distance, int) and distance <= _NEAR_M),
+            ("near", _near(lead)),
             ("going_on", bool(lead.get("going_on"))),
             ("heard_in_clip", bool(heard & {"siren", "air_horn"})),
             ("seen_in_photo", bool(seen - {"none", "helicopter"})),
@@ -83,6 +85,11 @@ def stand_in_investigator(body: Mapping[str, Any]) -> Mapping[str, Any]:
     official = [kind for kind in signals if kind in _OFFICIAL]
     crisis = [*on_radio, *official] if on_radio and official else []
     return _answer("incident", lead["id"], grounds, crisis)
+
+
+def _near(incident: Mapping[str, Any]) -> bool:
+    distance = incident.get("distance_m")
+    return isinstance(distance, int) and distance <= _NEAR_M
 
 
 def _weight(incident: Mapping[str, Any]) -> tuple[bool, int]:

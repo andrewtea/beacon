@@ -1735,6 +1735,52 @@ def test_a_date_in_retry_after_is_waited_out(storage: Storage) -> None:
     assert 15 < clock.sleeps[1] <= 20
 
 
+def test_a_call_held_to_a_limit_sends_its_paid_request_once_whatever_the_pacer_would_do(
+    storage: Storage,
+) -> None:
+    refusals = [_rate_limited()]
+    api = MetaApi(
+        create=lambda _request: (
+            refusals.pop(0) if refusals else httpx2.Response(200, json=completed())
+        )
+    )
+    clock = Clock()
+    pacer = Pacer(600, clock=clock, sleep=clock.sleep, jitter=lambda: 0.0)
+
+    # Room for one attempt, which is answered 429. The attempt keeps what was held
+    # back for it, so a second one would take the caller past what it allowed.
+    with pytest.raises(EmberCallError) as raised:
+        ask(api.client(storage, pacer=pacer), limit_nanousd=RESERVED_NANOUSD)
+
+    assert raised.value.status_code == 429
+    assert api.paths() == ["/v1/responses/input_tokens", "/v1/responses"]
+    assert [(row["status"], row["cost_nanousd"]) for row in ledger_rows(storage)] == [
+        ("unknown", RESERVED_NANOUSD)
+    ]
+    # The other threads still hold off.
+    assert pacer.rate_limited == 1
+
+    # A count of the tokens that is answered 429 cost nothing, and is asked for again.
+    counts = [_rate_limited()]
+    behind = MetaApi()
+
+    def refuse_a_count(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == "/v1/responses/input_tokens" and counts:
+            return counts.pop(0)
+        return behind(request)
+
+    clock = Clock()
+    counted = EmberClient.live(
+        storage,
+        api_key="test-key",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(refuse_a_count)),
+        pacer=Pacer(600, clock=clock, sleep=clock.sleep, jitter=lambda: 0.0),
+    )
+    answer = ask(counted, input="Another question.", limit_nanousd=RESERVED_NANOUSD)
+    assert answer.source == "live"
+    assert behind.paths() == ["/v1/responses/input_tokens", "/v1/responses"]
+
+
 def test_the_wait_for_the_rate_limit_is_not_part_of_a_calls_latency(storage: Storage) -> None:
     api = MetaApi()
     # One request every 0.15 s, and a call makes two: the second call's paid

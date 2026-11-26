@@ -256,9 +256,10 @@ class Run:
     # when the tap came, and the newest evidence row there was when it was made.
     as_of: datetime | None = None
     last_id: int | None = None
-    # How many calls to Ember failed after their paid request may have been sent.
-    # Such a call has a row in the Ember ledger, which holds what was kept back for
-    # it, and none here: the run's costs are then a lower bound.
+    # How many calls to Ember ended in an error after their paid request may have
+    # been sent. Such a call has no accounting here, so the run's totals may then
+    # be incomplete. What the Ember ledger kept back for it, when its row is there,
+    # is the ledger's to say: a ledger that was replaced has none.
     unaccounted: int = 0
 
     @property
@@ -441,25 +442,22 @@ def _form(text: str) -> object:
 
 def _outcome(said: object, scene: Scene, found: Found) -> Outcome:
     """What stands of Ember's answer. Nothing is read of it but the form's fields."""
-    if not isinstance(said, Mapping) or said.get("outcome") not in ("incident", "unconfirmed"):
+    said = _whole(said)
+    if said is None:
+        # Not the form: nothing is made of the parts of it that are there, and it
+        # counts as an answer Beacon could not use.
         return Outcome(status="unconfirmed", reason="no_answer")
     if said["outcome"] == "unconfirmed":
         # What is said of an unconfirmed tap is what the run's tools showed, and
         # not Ember's word for it.
         looked = "nothing_near" if found.looked else "not_looked"
         return Outcome(status="unconfirmed", reason="not_sure" if found.incidents else looked)
-    named = said.get("incident")
     # Only an incident a tool of this run returned, which is in this reading.
-    incident = scene.snapshot.get(named) if isinstance(named, str) else None
+    incident = scene.snapshot.get(said["incident"])
     if incident is None or incident.id not in found.incidents:
         return Outcome(status="unconfirmed", reason="not_grounded")
     distance = found.incidents[incident.id]
-    given = said.get("grounds")
-    cited = (
-        {ground for ground in given if isinstance(ground, str)}
-        if isinstance(given, list)
-        else set()
-    )
+    cited = set(said["grounds"])
     held = tuple(
         ground
         for ground in GROUNDS
@@ -482,6 +480,28 @@ def _outcome(said: object, scene: Scene, found: Found) -> Outcome:
         crisis_cited=rested_on,
         crisis_refused=refused,
     )
+
+
+def _whole(said: object) -> Mapping[str, Any] | None:
+    """An answer that is the form, every field there and in its shape, as the
+    schema Ember is given requires, or None. A value that is not on a field's list
+    is another matter: it is dropped from a form that is whole. An answer that
+    says "incident" and names none is not whole."""
+    if not isinstance(said, Mapping):
+        return None
+    outcome, named = said.get("outcome"), said.get("incident")
+    whole = (
+        outcome in ("incident", "unconfirmed")
+        and (isinstance(named, str) or (named is None and outcome == "unconfirmed"))
+        and _strings(said.get("grounds"))
+        and isinstance(said.get("crisis"), bool)
+        and _strings(said.get("crisis_signals"))
+    )
+    return said if whole else None
+
+
+def _strings(given: object) -> bool:
+    return isinstance(given, list) and all(isinstance(item, str) for item in given)
 
 
 def _holds(ground: str, incident: Incident, distance: float, scene: Scene, found: Found) -> bool:
@@ -525,8 +545,7 @@ def _crisis(said: Mapping[str, Any], incident: Incident) -> tuple[bool, tuple[Ci
     stand. Every signal it cites has to be one the engine found for the incident."""
     if said.get("crisis") is not True:
         return False, (), False
-    given = said.get("crisis_signals")
-    cited = {kind for kind in given if isinstance(kind, str)} if isinstance(given, list) else set()
+    cited = set(said["crisis_signals"])
     has = {signal.kind for signal in incident.signals}
     if incident.category == MEDICAL_EVENT or not cited or not cited <= has:
         return False, (), True

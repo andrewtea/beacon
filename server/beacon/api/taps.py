@@ -6,7 +6,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from beacon.api.incidents import CreditOut, IncidentSummary, summary_of
+from beacon.api.incidents import CreditOut, IncidentSummary, cited_credit, summary_of
 from beacon.evidence import Evidence
 from beacon.incident import Engine, Snapshot
 from beacon.incident.build import CREDIT_511
@@ -139,8 +139,9 @@ class TapAnswer(BaseModel):
     since: list[IncidentSummary]
     since_text: str | None
     # What the investigation cost, and how many calls to Ember it made.
-    # `cost_incomplete` is true when a call failed after it may have been sent, or
-    # the run was lost: the cost is then a lower bound, and `cost_text` says so.
+    # `cost_incomplete` is true when a call ended in an error after it may have
+    # been sent, or nothing was kept of the run: the totals may then be incomplete,
+    # and `cost_text` says which.
     cost_usd: float
     ember_calls: int
     cost_incomplete: bool
@@ -198,6 +199,9 @@ class CitedThen(BaseModel):
     kind: str
     confidence: Literal["official", "high", "medium", "low"]
     evidence_ids: list[int]
+    # 511's credit for a `closure`, to be shown with it: the incident may have no
+    # closure signal now to carry it.
+    credit: CreditOut | None
 
 
 class OutcomeOut(BaseModel):
@@ -248,9 +252,9 @@ class TapRun(BaseModel):
     cut_short: str | None = None
     cut_short_text: str | None = None
     # Every call to Ember that answered, together. `unaccounted_calls` is how many
-    # failed after their paid request may have been sent: each has a row in the
-    # Ember ledger and none here, so the totals are then a lower bound
-    # (`cost_incomplete`, which is also true of a run that was lost).
+    # ended in an error after their paid request may have been sent: none of them
+    # is in these totals, which may then be incomplete (`cost_incomplete`, which is
+    # also true of a run nothing was kept of). `cost_text` says which.
     ember_calls: int = 0
     input_tokens: int = 0
     cached_tokens: int = 0
@@ -420,7 +424,7 @@ def tap_answer(request: Request, tap_id: str) -> TapAnswer:
         incident.stand_in for incident in shown
     )
     lost = state == "lost"
-    incomplete = lost or (run is not None and run.unaccounted > 0)
+    unaccounted = run is not None and run.unaccounted > 0
     return TapAnswer(
         mode=taps.store.mode,
         as_of=snapshot.as_of,
@@ -452,8 +456,8 @@ def tap_answer(request: Request, tap_id: str) -> TapAnswer:
         since_text=words.SINCE if since else None,
         cost_usd=0.0 if run is None else run.cost_usd,
         ember_calls=0 if run is None else len(run.calls),
-        cost_incomplete=incomplete,
-        cost_text=words.COST_INCOMPLETE if incomplete else None,
+        cost_incomplete=lost or unaccounted,
+        cost_text=words.COST_LOST if lost else words.COST_INCOMPLETE if unaccounted else None,
     )
 
 
@@ -552,7 +556,7 @@ def tap_run(request: Request, tap_id: str) -> TapRun:
             tap_id=row.ref,
             state=state,
             cost_incomplete=lost,
-            cost_text=words.COST_INCOMPLETE if lost else None,
+            cost_text=words.COST_LOST if lost else None,
         )
     calls = run.calls
     incomplete = run.unaccounted > 0
@@ -610,6 +614,7 @@ def tap_run(request: Request, tap_id: str) -> TapRun:
                     kind=cited.kind,
                     confidence=cited.confidence,  # type: ignore[arg-type]
                     evidence_ids=list(cited.evidence_ids),
+                    credit=cited_credit(cited.kind),
                 )
                 for cited in run.outcome.crisis_cited
             ],

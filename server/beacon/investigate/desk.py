@@ -100,7 +100,10 @@ class InvestigationDesk:
         self._waiting: queue.Queue[str | None] = queue.Queue(maxsize=QUEUE)
         # The taps that are waiting for a worker, and the ones a run is being made
         # for. Whoever reads a tap's answer asks (`state_of`), so that a tap is
-        # said to be pending for as long as it is, and no longer.
+        # said to be pending for as long as it is, and no longer. A tap is taken
+        # into the queue, and the queue is emptied at a stop, under this lock, so
+        # that none is taken in after the stop has emptied it; and a tap has one
+        # run under way at most, whose thread alone takes its mark off.
         self._tracking = threading.Lock()
         self._queued: set[str] = set()
         self._running: set[str] = set()
@@ -133,21 +136,26 @@ class InvestigationDesk:
         """Hand a tap in to be looked into, and say whether it was taken. It does
         not wait and does not raise. A tap that finds the queue full is passed
         over for good; one that comes while the desk is closing is left alone."""
-        if self._closing.is_set():
-            return False
         with self._tracking:
-            # Before it is in the queue, so that a worker that takes it at once
-            # finds it here.
-            self._queued.add(tap_id)
-        try:
-            self._waiting.put_nowait(tap_id)
-        except queue.Full:
-            with self._tracking:
-                self._queued.discard(tap_id)
+            # Looked at under the lock a stop empties the queue under: a tap that
+            # is taken in is either emptied out by the stop or was never taken.
+            if self._closing.is_set():
+                return False
+            if tap_id in self._queued or tap_id in self._running:
+                # It is here already, and has one place.
+                return True
+            try:
+                # It does not wait: the queue is full or it is not.
+                self._waiting.put_nowait(tap_id)
+            except queue.Full:
+                full = True
+            else:
+                full = False
+                self._queued.add(tap_id)
+        if full:
             with contextlib.suppress(RunsError):
                 self._runs.skip(tap_id, self._clock())
-            return False
-        return True
+        return not full
 
     def investigate(self, tap_id: str) -> Run | None:
         """Look into one tap, now, and return its run. None when none was made: the
@@ -157,6 +165,11 @@ class InvestigationDesk:
         Raises RunsError when the investigations file is closed."""
         with self._tracking:
             self._queued.discard(tap_id)
+            if tap_id in self._running:
+                # Another thread is making its run, and the mark is that thread's:
+                # taken off here, the tap would be said to have no run coming
+                # while its run is being made.
+                return None
             self._running.add(tap_id)
         try:
             return self._investigate(tap_id)
@@ -249,10 +262,12 @@ class InvestigationDesk:
         self.close()
         drained = self.drain(paid_timeout)
         # The taps still waiting are left alone: nothing was claimed for them.
-        with contextlib.suppress(queue.Empty):
-            while True:
-                self._waiting.get_nowait()
+        # Under the lock taps are taken in under, and after the desk was closed:
+        # none is taken in once this is done.
         with self._tracking:
+            with contextlib.suppress(queue.Empty):
+                while True:
+                    self._waiting.get_nowait()
             self._queued.clear()
         for _ in self._threads:
             with contextlib.suppress(queue.Full):

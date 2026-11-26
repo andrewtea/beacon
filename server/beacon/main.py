@@ -325,7 +325,7 @@ async def _stop_investigations(
             "A tap was still being investigated when the server shut down. If a paid "
             "Ember request of its was out, it can still be sent and paid for: it is in "
             "the Ember ledger, and the tap's answer says its investigation was cut "
-            "short and that its cost is not all there."
+            "short and that its totals may be incomplete."
         )
 
 

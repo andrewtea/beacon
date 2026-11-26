@@ -57,6 +57,16 @@ CLIP = b"RIFF a voice saying a name"
 PHOTO = b"\xff\xd8 a face"
 
 
+# A form that is whole and says the tap is unconfirmed.
+WHOLE: dict[str, Any] = {
+    "outcome": "unconfirmed",
+    "incident": None,
+    "grounds": [],
+    "crisis": False,
+    "crisis_signals": [],
+}
+
+
 @pytest.fixture
 def rows(tmp_path: Path) -> Rows:
     return Rows(mock_store(tmp_path))
@@ -282,7 +292,7 @@ def test_only_a_closure_the_incidents_own_signal_rests_on_is_counted_as_one(
     assert call.returned["closures"] == 0
     assert words.returned_text(call) == (
         "Found 0 official alerts or notices, 0 of them an alert in force. 0 511 events "
-        "in force list a road of the incident's as closed."
+        "in force list a road as closed on a street of the incident's or near it."
     )
 
     # One that does close the street is counted, once.
@@ -293,7 +303,7 @@ def test_only_a_closure_the_incidents_own_signal_rests_on_is_counted_as_one(
     assert told(script.requests[2])[-1]["road_closures_in_force"] == 1
     assert words.returned_text(made.run.rounds[1].calls[0]) == (
         "Found 0 official alerts or notices, 0 of them an alert in force. 1 511 event "
-        "in force lists a road of the incident's as closed."
+        "in force lists a road as closed on a street of the incident's or near it."
     )
 
 
@@ -627,6 +637,50 @@ def test_a_sound_or_a_sight_is_a_ground_only_for_an_incident_it_fits(
     )
 
 
+def test_a_grounds_sentence_says_what_code_checked_and_no_more(
+    rows: Rows, storage: Storage
+) -> None:
+    city(rows)
+    tap = rows.tap(6, ref=TAP, clip=True, photo=True)
+    scene = scene_of(rows, tap, lambda _id, kind: CLIP if kind == "clip" else PHOTO)
+    fire, medical = of_category(scene, "fire"), of_category(scene, "medical response")
+    script = Script(
+        [
+            asks(NEAR, ("listen_clip", {}), ("look_photo", {})),
+            fake_response(text=json.dumps({"heard": ["siren"]})),
+            fake_response(text=json.dumps({"seen": ["ambulance", "flames"]})),
+            form(medical.id, ("near", "going_on", "heard_in_clip", "seen_in_photo")),
+        ]
+    )
+
+    run = investigate_tap(EmberClient.fake(storage, script), scene).run
+
+    assert run.outcome.grounds == ("near", "going_on", "heard_in_clip", "seen_in_photo")
+    assert [words.ground_text(ground, run) for ground in run.outcome.grounds] == [
+        "When Beacon looked, the incident was about 100 m from where the tap came from.",
+        # Open, or with an update shortly before: not "going on", which an incident
+        # that is over and has a late press release is not.
+        "The incident was open when the tap came, or Beacon had an update about it in the "
+        "fifteen minutes before.",
+        "In the clip sent with the tap, the investigator made out: a siren. That fits an "
+        "incident of this kind.",
+        # The ambulance fits a medical response and the flames do not: the ground
+        # holds on one of them, and the sentence does not say that both fit.
+        "In the photo sent with the tap, the investigator made out: flames, an ambulance. "
+        "At least one of these fits an incident of this kind.",
+    ]
+
+    # The fire is where the tap is. Its distance was kept as 0, rounded to 50 m,
+    # and is not said to be 50.
+    script = Script([asks(NEAR), form(fire.id, ("near",))])
+    scene = scene_of(rows, rows.tap(6.1, ref="tap-AAAAAAAA0009"))
+    run = investigate_tap(EmberClient.fake(storage, script), scene).run
+    assert words.found_then(run, fire.id)["distance_m"] == 0  # type: ignore[index]
+    assert words.ground_text("near", run) == (
+        "When Beacon looked, the incident was within 25 m of where the tap came from."
+    )
+
+
 def test_the_aircraft_over_the_incident_has_to_be_the_one_in_reach_of_the_tap(
     rows: Rows, storage: Storage
 ) -> None:
@@ -710,6 +764,13 @@ def test_a_helicopter_in_the_clip_fits_only_where_the_aircraft_overhead_was_one(
         (fake_response(text="It is the fire on Hayes St. Leave now."), "no_answer", False),
         (fake_response(text=json.dumps({"outcome": "certain"})), "no_answer", False),
         (fake_response(text=json.dumps(["incident"])), "no_answer", False),
+        # A form with fields missing names no incident, whatever it says it did.
+        (fake_response(text=json.dumps({"outcome": "incident"})), "no_answer", False),
+        (fake_response(text=json.dumps(WHOLE | {"outcome": "incident"})), "no_answer", False),
+        (fake_response(text=json.dumps(WHOLE | {"grounds": "near"})), "no_answer", False),
+        (fake_response(text=json.dumps(WHOLE | {"crisis": "no"})), "no_answer", False),
+        (fake_response(text=json.dumps(WHOLE | {"crisis_signals": [1]})), "no_answer", False),
+        (fake_response(text=json.dumps(WHOLE)), "not_sure", True),
     ],
 )
 def test_an_answer_that_names_nothing_or_is_no_form_is_unconfirmed(
@@ -878,7 +939,8 @@ def test_a_tap_that_has_cost_its_most_is_cut_short_before_the_next_call_to_ember
     assert (made.run.cut_short, len(script.requests)) == ("budget", 1)
     assert made.run.outcome == Outcome(status="unconfirmed", reason="cut_short")
     assert words.cut_short_text(made.run) == (
-        "The investigation reached the most one tap may cost, and stopped."
+        "The investigation stopped: its next call to Muse Ember could have taken it past "
+        "the most one tap may cost."
     )
     # The round that was paid for is kept, with what it cost. Nothing is unknown
     # about the run's cost: the call that was refused was not sent.
@@ -1138,7 +1200,7 @@ def test_every_sentence_about_a_run_is_written_by_code_from_its_counts_and_tags(
             "Thinks it is an incident.",
             "Asked for the official alerts, notices, and closures of its lead, to check the lead.",
             "Found 2 official alerts or notices, 1 of them an alert in force. 1 511 event "
-            "in force lists a road of the incident's as closed.",
+            "in force lists a road as closed on a street of the incident's or near it.",
         ),
         (
             "Thinks it is an incident.",
@@ -1177,9 +1239,10 @@ def test_every_sentence_about_a_run_is_written_by_code_from_its_counts_and_tags(
     )
     assert [words.ground_text(ground, run) for ground in run.outcome.grounds] == [
         "When Beacon looked, the incident was about 100 m from where the tap came from.",
-        "The incident was going on when the tap came, or had been shortly before.",
+        "The incident was open when the tap came, or Beacon had an update about it in the "
+        "fifteen minutes before.",
         "In the clip sent with the tap, the investigator made out: a siren, a helicopter. "
-        "That fits an incident of this kind.",
+        "At least one of these fits an incident of this kind.",
         "An aircraft that was over the incident was also within reach of where the tap came "
         "from, shortly before the tap.",
         "1 other tap came from nearby. Beacon cannot tell whether taps are from different people.",
@@ -1211,6 +1274,7 @@ def test_every_sentence_about_a_run_is_written_by_code_from_its_counts_and_tags(
         words.SINCE,
         words.NEARBY,
         words.COST_INCOMPLETE,
+        words.COST_LOST,
         words.investigator_text("fake") or "",
         words.investigator_text("live") or "",
     ):
@@ -1371,6 +1435,90 @@ def test_a_file_of_an_earlier_shape_keeps_its_claims_and_loses_its_runs(tmp_path
     assert again.get(TAP) == (at(6), None)
     assert again.claim(TAP, at(7)) is False
     assert again.crisis("inc-1") is None
+
+
+def test_a_file_the_first_shape_wrote_keeps_its_claims_and_none_of_what_it_cannot_read(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "investigate" / "mock.sqlite3"
+    runs_file(tmp_path).close()
+    stamp = at(6).strftime("%Y-%m-%dT%H:%M:%S.%f")
+    # A run and a decision as the first shape kept them: a decision's signals as
+    # their kinds only, and of the incidents found only their ids.
+    accounting = {
+        "source": "fake",
+        "input_tokens": 0,
+        "cached_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "cost_usd": 0.0,
+        "latency_ms": 0,
+        "ledger": ["generation", 1, "hash"],
+    }
+    first_shape = {
+        "started_at": at(6).isoformat(),
+        "finished_at": at(6.1).isoformat(),
+        "outcome": {
+            "status": "incident",
+            "reason": None,
+            "incident_id": "inc-1",
+            "grounds": ["near"],
+            "grounds_dropped": 0,
+            "confidence": "low",
+            "crisis": True,
+            "crisis_signals": ["alarm"],
+            "crisis_refused": False,
+        },
+        "rounds": [
+            {
+                "n": 1,
+                "ember": accounting,
+                "calls": [
+                    {
+                        "tool": "nearby_incidents",
+                        "thinking": "no_lead",
+                        "lead": None,
+                        "why": "look_for_a_lead",
+                        "args": {"radius_m": 1000, "minutes": 30},
+                        "ok": True,
+                        "returned": {"incidents": ["inc-1"], "more": False, "unlocated": 0},
+                        "ember": None,
+                    }
+                ],
+            }
+        ],
+        "final": accounting,
+        "model": "fake",
+        "stand_in": True,
+        "cut_short": None,
+        "as_of": at(6).isoformat(),
+    }
+    decision = {"signals": ["alarm"], "model": "fake", "stand_in": True}
+    with closing(sqlite3.connect(path)) as db:
+        db.execute(
+            "INSERT INTO run (tap_id, claimed_at, finished_at, run) VALUES (?, ?, ?, ?)",
+            (TAP, stamp, stamp, json.dumps(first_shape)),
+        )
+        db.execute(
+            "INSERT INTO crisis (incident_id, decided_at, decision) VALUES (?, ?, ?)",
+            ("inc-1", stamp, json.dumps(decision)),
+        )
+        db.commit()
+        db.execute("PRAGMA user_version = 1")
+
+    again = Runs(path, "mock")
+
+    # The tap was paid for and is not paid for again. Its run and the decision are
+    # not read as if they were this shape's: they are gone.
+    assert again.get(TAP) == (at(6), None)
+    assert again.claim(TAP, at(7)) is False
+    assert again.crisis("inc-1") is None
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+    # And the file is this shape's from here on.
+    again.claim("tap-AAAAAAAA0002", at(7))
+    again.write(crisis_run("tap-AAAAAAAA0002", "inc-1", 7, ("alarm",)))
+    assert Runs(path, "mock").crisis("inc-1") is not None
 
 
 def test_a_closed_file_takes_nothing_more_and_is_still_read(tmp_path: Path) -> None:

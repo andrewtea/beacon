@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict
 
 from beacon.incident import Engine, Incident
+from beacon.incident.build import CREDIT_511
 from beacon.investigate import Runs
 from beacon.investigate import card as words
 from beacon.radio.vocabulary import MEDICAL_EVENT
@@ -133,6 +134,10 @@ class CitedOut(BaseModel):
     # How the incident has a signal of that kind now: `same` when it rests on those
     # rows still, `changed` when it rests on others, `gone` when it has none.
     now: Literal["same", "changed", "gone"]
+    # 511's credit for a `closure`, which its data agreement requires beside what
+    # is shown from it. It is here, and not only on the signal the incident has
+    # now, because that signal can be gone while this is still shown.
+    credit: CreditOut | None
 
 
 class CrisisOut(BaseModel):
@@ -298,6 +303,7 @@ def crisis_of(request: Request, incident: Incident) -> CrisisOut | None:
                 else "same"
                 if set(cited.evidence_ids) <= now[cited.kind]
                 else "changed",
+                credit=cited_credit(cited.kind),
             )
             for cited in decision.cited
         ],
@@ -309,6 +315,11 @@ def crisis_of(request: Request, incident: Incident) -> CrisisOut | None:
             decision.model or "fake", evidence=decision.stand_in or incident.stand_in
         ),
     )
+
+
+def cited_credit(kind: str) -> CreditOut | None:
+    """The credit that goes with a signal a decision cited: a closure is 511's."""
+    return CreditOut.model_validate(CREDIT_511) if kind == "closure" else None
 
 
 def summary_of(request: Request, incident: Incident) -> IncidentSummary:

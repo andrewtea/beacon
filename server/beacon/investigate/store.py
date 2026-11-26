@@ -53,9 +53,10 @@ from beacon.investigate.tools import Accounting, Call
 KEPT = timedelta(hours=24)
 
 _WAIT_SECONDS = 5.0
-_FORMAT = 1
-# 0 is a file that says no shape, which a new file is too.
-_EARLIER = frozenset({0})
+_FORMAT = 2
+# 0 is a file that says no shape, which a new file is too. 1 kept a decision's
+# signals as their kinds only, and of `nearby_incidents` only the ids.
+_EARLIER = frozenset({0, 1})
 _SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS run (

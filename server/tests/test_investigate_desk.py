@@ -1,6 +1,7 @@
 """The investigation desk, the routes that answer a tap, and the server around them."""
 
 import asyncio
+import json
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -381,7 +382,12 @@ def test_answers_that_are_no_form_are_paid_for_once_each_and_hold_the_desk(world
     taps = [f"tap-AAAAAAAA10{n:02d}" for n in range(UNUSABLE_RUN_LIMIT + 1)]
     for tap_id in taps:
         world.rows.tap(6, ref=tap_id)
-    script = Script([fake_response(text="It is a fire.")] * UNUSABLE_RUN_LIMIT)
+    # Prose, and a form with most of its fields missing: neither is an answer.
+    unusable = [
+        fake_response(text="It is a fire."),
+        fake_response(text=json.dumps({"outcome": "incident"})),
+    ]
+    script = Script((unusable * UNUSABLE_RUN_LIMIT)[:UNUSABLE_RUN_LIMIT])
     desk = world.desk(script)
 
     made = [desk.investigate(tap_id) for tap_id in taps]
@@ -476,6 +482,152 @@ def test_a_tap_that_comes_after_the_desk_is_closed_is_not_claimed_and_not_taken(
     assert desk.stop(0.1) is True
     with pytest.raises(RunsError, match="closed"):
         desk.runs.save_state({})
+
+
+def test_a_tap_handed_in_while_the_desk_stops_is_not_left_waiting_for_good(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    desk = world.desk()
+    putting, go = threading.Event(), threading.Event()
+    put = desk._waiting.put_nowait
+
+    def slow_put(item: Any) -> None:
+        # The desk was seen to be open, and the tap is on its way into the queue.
+        putting.set()
+        assert go.wait(5)
+        put(item)
+
+    monkeypatch.setattr(desk._waiting, "put_nowait", slow_put)
+    taken: list[bool] = []
+    stopped: list[bool] = []
+    handing = threading.Thread(target=lambda: taken.append(desk.submit(TAP)))
+    stopping = threading.Thread(target=lambda: stopped.append(desk.stop(0.1)))
+    handing.start()
+    try:
+        assert putting.wait(5)
+        stopping.start()
+        # The stop does not empty the queue under a tap that is being taken in.
+        stopping.join(0.2)
+        waited = stopping.is_alive()
+    finally:
+        go.set()
+        handing.join(5)
+        stopping.join(5)
+
+    assert (waited, taken, stopped) == (True, [True], [True])
+    # Once the desk has stopped it has no tap: none whose answer is said to be
+    # coming from a desk that will never make it.
+    assert (desk._waiting.empty(), desk.state_of(TAP)) == (True, None)
+    assert desk.submit(TAP) is False
+
+
+def test_a_tap_has_one_place_at_the_desk_and_its_run_is_marked_by_the_thread_making_it(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world.rows.tap(6, ref=TAP)
+    desk = world.desk()
+    # Handed in twice, it waits once.
+    assert (desk.submit(TAP), desk.submit(TAP)) == (True, True)
+    assert (desk._waiting.qsize(), desk.state_of(TAP)) == (1, "queued")
+    investigate = desk_module.investigate_tap
+    under_way, go = threading.Event(), threading.Event()
+
+    def investigating(ember: EmberClient, scene: Any, **more: Any) -> Investigation:
+        under_way.set()
+        assert go.wait(5)
+        return investigate(ember, scene, **more)
+
+    monkeypatch.setattr(desk_module, "investigate_tap", investigating)
+    first = threading.Thread(target=desk.investigate, args=(TAP,))
+    first.start()
+    try:
+        assert under_way.wait(5)
+        # Asked for again while its run is being made: nothing is made, and the
+        # run that is under way is still said to be.
+        assert desk.investigate(TAP) is None
+        assert desk.state_of(TAP) == "running"
+        assert (desk.submit(TAP), desk._waiting.qsize()) == (True, 1)
+        assert desk.state_of(TAP) == "running"
+    finally:
+        go.set()
+        first.join(5)
+
+    assert desk.state_of(TAP) is None
+    assert desk.runs.get(TAP)[1].outcome.status == "incident"  # type: ignore[index,union-attr]
+
+
+def test_the_stand_in_takes_a_lead_that_is_near_over_a_farther_one_with_more_signals(
+    world: World,
+) -> None:
+    # A rescue 900 m north of the fire, which has no signal to the fire's many.
+    there = offset(HAYES, 900, 0)
+    listed = [(street, block, p.lat, p.lon) for (street, block), p in BLOCKS.points.items()]
+    blocks = Blocks.of([*listed, ("Oak St", 100, there.lat, there.lon)])
+    engine = Engine(world.rows.store, blocks, names=NAMES, clock=lambda: world.now[0])
+    world = replace(world, engine=engine)
+    world.rows.radio(5, "rescue", "working", units=("E5",), street="Oak St", block=100)
+    (rescue,) = [i for i in engine.incidents() if i.category == "rescue"]
+    fire = fire_id(world)
+    assert len(rescue.signals) < len(engine.snapshot().get(fire).signals)  # type: ignore[union-attr]
+    # A tap 100 m from the rescue and 800 m from the fire.
+    world.rows.tap(6, offset(HAYES, 800, 0), ref=TAP)
+
+    run = world.desk().investigate(TAP)
+
+    assert run is not None
+    found = run.rounds[0].calls[0].returned["incidents"]
+    # Nearest first. The medical response a block south of the fire is third.
+    assert [(item["id"], item["distance_m"]) for item in found][:2] == [
+        (rescue.id, 100),
+        (fire, 800),
+    ]
+    assert run.rounds[1].calls[0].lead == rescue.id
+    assert (run.outcome.status, run.outcome.incident_id, run.outcome.grounds) == (
+        "incident",
+        rescue.id,
+        ("near", "going_on"),
+    )
+
+
+def test_a_closure_a_decision_rested_on_carries_511s_credit_where_the_decision_is_shown(
+    world: World,
+) -> None:
+    world.rows.tap(6, ref=TAP)
+    desk = world.desk(Script([form()]))
+    client = world.app(desk)
+    fire = fire_id(world)
+    # A decision that rested on a closure, on a row the incident's closure signal
+    # no longer rests on: what the incident shows now carries no credit for it.
+    outcome = Outcome(
+        status="incident",
+        incident_id=fire,
+        grounds=("near",),
+        confidence="low",
+        crisis=True,
+        crisis_cited=(Cited("closure", "official", (999,)), Cited("alarm", "medium", (2,))),
+    )
+    desk.runs.claim(TAP, at(6.5))
+    desk.runs.write(
+        Run(
+            tap_id=TAP,
+            started_at=at(6.5),
+            finished_at=at(6.5),
+            outcome=outcome,
+            model="fake",
+            stand_in=True,
+        )
+    )
+    credit = {"text": CREDIT_511.text, "url": CREDIT_511.url}
+
+    crisis = client.get(f"/api/incidents/{fire}").json()["incident"]["crisis"]
+    run = client.get(f"/api/taps/{TAP}/run").json()
+
+    for cited in (crisis["cited"], run["outcome"]["crisis_cited"]):
+        assert [(one["kind"], one["credit"]) for one in cited] == [
+            ("closure", credit),
+            ("alarm", None),
+        ]
+    assert crisis["cited"][0]["now"] == "changed"
 
 
 def test_a_tap_that_finds_the_queue_full_is_passed_over_and_costs_nothing(
@@ -651,7 +803,8 @@ def test_a_tap_on_the_mock_scenario_is_answered_with_the_fire_and_every_part_say
             },
             {
                 "kind": "going_on",
-                "text": "The incident was going on when the tap came, or had been shortly before.",
+                "text": "The incident was open when the tap came, or Beacon had an update "
+                "about it in the fifteen minutes before.",
                 "basis": "nearby_incidents",
                 "credit": None,
             },
@@ -762,7 +915,7 @@ def test_a_tap_on_the_mock_scenario_is_answered_with_the_fire_and_every_part_say
         "crisis": True,
         "crisis_signals": kinds,
         "crisis_cited": [
-            {key: cited[key] for key in ("kind", "confidence", "evidence_ids")}
+            {key: cited[key] for key in ("kind", "confidence", "evidence_ids", "credit")}
             for cited in crisis["cited"]
         ],
         "crisis_refused": False,
@@ -898,7 +1051,10 @@ def test_a_run_that_was_begun_and_never_kept_is_said_to_be_lost_and_its_cost_unk
         run = again.get(f"/api/taps/{tap_id}/run").json()
         for shown in (answer, run):
             assert (shown["cost_usd"], shown["cost_incomplete"]) == (0.0, True)
-            assert shown["cost_text"] == words.COST_INCOMPLETE
+            # Nothing is said of a call that failed: none may have been made.
+            assert shown["cost_text"] == words.COST_LOST
+            assert "failed" not in shown["cost_text"]
+            assert "ledger" not in shown["cost_text"]
 
 
 def test_what_was_investigated_before_is_read_by_a_server_that_investigates_nothing(

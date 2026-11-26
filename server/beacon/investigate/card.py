@@ -56,10 +56,14 @@ SINCE = (
     "The first radio call of this incident, near where the tap came from, came after "
     "the tap. Nobody has investigated whether it is what the tap was about."
 )
+# Neither says where the rest is: Beacon does not know that there is a rest.
 COST_INCOMPLETE = (
-    "A call to Muse Ember failed after it may have been sent, and may have been paid "
-    "for. Its cost is in the Ember ledger and not in these totals, which are a lower "
-    "bound."
+    "These totals may be incomplete: a call to Muse Ember ended in an error after it "
+    "may have been sent, and may have been paid for."
+)
+COST_LOST = (
+    "These totals may be incomplete: nothing was kept of this investigation, and it "
+    "may have made calls to Muse Ember before it was lost."
 )
 _UNCONFIRMED = {
     "nothing_near": (
@@ -173,23 +177,23 @@ def ground_text(ground: str, run: Run) -> str:
         distance = None if then is None else then.get("distance_m")
         if not isinstance(distance, int) or isinstance(distance, bool):
             return "When Beacon looked, the incident was within 500 m of where the tap came from."
-        return (
-            f"When Beacon looked, the incident was about {_metres(distance)} from where "
-            "the tap came from."
-        )
+        return f"When Beacon looked, the incident was {_metres(distance)} where the tap came from."
     if ground == "going_on":
-        return "The incident was going on when the tap came, or had been shortly before."
-    if ground == "heard_in_clip":
-        heard = _listed(_tags(run, "heard"), _SOUNDS)
+        # What code checked, and no more: an incident that is over can have an
+        # update, such as a press release, and that is not its going on.
         return (
-            f"In the clip sent with the tap, the investigator made out: {heard}. That "
-            "fits an incident of this kind."
+            "The incident was open when the tap came, or Beacon had an update about it "
+            "in the fifteen minutes before."
+        )
+    if ground == "heard_in_clip":
+        return (
+            "In the clip sent with the tap, the investigator made out: "
+            f"{_made_out(_tags(run, 'heard'), _SOUNDS)}"
         )
     if ground == "seen_in_photo":
-        seen = _listed(_tags(run, "seen"), _SIGHTS)
         return (
-            f"In the photo sent with the tap, the investigator made out: {seen}. That "
-            "fits an incident of this kind."
+            "In the photo sent with the tap, the investigator made out: "
+            f"{_made_out(_tags(run, 'seen'), _SIGHTS)}"
         )
     if ground == "aircraft_overhead":
         return (
@@ -261,10 +265,12 @@ def returned_text(call: Call) -> str:
         )
         closures = got.get("closures") or 0
         listed = "lists" if closures == 1 else "list"
+        # As the engine's closure signal has it: a road of the incident's, or a
+        # road closed near its place.
         return (
             f"Found {official}, {got.get('in_force') or 0} of them an alert in force. "
-            f"{_count(closures, '511 event')} in force {listed} a road of the incident's "
-            "as closed."
+            f"{_count(closures, '511 event')} in force {listed} a road as closed on a "
+            "street of the incident's or near it."
         )
     if call.tool == "nearby_taps":
         return f"Found {_count(got.get('taps') or 0, 'other tap')}.{more}"
@@ -280,7 +286,12 @@ def cut_short_text(run: Run) -> str | None:
     if run.cut_short is None:
         return None
     if run.cut_short == "budget":
-        return "The investigation reached the most one tap may cost, and stopped."
+        # It can have stopped well short of the cap: what could not fit was the
+        # most its next call could have cost.
+        return (
+            "The investigation stopped: its next call to Muse Ember could have taken it "
+            "past the most one tap may cost."
+        )
     if run.cut_short == "tool_failed":
         return (
             "Beacon could not read what one of its tools looks at, and the investigation stopped."
@@ -312,6 +323,16 @@ def _listed(tags: Sequence[Any], words: Mapping[str, str]) -> str:
     return ", ".join(named) if named else "nothing Beacon looks for"
 
 
+def _made_out(tags: Sequence[Any], words: Mapping[str, str]) -> str:
+    """What was made out in a clip or a photo, and how it bears on the match. The
+    ground holds when one of them fits the incident, and that is all that is said:
+    which of several did is not kept."""
+    named = [words[tag] for tag in tags if tag in words]
+    if len(named) == 1:
+        return f"{named[0]}. That fits an incident of this kind."
+    return f"{_listed(tags, words)}. At least one of these fits an incident of this kind."
+
+
 def _taps(count: int) -> str:
     return f"{count} other tap came" if count == 1 else f"{count} other taps came"
 
@@ -320,5 +341,7 @@ def _count(count: int, one: str, many: str | None = None) -> str:
     return f"{count} {one if count == 1 else (many or one + 's')}"
 
 
-def _metres(distance_m: float) -> str:
-    return f"{max(50, int(round(distance_m / 50) * 50))} m"
+def _metres(distance_m: int) -> str:
+    """A distance a run kept, which is rounded to 50 m, with the word that goes
+    before "where the tap came from". Zero is anything nearer than 25 m."""
+    return "within 25 m of" if distance_m <= 0 else f"about {distance_m} m from"
