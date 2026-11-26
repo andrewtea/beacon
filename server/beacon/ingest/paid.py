@@ -19,8 +19,9 @@ the rules about money are written once:
 - **A replaced ledger stops the poller for the life of the process.** What was
   spent is then not known from the ledger, and an operator has to compare Meta's
   Usage page with it first.
-- **A poller that can spend has a budget of its own.** A live client without a
-  `SpendScope` is refused.
+- **A poller that can spend has a budget of its own.** A live client is refused
+  unless it pays under the poller's own `SpendScope`, by its label: not under
+  none, and not under another poller's, whose budget it would then spend.
 - **Shutting down admits nothing new and loses no answer.** `close` closes the
   poller's Ember client. Work under a claim is counted (`working`), and `drain`
   waits until its row is stored.
@@ -100,6 +101,7 @@ class PaidDesk:
         *,
         poller: str,
         items: str,
+        scope: str,
         wall_clock: Callable[[], datetime] | None = None,
     ) -> None:
         """`poller` and `items` are what the poller and what it pays for are called
@@ -108,13 +110,15 @@ class PaidDesk:
         scenario is played on a clock of its own.
 
         `ember` is closed with the desk (`close`), so it is a client of the
-        poller's own. One that can spend has a budget of its own as well (a
-        `SpendScope`), under the spending stop: what a poller may pay for over
-        every run is a number an operator set, and never the whole stop."""
-        if ember.mode == "live" and ember.scope is None:
+        poller's own. One that can spend has a budget of its own as well, under
+        the spending stop: the `SpendScope` labelled `scope`, which is this
+        poller's and no other's. What a poller may pay for over every run is a
+        number an operator set for it, and never the whole stop or the number set
+        for another poller."""
+        if ember.mode == "live" and (ember.scope is None or ember.scope.label != scope):
             raise ValueError(
                 f"The {poller} poller pays under a budget of its own: its Ember client "
-                "needs a spending scope."
+                f"needs the spending scope {scope}."
             )
         self._ember = ember
         self._wall_clock = (lambda: datetime.now(UTC)) if wall_clock is None else wall_clock

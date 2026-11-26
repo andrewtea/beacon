@@ -118,6 +118,9 @@ from beacon.radio.audio import container, plain_wav, wav_seconds
 from beacon.radio.vocabulary import Known
 
 SOURCE = "openmhz"
+# The label of the spending scope every live radio call is paid under. A live Ember
+# client that pays under any other is refused (`beacon.ingest.paid`).
+SCOPE = "ingest:openmhz"
 API = "https://api.openmhz.com"
 # San Francisco's P25 system, by the short name OpenMHz gives it.
 SAN_FRANCISCO = "sfp25"
@@ -243,7 +246,9 @@ class OpenMhzRadio:
         self._page_size = page_size
         self._transcoder = transcoder
         # What every poller that pays Ember keeps to: `beacon.ingest.paid`.
-        self._paid = PaidDesk(ember, poller="radio", items="calls", wall_clock=wall_clock)
+        self._paid = PaidDesk(
+            ember, poller="radio", items="calls", scope=SCOPE, wall_clock=wall_clock
+        )
 
     @property
     def origin(self) -> Origin:

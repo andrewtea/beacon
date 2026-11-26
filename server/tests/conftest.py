@@ -87,5 +87,10 @@ def offline_environment(
         "BEACON_OPENMHZ_EMS_TALKGROUPS",
         "BEACON_OPENMHZ_MEDIA_HOSTS",
         "BEACON_OPENMHZ_BUDGET_USD",
+        "BEACON_RADIO_STREETS_FILE",
+        "BEACON_RADIO_UNITS_FILE",
+        "BEACON_NOTICES_FEED_URL",
+        "BEACON_NOTICES_HOSTS",
+        "BEACON_NOTICES_BUDGET_USD",
     ):
         monkeypatch.delenv(name, raising=False)

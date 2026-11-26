@@ -921,6 +921,36 @@ def test_what_could_not_be_read_is_counted_once_whatever_went_wrong_with_it_late
     assert (report.added, report.unreadable, site.asked) == (0, 0, [pdf(1)])
 
 
+@pytest.mark.parametrize("trouble", ["host", "ember"])
+def test_what_a_poll_that_ended_in_an_error_counted_is_in_the_next_report(
+    store: EvidenceStore, site: Site, storage: Storage, wall: list[datetime], trouble: str
+) -> None:
+    # An item that does not say when it was published, a document that is not
+    # there, and after them the trouble that ends the poll with no report.
+    site.notice(1, None)
+    site.notice(2, minutes(-10), document=404)
+    last = site.notice(3, minutes(-20), document=429 if trouble == "host" else None)
+    if trouble == "ember":
+        site.refused[pdf(3)] = EmberError("Ember failed.")
+    poller = build(site, storage, wall_clock=lambda: wall[0])
+
+    with pytest.raises(SourceError if trouble == "host" else EmberError):
+        poller.poll(store, NOON)
+    assert site.downloads == ["2", "3"]
+
+    # The trouble is over, and Ember's hold on the poller with it.
+    site.documents[last] = pdf(3)
+    site.read[pdf(3)] = form()
+    site.refused.clear()
+    wall[0] = minutes(15)
+    report = poller.poll(store, minutes(15))
+
+    # The undated item and the missing document, each once, and not lost with the
+    # poll that found them.
+    assert report.unreadable == 2
+    assert poller.poll(store, minutes(17)).unreadable == 0
+
+
 def test_what_was_counted_is_remembered_for_the_last_two_thousand_and_no_more(
     site: Site, poller: NoticeFeed
 ) -> None:
@@ -942,9 +972,16 @@ def test_a_poller_that_can_spend_has_a_budget_of_its_own(
         storage, api_key="test-key", scope=SpendScope("ingest:notices", 500_000_000)
     )
 
+    radio = EmberClient.live(
+        storage, api_key="test-key", scope=SpendScope("ingest:openmhz", 500_000_000)
+    )
+
     # Without one, all that holds its spending is the stop on everything.
-    with pytest.raises(ValueError, match="pays under a budget of its own"):
+    with pytest.raises(ValueError, match="needs the spending scope ingest:notices"):
         NoticeFeed(SourceHttp(), unscoped, feed_url=FEED)
+    # Under radio's, reading notices would spend what was set aside for radio.
+    with pytest.raises(ValueError, match="needs the spending scope ingest:notices"):
+        NoticeFeed(SourceHttp(), radio, feed_url=FEED)
 
     with SourceHttp() as http:
         assert NoticeFeed(http, scoped, feed_url=FEED).origin == "live"

@@ -52,7 +52,8 @@ What follows from what a notice is:
 - **What could not be read is counted once.** A feed lists the same items at every
   poll, so an item that cannot be read, or a document that cannot be had, is
   counted as `unreadable` once and not at every poll, for as long as it is among
-  the last `_COUNTED_ONCE` things this process counted.
+  the last `_COUNTED_ONCE` things this process counted. A poll that ends in an
+  error makes no report, so what it counted is in the next report that is made.
 - **Trouble with Ember holds the poller**, as it holds radio.
 
 What a row says is Ember's reading of the document, and `beacon.notice.read` says
@@ -80,6 +81,9 @@ from beacon.ingest.runner import PollReport
 from beacon.notice import MAX_PDF_BYTES, Notice, NoticeError, is_pdf, read_notice
 
 SOURCE = "notices"
+# The label of the spending scope every live reading of a notice is paid under. A
+# live Ember client that pays under any other is refused (`beacon.ingest.paid`).
+SCOPE = "ingest:notices"
 
 INTERVAL_SECONDS = 120.0
 # A notice the feed dates longer ago than this is not read: the first poll of a
@@ -154,10 +158,15 @@ class NoticeFeed:
         self._feed_url = feed_url
         self._hosts = frozenset({host, *(named.lower() for named in document_hosts)})
         # What every poller that pays Ember keeps to: `beacon.ingest.paid`.
-        self._paid = PaidDesk(ember, poller="notice", items="notices", wall_clock=wall_clock)
+        self._paid = PaidDesk(
+            ember, poller="notice", items="notices", scope=SCOPE, wall_clock=wall_clock
+        )
         # The items and documents this process has counted as unreadable, the
         # last `_COUNTED_ONCE` of them, oldest first.
         self._counted: dict[str, None] = {}
+        # How many of them no report has said yet: a poll that ends in an error
+        # makes none, and what it counted is not counted again.
+        self._unreported = 0
         # How many polls this process has made, and for a document that could not
         # be had, the poll in which that was last so.
         self._polls = 0
@@ -194,7 +203,7 @@ class NoticeFeed:
             headers={"Accept": "application/feed+json, application/json"},
         )
         listed, unread, cut = parse_feed(read_json(body, SOURCE), self._hosts)
-        unreadable = self._new(unread)
+        self._new(unread)
         # Published by now, and not long ago. One dated later than now waits.
         recent = [notice for notice in listed if timedelta(0) <= now - notice.published <= MAX_AGE]
         taken = store.taken(SOURCE, [notice.ref for notice in recent])
@@ -217,8 +226,7 @@ class NoticeFeed:
             ),
         )
         added = fetched = read = 0
-        left = False
-        missed: list[str] = []
+        left = missed = False
         for notice in waiting:
             if fetched >= MAX_FETCHES_PER_POLL or read >= MAX_READS_PER_POLL:
                 left = True
@@ -235,7 +243,8 @@ class NoticeFeed:
                     # the host asked to be left alone, and is: the runner waits
                     # as long as it asked before the next poll.
                     raise
-                missed.append(notice.ref)
+                missed = True
+                self._new([notice.ref])
                 continue
             self._missed_in.pop(notice.ref, None)
             if not store.claim(SOURCE, notice.ref, now=now):
@@ -243,33 +252,32 @@ class NoticeFeed:
                 continue
             if pdf is None:
                 # Longer than a notice is. It stays claimed, and is not fetched again.
-                unreadable += self._new([notice.ref])
+                self._new([notice.ref])
                 continue
             read += 1
             # From here to the row, a shutdown waits (`drain`).
             with self._paid.working():
                 reading = self._read(store, notice, pdf, hold, now)
                 if reading is None:
-                    unreadable += self._new([notice.ref])
+                    self._new([notice.ref])
                     continue
                 # The row and what the poller remembers are saved together.
                 state = (self.name, hold.hold_state())
                 added += len(store.add([self._row(notice, reading)], state=state, now=now))
         store.add([], state=(self.name, hold.hold_state()), now=now)
-        return PollReport(
-            added=added,
-            unreadable=unreadable + self._new(missed),
-            partial=left or cut or bool(missed),
-        )
+        # Taken only now that there is a report to say it in.
+        unreadable, self._unreported = self._unreported, 0
+        return PollReport(added=added, unreadable=unreadable, partial=left or cut or missed)
 
     def _new(self, keys: list[str]) -> int:
         """How many of these are not among what this process last counted as
-        unreadable. They are now."""
+        unreadable. They are now, and the next report says so."""
         new = [key for key in dict.fromkeys(keys) if key not in self._counted]
         self._counted.update(dict.fromkeys(new))
         while len(self._counted) > _COUNTED_ONCE:
             # The oldest: long enough ago that saying it again is news.
             del self._counted[next(iter(self._counted))]
+        self._unreported += len(new)
         return len(new)
 
     def _document(self, notice: ListedNotice) -> bytes | None:

@@ -54,9 +54,11 @@ from beacon.ember.client import REQUEST_TIMEOUT_SECONDS, default_data_dir
 from beacon.ember.pricing import parse_usd
 from beacon.evidence import EvidenceStore, Mode
 from beacon.ingest.http import SourceHttp
+from beacon.ingest.notices import SCOPE as NOTICES_SCOPE
 from beacon.ingest.notices import NoticeFeed
 from beacon.ingest.nws import NwsAlerts
 from beacon.ingest.openmhz import PAGE_SIZE as OPENMHZ_PAGE_SIZE
+from beacon.ingest.openmhz import SCOPE as RADIO_SCOPE
 from beacon.ingest.openmhz import OpenMhzRadio
 from beacon.ingest.opensky import SIGNED_IN_INTERVAL_SECONDS, OpenSkyAircraft
 from beacon.ingest.runner import Clock, PaidWork, Poller, PollerStatus, Runner
@@ -85,11 +87,6 @@ RADIO_UNITS_VARIABLE = "BEACON_RADIO_UNITS_FILE"
 NOTICES_FEED_VARIABLE = "BEACON_NOTICES_FEED_URL"
 NOTICES_HOSTS_VARIABLE = "BEACON_NOTICES_HOSTS"
 NOTICES_BUDGET_VARIABLE = "BEACON_NOTICES_BUDGET_USD"
-
-# The label of the spending scope every live radio call is made under, and the one
-# every live reading of a notice is made under.
-RADIO_SCOPE = "ingest:openmhz"
-NOTICES_SCOPE = "ingest:notices"
 
 # A mock store that is begun starts its story this long ago, so the first thing a
 # developer sees is a fire in progress and not an empty city.
