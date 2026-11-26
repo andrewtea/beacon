@@ -395,6 +395,23 @@ def test_the_live_engine_takes_its_blocks_from_the_file_the_environment_names(
         open_engine({BLOCKS_VARIABLE: str(tmp_path / "missing.txt")}, live)
 
 
+def test_a_listed_place_that_is_not_written_plainly_is_left_out_and_counted_in_the_log(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    live = EvidenceStore(tmp_path / "live.sqlite3", "live")
+    places = tmp_path / "places.txt"
+    places.write_text("Civic Center Plaza\n\u674e Lee \u516c\u5712\n", encoding="utf-8")
+
+    names = open_engine({"BEACON_PLACES_FILE": str(places)}, live).names
+
+    assert names is not None
+    assert names.public_body("Civic Center Plaza") == "Civic Center Plaza"
+    assert names.public_body("Lee") is None
+    # How many were left out, and not which.
+    assert "1 names in the lists of streets, units, and places" in caplog.text
+    assert "Lee" not in caplog.text
+
+
 def test_the_routes_list_incidents_and_give_one_with_a_source_on_every_line(story: Story) -> None:
     app = create_app()
     app.state.incidents = story.play(20)

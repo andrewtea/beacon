@@ -19,6 +19,9 @@ is kept here, under the incident's id and the basis it was written from
   model is `fake` there.
 - Rows older than `KEPT` are deleted when a new one is claimed: the engine reads
   twelve hours, and an incident older than that has no reader.
+- **A file of an earlier shape keeps its claims and none of its stories.** The
+  shape is the file's `user_version` (`_FORMAT`); opening a file of another one
+  empties its stories, which are never read, and leaves each row as a claim.
 """
 
 import json
@@ -41,6 +44,10 @@ Mode = Literal["live", "mock"]
 KEPT = timedelta(hours=24)
 
 _WAIT_SECONDS = 5.0
+# The shape a story is kept in, as the file's `user_version`. Raise it whenever
+# `_as_json` changes what it writes: a file of an earlier shape then has its stories
+# dropped when it is opened, and keeps its claims.
+_FORMAT = 2
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS story (
     incident_id TEXT NOT NULL,
@@ -100,6 +107,7 @@ class Stories:
             db.executescript(_SCHEMA)
             db.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('mode', ?)", (mode,))
             begun = db.execute("SELECT value FROM meta WHERE key = 'mode'").fetchone()[0]
+            _drop_old_stories(db)
         if begun != mode:
             raise StoriesError(
                 f"The stories file was begun as the {begun} one, and cannot be the {mode} one."
@@ -239,6 +247,24 @@ class Stories:
                     db.execute("ROLLBACK")
                     raise
                 db.execute("COMMIT")
+
+
+def _drop_old_stories(db: sqlite3.Connection) -> None:
+    """Drop the stories a file holds in an earlier shape, and keep their claims.
+
+    An earlier shape cannot be read as this one, and the first one held sentences
+    a model wrote, which are not shown any more. A story of an earlier shape is
+    emptied and never read. Its row stays, as a claim: the lines it was made from
+    were paid for once, and are not paid for again."""
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if db.execute("PRAGMA user_version").fetchone()[0] != _FORMAT:
+            db.execute("UPDATE story SET story = NULL, written_at = NULL WHERE story IS NOT NULL")
+            db.execute(f"PRAGMA user_version = {_FORMAT}")
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
+    db.execute("COMMIT")
 
 
 def _save_state(db: sqlite3.Connection, state: Mapping[str, Any]) -> None:

@@ -22,6 +22,7 @@ and waits for the answer that is out.
 
 import contextlib
 import logging
+import threading
 from collections.abc import Callable
 from datetime import datetime, timedelta
 
@@ -42,6 +43,8 @@ MIN_LINES = 3
 INTERVAL = timedelta(minutes=2)
 # How many incidents one pass asks Ember about at most, whatever it answers.
 MAX_PER_PASS = 3
+
+_CLOSED = "The story desk is closed and asks Ember nothing more. Nothing that costs money was sent."
 
 logger = logging.getLogger("beacon.story")
 
@@ -65,6 +68,10 @@ class StoryDesk:
         self._ember = ember
         self._stories = stories
         self._interval = interval
+        # Set by `close`, before anything is waited for. A refresh reads it after
+        # it has entered `working()`, so either `drain` waits for that refresh or
+        # the refresh sees the desk closed and claims nothing.
+        self._closing = threading.Event()
 
     @property
     def stories(self) -> Stories:
@@ -109,6 +116,11 @@ class StoryDesk:
         # claim that was made is written under or given up before the file is
         # closed, and is never left behind for lines nobody paid for.
         with self._paid.working():
+            if self._closing.is_set():
+                # Closed, and maybe already drained: a claim made now could not be
+                # given up once the stories file is closed, and would be left
+                # behind for lines nobody paid for. So none is made.
+                raise_bare(EmberClosedError(_CLOSED))
             if not self._stories.claim(incident.id, basis, now, self._interval):
                 return None, False
             draft: Draft | None = None
@@ -178,8 +190,10 @@ class StoryDesk:
         return written
 
     def close(self) -> None:
-        """Admit no more paid work. A story Ember had already been asked for is
-        still paid for; `drain` waits for it."""
+        """Admit no more paid work, and claim no more: a refresh that has not
+        claimed its basis yet raises EmberClosedError and leaves no claim. A story
+        Ember had already been asked for is still paid for; `drain` waits for it."""
+        self._closing.set()
         self._paid.close()
 
     def drain(self, timeout: float) -> bool:

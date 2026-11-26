@@ -21,7 +21,9 @@ shown**:
 - **Code writes the sentence**, from the cited rows' own fields, in the engine's
   words: what crews said about an evacuation, sheltering, or an all-clear is written
   with "That is radio traffic, not an official order.", as it is in the timeline.
-  A 511 event, an aircraft, and taps are told in the timeline's own line.
+  A 511 event, an aircraft, and taps are told in the timeline's own line; a version
+  of a 511 event that is no longer the one in force is told only as having been
+  listed, because the row a point cites shows no more than that.
 - **Code gives it its sources and its confidence**: the sources of the lines it
   cites, and the least confidence among them.
 - **Ember is given only the lines of radio, 511 events, aircraft, and taps.** It is
@@ -64,6 +66,8 @@ MAX_POINTS = 8
 MAX_CITES = 4
 # The most units one sentence names.
 MAX_UNITS = 12
+# What is said of a version of a 511 event that is not the one in force.
+OLD_CLOSURE = "511 listed a traffic event here."
 
 # What a point can be about. `status`, `alarm`, `units`, and each detail a call can
 # give rest on radio lines; the last three on a line of their own kind.
@@ -90,7 +94,8 @@ should see them: how far the call has got, how large it is, who is on it, and wh
 else was seen. For each point give its kind and the numbers of the lines that show it.
 
 - status: one radio line, the one that says how far the call has got now.
-- alarm: the radio lines that give the alarm level.
+- alarm: the radio line that gives the alarm level as it is now, and others only \
+when they give the same level.
 - units: radio lines that name the units on the call.
 - a detail (smoke_showing, evacuation, knocked_down, and the others): the radio lines \
 that say it.
@@ -259,12 +264,17 @@ def _sentence(kind: str, cited: Sequence[Entry]) -> str | None:
     if kind in ("closure", "aircraft", "taps"):
         if len(cited) != 1 or cited[0].kind != kind:
             return None
-        if kind == "closure" and details[0].get("state") in ("replaced", "not_listed"):
-            # A version of a 511 event that 511 has since changed or stopped
-            # listing: its words are not what 511 says now.
-            return "511 listed a traffic event here, in a version it has since changed."
-        # The engine's own line, as the timeline has it: for a 511 event that is
-        # 511's words, and for a change what Beacon saw and that it is no reopening.
+        said = details[0]
+        if kind == "closure" and "change" not in said and said.get("state") != "in_force":
+            # A version of a 511 event that is not the one in force: its words are
+            # not what 511 says now. The row shows that 511 listed an event, and
+            # that is all the sentence says. What came after it (a later version,
+            # or Beacon no longer seeing it listed) is another row's to show, which
+            # this point does not cite.
+            return OLD_CLOSURE
+        # The engine's own line, as the timeline has it: for the version of a 511
+        # event that is in force that is 511's words, and for a change what Beacon
+        # saw and that it is no reopening.
         return cited[0].text
     if any(entry.kind != "radio" for entry in cited):
         return None
@@ -277,7 +287,11 @@ def _sentence(kind: str, cited: Sequence[Entry]) -> str | None:
         levels = [said.get("alarm") for said in details]
         if not all(isinstance(level, int) and not isinstance(level, bool) for level in levels):
             return None
-        return f"The radio said: alarm level {max(levels)}."  # type: ignore[type-var]
+        # Every cited call has to give the same level: the sentence has the time
+        # of the newest of them, and an older, higher level is not the level then.
+        if len(set(levels)) != 1:
+            return None
+        return f"The radio said: alarm level {levels[0]}."
     if kind == "units":
         named: dict[str, None] = {}
         for said in details:

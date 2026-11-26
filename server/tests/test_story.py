@@ -277,6 +277,27 @@ def test_a_point_that_says_again_what_another_said_is_told_once(
     assert draft.left_out == 1
 
 
+def test_an_alarm_level_is_told_only_from_calls_that_give_the_same_level(
+    rows: Rows, storage: Storage
+) -> None:
+    fire(rows)
+    # The second call gave level 2. Later calls give level 1, twice.
+    rows.radio(5.5, "fire", "working", units=("E36",), alarm=1)
+    rows.radio(5.7, "fire", "working", units=("B2",), alarm=1)
+    incident = fire(rows)
+    script = Script([answer(("alarm", [2, 6]), ("alarm", [6, 7]), ("alarm", [2]))])
+
+    draft = merge_incident(EmberClient.fake(storage, script), incident)
+
+    # Level 2 and level 1 together would be "level 2" as of the later call, which
+    # no call said then: the point is left out.
+    assert [(claim.text, claim.at) for claim in draft.claims] == [
+        ("The radio said: alarm level 1.", at(5.7)),
+        ("The radio said: alarm level 2.", at(1)),
+    ]
+    assert draft.left_out == 1
+
+
 def test_a_version_of_a_closure_that_511_has_changed_is_not_told_as_what_511_says_now(
     rows: Rows, storage: Storage
 ) -> None:
@@ -289,12 +310,26 @@ def test_a_version_of_a_closure_that_511_has_changed_is_not_told_as_what_511_say
 
     draft = merge_incident(EmberClient.fake(storage, script), incident)
 
-    assert [claim.text for claim in draft.claims] == [
-        "511 listed a traffic event here, in a version it has since changed.",
-        "511 listed a traffic event here, in a version it has since changed.",
-        "511 no longer lists this event. That is what Beacon saw, not an official reopening.",
+    first, second = rows.store.search(kinds=["traffic"])[:2]
+    # A version that is not the one in force is told as having been listed, which
+    # is all its row shows, and in no word of its own. What followed (a later
+    # version, Beacon no longer seeing it listed) is told only by the row that
+    # shows it, at that row's confidence.
+    assert [(claim.text, claim.confidence) for claim in draft.claims] == [
+        ("511 listed a traffic event here.", "official"),
+        ("511 listed a traffic event here.", "official"),
+        (
+            "511 no longer lists this event. That is what Beacon saw, not an official reopening.",
+            "medium",
+        ),
     ]
-    assert [claim.confidence for claim in draft.claims] == ["official", "official", "medium"]
+    assert [[source.evidence_id for source in claim.sources] for claim in draft.claims][:2] == [
+        [first.id],
+        [second.id],
+    ]
+    shown = " ".join(claim.text for claim in draft.claims)
+    assert "changed" not in shown
+    assert "Gough St" not in shown
 
 
 def test_the_stand_in_cites_the_call_that_gave_the_status_and_not_the_newest_call(
@@ -435,6 +470,44 @@ def test_the_live_file_holds_nothing_a_stand_in_wrote_and_a_file_keeps_its_mode(
 
     with pytest.raises(StoriesError, match="begun as the live one"):
         Stories(tmp_path / "story" / "live.sqlite3", "mock")
+
+
+def test_a_file_of_an_earlier_shape_keeps_its_claims_and_none_of_its_stories(
+    rows: Rows, storage: Storage, tmp_path: Path
+) -> None:
+    kept = stories(tmp_path)
+    kept.claim("inc-a", "one", at(0), timedelta(0))
+    kept.claim("inc-a", "two", at(1), timedelta(0))
+    # As the first shape kept a story: sentences a model wrote, with no kind and
+    # no time, under a headline.
+    old = {
+        "written_at": at(0.5).isoformat(),
+        "headline": "Fire on Hayes St",
+        "claims": [{"text": "Exit the building.", "note": None, "confidence": "medium"}],
+    }
+    with sqlite3.connect(tmp_path / "story" / "mock.sqlite3") as db:
+        db.execute(
+            "UPDATE story SET written_at = ?, story = ? WHERE basis = 'one'",
+            (at(0.5).isoformat(), json.dumps(old)),
+        )
+        db.execute("PRAGMA user_version = 0")
+
+    opened = stories(tmp_path)
+
+    # The old story is not read, by the route or by the desk, and is not there.
+    assert opened.latest("inc-a") is None
+    with sqlite3.connect(tmp_path / "story" / "mock.sqlite3") as db:
+        assert db.execute("SELECT basis, story FROM story ORDER BY basis").fetchall() == [
+            ("one", None),
+            ("two", None),
+        ]
+    # Its lines were paid for once, and are not paid for again.
+    assert not opened.claim("inc-a", "one", at(5), timedelta(0))
+    # A new basis gets a story, which is read back, and opening the file again
+    # drops nothing of this shape.
+    assert opened.claim("inc-a", "three", at(5), timedelta(0))
+    written = opened.write("inc-a", "three", draft_of(rows, storage), stand_in=True, now=at(6))
+    assert stories(tmp_path).latest("inc-a") == written
 
 
 def test_a_closed_file_takes_nothing_more_and_is_still_read(
@@ -659,7 +732,7 @@ def test_a_closed_desk_asks_nothing_and_leaves_the_lines_for_the_next_run(
     with pytest.raises(EmberClosedError):
         desk.refresh(incident, at(6))
     assert desk.stop(0.1) is True
-    with pytest.raises(StoriesError):
+    with pytest.raises(EmberClosedError):
         desk.refresh(incident, at(7))
 
     # Nothing was paid and nothing is held: the next process writes the story.
@@ -767,6 +840,49 @@ def test_a_shutdown_waits_from_before_the_claim_until_the_story_is_stored(
     assert desk.drain(1) is True
     assert made[0] is not None
     assert desk.latest(incident) == (made[0], True)
+
+
+def test_a_refresh_that_comes_after_the_desk_is_closed_claims_nothing(
+    rows: Rows,
+    storage: Storage,
+    tmp_path: Path,
+    writer: Writer,
+    wall: list[datetime],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    desk = desk_of(tmp_path, storage, writer, wall)
+    incident = fire(rows)
+    claimed: list[Any] = []
+    claim = desk.stories.claim
+
+    def seen(*given: Any) -> bool:
+        claimed.append(given)
+        return claim(*given)
+
+    monkeypatch.setattr(desk.stories, "claim", seen)
+    released = threading.Event()
+    release = desk.stories.release
+
+    def too_late(*given: Any) -> None:
+        # Between a shutdown's `drain` and this, the stories file is closed, and a
+        # claim can no longer be given up.
+        released.set()
+        desk.stories.close()
+        release(*given)
+
+    monkeypatch.setattr(desk.stories, "release", too_late)
+
+    # The desk is closed and has drained; the file is still open. A pass that was
+    # under way gets to its next incident only now.
+    desk.close()
+    assert desk.drain(0.1) is True
+    with pytest.raises(EmberClosedError, match="story desk is closed"):
+        desk.refresh(incident, at(6))
+
+    # It made no claim, so there was none to be stranded by the file closing.
+    assert (claimed, released.is_set(), writer.asked) == ([], False, 0)
+    again = desk_of(tmp_path, storage, writer, wall)
+    assert again.refresh(incident, at(6.1)) is not None
 
 
 def test_a_live_desk_pays_only_under_its_own_scope(storage: Storage, tmp_path: Path) -> None:

@@ -114,6 +114,44 @@ def test_a_listed_name_passes_only_as_a_whole_phrase() -> None:
 
 
 @pytest.mark.parametrize(
+    "name",
+    [
+        # A name in another script with a word in this one among it: listing the
+        # word that can be read would list `Lee`.
+        "\u674e Lee \u516c\u5712",
+        "Lee (the resident)",
+        "Lee & Sons Plaza",
+        "Lee, Jane",
+        "Lee\u200b",
+        "\u00c9cole Lee",
+    ],
+)
+def test_a_listed_name_that_is_not_written_plainly_is_left_out_whole(name: str) -> None:
+    for names, left_out in (
+        Names.kept(places=[name]),
+        Names.kept(streets=[name]),
+        Names.kept(units=[name]),
+    ):
+        assert left_out == 1
+        assert names == NO_NAMES
+        assert names.public_body("Lee") is None
+        assert reading("The crew of Lee was here.", names) is None
+    assert Names.of(places=[name, "Civic Center Plaza"]) == Names.of(places=["Civic Center Plaza"])
+
+
+def test_a_listed_name_written_plainly_is_kept_with_its_stops_and_hyphens() -> None:
+    names, left_out = Names.kept(
+        streets=["Hayes  St.", "O'Farrell St"],
+        places=["St. Mary's Cathedral", "Pier 39", "Embarcadero-Ferry Plaza"],
+    )
+
+    assert left_out == 0
+    assert reading("Go to St. Mary's Cathedral or Pier 39, by O'Farrell St.", names) is not None
+    assert names.public_body("Embarcadero-Ferry Plaza") == "Embarcadero-Ferry Plaza"
+    assert names.public_body("Ferry Plaza") is None
+
+
+@pytest.mark.parametrize(
     "issuer",
     [
         "San Francisco Fire Department, Chief Jane Doe",

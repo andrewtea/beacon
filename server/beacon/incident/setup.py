@@ -95,4 +95,12 @@ def _live_names(env: Mapping[str, str]) -> Names:
             raise IncidentConfigError(
                 f"{PLACES_VARIABLE} names a file that cannot be read as text."
             ) from error
-    return Names.of(streets=known.streets, units=known.units, places=places)
+    names, left_out = Names.kept(streets=known.streets, units=known.units, places=places)
+    if left_out:
+        # How many, and never which: a list can hold a name by mistake.
+        logger.warning(
+            "%d names in the lists of streets, units, and places are not written in "
+            "plain letters and digits, and were left out whole.",
+            left_out,
+        )
+    return names

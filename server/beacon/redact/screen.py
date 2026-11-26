@@ -88,15 +88,45 @@ class Names:
     ) -> "Names":
         """The lists an operator gives, with the public bodies Beacon knows itself
         (`PUBLIC_NAMES`). `places` are public places and bodies a notice may name:
-        a plaza, a school that is a shelter, an agency. A name with no letter or
-        digit in it is left out."""
-        public = {_words(name) for name in (*PUBLIC_NAMES, *places)} - {()}
-        rest = {_words(name) for name in (*units, *OTHER_NAMES)} - {()}
-        return cls(
-            streets=frozenset({_words(name) for name in streets} - {()}),
+        a plaza, a school that is a shelter, an agency. A name that is not written
+        plainly is left out whole (`kept` says how many were)."""
+        return cls.kept(streets=streets, units=units, places=places)[0]
+
+    @classmethod
+    def kept(
+        cls,
+        *,
+        streets: Iterable[str] = (),
+        units: Iterable[str] = (),
+        places: Iterable[str] = (),
+    ) -> "tuple[Names, int]":
+        """The lists as `of` makes them, and how many names were left out.
+
+        A name is listed whole or not at all. One that holds anything besides
+        plain words (another script, a bracket, an `&`) is left out: listing the
+        words of it that can be read would list a name nobody gave, and `李 Lee 公園`
+        would make `Lee` a name every text may hold."""
+        left_out = 0
+
+        def listed(names: Iterable[str]) -> set[tuple[str, ...]]:
+            nonlocal left_out
+            found: set[tuple[str, ...]] = set()
+            for name in names:
+                plain = _plain(name)
+                if plain is None:
+                    left_out += 1
+                else:
+                    found.add(_words(plain))
+            return found
+
+        public = listed((*PUBLIC_NAMES, *places))
+        rest = listed((*units, *OTHER_NAMES))
+        names = cls(
+            streets=frozenset(listed(streets)),
             others=frozenset(public | rest),
             public=frozenset(public),
         )
+        return names, left_out
 
     @cached_property
     def _pattern(self) -> re.Pattern[str] | None:
@@ -129,10 +159,8 @@ class Names:
         """The text when it is the name of a listed public body or place and not
         one character more, which is what a notice's issuer has to be to be shown.
         Else None: an issuer with anything beside the name is left out whole."""
-        if not isinstance(value, str) or len(value) > MAX_TEXT:
-            return None
-        text = " ".join(value.split())
-        if _PLAIN_NAME.fullmatch(text) is None:
+        text = _plain(value)
+        if text is None:
             return None
         return text if _words(text) in self.public else None
 
@@ -204,6 +232,15 @@ def _is_month(tokens: Sequence[str], place: int) -> bool:
         0 <= beside < len(tokens) and _NUMBER.fullmatch(tokens[beside]) is not None
         for beside in (place - 1, place + 1)
     )
+
+
+def _plain(value: object) -> str | None:
+    """A name with its white space made single spaces, when it is written plainly
+    from its first character to its last. Else None."""
+    if not isinstance(value, str) or len(value) > MAX_TEXT:
+        return None
+    text = " ".join(value.split())
+    return text if _PLAIN_NAME.fullmatch(text) is not None else None
 
 
 def _words(name: str) -> tuple[str, ...]:
