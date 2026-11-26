@@ -1,13 +1,30 @@
-import { beforeEach, expect, test } from 'vitest'
+import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import { fireAnswer, quietAnswer } from '../test/fixtures.ts'
 import { OPEN_MS, OVER_MS, PENDING_MS, tapCadence } from './cadence.ts'
 import { rounded } from './geo.ts'
+import { withoutTapIds } from './logging.ts'
 import { fitted } from './photo.ts'
+import { recordClip } from './recorder.ts'
 import { href, parseRoute } from './router.ts'
-import { forgetTap, KEPT_MS, keepTap, keptTaps } from './tapStore.ts'
+import {
+  forgetTap,
+  KEPT_MS,
+  keepTap,
+  keptTaps,
+  pruneTaps,
+  sweepTaps,
+} from './tapStore.ts'
 import { encodeWav, toBase64 } from './wav.ts'
 
 beforeEach(() => window.localStorage.clear())
+afterEach(() => vi.useRealTimers())
+
+const stored = (): string[] =>
+  (
+    JSON.parse(window.localStorage.getItem('beacon.taps.v1') ?? '[]') as {
+      id: string
+    }[]
+  ).map((tap) => tap.id)
 
 test('a route is read from the fragment, and an id that is not one names nothing', () => {
   expect(parseRoute('')).toEqual({ view: 'home' })
@@ -131,4 +148,128 @@ test('a tap’s answer is asked for again while it can change, and not after', (
   ).toBe(OVER_MS)
   expect(tapCadence({ ...quietAnswer, watching: false })).toBeNull()
   expect(tapCadence({ ...quietAnswer, watching: true })).not.toBeNull()
+})
+
+test('a tap the server no longer answers for is deleted from storage, not only hidden', () => {
+  const now = Date.parse('2026-11-26T12:00:00Z')
+  const at = (msAgo: number) => new Date(now - msAgo).toISOString()
+  const tap = (id: string, msAgo: number) => ({
+    id,
+    at: at(msAgo),
+    photo: false,
+    clip: false,
+  })
+  window.localStorage.setItem(
+    'beacon.taps.v1',
+    JSON.stringify([tap('fresh', 1_000), tap('stale', KEPT_MS + 1)]),
+  )
+  expect(stored()).toEqual(['fresh', 'stale'])
+
+  expect(pruneTaps(now)).toBe(true)
+
+  expect(stored()).toEqual(['fresh'])
+  expect(pruneTaps(now)).toBe(false)
+})
+
+test('an open app deletes each tap from storage at the moment it runs out', () => {
+  vi.useFakeTimers()
+  const now = Date.parse('2026-11-26T12:00:00Z')
+  vi.setSystemTime(now)
+  const at = (msAgo: number) => new Date(now - msAgo).toISOString()
+  const tap = (id: string, msAgo: number) => ({
+    id,
+    at: at(msAgo),
+    photo: false,
+    clip: false,
+  })
+  window.localStorage.setItem(
+    'beacon.taps.v1',
+    JSON.stringify([
+      tap('new', 0),
+      tap('soon', KEPT_MS - 60_000),
+      tap('stale', KEPT_MS + 60_000),
+    ]),
+  )
+
+  const stop = sweepTaps()
+  // At the start, what had already run out is gone.
+  expect(stored()).toEqual(['new', 'soon'])
+
+  vi.advanceTimersByTime(59_000)
+  expect(stored()).toEqual(['new', 'soon'])
+  vi.advanceTimersByTime(2_000)
+  expect(stored()).toEqual(['new'])
+
+  // A tap kept while the app is open is swept in its turn.
+  keepTap(tap('later', KEPT_MS - 5_000))
+  vi.advanceTimersByTime(6_000)
+  expect(stored()).toEqual(['new'])
+
+  stop()
+  vi.advanceTimersByTime(KEPT_MS)
+  expect(stored()).toEqual(['new'])
+})
+
+test('a path of a tap’s own routes is written to a log without the tap’s id', () => {
+  expect(
+    withoutTapIds('http proxy error: /api/taps/f7fClvPJ0K8LF47x\nError: x'),
+  ).toBe('http proxy error: /api/taps/[left out]\nError: x')
+  expect(withoutTapIds('GET /api/taps/f7fClvPJ0K8LF47x/run 502')).toBe(
+    'GET /api/taps/[left out] 502',
+  )
+  expect(withoutTapIds('/api/taps%2Ff7fClvPJ0K8LF47x')).toBe(
+    '/api/taps/[left out]',
+  )
+  // Nothing else is touched: the route that takes a tap names none.
+  expect(withoutTapIds('http proxy error: /api/taps')).toBe(
+    'http proxy error: /api/taps',
+  )
+  expect(withoutTapIds('http proxy error: /api/incidents/inc-1')).toBe(
+    'http proxy error: /api/incidents/inc-1',
+  )
+})
+
+function microphone() {
+  const stop = vi.fn()
+  const getUserMedia = vi.fn(async () => ({ getTracks: () => [{ stop }] }))
+  vi.stubGlobal('navigator', { mediaDevices: { getUserMedia } })
+  vi.stubGlobal('AudioWorkletNode', class {})
+  return { stop, getUserMedia }
+}
+
+test('the microphone is let go of when the recording cannot even begin', async () => {
+  const { stop } = microphone()
+  vi.stubGlobal(
+    'AudioContext',
+    class {
+      constructor() {
+        throw new Error('No audio device.')
+      }
+    },
+  )
+
+  await expect(recordClip(1)).rejects.toThrow('Beacon could not record a clip.')
+
+  expect(stop).toHaveBeenCalledTimes(1)
+})
+
+test('a tap called off while the microphone was being asked for records nothing and lets go of it', async () => {
+  const { stop } = microphone()
+  const made = vi.fn()
+  vi.stubGlobal(
+    'AudioContext',
+    class {
+      constructor() {
+        made()
+      }
+    },
+  )
+  const controller = new AbortController()
+
+  const recording = recordClip(1, controller.signal)
+  controller.abort()
+
+  await expect(recording).rejects.toMatchObject({ name: 'AbortError' })
+  expect(stop).toHaveBeenCalledTimes(1)
+  expect(made).not.toHaveBeenCalled()
 })

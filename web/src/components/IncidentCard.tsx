@@ -1,48 +1,57 @@
-import type { Confidence, IncidentSummary, Source } from '../api/incidents.ts'
-import { isMedical, standing } from '../lib/labels.ts'
+import type { IncidentSummary } from '../api/incidents.ts'
+import { isMedical, recordState } from '../lib/labels.ts'
 import { href } from '../lib/router.ts'
 import { clock } from '../lib/time.ts'
 import { ConfidenceLabel, Sources, StandInTag } from './Provenance.tsx'
 
-/** What the card's facts rest on: the radio rows of the incident, and the
- * least confidence among them. */
-export type Basis = { confidence: Confidence; sources: Source[] }
-
 /**
- * The incident card: what, who is responding, roughly where, and how it stands.
- * Every word about the incident is the server's. A medical response is its
- * crews and its block, and nothing else is asked of it here.
+ * The incident card: what, who is responding, roughly where, and what the radio
+ * last said of it. Every word about the incident is the server's, and every fact
+ * on the card is one its radio calls gave, shown with those calls as its source
+ * and the least confidence among them (`incident.radio`). What rests on another
+ * source (how many taps came, when the newest line is from) is not on the card:
+ * the timeline has it, each line with its own source.
+ *
+ * A medical response is its title, its crews, and its block, with their source.
+ * Nothing else of one is shown, whatever the route sent: no status, no alarm,
+ * no taps, no time, and not whether Beacon's record of it is open.
  */
 export function IncidentCard({
   incident,
-  basis = null,
   heading = 'h2',
   link = false,
 }: {
   incident: IncidentSummary
-  basis?: Basis | null
   heading?: 'h1' | 'h2' | 'h3'
-  // Whether the title opens the incident's own page.
+  // Whether the title opens the incident's own page. A medical response has
+  // none to open: its card is all that is shown of it.
   link?: boolean
 }) {
   const Heading = heading
   const medical = isMedical(incident)
+  // A closed record is drawn quieter, which would say of a medical response
+  // what its card does not.
+  const closed = !medical && !incident.open
   return (
-    <article className={incident.open ? 'card incident' : 'card incident over'}>
+    <article className={closed ? 'card incident over' : 'card incident'}>
       <Heading className="incident-title">
-        {link ? (
+        {link && !medical ? (
           <a href={href.incident(incident.id)}>{incident.title}</a>
         ) : (
           incident.title
         )}
       </Heading>
-      <p className="chips">
-        <span className={incident.open ? 'tag open' : 'tag closed'}>
-          {standing(incident)}
-        </span>
-        {incident.stand_in && <StandInTag />}
-      </p>
-      {incident.status_text !== null && (
+      {(!medical || incident.stand_in) && (
+        <p className="chips">
+          {!medical && (
+            <span className={incident.open ? 'tag open' : 'tag closed'}>
+              {recordState(incident)}
+            </span>
+          )}
+          {incident.stand_in && <StandInTag />}
+        </p>
+      )}
+      {!medical && incident.status_text !== null && (
         <p className="status-text">{incident.status_text}</p>
       )}
       <dl className="facts">
@@ -70,30 +79,21 @@ export function IncidentCard({
             <dd>{incident.alarm}</dd>
           </>
         )}
-        {!medical && incident.taps > 0 && (
+        {!medical && (
           <>
-            <dt>Taps from nearby</dt>
+            <dt>First radio call</dt>
             <dd>
-              {incident.taps_more ? `At least ${incident.taps}` : incident.taps}{' '}
-              <span className="aside">taps, not people</span>
+              <time dateTime={incident.opened_at}>
+                {clock(incident.opened_at)}
+              </time>
             </dd>
           </>
         )}
-        <dt>First heard</dt>
-        <dd>
-          <time dateTime={incident.opened_at}>{clock(incident.opened_at)}</time>
-        </dd>
-        <dt>Latest update</dt>
-        <dd>
-          <time dateTime={incident.updated_at}>
-            {clock(incident.updated_at)}
-          </time>
-        </dd>
       </dl>
-      {basis !== null && (
+      {incident.radio !== null && (
         <div className="basis">
-          <ConfidenceLabel level={basis.confidence} />
-          <Sources sources={basis.sources} />
+          <ConfidenceLabel level={incident.radio.confidence} />
+          <Sources sources={incident.radio.sources} />
         </div>
       )}
     </article>

@@ -187,11 +187,10 @@ function Finished({ run }: { run: TapRun }) {
           <li key={round.n} className="round">
             <h3>Round {round.n}</h3>
             <p className="meta">
-              One request came back asking for{' '}
               {round.calls.length === 1
-                ? '1 tool call'
-                : `${round.calls.length} tool calls`}
-              .
+                ? '1 tool call of this round was kept.'
+                : `${round.calls.length} tool calls of this round were kept.`}{' '}
+              A round can have asked for more than were kept.
             </p>
             <Accounting ember={round.ember} />
             <ol className="calls">
@@ -214,7 +213,7 @@ function Finished({ run }: { run: TapRun }) {
         <h2 id="totals-heading">Totals</h2>
         <dl className="accounting">
           <div>
-            <dt>Requests</dt>
+            <dt>Requests answered</dt>
             <dd>{run.ember_calls}</dd>
           </div>
           <div>
@@ -245,13 +244,6 @@ function Finished({ run }: { run: TapRun }) {
           <p className="meta">
             The stand-in answered every request. These are not Muse Ember’s
             numbers, and nothing was spent.
-          </p>
-        )}
-        {run.unaccounted_calls > 0 && (
-          <p className="note">
-            {run.unaccounted_calls}{' '}
-            {run.unaccounted_calls === 1 ? 'request is' : 'requests are'} not in
-            these totals.
           </p>
         )}
         {run.cost_text !== null && <p className="note">{run.cost_text}</p>}

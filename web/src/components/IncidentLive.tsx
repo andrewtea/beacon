@@ -1,30 +1,21 @@
 import type { ReactNode } from 'react'
-import {
-  fetchIncident,
-  type IncidentAnswer,
-  type IncidentSummary,
-} from '../api/incidents.ts'
+import { fetchIncident, type IncidentSummary } from '../api/incidents.ts'
 import { crisisLeads, incidentCadence } from '../lib/cadence.ts'
-import { weakest } from '../lib/labels.ts'
+import { isMedical } from '../lib/labels.ts'
 import { usePolled } from '../lib/poll.ts'
 import { IncidentBody, IncidentLead } from './IncidentBody.tsx'
-import { type Basis, IncidentCard } from './IncidentCard.tsx'
-
-/** What the card's facts rest on: the incident's radio lines. */
-function basisOf(answer: IncidentAnswer): Basis | null {
-  const radio = answer.incident.timeline.filter(
-    (entry) => entry.kind === 'radio' || entry.kind === 'medical',
-  )
-  const confidence = weakest(radio.map((entry) => entry.confidence))
-  if (confidence === null) return null
-  return { confidence, sources: radio.flatMap((entry) => entry.sources) }
-}
+import { IncidentCard } from './IncidentCard.tsx'
 
 /**
  * An incident, read again for as long as it is shown: its card, then whatever
  * the caller puts between (a tap's match), then its crisis mode, what
  * authorities published, and its timeline. `summary` is shown until the first
- * reading arrives, and when the incident can no longer be read.
+ * reading arrives.
+ *
+ * When the server says there is no such incident, nothing of it is shown: not
+ * the last reading, whose "crisis mode is on" and "in force" nobody is checking
+ * any more, and not `summary`. What the caller puts between stays, so a tap
+ * keeps the match that was made for it.
  */
 export function IncidentLive({
   id,
@@ -42,22 +33,29 @@ export function IncidentLive({
     (signal) => fetchIncident(id, signal),
     incidentCadence,
   )
-  const answer = polled.data
-  const shown = answer?.incident ?? summary
+  const gone = polled.error?.status === 404
+  const read = gone ? null : polled.data
+  // A medical response is its card: its title, its crews, and its block. Its
+  // timeline would add the times of its calls, which are not shown.
+  const medical = read !== null && isMedical(read.incident)
+  const answer = medical ? null : read
+  const shown = gone ? null : (read?.incident ?? summary)
   return (
     <>
-      {shown !== null && (
-        <IncidentCard
-          incident={shown}
-          basis={answer === null ? null : basisOf(answer)}
-          heading={heading}
-        />
+      {shown !== null && <IncidentCard incident={shown} heading={heading} />}
+      {gone && (
+        <>
+          {heading === 'h1' && <h1>Beacon has no incident at this address</h1>}
+          <p className="note problem" role="status">
+            An incident’s address can change when its calls are grouped anew,
+            and an old incident is no longer read. Nothing is shown of what was
+            at this address before.
+          </p>
+        </>
       )}
-      {polled.error !== null && (
+      {polled.error !== null && !gone && (
         <p className="note problem" role="status">
-          {polled.error.status === 404
-            ? 'Beacon no longer has this incident: its calls were regrouped, or it is older than Beacon reads.'
-            : `${polled.error.message} What is shown may be out of date.`}
+          {polled.error.message} What is shown may be out of date.
         </p>
       )}
       {answer?.partial && (
@@ -72,7 +70,13 @@ export function IncidentLive({
       )}
       {children}
       {answer !== null && <IncidentBody incident={answer.incident} />}
-      {answer === null && polled.error === null && (
+      {medical && (
+        <p className="note">
+          Beacon shows a medical response as its crews and its block, and
+          nothing else.
+        </p>
+      )}
+      {polled.data === null && polled.error === null && (
         <p className="meta" role="status">
           Reading the incident…
         </p>

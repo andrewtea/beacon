@@ -1,8 +1,10 @@
+import { useEffect } from 'react'
 import './App.css'
 import { fetchHealth } from './api/health.ts'
 import { Icon } from './components/Icon.tsx'
 import { usePolled } from './lib/poll.ts'
 import { href, type Route, useRoute } from './lib/router.ts'
+import { sweepTaps } from './lib/tapStore.ts'
 import { Home } from './views/Home.tsx'
 import { IncidentView } from './views/IncidentView.tsx'
 import { TapView } from './views/TapView.tsx'
@@ -38,6 +40,8 @@ export default function App() {
   const health = usePolled('health', fetchHealth, () => HEALTH_MS)
   const mode = health.data?.mode ?? null
   const unreachable = health.error !== null
+  // A tap the server no longer answers for is deleted from this device.
+  useEffect(() => sweepTaps(), [])
 
   return (
     <div className="app">

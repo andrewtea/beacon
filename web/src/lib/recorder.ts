@@ -38,26 +38,37 @@ export async function recordClip(
       'Beacon could not use the microphone. Allow it for this site to send a clip.',
     )
   }
-  const context = new AudioContext()
-  const module = URL.createObjectURL(
-    new Blob([WORKLET], { type: 'text/javascript' }),
-  )
+  // From here the microphone is held, so everything that can fail is inside the
+  // block that lets go of it, the making of the audio context included. Only
+  // what was made is undone.
+  let context: AudioContext | null = null
+  let module: string | null = null
+  let late: ReturnType<typeof setTimeout> | undefined
+  let abort: (() => void) | undefined
   try {
+    // The tap can have been called off while the browser asked for permission.
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+    context = new AudioContext()
+    module = URL.createObjectURL(
+      new Blob([WORKLET], { type: 'text/javascript' }),
+    )
     await context.audioWorklet.addModule(module)
     const node = new AudioWorkletNode(context, 'beacon-tap', {
       numberOfInputs: 1,
       numberOfOutputs: 0,
       channelCount: 1,
     })
-    const wanted = Math.round(seconds * context.sampleRate)
+    const rate = context.sampleRate
+    const wanted = Math.round(seconds * rate)
     const samples = new Float32Array(wanted)
     let have = 0
+    const source = context.createMediaStreamSource(stream)
     await new Promise<void>((resolve, reject) => {
-      const abort = () => reject(new DOMException('Aborted', 'AbortError'))
+      abort = () => reject(new DOMException('Aborted', 'AbortError'))
       if (signal?.aborted) return abort()
       signal?.addEventListener('abort', abort, { once: true })
       // A microphone that sends nothing does not hold the tap up for good.
-      const late = setTimeout(
+      late = setTimeout(
         () => reject(new ClipError('The microphone sent no sound.')),
         (seconds + 5) * 1000,
       )
@@ -65,21 +76,21 @@ export async function recordClip(
         const block = event.data.subarray(0, wanted - have)
         samples.set(block, have)
         have += block.length
-        if (have >= wanted) {
-          clearTimeout(late)
-          resolve()
-        }
+        if (have >= wanted) resolve()
       }
-      context.createMediaStreamSource(stream).connect(node)
-      void context.resume()
+      source.connect(node)
+      void context?.resume()
     })
-    return encodeWav(samples, context.sampleRate)
+    return encodeWav(samples, rate)
   } catch (error) {
     if (error instanceof ClipError || error instanceof DOMException) throw error
     throw new ClipError('Beacon could not record a clip.')
   } finally {
-    URL.revokeObjectURL(module)
     for (const track of stream.getTracks()) track.stop()
-    void context.close()
+    clearTimeout(late)
+    if (abort !== undefined) signal?.removeEventListener('abort', abort)
+    if (module !== null) URL.revokeObjectURL(module)
+    // Closing a context that is already closed is refused, and is no failure.
+    if (context !== null) void context.close().catch(() => undefined)
   }
 }

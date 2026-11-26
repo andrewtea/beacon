@@ -60,7 +60,8 @@ function YourTaps() {
       <h2 id="taps-heading">Your taps</h2>
       <p className="meta">
         Kept on this device only. Beacon keeps an answer for 23 hours and lists
-        taps for nobody.
+        taps for nobody. A tap is deleted from this device when its answer runs
+        out, or the next time Beacon is opened after that.
       </p>
       <ul className="tap-list">
         {taps.map((tap) => (
@@ -91,15 +92,23 @@ export function Home({ mode }: { mode: Mode | null }) {
   const [withClip, setWithClip] = useState(false)
   const [photo, setPhoto] = useState<Blob | null>(null)
   const [photoProblem, setPhotoProblem] = useState<string | null>(null)
+  // A picture that was chosen is being drawn again. Until that is done there is
+  // no photo to send, so no tap is taken and no other picture chosen: a tap
+  // sent now would go without it, and a second choice could finish first.
+  const [drawing, setDrawing] = useState(false)
   const sending = useRef<AbortController | null>(null)
   const picker = useRef<HTMLInputElement | null>(null)
   // A tap that is on its way when the view is left is called off.
   useEffect(() => () => sending.current?.abort(), [])
 
-  const busy = BUSY[phase.kind]
+  const busy = drawing ? 'Reading the picture…' : BUSY[phase.kind]
+  // Whether the server runs on real sources or on the invented scenario is known
+  // before a tap is taken, so that nobody sends where they are, a clip, or a
+  // photo to the scenario without having been told that is what it is.
+  const ready = mode !== null
 
   const tap = async (from?: Place) => {
-    if (busy !== null) return
+    if (busy !== null || !ready) return
     const controller = new AbortController()
     sending.current = controller
     try {
@@ -133,8 +142,9 @@ export function Home({ mode }: { mode: Mode | null }) {
   }
 
   const choosePhoto = async (file: File | undefined) => {
+    if (file === undefined || drawing) return
     setPhotoProblem(null)
-    if (file === undefined) return
+    setDrawing(true)
     try {
       setPhoto(await drawPhoto(file))
     } catch (error) {
@@ -144,6 +154,8 @@ export function Home({ mode }: { mode: Mode | null }) {
           ? error.message
           : 'Beacon could not read that picture.',
       )
+    } finally {
+      setDrawing(false)
     }
   }
 
@@ -153,9 +165,15 @@ export function Home({ mode }: { mode: Mode | null }) {
         <h1 className="sr-only">Beacon</h1>
         <button
           type="button"
-          className={busy === null ? 'beacon-button' : 'beacon-button busy'}
+          className={
+            !ready
+              ? 'beacon-button waiting'
+              : busy === null
+                ? 'beacon-button'
+                : 'beacon-button busy'
+          }
           onClick={() => void tap()}
-          disabled={busy !== null}
+          disabled={busy !== null || !ready}
         >
           <span className="rings" aria-hidden="true">
             <span />
@@ -165,7 +183,9 @@ export function Home({ mode }: { mode: Mode | null }) {
         </button>
         <p className="ask-status" role="status" aria-live="polite">
           {busy ??
-            'Heard a siren or saw a helicopter? Tap, and Beacon looks into what is going on near you.'}
+            (ready
+              ? 'Heard a siren or saw a helicopter? Tap, and Beacon looks into what is going on near you.'
+              : 'Beacon takes a tap once it has heard from its server.')}
         </p>
         {phase.kind === 'failed' && (
           <p className="note problem" role="alert">
@@ -174,7 +194,7 @@ export function Home({ mode }: { mode: Mode | null }) {
         )}
       </div>
 
-      <fieldset className="extras" disabled={busy !== null}>
+      <fieldset className="extras" disabled={busy !== null || !ready}>
         <legend>Add to your tap</legend>
         <label className="extra">
           <input

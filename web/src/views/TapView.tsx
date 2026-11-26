@@ -26,7 +26,7 @@ function Investigation({ answer }: { answer: TapAnswer }) {
         <p className="meta">
           {calls} {calls === 1 ? 'request' : 'requests'}{' '}
           {answer.investigated_by === 'model'
-            ? 'to Muse Ember'
+            ? 'answered by Muse Ember'
             : 'answered by the stand-in, none by Muse Ember'}{' '}
           · {usd(answer.cost_usd)}
         </p>

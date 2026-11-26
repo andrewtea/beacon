@@ -1,8 +1,17 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
-import { beforeEach, expect, test, vi } from 'vitest'
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react'
+import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import App from './App.tsx'
+import { CrisisPanel } from './components/IncidentBody.tsx'
 import { IncidentCard } from './components/IncidentCard.tsx'
 import { Sources } from './components/Provenance.tsx'
+import { OPEN_MS } from './lib/cadence.ts'
+import { drawPhoto } from './lib/photo.ts'
 import { keepTap, keptTaps } from './lib/tapStore.ts'
 import {
   FIRE_TAP,
@@ -19,6 +28,11 @@ vi.mock('./lib/recorder.ts', () => ({
   ClipError: class extends Error {},
   // A clip of four bytes, in place of five seconds of a microphone.
   recordClip: vi.fn(async () => new Uint8Array([82, 73, 70, 70])),
+}))
+
+vi.mock('./lib/photo.ts', async (original) => ({
+  ...(await original<typeof import('./lib/photo.ts')>()),
+  drawPhoto: vi.fn(),
 }))
 
 const FIRE_ID = fireIncident.incident.id
@@ -42,6 +56,10 @@ beforeEach(() => {
   window.localStorage.clear()
   window.location.hash = ''
 })
+afterEach(() => vi.useRealTimers())
+
+const ASK = 'What’s that?'
+const INVENTED = /running on an invented scenario, not real sources/
 
 const click = (element: HTMLElement) => element.click()
 
@@ -50,14 +68,45 @@ test('says that it runs on an invented scenario before anybody taps', async () =
 
   render(<App />)
 
+  expect(await screen.findByText(INVENTED)).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: ASK })).toBeEnabled()
+})
+
+test('takes no tap until the server has said whether it runs on real sources', async () => {
+  // The server answers only when it is let: until then nobody has been told
+  // whether a tap would go to the invented scenario.
+  let answer: (response: Response) => void = () => undefined
+  const asked = serve({
+    'GET /api/health': () =>
+      new Promise<Response>((resolve) => (answer = resolve)),
+    'POST /api/taps': () => Response.json(receipt(FIRE_TAP), { status: 201 }),
+  })
+  render(<App />)
+
+  const button = screen.getByRole('button', { name: ASK })
+  expect(button).toBeDisabled()
   expect(
-    await screen.findByText(
-      /running on an invented scenario, not real sources/,
-    ),
-  ).toBeInTheDocument()
-  expect(
-    screen.getByRole('button', { name: 'What’s that?' }),
-  ).toBeInTheDocument()
+    screen.getByRole('checkbox', { name: '5 seconds of sound' }),
+  ).toBeDisabled()
+  click(button)
+  expect(asked.filter((request) => request.key === 'POST /api/taps')).toEqual(
+    [],
+  )
+
+  answer(Response.json(MOCK_HEALTH))
+  expect(await screen.findByText(INVENTED)).toBeInTheDocument()
+  expect(button).toBeEnabled()
+})
+
+test('takes no tap from a server that could not say which mode it is in', async () => {
+  serve({
+    'GET /api/health': () => Response.json({ detail: 'No.' }, { status: 500 }),
+  })
+  render(<App />)
+
+  expect(await screen.findByText('No.')).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: ASK })).toBeDisabled()
+  expect(screen.queryByText(INVENTED)).not.toBeInTheDocument()
 })
 
 test('offers no invented places and no invented label on a live server', async () => {
@@ -82,18 +131,21 @@ test('sends a tap, keeps its id on the device, and shows the incident it was mat
     }),
   )
 
-  expect(
-    await screen.findByRole('heading', {
-      level: 1,
-      name: 'Fire at the 400 block of Hayes St',
-    }),
-  ).toBeInTheDocument()
+  const title = await screen.findByRole('heading', {
+    level: 1,
+    name: 'Fire at the 400 block of Hayes St',
+  })
   // The status, the match, and who investigated are the server's sentences.
-  expect(screen.getByText('The radio said: crews at work.')).toBeInTheDocument()
+  expect(title.closest('article')).toHaveTextContent(
+    'The radio said: crews at work.',
+  )
   expect(screen.getAllByText(fireAnswer.match!.text)).not.toHaveLength(0)
   expect(screen.getAllByText(fireAnswer.stand_in_text!)).not.toHaveLength(0)
   for (const ground of fireAnswer.match!.grounds)
     expect(screen.getByText(ground.text)).toBeInTheDocument()
+  // The ground's name says what its check checked: open, or lately updated.
+  expect(screen.getByText('Open or recently updated')).toBeInTheDocument()
+  expect(screen.queryByText(/going on at the time/i)).not.toBeInTheDocument()
   // Only a place went with the tap: nothing was added to it.
   const sent = asked.find((request) => request.key === 'POST /api/taps')
   expect(sent?.body).toEqual({ location: { lat: 37.776, lon: -122.424 } })
@@ -116,8 +168,9 @@ test('rounds the phone’s position to about a block before it is sent, and send
   })
   render(<App />)
 
-  click(await screen.findByRole('checkbox', { name: '5 seconds of sound' }))
-  click(screen.getByRole('button', { name: 'What’s that?' }))
+  await screen.findByText(INVENTED)
+  click(screen.getByRole('checkbox', { name: '5 seconds of sound' }))
+  click(screen.getByRole('button', { name: ASK }))
 
   await screen.findByRole('heading', { level: 1, name: /Fire at/ })
   const sent = asked.find((request) => request.key === 'POST /api/taps')
@@ -266,6 +319,12 @@ test('the trace shows each tool call in the server’s words and never calls the
   expect(answerers).toHaveLength(fireRun.rounds.length + 1)
   expect(new Set(answerers)).toEqual(new Set(['The stand-in']))
   expect(screen.getByText(fireRun.stand_in_text!)).toBeInTheDocument()
+  // The calls listed are the ones that were kept, which a round can have asked
+  // for more than.
+  expect(
+    screen.getAllByText(/tool calls? of this round (was|were) kept/),
+  ).toHaveLength(fireRun.rounds.length)
+  expect(screen.queryByText(/came back asking for/)).not.toBeInTheDocument()
   // The count of closures a tool returned is 511's, and says so.
   expect(
     screen.getByRole('link', { name: 'data provided by 511.org' }),
@@ -293,17 +352,239 @@ test('a medical response is shown as its crews and its block, and nothing else',
   const medical = fireAnswer.nearby[0]
   expect(medical.category).toBe('medical response')
 
-  render(
+  const { container } = render(
     <IncidentCard
-      incident={{ ...medical, alarm: 2, taps: 4, status_text: null }}
+      incident={{
+        ...medical,
+        open: false,
+        alarm: 2,
+        taps: 4,
+        status_text: 'The radio said: units cleared.',
+      }}
     />,
   )
 
+  expect(screen.getByText(medical.title)).toBeInTheDocument()
   expect(screen.getByText(medical.place!)).toBeInTheDocument()
   for (const unit of medical.units)
     expect(screen.getByText(unit)).toBeInTheDocument()
-  expect(screen.queryByText(/alarm/i)).not.toBeInTheDocument()
-  expect(screen.queryByText(/taps/i)).not.toBeInTheDocument()
+  // Where it is from is kept: the calls it rests on, and how far to trust them.
+  expect(screen.getByText('Medium confidence')).toBeInTheDocument()
+  expect(screen.getByText(medical.radio!.sources[0].label)).toBeInTheDocument()
+  // Nothing else of it is shown, whatever the route sent: no alarm, no taps,
+  // no status, no time, and not whether its record is open.
+  const card = screen.getByRole('article')
+  expect(card).not.toHaveTextContent(/alarm/i)
+  expect(card).not.toHaveTextContent(/taps/i)
+  expect(card).not.toHaveTextContent(/cleared/i)
+  expect(card).not.toHaveTextContent(/record/i)
+  expect(card).not.toHaveTextContent(/first radio call/i)
+  expect(container.querySelector('time')).toBeNull()
+  expect(card).not.toHaveClass('over')
+})
+
+test('a medical response’s own page is its card, with no timeline and no time', async () => {
+  // Whatever the route sends of one: here, everything the fire has.
+  serve({
+    'GET /api/health': MOCK_HEALTH,
+    [`GET /api/incidents/${FIRE_ID}`]: {
+      ...fireIncident,
+      incident: { ...fireIncident.incident, category: 'medical response' },
+    },
+  })
+  window.location.hash = `#/incident/${FIRE_ID}`
+  const { container } = render(<App />)
+
+  expect(
+    await screen.findByText(/shows a medical response as its crews/),
+  ).toBeInTheDocument()
+  expect(screen.getByRole('article')).toHaveTextContent(
+    fireIncident.incident.place!,
+  )
+  expect(screen.queryByText(/timeline/i)).not.toBeInTheDocument()
+  expect(screen.queryByText(/Crisis mode/)).not.toBeInTheDocument()
+  expect(screen.queryByText('From authorities')).not.toBeInTheDocument()
+  expect(container.querySelector('time')).toBeNull()
+})
+
+test('a card says how Beacon’s record stands, and shows only what the radio gave, with the radio as its source', () => {
+  const fire = fireAnswer.incident!
+  expect(fire.taps).toBeGreaterThan(0)
+
+  const { rerender } = render(<IncidentCard incident={fire} />)
+
+  const card = screen.getByRole('article')
+  expect(card).toHaveTextContent('Open in Beacon’s record')
+  expect(card).toHaveTextContent('Medium confidence')
+  expect(
+    within(card).getAllByText(fire.radio!.sources[0].label),
+  ).not.toHaveLength(0)
+  // How many taps came and when the newest line is from are not the radio's,
+  // and are left to the timeline, where each has its own source.
+  expect(card).not.toHaveTextContent(/taps/i)
+  expect(card).not.toHaveTextContent(/latest update/i)
+
+  // A record that is closed is said to be that, and nothing is said of the
+  // place: the radio can only have gone quiet.
+  rerender(<IncidentCard incident={{ ...fire, open: false }} />)
+  expect(card).toHaveTextContent('Closed in Beacon’s record')
+  expect(card).not.toHaveTextContent(/going on/i)
+})
+
+test('crisis mode that is no longer on is said to have been on, and the app says nothing of the place', () => {
+  const crisis = { ...fireIncident.incident.crisis!, active: false }
+
+  render(<CrisisPanel crisis={crisis} />)
+
+  const panel = screen.getByRole('region', { name: 'Crisis mode was on' })
+  expect(panel).toHaveTextContent(crisis.text)
+  expect(panel).not.toHaveTextContent(/going on/i)
+})
+
+test('shows nothing of an incident the server says it does not have, and keeps the tap’s match', async () => {
+  // The tap's answer still names the incident; the incident's own route does not.
+  serve({
+    'GET /api/health': MOCK_HEALTH,
+    [`GET /api/taps/${FIRE_TAP}`]: fireAnswer,
+  })
+  window.location.hash = `#/tap/${FIRE_TAP}`
+  render(<App />)
+
+  expect(
+    await screen.findByRole('heading', {
+      name: 'Beacon has no incident at this address',
+    }),
+  ).toBeInTheDocument()
+  // No card of the incident from the tap's own answer, and none of its crisis.
+  expect(
+    screen.queryByRole('heading', { name: fireAnswer.incident!.title }),
+  ).not.toBeInTheDocument()
+  expect(screen.queryByText(/Crisis mode/)).not.toBeInTheDocument()
+  expect(
+    screen.getByRole('region', { name: 'Why this incident' }),
+  ).toHaveTextContent(fireAnswer.match!.text)
+})
+
+test('takes an incident off the screen when the server stops having it', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true })
+  let gone = false
+  serve({
+    'GET /api/health': MOCK_HEALTH,
+    [`GET /api/incidents/${FIRE_ID}`]: () =>
+      gone
+        ? Response.json(
+            { detail: 'There is no such incident.' },
+            { status: 404 },
+          )
+        : Response.json(fireIncident),
+  })
+  window.location.hash = `#/incident/${FIRE_ID}`
+  render(<App />)
+
+  expect(
+    await screen.findByRole('region', { name: 'Crisis mode is on' }),
+  ).toBeInTheDocument()
+  expect(screen.getByText('In force')).toBeInTheDocument()
+
+  gone = true
+  await vi.advanceTimersByTimeAsync(OPEN_MS + 100)
+
+  expect(
+    await screen.findByRole('heading', {
+      name: 'Beacon has no incident at this address',
+    }),
+  ).toBeInTheDocument()
+  // What was read before is not left standing with nobody checking it.
+  expect(screen.queryByText(/Crisis mode/)).not.toBeInTheDocument()
+  expect(screen.queryByText('In force')).not.toBeInTheDocument()
+  expect(screen.queryByRole('article')).not.toBeInTheDocument()
+})
+
+test('a story chosen from an earlier reading is said to be that, with no claim about which lines are newer', async () => {
+  const story = fireIncident.incident.story!
+  serve({
+    ...fireRoutes,
+    [`GET /api/incidents/${FIRE_ID}`]: {
+      ...fireIncident,
+      incident: {
+        ...fireIncident.incident,
+        story: { ...story, current: false, left_out: 2 },
+      },
+    },
+  })
+  window.location.hash = `#/incident/${FIRE_ID}`
+  render(<App />)
+
+  const points = await screen.findByRole('region', { name: 'Key points' })
+  expect(points).toHaveTextContent(/at an earlier reading/)
+  expect(points).toHaveTextContent(
+    '2 more points that were chosen are not shown.',
+  )
+  expect(points).not.toHaveTextContent(/newer/)
+  expect(points).not.toHaveTextContent(/did not show/)
+})
+
+test('a run whose totals may be incomplete says so in the server’s sentence, and claims no request went missing', async () => {
+  const cost = 'These totals may be incomplete: the server’s own sentence.'
+  serve({
+    ...fireRoutes,
+    [`GET /api/taps/${FIRE_TAP}/run`]: {
+      ...fireRun,
+      unaccounted_calls: 1,
+      cost_incomplete: true,
+      cost_text: cost,
+    },
+  })
+  window.location.hash = `#/tap/${FIRE_TAP}/trace`
+  render(<App />)
+
+  const totals = await screen.findByRole('region', { name: 'Totals' })
+  expect(totals).toHaveTextContent(cost)
+  expect(totals).toHaveTextContent('Requests answered')
+  expect(totals).not.toHaveTextContent(/not in these totals/)
+})
+
+test('takes no tap and no second picture while a chosen photo is still being drawn', async () => {
+  let drawn: (photo: Blob) => void = () => undefined
+  vi.mocked(drawPhoto).mockReturnValueOnce(
+    new Promise<Blob>((resolve) => (drawn = resolve)),
+  )
+  const asked = serve({
+    ...fireRoutes,
+    'POST /api/taps': () => Response.json(receipt(FIRE_TAP), { status: 201 }),
+  })
+  const { container } = render(<App />)
+  await screen.findByText(INVENTED)
+
+  const picker = container.querySelector<HTMLInputElement>('input[type=file]')!
+  fireEvent.change(picker, {
+    target: { files: [new File(['raw'], 'a.jpg', { type: 'image/jpeg' })] },
+  })
+
+  // Until the picture is drawn there is no photo to send: a tap now would go
+  // without it.
+  const button = screen.getByRole('button', { name: ASK })
+  await waitFor(() => expect(button).toBeDisabled())
+  expect(screen.getByRole('button', { name: 'A photo' })).toBeDisabled()
+  const spot = screen.getByRole('button', {
+    name: 'Near the invented fire, Hayes Valley',
+  })
+  expect(spot).toBeDisabled()
+  click(button)
+  click(spot)
+  expect(asked.some((request) => request.key === 'POST /api/taps')).toBe(false)
+
+  drawn(new Blob([new Uint8Array([255, 216, 255])], { type: 'image/jpeg' }))
+  await screen.findByRole('button', { name: 'Photo attached. Remove it' })
+  click(
+    screen.getByRole('button', {
+      name: 'Near the invented fire, Hayes Valley',
+    }),
+  )
+
+  await screen.findByRole('heading', { level: 1, name: /Fire at/ })
+  const sent = asked.find((request) => request.key === 'POST /api/taps')
+  expect(sent?.body).toMatchObject({ photo: '/9j/' })
 })
 
 test('a source is linked only at a web address, and its credit is shown either way', () => {

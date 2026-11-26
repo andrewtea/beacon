@@ -61,6 +61,10 @@ export type Crisis = {
 
 export type Point = { lat: number; lon: number }
 
+/** The radio calls an incident's title, status, place, units, alarm, and first
+ * call rest on: the least confidence among them, and a source for each. */
+export type Radio = { confidence: Confidence; sources: Source[] }
+
 export type IncidentSummary = {
   id: string
   category: string
@@ -68,9 +72,14 @@ export type IncidentSummary = {
   status: string
   // The status in the server's sentence. Null for a medical response.
   status_text: string | null
+  // Whether Beacon's record of it is open. Not whether anything is happening
+  // at the place: a record also closes when the radio has only gone quiet.
   open: boolean
+  // When its first radio call came, and when the newest line of its timeline is
+  // from, whichever source that line is from.
   opened_at: string
   updated_at: string
+  radio: Radio | null
   place: string | null
   point: Point | null
   point_from: string | null

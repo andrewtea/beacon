@@ -480,6 +480,17 @@ button.quiet:hover {
   cursor: progress;
 }
 
+/* Not yet taking taps: the server has not said which mode it is in. */
+.beacon-button.waiting {
+  background: var(--line);
+  color: var(--text-soft);
+  cursor: not-allowed;
+}
+
+.beacon-button.waiting .rings {
+  display: none;
+}
+
 .beacon-label {
   position: relative;
   font-size: clamp(1.5rem, 7vw, 1.9rem);

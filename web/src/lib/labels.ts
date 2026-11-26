@@ -1,4 +1,4 @@
-import type { Confidence, IncidentSummary, Official } from '../api/incidents.ts'
+import type { IncidentSummary, Official } from '../api/incidents.ts'
 
 // Short labels for the server's closed lists. They name a thing and claim
 // nothing about it: every sentence about an incident, an order, or an
@@ -74,7 +74,7 @@ export function citedNow(now: string): string {
 // The grounds a match can rest on, by name. Their sentences are the server's.
 const GROUND: Record<string, string> = {
   near: 'Near the tap',
-  going_on: 'Going on at the time',
+  going_on: 'Open or recently updated',
   heard_in_clip: 'Heard in the clip',
   seen_in_photo: 'Seen in the photo',
   aircraft_overhead: 'Aircraft overhead',
@@ -118,17 +118,9 @@ export function isMedical(incident: IncidentSummary): boolean {
   return incident.category === 'medical response'
 }
 
-/** How an incident stands, in a few words: going on, or what was last heard. */
-export function standing(incident: IncidentSummary): string {
-  if (incident.open) return 'Going on'
-  return 'Not going on now'
-}
-
-const RANK: Confidence[] = ['official', 'high', 'medium', 'low']
-
-/** The least confidence among several: a claim that rests on several rows is
- * trusted as little as the weakest, as the server has it. */
-export function weakest(levels: Confidence[]): Confidence | null {
-  if (levels.length === 0) return null
-  return RANK[Math.max(...levels.map((level) => RANK.indexOf(level)))] ?? 'low'
+/** Whether Beacon's record of an incident is open. It is the record's state and
+ * not the state of things at the place: a record closes when the radio says the
+ * call is cleared or cancelled, and also when the radio has only gone quiet. */
+export function recordState(incident: IncidentSummary): string {
+  return incident.open ? 'Open in Beacon’s record' : 'Closed in Beacon’s record'
 }

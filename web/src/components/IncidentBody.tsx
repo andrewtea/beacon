@@ -37,11 +37,6 @@ export function CrisisPanel({ crisis }: { crisis: Crisis }) {
       <h2 id="crisis-heading">
         {crisis.active ? 'Crisis mode is on' : 'Crisis mode was on'}
       </h2>
-      {!crisis.active && (
-        <p className="note">
-          The incident is not going on now, so crisis mode is no longer on.
-        </p>
-      )}
       <p>{crisis.text}</p>
       <p className="meta">
         Decided at{' '}
@@ -226,9 +221,9 @@ function StoryPanel({ story }: { story: Story }) {
           : 'A stand-in for Muse Ember chose these points from the incident’s radio, closure, aircraft, and tap lines, by rule. No model chose them.'}{' '}
         Code checked each against its evidence and wrote every sentence.
         {!story.current &&
-          ' The timeline has lines newer than the ones these were chosen from.'}
+          ' They were chosen from the lines the incident had at an earlier reading, which are not the same as the lines it has now.'}
         {story.left_out > 0 &&
-          ` ${story.left_out} chosen ${story.left_out === 1 ? 'point was' : 'points were'} left out because the evidence did not show ${story.left_out === 1 ? 'it' : 'them'}.`}
+          ` ${story.left_out} more ${story.left_out === 1 ? 'point that was chosen is' : 'points that were chosen are'} not shown.`}
       </p>
       <ul className="lines">
         {story.claims.map((claim, index) => (

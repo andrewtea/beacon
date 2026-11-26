@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict
 
 from beacon.incident import Engine, Incident
-from beacon.incident.build import CREDIT_511, STATUS_WORDS
+from beacon.incident.build import CREDIT_511, STATUS_WORDS, weakest
 from beacon.investigate import Runs
 from beacon.investigate import card as words
 from beacon.radio.vocabulary import MEDICAL_EVENT
@@ -148,7 +148,8 @@ class CrisisOut(BaseModel):
     off. It is the investigator's decision and no authority's, and `text` says so.
     It tells nobody what to do."""
 
-    # Whether it is on now: it was turned on, and the incident is still going on.
+    # Whether it is on now: it was turned on, and Beacon's record of the incident
+    # is open (the incident's `open`).
     active: bool
     decided_at: datetime
     text: str
@@ -170,6 +171,18 @@ class CrisisOut(BaseModel):
     stand_in_text: str | None
 
 
+class RadioOut(BaseModel):
+    """What an incident's `title`, `status`, `place`, `units`, `alarm`, and
+    `opened_at` rest on: the radio calls it is made of. They are what a card of
+    the incident shows, so a card shows this with them."""
+
+    # The least confidence among the calls: the facts are trusted no more than
+    # the weakest call under them.
+    confidence: Literal["official", "high", "medium", "low"]
+    # One source for each call.
+    sources: list[SourceOut]
+
+
 class IncidentSummary(_Read):
     id: str
     category: str
@@ -178,9 +191,18 @@ class IncidentSummary(_Read):
     # The status in a sentence, as what the radio said: show it as it is. Null for
     # a medical response, of which no status is shown, and when the radio gave none.
     status_text: str | None = None
+    # Whether Beacon's record of it is open: its radio has not cleared it and was
+    # heard from in the last 45 minutes, or an alert for its place is in force. A
+    # record that is closed says nothing of what is happening at the place now:
+    # the radio can simply have gone quiet. Label it as the record's state.
     open: bool
+    # When its first radio call came, and when the newest line of its timeline
+    # is from, which can be a line from any source.
     opened_at: datetime
     updated_at: datetime
+    # The radio calls its title, status, place, units, alarm, and first call rest
+    # on. Null when none of its calls is among the lines that were read.
+    radio: RadioOut | None = None
     place: str | None
     point: PointOut | None
     point_from: str | None
@@ -191,7 +213,9 @@ class IncidentSummary(_Read):
     streets: list[str]
     units: list[str]
     alarm: int | None
-    # Taps, not people. `taps_more` says there were more than were counted.
+    # Taps, not people. `taps_more` says there were more than were counted. The
+    # count is from taps and not from the radio: the timeline has a line for it,
+    # with its own source and confidence.
     taps: int
     taps_more: bool
     # Whether more positions of aircraft were near it than were read.
@@ -333,16 +357,33 @@ def status_text_of(incident: Incident) -> str | None:
     if incident.category == MEDICAL_EVENT or incident.status == "unknown":
         return None
     if incident.status == "clearing":
-        # A call cleared or cancelled units while others had been named lately.
-        return "The radio said some units were cleared or cancelled."
+        # A call gave a status of cleared or cancelled while a unit it did not
+        # name had been named lately. Whether the call cleared units, and which,
+        # is not kept: a call that cancels can name a street and no unit. So this
+        # says that such a call was made, and nothing of what it was about.
+        return "A clearance or a cancellation was reported on the radio."
     words_for = STATUS_WORDS.get(incident.status)
     return None if words_for is None else f"The radio said: {words_for}."
 
 
+def radio_of(incident: Incident) -> RadioOut | None:
+    """The radio calls an incident's card rests on, from the lines of its timeline
+    that are calls, each of which has its row's source and confidence."""
+    calls = [entry for entry in incident.timeline if entry.kind in ("radio", "medical")]
+    if not calls:
+        return None
+    return RadioOut(
+        confidence=weakest([entry.confidence for entry in calls]),
+        sources=[SourceOut.model_validate(source) for entry in calls for source in entry.sources],
+    )
+
+
 def summary_of(request: Request, incident: Incident) -> IncidentSummary:
-    """An incident as the list has it, with its status in words and its crisis mode."""
+    """An incident as the list has it, with its status in words, the calls it
+    rests on, and its crisis mode."""
     summary = IncidentSummary.model_validate(incident)
     summary.status_text = status_text_of(incident)
+    summary.radio = radio_of(incident)
     summary.crisis = crisis_of(request, incident)
     return summary
 
@@ -356,8 +397,8 @@ def _engine(request: Request) -> Engine:
 
 @router.get("/incidents")
 def incidents(request: Request, everything: bool = Query(False, alias="all")) -> Incidents:
-    """The incidents that are going on, and the ones that ended in the last two
-    hours, newest first. With `all=true`, every incident the engine has."""
+    """The incidents whose record is open, and the ones whose newest line is from
+    the last two hours, newest first. With `all=true`, every incident the engine has."""
     engine = _engine(request)
     # One reading for the whole answer: its incidents, its moment, and its flag.
     snapshot = engine.snapshot()
@@ -384,6 +425,7 @@ def incident(request: Request, incident_id: str) -> IncidentAnswer:
         raise HTTPException(404, "There is no such incident.")
     detail = IncidentDetail.model_validate(found)
     detail.status_text = status_text_of(found)
+    detail.radio = radio_of(found)
     detail.crisis = crisis_of(request, found)
     desk: StoryDesk | None = getattr(request.app.state, "stories", None)
     # Reading a story asks Ember nothing: only the desk's own pass writes one.
