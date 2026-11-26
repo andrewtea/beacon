@@ -9,7 +9,13 @@ Beacon is a "What's that?" button for San Francisco, built for the Meta Muse Emb
 - `scripts/`: repository scripts. Python scripts import `beacon` and run with `uv run --project server python scripts/<name>.py`. Keep their logic in `server/beacon/` so it is tested; the script is a thin entry point.
 - `data/`: local runtime data (SQLite files, recordings, downloads), ignored by Git. The Ember client writes under `data/ember/`. `BEACON_DATA_DIR` moves it and must be an absolute path (`beacon.ember.client.default_data_dir`); code that stores data must honor it.
 
-Each `server/beacon/` package has one concern, so parallel pull requests stay apart. Today: `api/` (HTTP routes, one module per resource, each exposing a `router` that `beacon.main` mounts under `/api`) and `ember/` (the Meta Model API client, its ledger, replay cache, and trace). When you add a package, add it to this list and to the README's layout table.
+Each `server/beacon/` package has one concern, so parallel pull requests stay apart. When you add a package, add it to this list and to the README's layout table.
+
+- `api/`: HTTP routes, one module per resource, each exposing a `router` that `beacon.main` mounts under `/api`.
+- `ember/`: the Meta Model API client, its ledger, replay cache, and trace.
+- `evidence/`: the evidence store. Every poller writes to it and every reader of what a source said reads from it. See [Using the evidence store](#using-the-evidence-store).
+- `ingest/`: one module per source (`nws`, `opensky`, `traffic511`), the `Runner` that polls them, and `setup.build`, which makes them from the environment.
+- `scenario/`: the mock scenario, an invented San Francisco fire served to the pollers in each source's own format.
 
 ## Commands
 
@@ -27,7 +33,9 @@ Run one server test with `cd server && uv run pytest tests/test_health.py -k nam
 - **Only `server/beacon/ember/` may call the Meta Model API.** Every model call goes through `EmberClient.respond`, which records tokens and cost for each call, replays recorded responses when `REPLAY=1`, and refuses a call past the spending stop. No other module imports `openai` or another model SDK, or sends a request to `api.meta.ai`. Do not raise the stop's default or the ceiling in `beacon/ember/pricing.py`, do not give `EMBER_SPENT_BEFORE_USD` a default, and do not delete `data/ember/ledger.sqlite3` or point two processes at different ledgers: going over $10 disqualifies the entry. See [Using the Ember client](#using-the-ember-client).
 - **Tests and CI never call the Meta Model API or a live data source.** Tests replay recorded or hand-written responses. `server/tests/conftest.py` removes `MODEL_API_KEY`, sets `REPLAY=1`, and patches Python's `socket.connect` and `socket.connect_ex` to raise `NetworkBlockedError` for an address that is not this machine. The patch is a backstop: a test that catches the error still passes, and native code that opens its own sockets is not covered, so the rule is yours to keep. Do not weaken the guard; give the code under test a fake transport instead.
 - **Never commit secrets, raw radio audio, or downloaded source data.** The repository is public. Keys come from the environment (`MODEL_API_KEY`). Runtime data stays under the Git-ignored `data/`. Beacon publishes summaries, never raw radio audio.
-- **Say what is mocked.** Until real keys and permissions exist, features run on mock data. Anything a stand-in produced is labeled as such in the API reply and in the app, and the README's status says so. Never present a stand-in's output as Ember's.
+- **Say what is mocked.** Until real keys and permissions exist, features run on mock data. Anything a stand-in produced is labeled as such in the API reply and in the app, and the README's status says so. Never present a stand-in's output as Ember's. An evidence row says it itself: `row.stand_in` is true when it came from the mock scenario (`origin == "mock"`) or a fake Ember wrote it (`model == "fake"`), and whatever is built from such a row is a stand-in's too. The live evidence store refuses those rows; do not add a way around that.
+- **Mock data is invented, never copied.** The repository is public and holds no real radio traffic, transcript, recording, or notice. What the mock scenario says is made up and says so in its text (`beacon.scenario.INVENTED`).
+- **A poller's request goes through `beacon.ingest.http.fetch`,** which caps what is read, follows no redirect, and fails with a `SourceError` whose text is fixed. Never log or raise a request's address (511's holds the token), a reply's body, or an exception from the HTTP library.
 - **Product lines that keep Beacon inside the hackathon rules** (see HACKATHON.md, "Constraints for Beacon"):
   - The answer to a tap is the product. The map is secondary and opened from an incident card.
   - A photo only adds evidence to a tap and its incident. There is no "analyze this photo" feature.
@@ -98,6 +106,48 @@ ember = EmberClient.from_env()
 - **In tests**, use `EmberClient.fake(Storage.under(tmp_path), Script([fake_response(text="...")]))` from `beacon.ember`; `fake_response` also takes `function_calls` and token counts. It checks requests the way a live client does and spends nothing. `server/tests/test_ember_audio_rate.py` is a short example.
 - **With no key**, a feature runs on a responder passed to `EmberClient.fake`. Its answers have `source == "fake"`: carry that to the API reply and the app, and label the result as a stand-in's.
 - No real Ember call has been made yet, so the request shapes are from Meta's documentation and unverified. When a key exists, run `scripts/measure_audio_rate.py` first (README, "Measure the audio token rate").
+
+## Using the evidence store
+
+```python
+import os
+from datetime import timedelta
+
+from beacon.evidence import EvidenceStore, NewEvidence, Point
+
+store = EvidenceStore.from_env(os.environ)  # the mock store unless BEACON_LIVE_SOURCES names a source
+
+# Read: what any source said near a place in the last ten minutes, plus rows with no
+# point, such as a city-wide alert. Oldest first.
+rows = store.search(
+    kinds=["radio", "aircraft", "alert", "traffic"],
+    start=now - timedelta(minutes=10),
+    end=now,
+    near=Point(37.7766, -122.4236),
+    radius_m=500,
+    include_unlocated=True,
+)
+for row in rows:
+    row.kind, row.source, row.ref  # ("alert", "nws", "urn:oid:...")
+    row.occurred_at, row.until  # aware datetimes in UTC; until is None for most kinds
+    row.point, row.place  # Point | None, and the place in words | None
+    row.confidence  # "official", "high", "medium", or "low"
+    row.stand_in  # True for the mock scenario's rows and a fake Ember's
+    row.data  # a dict whose shape belongs to the row's kind and source
+
+# Write: only a poller or an ingest route does. The same source and ref is stored once.
+store.add([NewEvidence(kind="tap", source="app", ref=tap_id, occurred_at=now,
+                       confidence="low", origin="live", point=where)])
+```
+
+- **A row is one thing one source said, and it is never changed.** A revision is a new row: an NWS update names the alerts it replaces in `data["replaces"]`, and each version of a 511 event is a row whose `data["event_id"]` is the same. A row whose `data["clears"]` holds another row's `ref` says that alert or event is over. To know what is in force, read the rows and apply those three; the store does not do it for you.
+- **Rows carry what the source said, not a judgment.** Grouping rows into incidents, deciding that an aircraft is circling, and weighing a notice against radio are the incident engine's, and stay deterministic and tested.
+- `search` finds a row with an `until` when its span touches the window, and any other row when it happened inside it. Pass `include_unlocated=True` with `near` unless you want only rows that have a point. Aircraft are one row per position, about every 30 seconds each, so give an aircraft query a short window or a larger `limit` (default 500).
+- What `data` holds is documented where it is written: `beacon/ingest/nws.py` (`_alert`), `opensky.py` (`_aircraft`), and `traffic511.py` (`_event`). Units are SI: metres, metres per second, degrees clockwise from north.
+- Anything shown from a `511` row carries the words "data provided by 511.org" with a link to https://511.org beside it: 511's data agreement requires it.
+- The mock store and the live store are separate files, and a store is one or the other for life. Code that reads evidence takes an `EvidenceStore` as an argument; only an entry point (the server's startup, a script) calls `from_env`.
+- **In tests**, make a store with `EvidenceStore(tmp_path / "evidence.sqlite3", "mock")` and add rows, or play the scenario: `build({"BEACON_DATA_DIR": str(tmp_path)}, Clock(lambda: moment)).catch_up()` from `beacon.ingest` stores everything the invented fire's sources said up to `moment`. `server/tests/test_ingest_setup.py` shows the whole story and when each row appears.
+- **A new source** is a module in `beacon/ingest/` that copies `nws.py`: a class with `name`, `interval_seconds`, and `poll(store, now)`, a pure `parse_...` function that turns the source's reply into `NewEvidence` and counts what it could not read, the source's answers added to `beacon/scenario/`, and its name added to `SOURCES` and `_live_pollers` in `setup.py`. Its tests answer through `httpx2.MockTransport`.
 
 ## Conventions
 

@@ -4,7 +4,7 @@ Beacon is a "What's that?" button for your city. You hear a siren or see a helic
 
 Beacon is being built for the Meta Muse Ember Hackathon (Nov 23 to Dec 2, 2026). The rules, the $10 budget, and the submission checklist are in [HACKATHON.md](HACKATHON.md).
 
-**Status:** scaffold and Ember client. The web app is an installable shell that shows whether the server is reachable, and the server answers a health check. The client every model call will go through is built, and no route uses it yet. **No real Ember call has been made:** there is no API key, so the client has run only against a mock of the Meta Model API in tests, and its request shapes come from Meta's documentation, not from an answer of Ember's. The audio token rate the budget rests on is [still a guess](#measure-the-audio-token-rate). Nothing listens to radio, and no incident exists.
+**Status:** scaffold, Ember client, evidence store, and the first three pollers. The web app is an installable shell that shows whether the server is reachable. The server stores evidence rows and runs pollers for National Weather Service alerts, OpenSky aircraft positions, and 511 road closures. **By default the pollers are fed an invented scenario, not real sources:** a made-up three-alarm fire in Hayes Valley, told in each source's own format, and every row from it is stored as `mock`. The NWS poller has also been run once against the real API. The OpenSky and 511 pollers have run only against mocked HTTP: there is no 511 token, and OpenSky did not answer from the machine this was built on. **No real Ember call has been made:** there is no API key, so the client has run only against a mock of the Meta Model API in tests, and its request shapes come from Meta's documentation, not from an answer of Ember's. The audio token rate the budget rests on is [still a guess](#measure-the-audio-token-rate). Nothing listens to radio, and no incident exists.
 
 ## Layout
 
@@ -15,7 +15,15 @@ Beacon is being built for the Meta Muse Ember Hackathon (Nov 23 to Dec 2, 2026).
 | [`scripts/`](scripts) | Repository scripts: `check` runs what CI runs, `measure_audio_rate.py` measures what Ember bills for audio, and `generate-icons.sh` redraws the PWA icons from `web/public/favicon.svg`. |
 | `data/` | Local runtime data. Ignored by Git, never committed. |
 
-Inside `server/beacon/`, each package has one concern so pull requests stay apart: `api/` holds the HTTP routes, and `ember/` is the only code that calls the Meta Model API.
+Inside `server/beacon/`, each package has one concern so pull requests stay apart:
+
+| Package | What it holds |
+| --- | --- |
+| `api/` | The HTTP routes. |
+| `ember/` | The Muse Ember client, the only code that calls the Meta Model API. |
+| `evidence/` | The evidence store: one SQLite row for each thing a source said. |
+| `ingest/` | One poller per source, the loop that runs them, and how they are built from the environment. |
+| `scenario/` | The mock scenario: an invented San Francisco fire, served to the pollers in each source's format. |
 
 ## Run locally
 
@@ -52,13 +60,13 @@ scripts/check web      # format, lint, tests, type check, build
 scripts/check server   # format, lint, tests
 ```
 
-Tests never call the Meta Model API or a live data source. Two entry points enforce the environment for that: `scripts/check`, which CI also runs, sets `REPLAY=1` and removes `MODEL_API_KEY` before it checks either side, and server pytest does the same however it is started, because `server/tests/conftest.py` does it. CI holds no key. A web test run directly with `pnpm test` keeps whatever environment the shell has; nothing in `web/` reads the key. As a backstop for the server tests, `server/tests/conftest.py` patches Python's `socket.connect` and `socket.connect_ex` in the test process to raise `NetworkBlockedError` for any address that is not this machine. It is a backstop and not a sandbox: a test that catches that error still passes, and the patch does not reach DNS lookups, subprocesses, or native code that opens sockets without Python's `socket` module.
+Tests never call the Meta Model API or a live data source: the pollers' tests answer from hand-written replies and the mock scenario. Two entry points enforce the environment for that: `scripts/check`, which CI also runs, sets `REPLAY=1` and removes `MODEL_API_KEY` before it checks either side, and server pytest does the same however it is started, because `server/tests/conftest.py` does it. CI holds no key. A web test run directly with `pnpm test` keeps whatever environment the shell has; nothing in `web/` reads the key. As a backstop for the server tests, `server/tests/conftest.py` patches Python's `socket.connect` and `socket.connect_ex` in the test process to raise `NetworkBlockedError` for any address that is not this machine. It is a backstop and not a sandbox: a test that catches that error still passes, and the patch does not reach DNS lookups, subprocesses, or native code that opens sockets without Python's `socket` module.
 
 ## Configuration
 
 Settings come from the environment. The server does not load the repository-root `.env` file: export a variable in your shell or put it in front of the command. (Vite loads `web/.env` for the web app, as it does by default, and exposes only names that start with `VITE_` to the browser. Beacon has no such file and no such setting.)
 
-[`.env.example`](.env.example) lists the settings, and the Ember client is what reads them (`EmberClient.from_env`). The two `EMBER_` settings are read from the process's environment and nowhere else: a mapping handed to `from_env` can choose the mode, the key, and the data directory, and cannot supply or change the spending settings.
+[`.env.example`](.env.example) lists the settings. The Ember client reads the first five (`EmberClient.from_env`), and the server reads the rest when it starts. The two `EMBER_` settings are read from the process's environment and nowhere else: a mapping handed to `from_env` can choose the mode, the key, and the data directory, and cannot supply or change the spending settings.
 
 | Variable | What it does | When unset |
 | --- | --- | --- |
@@ -67,8 +75,59 @@ Settings come from the environment. The server does not load the repository-root
 | `EMBER_STOP_USD` | The most the Ember ledger may hold in live spend, in dollars. | `3.00` |
 | `EMBER_SPENT_BEFORE_USD` | The total spend against the $10 credit, for every model, that Meta's Usage page showed before Beacon's first call, in dollars. `0` is an answer; it has no default. | No live calls: a client that can spend is refused. |
 | `BEACON_DATA_DIR` | Where runtime data goes. An absolute path; a relative one is refused. | The repository's `data/`. |
+| `BEACON_LIVE_SOURCES` | The sources to poll for real, as a list: `nws`, `opensky`, `511`. Naming any source turns the mock scenario off for all of them. | Every poller runs on the mock scenario, and nothing asks a real source. |
+| `BEACON_511_API_KEY` | The [511 SF Bay token](https://511.org/open-data/token). Needed when `BEACON_LIVE_SOURCES` names `511`. | 511 cannot be named. |
+| `OPENSKY_CLIENT_ID`, `OPENSKY_CLIENT_SECRET` | An OpenSky API client, for 4,000 requests a day in place of 400. Set both or neither. | OpenSky is asked without an account, every four minutes. |
+| `BEACON_INGEST` | `0` starts the server without its pollers. | `1`: the server runs the pollers. |
 
-The server's routes do not build an Ember client yet, so today the settings are read by the two commands under [Ember client](#ember-client) and nothing else. Three places set any of them. `scripts/check`, and so CI, sets `REPLAY=1` and removes `MODEL_API_KEY`. Server pytest does the same, removes `EMBER_STOP_USD` and `EMBER_SPENT_BEFORE_USD`, and points `BEACON_DATA_DIR` at a temporary directory for each test. The orb's API service in [`.amp/services.yaml`](.amp/services.yaml) sets `REPLAY=1`.
+The server's routes do not build an Ember client yet, so today the Ember settings are read by the two commands under [Ember client](#ember-client) and nothing else. The server reads the source settings when it starts, and `BEACON_DATA_DIR` with them. Three places set any of them. `scripts/check`, and so CI, sets `REPLAY=1` and removes `MODEL_API_KEY`. Server pytest does the same, removes the spending settings and every source setting, and points `BEACON_DATA_DIR` at a temporary directory for each test. The orb's API service in [`.amp/services.yaml`](.amp/services.yaml) sets `REPLAY=1`.
+
+## Evidence and ingest
+
+Each source has a poller in [`server/beacon/ingest/`](server/beacon/ingest) that writes **evidence** rows to SQLite through [`server/beacon/evidence/`](server/beacon/evidence). A row is one thing one source said: a weather alert, one position of an aircraft, one version of a road closure. Later phases read the rows back by kind, time, and place to build incidents and answer taps.
+
+| Column | What it holds |
+| --- | --- |
+| `kind` | `radio`, `aircraft`, `alert`, `traffic`, `notice`, or `tap`. Only `aircraft`, `alert`, and `traffic` are written today. |
+| `source`, `ref` | The feed (`nws`, `opensky`, `511`) and the source's own name for the item. Together they name one row, so an item a source sends twice is stored once. |
+| `occurred_at`, `until` | When it happened according to the source, and when it stops applying, for an alert. |
+| `point`, `place` | A latitude and longitude, and the place in words. Either can be missing: a city-wide alert has no point. |
+| `confidence` | `official` for an authority speaking for itself, else `high`, `medium`, or `low`. |
+| `origin` | `mock` for the invented scenario, `live` for a real source. |
+| `model` | Which kind of Ember client wrote the row's data, when a model did: `live`, `replay`, or `fake`. |
+| `data` | What the source said, as JSON in a shape of the row's kind. Each poller's module documents its own. |
+| `url` | Where a person can read the original, when it is public. |
+
+Rows are never changed. A source that revises what it said gets a new row: an NWS update is a new message, and each version of a 511 event is stored under the event's id and its update time. NWS and 511 do not announce that something ended; it goes missing from their next answer. When an item has been missing from two answers in a row, and for an alert before the time it said it would end, the poller stores a row that says it cleared.
+
+| Source | What is asked | Kept | Terms |
+| --- | --- | --- | --- |
+| [NWS](https://www.weather.gov/documentation/services-web-api) | Active alerts for San Francisco's forecast zone and county, every 2 minutes. No key. | Every `Actual` alert, including civil messages NWS relays, such as a shelter-in-place warning. | Public domain. |
+| [OpenSky](https://openskynetwork.github.io/opensky-api/rest.html) | Aircraft in a box around the city, every 4 minutes without an account or every 30 seconds with one. | Aircraft that are airborne below 3,000 m: what a person on the street could notice. | Free for non-commercial use. |
+| [511 SF Bay](https://511.org/open-data/traffic) | Active traffic events, every 2 minutes. Needs a token. | Events inside the city. | [511's data agreement](https://511.org/sites/default/files/2026-04/511_Data_Agreement_Final_2026.pdf) licenses storing, displaying, and deriving from the data. Wherever the app shows it, it must say "data provided by 511.org" with a link to 511.org. |
+
+### Mock and live
+
+**With `BEACON_LIVE_SOURCES` unset, which is the default, no real source is asked anything.** The pollers are the real ones, and where the network would be stands the mock scenario in [`server/beacon/scenario/`](server/beacon/scenario): an invented three-alarm fire on the 400 block of Hayes St, told as what NWS, OpenSky, and 511 would have answered minute by minute. A helicopter circles, 511 closes Hayes St and widens the closure, a shelter-in-place warning is issued, narrowed, and dropped, and the closure lifts. Nothing in it happened; its texts say "Invented for Beacon's mock scenario", and its rows have the origin `mock`. The story begins twenty minutes before a mock store is first opened and runs 95 minutes in real time. To play it again, delete `data/evidence/mock.sqlite3`.
+
+There are two store files, `data/evidence/mock.sqlite3` and `data/evidence/live.sqlite3`, and **the live store refuses any row a stand-in had a part in**: one from the mock scenario, or one a fake Ember wrote. So a source that is not named in `BEACON_LIVE_SOURCES` does not run beside the live ones; it is off. Anything read from the mock store is a stand-in's, and has to be labeled as one wherever it is shown.
+
+To poll a source for real, name it and set its key. No code changes:
+
+```sh
+BEACON_LIVE_SOURCES=nws,opensky,511 BEACON_511_API_KEY=... \
+  uv run uvicorn beacon.main:app
+```
+
+The server runs the pollers on a thread of its own, so run one server process: two would ask every source twice as often. `GET /api/sources` says which mode the server is in and how each poller's last poll went. To poll without the server:
+
+```sh
+cd server
+uv run python -m beacon.ingest            # poll once, print what the store holds
+uv run python -m beacon.ingest --follow   # keep polling
+```
+
+A poller's failure is logged as one fixed sentence, such as `511 answered HTTP 401.`, and never with the address that was asked: 511's holds the token. The HTTP library's own request log is switched off for the same reason.
 
 ## Ember client
 
