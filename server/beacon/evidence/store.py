@@ -363,6 +363,13 @@ class EvidenceStore:
         with closing(self._connect()) as db:
             return dict(db.execute("SELECT source, COUNT(*) FROM evidence GROUP BY source"))
 
+    def last_id(self) -> int:
+        """The id of the row that was stored last, or 0 for a store with no rows.
+        Rows are never changed and never removed, and each new one gets a larger id,
+        so a reader that has read up to this id has missed nothing until it grows."""
+        with closing(self._connect()) as db:
+            return db.execute("SELECT COALESCE(MAX(id), 0) FROM evidence").fetchone()[0]
+
     def get(self, evidence_id: int) -> Evidence | None:
         with closing(self._connect()) as db:
             row = db.execute(

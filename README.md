@@ -4,7 +4,7 @@ Beacon is a "What's that?" button for your city. You hear a siren or see a helic
 
 Beacon is being built for the Meta Muse Ember Hackathon (Nov 23 to Dec 2, 2026). The rules, the $10 budget, and the submission checklist are in [HACKATHON.md](HACKATHON.md).
 
-**Status:** scaffold, Ember client, evidence store, five pollers, and the route that takes a tap. The web app is an installable shell that shows whether the server is reachable; it has no button yet, and **a tap is stored and not yet answered**. The server stores evidence rows and runs pollers for National Weather Service alerts, OpenSky aircraft positions, 511 road closures, OpenMHz dispatch radio, each call of which Ember hears and turns into a row, and official notices, each document of which Ember reads (`read_notice`). **By default the pollers are fed an invented scenario, not real sources:** a made-up three-alarm fire in Hayes Valley, told in each source's own format, and every row from it is stored as `mock`. Its radio calls are generated tones and its notices are invented PDFs, and what was "said" in them is filled in by a stand-in for Ember, so its radio and notice rows are a stand-in's twice over. An early version of the NWS poller was run once against the real API; nothing else has been. The 511 poller has run only against mocked HTTP, because there is no token. The OpenSky poller has too, and **may not be pointed at the real API yet:** OpenSky's terms require a written license for a running service, which nobody has asked for. **OpenMHz has never been asked anything:** using its audio needs its permission, which Beacon does not have, and the shapes of its API are read from its server's source and unverified. **No real Ember call has been made:** there is no API key, so the client has run only against a mock of the Meta Model API in tests, and its request shapes come from Meta's documentation, not from an answer of Ember's. **No real notice has been read:** Beacon knows of no San Francisco agency that lists its notices in the feed format the poller reads, so going live needs such a feed first. Nobody knows yet how well Ember hears a radio call or reads a notice. The audio token rate the budget rests on is [still a guess](#measure-the-audio-token-rate). No incident exists.
+**Status:** scaffold, Ember client, evidence store, five pollers, the route that takes a tap, and the incident engine. The web app is an installable shell that shows whether the server is reachable; it has no button yet, and **a tap is stored and not yet answered**. The server stores evidence rows and runs pollers for National Weather Service alerts, OpenSky aircraft positions, 511 road closures, OpenMHz dispatch radio, each call of which Ember hears and turns into a row, and official notices, each document of which Ember reads (`read_notice`). **By default the pollers are fed an invented scenario, not real sources:** a made-up three-alarm fire in Hayes Valley, told in each source's own format, and every row from it is stored as `mock`. Its radio calls are generated tones and its notices are invented PDFs, and what was "said" in them is filled in by a stand-in for Ember, so its radio and notice rows are a stand-in's twice over. An early version of the NWS poller was run once against the real API; nothing else has been. The 511 poller has run only against mocked HTTP, because there is no token. The OpenSky poller has too, and **may not be pointed at the real API yet:** OpenSky's terms require a written license for a running service, which nobody has asked for. **OpenMHz has never been asked anything:** using its audio needs its permission, which Beacon does not have, and the shapes of its API are read from its server's source and unverified. **No real Ember call has been made:** there is no API key, so the client has run only against a mock of the Meta Model API in tests, and its request shapes come from Meta's documentation, not from an answer of Ember's. **No real notice has been read:** Beacon knows of no San Francisco agency that lists its notices in the feed format the poller reads, so going live needs such a feed first. Nobody knows yet how well Ember hears a radio call or reads a notice. The audio token rate the budget rests on is [still a guess](#measure-the-audio-token-rate). **The [incident engine](#incidents) groups the evidence into incidents with plain code,** and on the default store every incident it shows is the invented scenario's (`stand_in`). No model writes about an incident yet, and no real incident has been read.
 
 ## Layout
 
@@ -22,6 +22,7 @@ Inside `server/beacon/`, each package has one concern so pull requests stay apar
 | `api/` | The HTTP routes. |
 | `ember/` | The Muse Ember client, the only code that calls the Meta Model API. |
 | `evidence/` | The evidence store: one SQLite row for each thing a source said. |
+| `incident/` | The incident engine: evidence rows grouped into incidents by plain code, with a source and a confidence on every line. |
 | `ingest/` | One poller per source, the loop that runs them, and how they are built from the environment. |
 | `notice/` | What is kept of an official notice, and the Ember call that reads one from its PDF (`read_notice`). |
 | `radio/` | What is kept of a dispatch radio call, the Ember call that hears one (`extract_transmission`), and the conversion of its audio. |
@@ -93,6 +94,7 @@ Settings come from the environment. The server does not load the repository-root
 | `BEACON_NOTICES_BUDGET_USD` | The most, in dollars, that reading notices may cost over every run. It has no default. | Notices cannot be named. |
 | `BEACON_NOTICES_HOSTS` | Hosts a notice's document may be fetched from besides the feed's own, as a list. | A document anywhere else is not fetched. |
 | `BEACON_INGEST` | `0` starts the server without its pollers. | `1`: the server runs the pollers. |
+| `BEACON_BLOCKS_FILE` | A text file that says where blocks are, one to a line: `Hayes St,400,37.7766,-122.4236` (street, hundred block, latitude, longitude). Read for the live store only. | An incident heard on real radio has a point only when 511 lists a closure on its street; otherwise no tap, alert, or aircraft is matched to it. |
 
 The server's routes do not build an Ember client yet. Today the Ember settings are read by the two commands under [Ember client](#ember-client), and by the pollers that pay Ember when they are turned on for real: `openmhz` and `notices` in `BEACON_LIVE_SOURCES`, each of which builds a client that can spend, under a budget of its own, in the server or in `python -m beacon.ingest`. The server reads the source settings when it starts, and `BEACON_DATA_DIR` with them. Three places set any of them. `scripts/check`, and so CI, sets `REPLAY=1` and removes `MODEL_API_KEY`. Server pytest does the same, removes the spending settings and every source setting, and points `BEACON_DATA_DIR` at a temporary directory for each test. The orb's API service in [`.amp/services.yaml`](.amp/services.yaml) sets `REPLAY=1`.
 
@@ -160,7 +162,7 @@ A notice is a document an authority published: an evacuation order, a shelter-in
 
 ### Taps
 
-`POST /api/taps` takes what the app sends when somebody presses "What's that?" ([`server/beacon/taps/`](server/beacon/taps)), and answers `201` with the tap's id. Nothing answers the tap yet: the incident engine and the investigator are the next phase.
+`POST /api/taps` takes what the app sends when somebody presses "What's that?" ([`server/beacon/taps/`](server/beacon/taps)), and answers `201` with the tap's id. Nothing answers the tap yet: the investigator is not built.
 
 ```json
 {
@@ -242,6 +244,48 @@ A request to a source is given 60 seconds from the lookup of its name to the las
 The store files are SQLite in write-ahead mode, so each has a `-wal` and a `-shm` file beside it while it is in use, and the newest rows can be in the `-wal` file alone. Do not copy the files of a store that is in use: copies made one after another can each be from a different moment. To copy one while Beacon runs, let SQLite do it, `sqlite3 data/evidence/live.sqlite3 ".backup copy.sqlite3"`; otherwise stop every process that uses the store first. Stop them as well before deleting the mock store to play its story again, and delete its `-wal` and `-shm` files with it.
 
 A poller's failure is logged as one fixed sentence, such as `511 answered HTTP 401.`, and never with the address that was asked, which for 511 holds the token, or with anything the source replied. The HTTP libraries' own request and header logs are switched off for the same reason, at every level.
+
+## Incidents
+
+The incident engine ([`server/beacon/incident/`](server/beacon/incident)) reads the evidence rows as **incidents**: the radio calls that are about one thing, and what the other sources said about the same place at the same time. It is plain code. No model is asked, the same rows give the same incidents, and **nothing it works out is stored**: an incident is derived from the evidence each time it is read, and kept in memory for a few seconds.
+
+```sh
+curl localhost:8000/api/incidents            # going on now, or ended in the last two hours
+curl localhost:8000/api/incidents?all=true   # every incident of the last twelve hours
+curl localhost:8000/api/incidents/<id>       # one, with its timeline
+```
+
+Both answers begin with `mode` (`mock` when the evidence is the invented scenario's), `as_of`, and `partial` (true when there was more evidence than the engine reads at once, so an incident can lack its oldest lines). An incident has an `id`, a `title` (`Fire at the 400 block of Hayes St`), a `category`, a `status`, whether it is `open`, a `place` no finer than a block, a `point`, its `units`, its `alarm` level, how many `taps` came from near it, its `signals`, and `stand_in`. One read by its id also has:
+
+- **`timeline`**: one entry for each thing a source said, oldest first. Every entry has a `text` written by code from the row's own fields, a `confidence` (`official`, `high`, `medium`, `low`), and `sources`: the feed, a label for a person, the evidence row's id, a link when the original is public, whether a stand-in produced it, and for 511 the credit its data agreement requires. `details` holds the fields the text was written from, for an app that draws the line its own way.
+- **`official`**: the alerts and notices authorities issued for the place, each with how it stands: `in_force`, `replaced`, `cancelled`, `not_listed`, `ended`, and for a notice `published` or `lifted`.
+- **`aircraft`**: the aircraft that circled or came low over it.
+
+How calls are grouped ([`calls.py`](server/beacon/incident/calls.py)):
+
+- A call that names a street joins the incident at that street and block, and never one somewhere else, whatever units they share.
+- A call that names only units, as most do, joins the incident those units are on.
+- **Medical calls are grouped only with medical calls**, even at a fire's block with a fire's engine.
+- An incident that has not been heard from for 45 minutes takes no more calls. A new dispatch to a block whose incident was cleared is a new incident.
+- A call nobody could make out, housekeeping traffic, and a call that names no unit and no street belong to no incident.
+
+What is attached to an incident ([`build.py`](server/beacon/incident/build.py)): a 511 event created while it was going on, on a road its calls name or within 300 m; an NWS alert drawn for an area that holds its point (a city-wide alert is the city's, not the incident's); a notice that names one of its streets; the taps from within 400 m, counted; and aircraft that circled or came low. A medical response gets none of these: it is its crews and its block.
+
+**Where an incident is.** A radio call gives a place in words and no point. The engine takes the point from a list of blocks: the story's own in the mock scenario, and the file `BEACON_BLOCKS_FILE` names for real radio. Nobody has made that file for San Francisco yet. Without it an incident gets its point from a closure 511 lists on its street, and has none otherwise.
+
+**What is in force.** The evidence store keeps history, and the engine reads it as a state ([`inforce.py`](server/beacon/incident/inforce.py)): an alert a later message replaces or cancels is not in force, only the latest version of a 511 event can be, and something a source stopped listing is `not_listed`, which the timeline words as what Beacon saw and never as an all-clear. A notice is lifted only by another notice: an order is `lifted` when a later all-clear about the same hazard is matched to the same incident. Beacon never says a notice is in force, only that it was `published` and that no notice it has read lifts it.
+
+The engine's wording keeps the product's rules:
+
+- A medical call is "Medical response", its units, and its block. Whatever else a row held is not read.
+- What crews say on the radio about an evacuation, sheltering, or an all-clear is written as radio traffic, with "That is radio traffic, not an official order."
+- An official alert's `instruction` is the authority's own words and is shown as its own. Beacon writes no instruction.
+- **A notice's words are not shown.** A notice row is a model's reading of a document, so an incident says that an authority published a notice of a type, that this is Beacon's reading, and where the document is (`source.url`). Its issuer, title, areas, instruction, and summary are left out until the redaction pass has read them, and of its streets only the ones the incident's own calls name are shown.
+- Taps are counted and never listed: a tap's id is what its sender reads the answer with.
+
+**Signals** are what code can say makes an incident more than an everyday call: an alarm level of two or more, an evacuation mentioned on the radio, eight or more units, an official order that no notice lifts, an official alert in force, a road 511 lists as closed, a circling aircraft, three or more taps. The engine lists them and decides nothing from them; whether they add up to crisis mode is the investigator's decision.
+
+Limits: the engine reads the last twelve hours and at most 20,000 rows, the newest first; an incident's `id` is a digest of the row that opened it, so an incident that runs longer than twelve hours changes its id; two incidents on one block within 45 minutes are taken for one; and an aircraft is "circling" when it stayed three minutes and went most of the way round, whoever it belongs to.
 
 ## Ember client
 

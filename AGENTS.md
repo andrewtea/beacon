@@ -14,6 +14,7 @@ Each `server/beacon/` package has one concern, so parallel pull requests stay ap
 - `api/`: HTTP routes, one module per resource, each exposing a `router` that `beacon.main` mounts under `/api`.
 - `ember/`: the Meta Model API client, its ledger, replay cache, and trace.
 - `evidence/`: the evidence store. Every poller writes to it and every reader of what a source said reads from it. See [Using the evidence store](#using-the-evidence-store).
+- `incident/`: the incident engine, which reads evidence rows as incidents and stores nothing. `calls` decides which radio calls are one incident, `build` attaches what else was said about the place and words every line, `inforce` says what is in force, `aircraft` makes tracks and says what circles, `places` is the list of blocks that gives a radio call's place a point, and `engine` is the reader (`open_engine`). See [Using the incident engine](#using-the-incident-engine).
 - `ingest/`: one module per source (`nws`, `opensky`, `traffic511`, `openmhz`, `notices`), the `Runner` that polls them, `paid` (what a poller that pays Ember for each item keeps to), and `setup`, which reads `BEACON_LIVE_SOURCES` once to open the right store (`open_store`) and make the pollers (`build`).
 - `notice/`: what is kept of an official notice (`Notice`), and the Ember call that reads one from its PDF (`read_notice` in `read`).
 - `radio/`: the closed vocabulary a radio call is kept in and the lists a unit or a street has to be on (`vocabulary`), the Ember call that hears one (`extract_transmission` in `extract`), and the in-memory, confined decoding of its audio (`audio`), whose `Ffmpeg` also draws a tap's photo again.
@@ -169,6 +170,34 @@ store.add([NewEvidence(kind="tap", source="app", ref=tap_id, occurred_at=now,
 - The mock store and the live store are separate files, and a store is one or the other for life. Code that reads evidence takes an `EvidenceStore` as an argument; only an entry point (the server's startup, a script) calls `open_store`. In the server, the store the pollers write to is `request.app.state.ingest.store`, and `request.app.state.taps.store` is the same file, opened for the taps, which is there with `BEACON_INGEST=0` too. It is closed when the server shuts down: `store.close()` makes every later `add` raise `EvidenceStoreError`, while reading goes on working.
 - **In tests**, make a store with `EvidenceStore(tmp_path / "evidence.sqlite3", "mock")` and add rows, or play the scenario: `build({"BEACON_DATA_DIR": str(tmp_path)}, Clock(lambda: moment)).catch_up()` from `beacon.ingest` stores everything the invented fire's sources said up to `moment`, where the story began twenty minutes before the `build`. `server/tests/test_ingest_setup.py` shows the whole story and when each row appears. The story's radio is in `beacon/scenario/radio.py` (`CALLS`): to hear a call of your own in a test, hand `extract_transmission` an `EmberClient.fake` whose responder answers with a filled-in form, as `server/tests/test_radio_extract.py` does.
 - **A new source** is a module in `beacon/ingest/` that copies `nws.py`: a class with `name`, `interval_seconds`, a read-only `origin` property that returns its client's (`self._http.origin`), and a `poll(store, now)` that begins with `store.refuse_stand_in(self.origin)` and returns a `PollReport` (with `partial=True` when it did not read the source's answer to its end), a pure `parse_...` function that turns the source's reply into `NewEvidence` and counts what it could not read, the source's answers added to `beacon/scenario/`, and its name added to `SOURCES`, `source_pollers`, and the mock pollers in `setup.py`. Its tests answer through `SourceHttp(httpx2.MockTransport(...))` and write to a mock store. A poller does not choose its rows' origin: it is `http.origin`, which is `mock` for a client built with a transport and `live` only for one that asks the network, so what a stand-in answers cannot be stored as `live`.
+
+## Using the incident engine
+
+```python
+from beacon.incident import open_engine
+
+engine = open_engine(os.environ, store)  # in the server: request.app.state.incidents
+for incident in engine.incidents():  # the last twelve hours, newest first
+    incident.id, incident.title, incident.status, incident.open
+    incident.place, incident.point  # no finer than a block; the point can be None
+    incident.stand_in  # True when any row under it is a stand-in's
+    for entry in incident.timeline:
+        entry.text, entry.confidence, entry.sources  # what one source said, and which
+    incident.official  # alerts and notices, each with its state
+    incident.signals  # what code can say makes it more than an everyday call
+engine.get(incident_id)  # one incident, or None
+```
+
+- **An incident is derived, never stored.** It is a function of the evidence rows (`build_incidents`), worked out again when the store has a new row. Do not add a table of incidents: a second record can disagree with the first. What a model later writes about an incident is kept under the incident's id and the evidence it was written from, beside the engine and not in it.
+- **The engine asks no model.** Grouping, what is in force, circling, and signals are plain code with tests. Change a rule in `calls.py` or `build.py` with a test that fails without the change.
+- **Every line names its rows.** An `Entry`, an `Official`, and a `Signal` carry the evidence ids they rest on, and an entry's confidence is its row's. A new kind of line does the same, with `source_of(row)`; a line that rests on several rows is trusted as little as the weakest (`weakest`).
+- **Medical stays medical.** A medical call is grouped only with medical calls, its entry is "Medical response", units, and block, and its incident has no alarm, no official list, no signals, and no taps. Nothing downstream adds them back.
+- **The engine never shows a notice's words.** `Official.issuer`, `headline`, and `instruction` are None for a notice, and a notice's entry says only that a document of its type was published, with its link. The words are a model's reading and may name a person: they go through the redaction pass, and are shown as a reading beside the link. Of a notice's streets only the incident's own are shown.
+- **`published` is not `in_force`.** Beacon has read a document; it does not know that an order still holds. Say that an authority published it and whether a later notice lifts it.
+- **`not_listed` is what Beacon saw.** Keep the words "not an official all-clear" with it.
+- **Taps are counted.** An incident holds how many taps came from near it and none of their ids, because a tap's id is what its sender reads the answer with. Do not put a tap's id or point into an incident.
+- An incident's `id` is a digest of the source and reference of the row that opened it, so it is the same in any store that holds the same story. It changes when that row leaves the engine's twelve hours.
+- **In tests**, `server/tests/incident_rows.py` has `Rows`, which stores one row of each kind in a mock store, and `open_engine({}, store, clock=...)` reads it at a moment of your choosing. `server/tests/test_incident_engine.py` plays the whole mock scenario through the engine.
 
 ## Conventions
 

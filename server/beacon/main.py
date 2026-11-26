@@ -13,7 +13,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from beacon import __version__
-from beacon.api import health, sources, taps
+from beacon.api import health, incidents, sources, taps
+from beacon.incident import open_engine
 from beacon.ingest import IngestConfigError, build
 from beacon.radio import core_dump_problem, forbid_core_dumps
 from beacon.taps import Taps, open_taps
@@ -164,6 +165,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         taps = open_taps(os.environ)
         app.state.taps = taps
+        # The incidents are read from the same evidence store the taps go to,
+        # which is there whether or not this server runs the pollers.
+        app.state.incidents = open_engine(os.environ, taps.store)
         sweeping = asyncio.create_task(_sweep_tap_media(taps, stop))
         if ingest is not None:
             app.state.ingest = ingest
@@ -229,6 +233,7 @@ def create_app() -> FastAPI:
     logging.getLogger("uvicorn.asgi").addFilter(_NOTHING)
     logging.getLogger("uvicorn.error").addFilter(_NO_TRACE)
     app.include_router(health.router, prefix="/api")
+    app.include_router(incidents.router, prefix="/api")
     app.include_router(sources.router, prefix="/api")
     app.include_router(taps.router, prefix="/api")
     return app

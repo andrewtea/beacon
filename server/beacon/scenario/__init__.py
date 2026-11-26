@@ -10,8 +10,16 @@ that "hears" them, `notices` for its official notices and the stand-in that "rea
 them, and `transport` for how it stands in for the network.
 """
 
-from beacon.scenario.fire import DURATION, FIRE, INVENTED, Scenario
+from beacon.scenario.fire import BLOCK_POINTS, DURATION, FIRE, INVENTED, Scenario
 from beacon.scenario.radio import stand_in_ember
 from beacon.scenario.transport import scenario_transport
 
-__all__ = ["DURATION", "FIRE", "INVENTED", "Scenario", "scenario_transport", "stand_in_ember"]
+__all__ = [
+    "BLOCK_POINTS",
+    "DURATION",
+    "FIRE",
+    "INVENTED",
+    "Scenario",
+    "scenario_transport",
+    "stand_in_ember",
+]
