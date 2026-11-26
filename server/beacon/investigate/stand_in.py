@@ -5,7 +5,7 @@ sends and plays the investigator by rule: it asks what is near, takes as its lea
 the incident that is going on with the most signals, and of those the nearest,
 checks the lead's official sources, the aircraft, the other taps, and the clip or
 photo when there is one, and answers with the grounds its own reading of the tools'
-answers gives. It decides on crisis mode
+answers gives, or with "unconfirmed" when that gives none. It decides on crisis mode
 when the lead has an alarm or an evacuation on the radio together with an official
 alert or notice.
 
@@ -20,7 +20,8 @@ from typing import Any
 
 from beacon.ember import fake_response
 
-_NEAR_M = 500
+# A distance comes rounded to 50 m, so this is the most that is surely within 500 m.
+_NEAR_M = 450
 _ON_RADIO = ("alarm", "evacuation_on_radio")
 _OFFICIAL = ("official_alert", "official_notice")
 
@@ -69,11 +70,14 @@ def stand_in_investigator(body: Mapping[str, Any]) -> Mapping[str, Any]:
             ("going_on", bool(lead.get("going_on"))),
             ("heard_in_clip", bool(heard & {"siren", "air_horn"})),
             ("seen_in_photo", bool(seen - {"none", "helicopter"})),
-            ("aircraft_overhead", bool(lead.get("aircraft"))),
+            ("aircraft_overhead", bool(lead.get("aircraft_over_it_in_reach_of_the_tap"))),
             ("other_taps", taps >= 1),
         )
         if holds
     ]
+    if not grounds:
+        # It found something, and nothing that ties this tap to it.
+        return _answer("unconfirmed", None, [], [])
     signals = [kind for kind in lead.get("signals") or [] if isinstance(kind, str)]
     on_radio = [kind for kind in signals if kind in _ON_RADIO]
     official = [kind for kind in signals if kind in _OFFICIAL]

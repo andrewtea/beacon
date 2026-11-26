@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict
 
 from beacon.incident import Engine, Incident
-from beacon.investigate import InvestigationDesk
+from beacon.investigate import Runs
 from beacon.investigate import card as words
 from beacon.radio.vocabulary import MEDICAL_EVENT
 from beacon.story import StoryDesk
@@ -121,24 +121,48 @@ class TrackOut(_Read):
     low: bool
 
 
-class CrisisOut(BaseModel):
-    """Crisis mode for an incident. Beacon's investigator decides on it when it
-    looks into a tap: that the incident's signals add up to more than an everyday
-    call. It is a model's decision, on signals code found, and `text` says so. It
-    tells nobody what to do."""
+class CitedOut(BaseModel):
+    """A signal a decision on crisis mode rested on, as the incident had it when
+    the decision was made."""
 
-    # Whether it is on now: it was decided on, and the incident is still going on.
+    kind: str
+    confidence: Literal["official", "high", "medium", "low"]
+    # The evidence rows the signal rested on then. Empty for taps, which are
+    # counted and not listed.
+    evidence_ids: list[int]
+    # How the incident has a signal of that kind now: `same` when it rests on those
+    # rows still, `changed` when it rests on others, `gone` when it has none.
+    now: Literal["same", "changed", "gone"]
+
+
+class CrisisOut(BaseModel):
+    """Crisis mode for an incident. Beacon's investigator turns it on when it looks
+    into a tap and decides that the incident's signals add up to more than an
+    everyday call; code holds the decision to signals the engine found. The first
+    such decision is the one kept: a later run that decides otherwise turns nothing
+    off. It is the investigator's decision and no authority's, and `text` says so.
+    It tells nobody what to do."""
+
+    # Whether it is on now: it was turned on, and the incident is still going on.
     active: bool
     decided_at: datetime
     text: str
-    # The kinds of signal the decision rested on, and those of them the incident
-    # has now, each with the sources it rests on.
-    cited: list[str]
+    # Who decided: `model` for Muse Ember, `stand_in` for the stand-in that works
+    # by rule. `decided_by_text` says it in a sentence: show it with `text`.
+    decided_by: Literal["model", "stand_in"]
+    decided_by_text: str
+    # The signals the decision rested on, as they were then.
+    cited: list[CitedOut]
+    # The signals of those kinds the incident has now, each with its sources, and
+    # a sentence that says that is what they are. They are not the decision's
+    # grounds: those are `cited`.
     signals: list[SignalOut]
+    signals_text: str
     # Which kind of Ember client decided: `live`, or `fake` for a stand-in.
     model: str | None
-    # True when a stand-in decided or what it looked at is a stand-in's: label it.
+    # True when a stand-in decided, or the incident is built from a stand-in's rows.
     stand_in: bool
+    stand_in_text: str | None
 
 
 class IncidentSummary(_Read):
@@ -241,26 +265,49 @@ class IncidentAnswer(BaseModel):
 
 
 def crisis_of(request: Request, incident: Incident) -> CrisisOut | None:
-    """The decision on crisis mode that was made for an incident, with the signals
-    it rests on as the incident has them now. Reading it asks Ember nothing."""
-    desk: InvestigationDesk | None = getattr(request.app.state, "investigations", None)
-    if desk is None or incident.category == MEDICAL_EVENT:
+    """The decision that turned crisis mode on for an incident, with what it
+    rested on then and what the incident has of it now. Reading it asks Ember
+    nothing, and needs no desk: a decision that was made is read whether or not
+    taps are still being investigated."""
+    runs: Runs | None = getattr(request.app.state, "runs", None)
+    if runs is None or incident.category == MEDICAL_EVENT:
         return None
-    decision = desk.runs.crisis(incident.id)
+    decision = runs.crisis(incident.id)
     if decision is None:
         return None
+    kinds = {cited.kind for cited in decision.cited}
+    now = {
+        signal.kind: {source.evidence_id for source in signal.sources} - {None}
+        for signal in incident.signals
+    }
+    having = [signal for signal in incident.signals if signal.kind in kinds]
+    by_model = decision.model == "live"
     return CrisisOut(
         active=incident.open,
         decided_at=decision.decided_at,
         text=words.CRISIS,
-        cited=list(decision.signals),
-        signals=[
-            SignalOut.model_validate(signal)
-            for signal in incident.signals
-            if signal.kind in decision.signals
+        decided_by="model" if by_model else "stand_in",
+        decided_by_text=words.investigator_text(decision.model or "fake") or "",
+        cited=[
+            CitedOut(
+                kind=cited.kind,
+                confidence=cited.confidence,  # type: ignore[arg-type]
+                evidence_ids=list(cited.evidence_ids),
+                now="gone"
+                if cited.kind not in now
+                else "same"
+                if set(cited.evidence_ids) <= now[cited.kind]
+                else "changed",
+            )
+            for cited in decision.cited
         ],
+        signals=[SignalOut.model_validate(signal) for signal in having],
+        signals_text=words.CRISIS_NOW if having else words.CRISIS_NONE_NOW,
         model=decision.model,
-        stand_in=decision.stand_in or incident.stand_in,
+        stand_in=decision.stand_in or incident.stand_in or not by_model,
+        stand_in_text=words.stand_in_text(
+            decision.model or "fake", evidence=decision.stand_in or incident.stand_in
+        ),
     )
 
 

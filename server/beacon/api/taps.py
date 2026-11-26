@@ -6,11 +6,13 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from beacon.api.incidents import IncidentSummary, summary_of
+from beacon.api.incidents import CreditOut, IncidentSummary, summary_of
 from beacon.evidence import Evidence
 from beacon.incident import Engine, Snapshot
-from beacon.investigate import KEPT, Accounting, InvestigationDesk, Outcome, Run
+from beacon.incident.build import CREDIT_511
+from beacon.investigate import KEPT, Accounting, InvestigationDesk, Outcome, Run, Runs
 from beacon.investigate import card as words
+from beacon.investigate.tools import Call
 from beacon.taps import MAX_CLIP_BYTES, MAX_PHOTO_BYTES, SOURCE, Tap, TapError, Taps
 from beacon.taps.media import is_tap_id
 
@@ -29,11 +31,6 @@ _NO_SUCH_TAP = "There is no such tap."
 # For how long a tap's answer is read. A run is kept for `KEPT`, and a tap that is
 # older is answered as one Beacon does not have, not as one it did not look into.
 ANSWERED = KEPT - timedelta(hours=1)
-# How long a tap that has no run yet is said to be waiting for one, and how long a
-# run that was begun is said to be under way. After that it is said not to have
-# been made: the server was stopped under it, or it was never handed in.
-WAITING = timedelta(minutes=2)
-RUNNING = timedelta(minutes=5)
 # For how long after an unconfirmed tap, and how near it, Beacon lists what began
 # since it looked.
 WATCH = timedelta(minutes=30)
@@ -68,12 +65,21 @@ class GroundOut(BaseModel):
     # What the match rests on: `near`, `going_on`, `heard_in_clip`,
     # `seen_in_photo`, `aircraft_overhead`, `other_taps`. Code checked each one.
     kind: str
+    # The ground in a sentence, from what the run found then, not from how the
+    # incident is now.
     text: str
+    # What it was checked against: the tool of the run whose answer shows it
+    # (`nearby_incidents`, `listen_clip`, `look_photo`, `nearby_taps`), or
+    # `incident_aircraft` for the incident's own aircraft in the run's reading.
+    basis: str
+    # The credit a source's terms require beside it: 511's, when the incident's
+    # place was taken from a closure 511 lists. Show it with the ground.
+    credit: CreditOut | None
 
 
 class MatchOut(BaseModel):
-    """Why the investigator took the tap to be about the incident. The choice is a
-    model's; the grounds are the ones code found to hold."""
+    """Why the investigator took the tap to be about the incident. The choice is
+    the investigator's; the grounds are the ones code found to hold."""
 
     # How far to trust the match, which code works out: `medium` or `low`, never more.
     confidence: Literal["medium", "low"]
@@ -91,8 +97,9 @@ class TapAnswer(BaseModel):
     as_of: datetime
     partial: bool
     tap: TapOut
-    # `pending` while the investigator has not answered. `incident` when it took
-    # the tap to be about one. `unconfirmed` otherwise: Beacon does not guess.
+    # `pending` while the tap waits for the investigator or is being looked into,
+    # for as long as that is so: go on asking. `incident` when the investigator
+    # took the tap to be about one. `unconfirmed` otherwise: Beacon does not guess.
     status: Literal["pending", "incident", "unconfirmed"]
     # Why it is unconfirmed: `nothing_near`, `not_looked`, `not_sure`,
     # `not_grounded`, `no_answer`, `cut_short`, `not_investigated`. Null otherwise.
@@ -100,10 +107,16 @@ class TapAnswer(BaseModel):
     # The status in a sentence, written by code.
     text: str
     investigated_at: datetime | None
+    # Who investigated: `model` for Muse Ember, `stand_in` for the stand-in that
+    # works by rule, null when nobody did. `investigator_text` says it in a
+    # sentence: show it with the answer.
+    investigated_by: Literal["model", "stand_in"] | None
+    investigator_text: str | None
     # Which kind of Ember client investigated: `live`, or `fake` for a stand-in.
     model: str | None
-    # True when a stand-in investigated or what it looked at is a stand-in's. Show
-    # `stand_in_text` with the answer then.
+    # True when a stand-in investigated, or when anything shown here (the incident,
+    # `nearby`, `since`) or looked at by the run is built from a stand-in's rows.
+    # `stand_in_text` says which, and is shown with the answer then.
     stand_in: bool
     stand_in_text: str | None
     # The incident the tap was taken to be about, as it is now, with its crisis
@@ -119,15 +132,19 @@ class TapAnswer(BaseModel):
     nearby: list[IncidentSummary]
     nearby_text: str | None
     # Whether Beacon still lists what begins near the tap: for half an hour after
-    # an unconfirmed tap. `since` are the incidents that began nearby after the
-    # investigator looked. Nobody investigated whether one is what the tap was
-    # about, and `since_text` says so: show it with them.
+    # an unconfirmed tap. `since` are the incidents whose first radio call came
+    # after the tap, within a kilometre. Nobody investigated whether one is what
+    # the tap was about, and `since_text` says so: show it with them.
     watching: bool
     since: list[IncidentSummary]
     since_text: str | None
     # What the investigation cost, and how many calls to Ember it made.
+    # `cost_incomplete` is true when a call failed after it may have been sent, or
+    # the run was lost: the cost is then a lower bound, and `cost_text` says so.
     cost_usd: float
     ember_calls: int
+    cost_incomplete: bool
+    cost_text: str | None
 
 
 class EmberCallOut(BaseModel):
@@ -161,6 +178,9 @@ class CallOut(BaseModel):
     # What came back, as ids, counts, and tags, and the same in a sentence.
     returned: dict[str, Any]
     returned_text: str
+    # The credits the sources of what came back require: 511's, when a count of
+    # road closures or an incident's place is from 511. Show them with the call.
+    credits: list[CreditOut]
     # The call to Ember a clip or a photo was given to. Null for the other tools.
     ember: EmberCallOut | None
 
@@ -172,6 +192,14 @@ class RoundOut(BaseModel):
     calls: list[CallOut]
 
 
+class CitedThen(BaseModel):
+    """A signal a decision on crisis mode rested on, as the incident had it then."""
+
+    kind: str
+    confidence: Literal["official", "high", "medium", "low"]
+    evidence_ids: list[int]
+
+
 class OutcomeOut(BaseModel):
     status: Literal["incident", "unconfirmed"]
     reason: str | None
@@ -181,9 +209,12 @@ class OutcomeOut(BaseModel):
     grounds_dropped: int
     confidence: Literal["medium", "low"] | None
     # Whether the investigator decided on crisis mode and the decision stood, the
-    # signals it rests on, and whether it decided on it and code refused it.
+    # signals it rested on (their kinds, and each as it was then), and whether it
+    # decided on it and code refused it. Only the first decision for an incident
+    # that stood turns crisis mode on: see the incident's `crisis`.
     crisis: bool
     crisis_signals: list[str]
+    crisis_cited: list[CitedThen]
     crisis_refused: bool
 
 
@@ -193,14 +224,18 @@ class TapRun(BaseModel):
 
     mode: Literal["live", "mock"]
     tap_id: str
-    # `pending` while a run is under way or about to be. `none` when none was made
-    # and none will be. `lost` when one was begun and nothing was kept of it: the
-    # server was stopped under it, and what it had asked Ember is in the ledger.
+    # `pending` while the tap waits for the investigator or its run is being made,
+    # for as long as that is so. `finished` when the run is kept. `none` when none
+    # was made and none is coming. `lost` when one was begun and nothing was kept
+    # of it: the server was stopped under it, and what it had asked Ember is in
+    # the Ember ledger and not here.
     state: Literal["none", "pending", "lost", "finished"]
     started_at: datetime | None = None
     finished_at: datetime | None = None
-    # The moment of the evidence the run looked at.
+    # The moment of the evidence the run looked at, which is when the tap came.
     evidence_as_of: datetime | None = None
+    investigated_by: Literal["model", "stand_in"] | None = None
+    investigator_text: str | None = None
     model: str | None = None
     stand_in: bool = False
     stand_in_text: str | None = None
@@ -208,11 +243,14 @@ class TapRun(BaseModel):
     # The request that came back with the answer. Null when there was none.
     final: EmberCallOut | None = None
     outcome: OutcomeOut | None = None
-    # Why the run ended before its answer, when it did: `budget`, or the kind of
-    # error Ember raised.
+    # Why the run ended before its answer, when it did: `budget`, `tool_failed`,
+    # or the kind of error Ember raised.
     cut_short: str | None = None
     cut_short_text: str | None = None
-    # Every call to Ember together.
+    # Every call to Ember that answered, together. `unaccounted_calls` is how many
+    # failed after their paid request may have been sent: each has a row in the
+    # Ember ledger and none here, so the totals are then a lower bound
+    # (`cost_incomplete`, which is also true of a run that was lost).
     ember_calls: int = 0
     input_tokens: int = 0
     cached_tokens: int = 0
@@ -220,6 +258,9 @@ class TapRun(BaseModel):
     reasoning_tokens: int = 0
     cost_usd: float = 0.0
     latency_ms: int = 0
+    unaccounted_calls: int = 0
+    cost_incomplete: bool = False
+    cost_text: str | None = None
 
 
 @router.post("/taps", status_code=201)
@@ -320,22 +361,27 @@ def _tap_row(request: Request, tap_id: str) -> tuple[Taps, Evidence, Snapshot]:
     return taps, row, snapshot
 
 
-def _kept(
-    request: Request, row: Evidence, now: datetime
-) -> tuple[Run | None, Literal["finished", "pending", "lost", "none"]]:
-    """A tap's run and how it stands. With no run: `pending` when one is still to
-    come, because the tap was handed in a moment ago or its run is being made;
-    `lost` when one was begun and never kept, because the server was stopped under
-    it; `none` when none was made and none will be."""
+State = Literal["finished", "pending", "lost", "none"]
+
+
+def _kept(request: Request, row: Evidence) -> tuple[Run | None, State]:
+    """A tap's run and how it stands. With no run: `pending` when the tap waits
+    for the investigator or its run is being made, which the desk says and no timer
+    guesses; `lost` when one was begun and never kept, and no run is being made
+    for it: the server was stopped under it; `none` when none was made and none is
+    coming. The runs are read whether or not this server investigates taps."""
+    runs: Runs | None = getattr(request.app.state, "runs", None)
     desk: InvestigationDesk | None = getattr(request.app.state, "investigations", None)
-    found = None if desk is None else desk.runs.get(row.ref)
-    if found is None:
-        waiting = desk is not None and desk.active and now - row.occurred_at < WAITING
-        return None, "pending" if waiting else "none"
-    claimed, run = found
-    if run is not None:
-        return run, "finished"
-    return None, "pending" if now - claimed < RUNNING else "lost"
+    # What the desk is doing is asked first. A run is written before the desk
+    # stops counting it as being made, so a tap the desk no longer counts has its
+    # run in the file by the time the file is read.
+    active = None if desk is None else desk.state_of(row.ref)
+    found = None if runs is None else runs.get(row.ref)
+    if found is not None and found[1] is not None:
+        return found[1], "finished"
+    if active is not None:
+        return None, "pending"
+    return None, "none" if found is None else "lost"
 
 
 @router.get("/taps/{tap_id}")
@@ -345,7 +391,7 @@ def tap_answer(request: Request, tap_id: str) -> TapAnswer:
     that the investigator has not answered yet. Reading it asks Ember nothing."""
     # One reading for the whole answer.
     taps, row, snapshot = _tap_row(request, tap_id)
-    run, state = _kept(request, row, snapshot.as_of)
+    run, state = _kept(request, row)
     outcome: Outcome | None
     if run is not None:
         outcome = run.outcome
@@ -364,9 +410,17 @@ def tap_answer(request: Request, tap_id: str) -> TapAnswer:
     )
     unconfirmed = outcome is not None and outcome.status == "unconfirmed"
     watching = unconfirmed and snapshot.as_of - row.occurred_at <= WATCH
-    since = _since(request, row, run, snapshot) if watching else []
-    nearby = [] if run is None else _nearby(request, run, snapshot)
-    stand_in = (run is not None and run.stand_in) or (matched is not None and matched.stand_in)
+    since = _since(row, snapshot) if watching else []
+    nearby = [] if run is None else _nearby(run, snapshot)
+    model = None if run is None else run.model
+    # A stand-in's part in the answer, from everything it shows: what the run
+    # looked at, and each incident that is listed, whoever did or did not look.
+    shown = [incident for incident in (matched, *nearby, *since) if incident is not None]
+    evidence = (run is not None and run.calls != [] and taps.store.mode == "mock") or any(
+        incident.stand_in for incident in shown
+    )
+    lost = state == "lost"
+    incomplete = lost or (run is not None and run.unaccounted > 0)
     return TapAnswer(
         mode=taps.store.mode,
         as_of=snapshot.as_of,
@@ -381,73 +435,102 @@ def tap_answer(request: Request, tap_id: str) -> TapAnswer:
         reason=None if outcome is None else outcome.reason,
         text=words.PENDING if outcome is None else words.status_text(outcome),
         investigated_at=None if run is None else run.finished_at,
-        model=None if run is None else run.model,
-        stand_in=stand_in,
-        stand_in_text=words.STAND_IN if stand_in else None,
+        investigated_by=_by(model),
+        investigator_text=words.investigator_text(model),
+        model=model,
+        stand_in=_by(model) == "stand_in" or evidence,
+        stand_in_text=words.stand_in_text(model, evidence=evidence),
         incident_id=None if outcome is None else outcome.incident_id,
         incident=None if matched is None else summary_of(request, matched),
         incident_gone=_gone(outcome, matched),
         incident_gone_text=words.INCIDENT_GONE if _gone(outcome, matched) else None,
-        match=None if run is None or outcome is None else _match(run, outcome, row, matched),
-        nearby=nearby,
+        match=None if run is None or outcome is None else _match(run, outcome),
+        nearby=[summary_of(request, incident) for incident in nearby],
         nearby_text=words.NEARBY if nearby else None,
         watching=watching,
-        since=since,
+        since=[summary_of(request, incident) for incident in since],
         since_text=words.SINCE if since else None,
         cost_usd=0.0 if run is None else run.cost_usd,
         ember_calls=0 if run is None else len(run.calls),
+        cost_incomplete=incomplete,
+        cost_text=words.COST_INCOMPLETE if incomplete else None,
     )
+
+
+def _by(model: str | None) -> Literal["model", "stand_in"] | None:
+    """Who investigated, from the kind of Ember client. Only a live Ember is a model."""
+    if model is None:
+        return None
+    return "model" if model == "live" else "stand_in"
 
 
 def _gone(outcome: Outcome | None, matched: object) -> bool:
     return outcome is not None and outcome.incident_id is not None and matched is None
 
 
-def _match(run: Run, outcome: Outcome, row: Evidence, matched: Any) -> MatchOut | None:
+def _match(run: Run, outcome: Outcome) -> MatchOut | None:
     if outcome.status != "incident" or outcome.confidence is None:
         return None
-    distance = (
-        None
-        if matched is None or matched.point is None or row.point is None
-        else matched.point.distance_m(row.point)
-    )
+    then = words.found_then(run, outcome.incident_id)
+    from_511 = then is not None and then.get("point_from") == "closure"
     return MatchOut(
         confidence=outcome.confidence,
         text=words.MATCHED,
         grounds=[
-            GroundOut(kind=ground, text=words.ground_text(ground, run, distance))
+            GroundOut(
+                kind=ground,
+                text=words.ground_text(ground, run),
+                basis=words.GROUND_BASIS.get(ground, "unknown"),
+                # How far it was is measured from a point of 511's.
+                credit=_credit() if ground == "near" and from_511 else None,
+            )
             for ground in outcome.grounds
         ],
         grounds_dropped=outcome.grounds_dropped,
     )
 
 
-def _nearby(request: Request, run: Run, snapshot: Snapshot) -> list[IncidentSummary]:
+def _credit() -> CreditOut:
+    return CreditOut.model_validate(CREDIT_511)
+
+
+def _credits(call: Call) -> list[CreditOut]:
+    """The credits a call's answer requires where it is shown: 511's for a count
+    of the closures it lists, and for an incident whose place is one of them."""
+    got = call.returned
+    found = got.get("incidents")
+    placed_by_511 = call.tool == "nearby_incidents" and any(
+        isinstance(item, dict) and item.get("point_from") == "closure"
+        for item in (found if isinstance(found, list) else [])
+    )
+    counted = call.tool == "get_official" and bool(got.get("closures"))
+    return [_credit()] if placed_by_511 or counted else []
+
+
+def _nearby(run: Run, snapshot: Snapshot) -> list[Any]:
     """The incidents a run's tools found near the tap, nearest first, other than
     the one the tap was taken to be about, as they are in this reading."""
     ids = [
-        incident_id
+        item.get("id")
         for round_ in run.rounds
         for call in round_.calls
         if call.tool == "nearby_incidents"
-        for incident_id in call.returned.get("incidents") or []
-        if incident_id != run.outcome.incident_id
+        for item in call.returned.get("incidents") or []
+        if isinstance(item, dict) and item.get("id") != run.outcome.incident_id
     ]
-    found = [snapshot.get(incident_id) for incident_id in dict.fromkeys(ids)]
-    return [summary_of(request, incident) for incident in found if incident is not None]
+    found = [snapshot.get(incident_id) for incident_id in dict.fromkeys(ids) if incident_id]
+    return [incident for incident in found if incident is not None]
 
 
-def _since(
-    request: Request, row: Evidence, run: Run | None, snapshot: Snapshot
-) -> list[IncidentSummary]:
-    """The incidents that began near an unconfirmed tap after the investigator
-    looked, or after the tap when nobody looked. Found by code, by place and time;
-    no one investigated whether one is what the tap was about."""
-    looked = row.occurred_at if run is None or run.as_of is None else run.as_of
+def _since(row: Evidence, snapshot: Snapshot) -> list[Any]:
+    """The incidents near an unconfirmed tap whose first call came after the tap,
+    which is the moment the investigator's reading of the evidence is as of. Found
+    by code, by place and time; no one investigated whether one is what the tap
+    was about."""
     return [
-        summary_of(request, incident)
+        incident
         for incident in snapshot.incidents
-        if incident.opened_at > looked
+        if incident.opened_at > row.occurred_at
         and incident.point is not None
         and row.point is not None
         and incident.point.distance_m(row.point) <= WATCH_M
@@ -459,12 +542,20 @@ def tap_run(request: Request, tap_id: str) -> TapRun:
     """The investigator's run for a tap, for whoever has its id: each round, the
     tools it called and why, what each returned, and each call's tokens, time, and
     cost. Reading it asks Ember nothing."""
-    taps, row, snapshot = _tap_row(request, tap_id)
-    run, state = _kept(request, row, snapshot.as_of)
+    taps, row, _snapshot = _tap_row(request, tap_id)
+    run, state = _kept(request, row)
     mode = taps.store.mode
     if run is None:
-        return TapRun(mode=mode, tap_id=row.ref, state=state)
+        lost = state == "lost"
+        return TapRun(
+            mode=mode,
+            tap_id=row.ref,
+            state=state,
+            cost_incomplete=lost,
+            cost_text=words.COST_INCOMPLETE if lost else None,
+        )
     calls = run.calls
+    incomplete = run.unaccounted > 0
     return TapRun(
         mode=mode,
         tap_id=row.ref,
@@ -472,9 +563,13 @@ def tap_run(request: Request, tap_id: str) -> TapRun:
         started_at=run.started_at,
         finished_at=run.finished_at,
         evidence_as_of=run.as_of,
+        investigated_by=_by(run.model),
+        investigator_text=words.investigator_text(run.model),
         model=run.model,
         stand_in=run.stand_in,
-        stand_in_text=words.STAND_IN if run.stand_in else None,
+        stand_in_text=words.stand_in_text(
+            run.model, evidence=mode == "mock" and (calls != [] or run.stand_in)
+        ),
         rounds=[
             RoundOut(
                 n=round_.n,
@@ -491,6 +586,7 @@ def tap_run(request: Request, tap_id: str) -> TapRun:
                         text=words.call_text(call),
                         returned=dict(call.returned),
                         returned_text=words.returned_text(call),
+                        credits=_credits(call),
                         ember=None if call.ember is None else _ember(call.ember),
                     )
                     for call in round_.calls
@@ -509,6 +605,14 @@ def tap_run(request: Request, tap_id: str) -> TapRun:
             confidence=run.outcome.confidence,
             crisis=run.outcome.crisis,
             crisis_signals=list(run.outcome.crisis_signals),
+            crisis_cited=[
+                CitedThen(
+                    kind=cited.kind,
+                    confidence=cited.confidence,  # type: ignore[arg-type]
+                    evidence_ids=list(cited.evidence_ids),
+                )
+                for cited in run.outcome.crisis_cited
+            ],
             crisis_refused=run.outcome.crisis_refused,
         ),
         cut_short=run.cut_short,
@@ -520,6 +624,9 @@ def tap_run(request: Request, tap_id: str) -> TapRun:
         reasoning_tokens=sum(call.reasoning_tokens for call in calls),
         cost_usd=run.cost_usd,
         latency_ms=sum(call.latency_ms for call in calls),
+        unaccounted_calls=run.unaccounted,
+        cost_incomplete=incomplete,
+        cost_text=words.COST_INCOMPLETE if incomplete else None,
     )
 
 

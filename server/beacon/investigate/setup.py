@@ -23,15 +23,21 @@ class InvestigateConfigError(Exception):
 
 def open_investigations(
     env: Mapping[str, str], engine: Engine, taps: Taps
-) -> InvestigationDesk | None:
-    """The desk that looks into the taps `taps` takes, against `engine`'s
-    incidents, or None when taps are not investigated.
+) -> tuple[Runs, InvestigationDesk | None]:
+    """The file the investigations of `taps`' taps are kept in, and the desk that
+    makes them against `engine`'s incidents, or None for the desk when taps are not
+    investigated.
 
-    On the mock store a stand-in for Ember investigates, which costs nothing, and
-    the runs go to `data/investigate/mock.sqlite3`. On the live store a live Ember
-    does, under a budget of its own, `BEACON_INVESTIGATE_BUDGET_USD`, and the runs
-    go to `data/investigate/live.sqlite3`; with no budget set no tap is
-    investigated, which the log says, because every investigation is paid for.
+    The file is opened either way, `data/investigate/mock.sqlite3` or
+    `data/investigate/live.sqlite3` as the evidence store is the mock one or the
+    live one: the runs and the decisions on crisis mode that were made and paid for
+    are read whether or not more are being made. Whoever opens it closes it
+    (`Runs.close`); a desk closes it when it is stopped.
+
+    On the mock store a stand-in for Ember investigates, which costs nothing. On
+    the live store a live Ember does, under a budget of its own,
+    `BEACON_INVESTIGATE_BUDGET_USD`; with no budget set no tap is investigated,
+    which the log says, because every investigation is paid for.
 
     Raises InvestigateConfigError when a budget is set that is not a dollar amount,
     or is set without a live Ember, and RunsError when the file was begun as the
@@ -40,15 +46,17 @@ def open_investigations(
     if engine.mode == "mock":
         runs = Runs(data_dir / "investigate" / "mock.sqlite3", "mock")
         ember = EmberClient.fake(Storage.under(data_dir), stand_in_investigator)
-        return InvestigationDesk(ember, runs, engine, taps)
+        return runs, InvestigationDesk(ember, runs, engine, taps)
+    path = data_dir / "investigate" / "live.sqlite3"
     budget = env.get(BUDGET_VARIABLE, "").strip()
     if not budget:
         logger.warning(
             "No budget for investigations (%s): a tap is taken and stored, and its "
-            "answer says it was not investigated.",
+            "answer says Beacon has no investigation of it. What was investigated "
+            "before is still read.",
             BUDGET_VARIABLE,
         )
-        return None
+        return Runs(path, "live"), None
     try:
         scope = SpendScope(SCOPE, parse_usd(budget))
     except ValueError:
@@ -65,9 +73,9 @@ def open_investigations(
             "cannot be replayed: set REPLAY=0, MODEL_API_KEY, and EMBER_SPENT_BEFORE_USD."
         )
     try:
-        runs = Runs(data_dir / "investigate" / "live.sqlite3", "live")
+        runs = Runs(path, "live")
     except BaseException:
         # A client that was built is closed when the desk it was for is not.
         ember.close()
         raise
-    return InvestigationDesk(ember, runs, engine, taps)
+    return runs, InvestigationDesk(ember, runs, engine, taps)

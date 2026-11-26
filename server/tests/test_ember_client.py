@@ -1737,14 +1737,18 @@ def test_a_date_in_retry_after_is_waited_out(storage: Storage) -> None:
 
 def test_the_wait_for_the_rate_limit_is_not_part_of_a_calls_latency(storage: Storage) -> None:
     api = MetaApi()
-    # One request every 0.15 s, so the second call waits 0.3 s behind the first.
+    # One request every 0.15 s, and a call makes two: the second call's paid
+    # request is the fourth, and is sent no sooner than 0.45 s after the first.
     ember = api.client(storage, pacer=Pacer(400))
 
-    ask(ember)
+    # Timed from before the first call. Timed from after it, the wait that is
+    # left is shorter by however long the first call took to return, which on a
+    # busy machine made this test fail.
     started = time.perf_counter()
+    ask(ember)
     second = ask(ember, input="Another question.")
 
-    assert time.perf_counter() - started >= 0.25
+    assert time.perf_counter() - started >= 0.4
     assert second.latency_ms < 150
 
 

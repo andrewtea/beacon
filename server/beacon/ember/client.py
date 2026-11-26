@@ -47,6 +47,7 @@ import openai
 
 from beacon.ember.errors import (
     BudgetExceededError,
+    CallLimitError,
     EmberCallError,
     EmberClosedError,
     EmberConfigError,
@@ -128,6 +129,10 @@ _CONTENT_FIELDS = ("input", "instructions", "tools", "text", "prompt_cache_key")
 # that a word the API sent is never copied into the ledger or an error.
 _STATUSES = frozenset({"completed", "incomplete", "failed", "cancelled", "queued", "in_progress"})
 
+_OVER_LIMIT = (
+    "Refused: the call could cost more than its caller allows this one call. Nothing "
+    "that costs money was sent."
+)
 _CLOSED = "The Ember client is closed and makes no more calls. Nothing that costs money was sent."
 _LOST_SETTLEMENT = (
     "The Ember ledger file was deleted or replaced while a paid request was out, so the "
@@ -542,6 +547,7 @@ class EmberClient:
         text: Mapping[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
         prompt_cache_key: str | None = None,
+        limit_nanousd: int | None = None,
     ) -> EmberResponse:
         """Send one request to Muse Ember. `task` labels the call in the ledger, the
         trace, and errors, for sensitive calls too, so it names the kind of work, such
@@ -571,6 +577,15 @@ class EmberClient:
         after the API answers 429: each such attempt is a call of its own in the ledger.
         Raises EmberClosedError once `close` has been called, to a call that had not
         sent its paid request: nothing was sent that costs money.
+
+        `limit_nanousd` is the most this one call may cost, for a caller that holds a
+        piece of work to a cap of its own, such as one tap's investigation: it passes
+        what is left of the cap. It only ever refuses, and is held beside the
+        spending stop and the scope's budget, never in place of them. A live call is
+        refused, with CallLimitError and before its paid request, when the most it
+        can cost (no cache hits, every output token used) is more than the limit,
+        and any call is when the limit is zero or less. A client with a pacer holds
+        each attempt to it.
         A client with a pacer raises RateLimitHoldError when the API asks for a wait
         longer than the pacer makes, to the call that was told so and to every call
         after it until the wait has passed.
@@ -590,6 +605,7 @@ class EmberClient:
             "text": text,
             "parallel_tool_calls": parallel_tool_calls,
             "prompt_cache_key": prompt_cache_key,
+            "limit_nanousd": limit_nanousd,
         }
         if not sensitive:
             return self._respond(sensitive=False, **request)
@@ -622,14 +638,22 @@ class EmberClient:
         text: Mapping[str, Any] | None,
         parallel_tool_calls: bool | None,
         prompt_cache_key: str | None,
+        limit_nanousd: int | None,
     ) -> EmberResponse:
         if not isinstance(task, str) or not task:
             raise EmberRequestError(
                 "task must be a non-empty label, such as 'extract_transmission'."
             )
+        if limit_nanousd is not None and (
+            not isinstance(limit_nanousd, int) or isinstance(limit_nanousd, bool)
+        ):
+            raise EmberRequestError("limit_nanousd must be a whole number of nano-dollars.")
         with self._sending:
             if self._closed:
                 raise EmberClosedError(_CLOSED)
+        if limit_nanousd is not None and limit_nanousd <= 0:
+            # Whatever kind of client this is: its caller has nothing left for the call.
+            raise CallLimitError(_OVER_LIMIT)
         body = _build_body(
             effort=effort,
             max_output_tokens=max_output_tokens,
@@ -665,7 +689,9 @@ class EmberClient:
                     f"{task!r}) is never recorded, so there is nothing to replay. Make it "
                     "with REPLAY=0 and MODEL_API_KEY, or use a fake client."
                 )
-            return self._call_until_answered(self._sdk, self._stop, body, call, sensitive)
+            return self._call_until_answered(
+                self._sdk, self._stop, body, call, sensitive, limit_nanousd
+            )
 
         recording = self._cache.get(call.request_hash)
         if recording is not None:
@@ -686,7 +712,9 @@ class EmberClient:
                 return self._record_free(
                     call, "replay", recording.response, recording.latency_ms, sensitive
                 )
-            return self._call_until_answered(self._sdk, self._stop, body, call, sensitive)
+            return self._call_until_answered(
+                self._sdk, self._stop, body, call, sensitive, limit_nanousd
+            )
 
     def _call_until_answered(
         self,
@@ -695,6 +723,7 @@ class EmberClient:
         body: dict[str, Any],
         call: Call,
         sensitive: bool,
+        limit_nanousd: int | None = None,
     ) -> EmberResponse:
         attempt = 0
         # The answer to the last attempt whose paid request was sent, when there
@@ -703,7 +732,7 @@ class EmberClient:
         while True:
             began = _Attempt()
             try:
-                return self._call_live(sdk, stop, body, call, sensitive, began)
+                return self._call_live(sdk, stop, body, call, sensitive, began, limit_nanousd)
             except (BudgetExceededError, EmberClosedError, InputTooLargeError) as refusal:
                 # Raised before a paid request is sent, which says that nothing was
                 # sent only when no earlier attempt was. The count of a request's
@@ -790,6 +819,7 @@ class EmberClient:
         call: Call,
         sensitive: bool,
         began: "_Attempt",
+        limit_nanousd: int | None = None,
     ) -> EmberResponse:
         # Before any request at all, as the stop below is. A replaced ledger holds
         # none of what was spent.
@@ -827,6 +857,9 @@ class EmberClient:
             input_tokens=input_tokens, cached_tokens=0, output_tokens=call.max_output_tokens
         )
         counting = time.perf_counter() - started
+        if limit_nanousd is not None and reserved > limit_nanousd:
+            # Before the call is reserved: nothing is held for it, and nothing sent.
+            raise CallLimitError(_OVER_LIMIT)
         row = self._ledger.reserve(
             call,
             reserved_nanousd=reserved,

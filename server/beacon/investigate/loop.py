@@ -14,11 +14,17 @@ What Ember decides, and what it does not:
   signals add up to crisis mode, with the signals it rests that on. No word Ember
   writes is read, kept, or shown; whoever shows an answer words it from the form
   (`beacon.investigate.card`).
-- **Code checks the answer.** The incident has to be one a tool returned in this
-  run, which means it has a known place within reach of the tap. Each ground is
-  checked against what the tools returned, and one that does not hold is dropped
-  and counted. A match stands only when it is near (`near`), or on two other
-  grounds. Otherwise the answer is "unconfirmed": thin evidence is not a guess.
+- **Code checks the answer.** The incident has to be one `nearby_incidents` returned
+  in this run, which means it has a known place within reach of the tap. Each
+  ground is checked against the run's reading of the evidence, and one that does
+  not hold is dropped and counted. A match stands only when it is near (`near`),
+  or when a ground that ties the tap to the incident holds (`LINKS`: the clip, the
+  photo, or one aircraft over both) together with another ground. That an incident
+  is going on, or that other taps came, says nothing of this tap. Otherwise the
+  answer is "unconfirmed": thin evidence is not a guess.
+- **The run reads the evidence as it stood when the tap came** (`Scene.snapshot`),
+  however long the tap waited to be looked into. An incident that began after the
+  tap is not what the tap was about, and is no part of the run.
 - **Crisis mode is Ember's decision, on grounds code checks**: every signal it
   cites has to be one the incident engine found for that incident, and a medical
   response is never one. Beacon decides nothing else from it and tells nobody what
@@ -29,8 +35,10 @@ What Ember decides, and what it does not:
   `medium`.
 
 The run is bounded: `MAX_ROUNDS` rounds of tool calls, `MAX_CALLS_PER_ROUND` calls
-in a round, and `TAP_BUDGET_USD` for all of a tap's calls, looked at before each
-one. A run that is cut short, by a cap or by Ember failing, ends "unconfirmed".
+in a round, and `TAP_BUDGET_NANOUSD` for all of a tap's calls. The cap is held by
+the Ember client: each call is handed what is left of it (`limit_nanousd`), and a
+call that could cost more is refused before its paid request, so a tap never goes
+over. A run that is cut short, by a cap or by Ember failing, ends "unconfirmed".
 
 Every call is `sensitive=True`: a request holds what sources said, as tags, and the
 ledger keeps the accounting only. What is kept of a run is `Run`, which holds ids,
@@ -43,15 +51,25 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
-from beacon.ember import EmberClient, EmberError
+from beacon.ember import (
+    BudgetExceededError,
+    CallLimitError,
+    EmberClient,
+    EmberClosedError,
+    EmberError,
+    InputTooLargeError,
+    LedgerReplacedError,
+    ReplayMissError,
+)
+from beacon.ember.pricing import NANOUSD_PER_USD, to_usd
 from beacon.incident import Incident
-from beacon.incident.aircraft import NEAR_M as AIRCRAFT_NEAR_M
 from beacon.investigate.tools import (
     SIGNAL_KINDS,
     Accounting,
     Call,
     Found,
     Scene,
+    overhead,
     run_tool,
     tool_specs,
 )
@@ -62,9 +80,10 @@ TASK = "investigate_tap"
 MAX_ROUNDS = 4
 MAX_CALLS_PER_ROUND = 6
 MAX_OUTPUT_TOKENS = 1200
-# The most all of one tap's calls may cost. It is looked at before each call to
-# Ember, a tool's own included, so a tap can go over it by one call and no more.
-TAP_BUDGET_USD = 0.01
+# The most all of one tap's calls may cost: one cent. Each call is handed what is
+# left of it, and is refused when it could cost more.
+TAP_BUDGET_NANOUSD = NANOUSD_PER_USD // 100
+TAP_BUDGET_USD = to_usd(TAP_BUDGET_NANOUSD)
 
 # What a match can rest on. Each is checked by `_holds`.
 GROUNDS: tuple[str, ...] = (
@@ -75,6 +94,9 @@ GROUNDS: tuple[str, ...] = (
     "aircraft_overhead",
     "other_taps",
 )
+# The grounds that tie the tap to the incident. The others are true of the incident
+# or of the neighbourhood whoever tapped, and carry no match by themselves.
+LINKS: frozenset[str] = frozenset({"near", "heard_in_clip", "seen_in_photo", "aircraft_overhead"})
 # Why an answer is "unconfirmed".
 UNCONFIRMED: tuple[str, ...] = (
     # Ember said so, and `nearby_incidents` had run and returned no incident.
@@ -98,10 +120,19 @@ CLOSE_M = 250.0
 # How long before a tap the last news of an incident may be for it to be going on.
 RECENT = timedelta(minutes=15)
 
-_HEARD = frozenset({"siren", "air_horn"})
-_SEEN = frozenset(
-    {"smoke", "flames", "fire_apparatus", "ambulance", "police_vehicle", "road_blocked"}
-)
+# What a sound or a sight fits: the categories of incident it can be evidence of. A
+# siren fits any response; smoke fits a fire and not a medical response. A
+# helicopter and a blocked road are checked against the incident itself (`_fits`).
+_RESPONSES = frozenset({"fire", "rescue", "hazmat", "collision", "alarm", MEDICAL_EVENT})
+_FITS: dict[str, frozenset[str]] = {
+    "siren": _RESPONSES,
+    "air_horn": _RESPONSES,
+    "smoke": frozenset({"fire", "hazmat"}),
+    "flames": frozenset({"fire"}),
+    "fire_apparatus": _RESPONSES,
+    "ambulance": frozenset({MEDICAL_EVENT, "collision", "rescue", "fire"}),
+    "police_vehicle": frozenset({"collision"}),
+}
 
 INSTRUCTIONS = """\
 You are the investigator of Beacon, an app for San Francisco. A person heard or saw \
@@ -120,10 +151,12 @@ Then answer with the form:
 "unconfirmed". Thin evidence is "unconfirmed". Never guess.
 - incident: its id, or null.
 - grounds: what the match rests on. near: it is within 500 m. going_on: it is going on \
-or there was news of it in the last 15 minutes. heard_in_clip, seen_in_photo: the clip or \
-photo fits it. aircraft_overhead: an aircraft was over it in the last 15 minutes, and the \
-tap is in reach of it. other_taps: other taps came from nearby. Beacon checks each ground \
-and throws away one that does not hold.
+or there was news of it in the last 15 minutes. heard_in_clip, seen_in_photo: what was \
+made out in the clip or photo fits an incident of its kind. aircraft_overhead: an aircraft \
+was over it in the last 15 minutes and in reach of the tap. other_taps: other taps came \
+from nearby. Beacon checks each ground and throws away one that does not hold. A match \
+needs near, or one of heard_in_clip, seen_in_photo, and aircraft_overhead together with \
+another ground. Of a medical response you are told only its category and its distance.
 - crisis: true when the incident's signals add up to more than an everyday call, such \
 as a second alarm together with an official alert or an evacuation. crisis_signals: the \
 signals of the incident that you rest that on.
@@ -152,6 +185,16 @@ _FORMAT = {
 
 
 @dataclass(frozen=True)
+class Cited:
+    """A signal a decision on crisis mode rested on, as the incident had it then."""
+
+    kind: str
+    # How far the signal was trusted, and the evidence rows it rested on.
+    confidence: str
+    evidence_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
 class Outcome:
     """What an investigation came to, after code checked Ember's answer."""
 
@@ -166,11 +209,16 @@ class Outcome:
     # How far the match is trusted, which code works out. None when unconfirmed.
     confidence: Literal["medium", "low"] | None = None
     # Whether Ember decided on crisis mode and the decision stood, and the signals
-    # of the incident it rests on. `crisis_refused` says Ember decided on it and
-    # the decision did not stand.
+    # of the incident it rested on, as they were then. `crisis_refused` says Ember
+    # decided on it and the decision did not stand.
     crisis: bool = False
-    crisis_signals: tuple[str, ...] = ()
+    crisis_cited: tuple[Cited, ...] = ()
     crisis_refused: bool = False
+
+    @property
+    def crisis_signals(self) -> tuple[str, ...]:
+        """The kinds of signal the decision rested on."""
+        return tuple(cited.kind for cited in self.crisis_cited)
 
 
 @dataclass(frozen=True)
@@ -204,8 +252,14 @@ class Run:
     # `budget` for the tap's own cap, or `tool_failed` when a tool of Beacon's own
     # could not read what it looks at. None for a run that ran to its answer.
     cut_short: str | None = None
-    # The reading of the evidence it looked at.
+    # The reading of the evidence it looked at: the moment it is as of, which is
+    # when the tap came, and the newest evidence row there was when it was made.
     as_of: datetime | None = None
+    last_id: int | None = None
+    # How many calls to Ember failed after their paid request may have been sent.
+    # Such a call has a row in the Ember ledger, which holds what was kept back for
+    # it, and none here: the run's costs are then a lower bound.
+    unaccounted: int = 0
 
     @property
     def calls(self) -> list[Accounting]:
@@ -217,8 +271,12 @@ class Run:
         return made if self.final is None else [*made, self.final]
 
     @property
+    def cost_nanousd(self) -> int:
+        return sum(call.cost_nanousd for call in self.calls)
+
+    @property
     def cost_usd(self) -> float:
-        return sum(call.cost_usd for call in self.calls)
+        return to_usd(self.cost_nanousd)
 
 
 @dataclass(frozen=True)
@@ -244,16 +302,14 @@ def investigate_tap(
     tools = tool_specs(scene)
     rounds: list[Round] = []
     request: list[Any] = [{"role": "user", "content": _opening(scene)}]
-    spent = 0.0
+    # In nano-dollars, as the ledger counts.
+    spent = 0
     failure: EmberError | None = None
     cut_short: str | None = None
     final: Accounting | None = None
     said: object = None
     model: str | None = None
     for n in range(1, MAX_ROUNDS + 2):
-        if spent >= TAP_BUDGET_USD:
-            cut_short = "budget"
-            break
         last = n > MAX_ROUNDS
         try:
             answer = ember.respond(
@@ -266,14 +322,19 @@ def investigate_tap(
                 # The last request offers no tool, so it can only answer.
                 tools=None if last else tools,
                 text=_FORMAT,
+                # What is left of the tap's cap. The client refuses a call that
+                # could cost more, before anything is paid.
+                limit_nanousd=TAP_BUDGET_NANOUSD - spent,
             )
+        except CallLimitError:
+            cut_short = "budget"
         except EmberError as error:
             failure = error
-        if failure is not None:
+        if failure is not None or cut_short is not None:
             break
         paid = Accounting.of(answer)
         model = answer.source
-        spent += paid.cost_usd
+        spent += paid.cost_nanousd
         asked = [] if last else _function_calls(answer.output)
         if not asked:
             final = paid
@@ -286,11 +347,17 @@ def investigate_tap(
                 # Every call is answered, so the next request is one Ember accepts.
                 told: dict[str, Any] = {"error": "too_many_calls"}
             else:
-                if spent >= TAP_BUDGET_USD:
-                    cut_short = "budget"
-                    break
                 try:
-                    call, told = run_tool(ember, scene, found, name, arguments)
+                    call, told = run_tool(
+                        ember,
+                        scene,
+                        found,
+                        name,
+                        arguments,
+                        limit_nanousd=TAP_BUDGET_NANOUSD - spent,
+                    )
+                except CallLimitError:
+                    cut_short = "budget"
                 except EmberError as error:
                     failure = error
                 except Exception:
@@ -301,7 +368,7 @@ def investigate_tap(
                 if failure is not None or cut_short is not None:
                     break
                 calls.append(call)
-                spent += 0.0 if call.ember is None else call.ember.cost_usd
+                spent += 0 if call.ember is None else call.ember.cost_nanousd
             outputs.append(
                 {"type": "function_call_output", "call_id": call_id, "output": json.dumps(told)}
             )
@@ -329,21 +396,27 @@ def investigate_tap(
         or (matched is not None and matched.stand_in),
         cut_short=cut_short,
         as_of=scene.snapshot.as_of,
+        last_id=scene.snapshot.last_id,
+        # The call that failed has no accounting here unless it is known that its
+        # paid request was never sent.
+        unaccounted=0 if failure is None or never_sent(failure) else 1,
     )
     return Investigation(run=run, failure=failure, usable=outcome.reason != "no_answer")
 
 
+def never_sent(failure: EmberError) -> bool:
+    """Whether a call that failed is known to have cost nothing: it was refused
+    before its paid request. A replaced ledger is a refusal by its class and is not
+    among them: it is also raised after a request that was sent."""
+    refusals = (BudgetExceededError, ReplayMissError, EmberClosedError, InputTooLargeError)
+    return isinstance(failure, refusals) and not isinstance(failure, LedgerReplacedError)
+
+
 def _opening(scene: Scene) -> str:
     """What Ember is told of the tap: that it came, and what was sent with it.
-    Not where it came from."""
+    Not where it came from, and not when."""
     return json.dumps(
-        {
-            "tap": {
-                "seconds_ago": max(0, round((scene.snapshot.as_of - scene.at).total_seconds())),
-                "sent_a_clip": scene.has_clip,
-                "sent_a_photo": scene.has_photo,
-            }
-        },
+        {"tap": {"sent_a_clip": scene.has_clip, "sent_a_photo": scene.has_photo}},
         sort_keys=True,
     )
 
@@ -393,10 +466,12 @@ def _outcome(said: object, scene: Scene, found: Found) -> Outcome:
         if ground in cited and _holds(ground, incident, distance, scene, found)
     )
     dropped = len(cited) - len(held)
-    if "near" not in held and len(held) < 2:
+    # Near, or tied to the incident by something else and not by that alone.
+    tied = "near" in held or (bool(LINKS & set(held)) and len(held) >= 2)
+    if not tied:
         return Outcome(status="unconfirmed", reason="not_grounded", grounds_dropped=dropped)
     close = distance <= CLOSE_M and {"near", "going_on"} <= set(held)
-    crisis, signals, refused = _crisis(said, incident)
+    crisis, rested_on, refused = _crisis(said, incident)
     return Outcome(
         status="incident",
         incident_id=incident.id,
@@ -404,45 +479,71 @@ def _outcome(said: object, scene: Scene, found: Found) -> Outcome:
         grounds_dropped=dropped,
         confidence="medium" if close else "low",
         crisis=crisis,
-        crisis_signals=signals,
+        crisis_cited=rested_on,
         crisis_refused=refused,
     )
 
 
 def _holds(ground: str, incident: Incident, distance: float, scene: Scene, found: Found) -> bool:
-    """Whether a ground for matching the tap to `incident` is true of what the
-    run's tools returned."""
+    """Whether a ground for matching the tap to `incident` is true of the run's
+    reading of the evidence and of what its tools returned."""
     if ground == "near":
         return distance <= NEAR_M
     if ground == "going_on":
         return incident.open or incident.updated_at >= scene.at - RECENT
-    # An aircraft that circled or came low over the incident, and was last seen
-    # there shortly before the tap: one from an hour ago is not what was heard.
-    helicopter = any(track.last_seen >= scene.at - RECENT for track in incident.aircraft)
     if ground == "heard_in_clip":
-        heard = set(found.heard or ())
-        return bool(heard & _HEARD) or ("helicopter" in heard and helicopter)
+        return any(_fits(tag, incident, scene) for tag in found.heard or ())
     if ground == "seen_in_photo":
-        seen = set(found.seen or ())
-        return bool(seen & _SEEN) or ("helicopter" in seen and helicopter)
+        return any(_fits(tag, incident, scene) for tag in found.seen or ())
     if ground == "aircraft_overhead":
-        # Such an aircraft over the incident, and the tap within what counts as
-        # under it or with an aircraft of its own.
-        return helicopter and (found.aircraft or distance <= AIRCRAFT_NEAR_M)
+        # One aircraft that was over the incident and, shortly before the tap,
+        # within reach of the tap. Not one over each.
+        return bool(overhead(incident, scene, since=RECENT))
     if ground == "other_taps":
         return found.other_taps >= 1
     return False
 
 
-def _crisis(said: Mapping[str, Any], incident: Incident) -> tuple[bool, tuple[str, ...], bool]:
-    """Whether Ember's decision on crisis mode stands, the signals it rests on,
-    and whether it decided on it and the decision did not stand. Every signal it
-    cites has to be one the engine found for the incident."""
+def _fits(tag: str, incident: Incident, scene: Scene) -> bool:
+    """Whether something made out in a tap's clip or photo is evidence of this
+    incident: smoke of a fire, and not of a medical response."""
+    if tag == "helicopter":
+        # Only a helicopter that was over the incident and in reach of the tap.
+        return any(
+            track.category == "rotorcraft" for track in overhead(incident, scene, since=RECENT)
+        )
+    if tag == "road_blocked":
+        return incident.category == "collision" or any(
+            signal.kind == "closure" for signal in incident.signals
+        )
+    return incident.category in _FITS.get(tag, frozenset())
+
+
+def _crisis(said: Mapping[str, Any], incident: Incident) -> tuple[bool, tuple[Cited, ...], bool]:
+    """Whether Ember's decision on crisis mode stands, the signals it rests on as
+    the incident has them, and whether it decided on it and the decision did not
+    stand. Every signal it cites has to be one the engine found for the incident."""
     if said.get("crisis") is not True:
         return False, (), False
     given = said.get("crisis_signals")
     cited = {kind for kind in given if isinstance(kind, str)} if isinstance(given, list) else set()
-    has = [signal.kind for signal in incident.signals]
-    if incident.category == MEDICAL_EVENT or not cited or not cited <= set(has):
+    has = {signal.kind for signal in incident.signals}
+    if incident.category == MEDICAL_EVENT or not cited or not cited <= has:
         return False, (), True
-    return True, tuple(dict.fromkeys(kind for kind in has if kind in cited)), False
+    rested_on = tuple(
+        Cited(
+            kind=signal.kind,
+            confidence=signal.confidence,
+            # A tap has no row of its own among a signal's sources.
+            evidence_ids=tuple(
+                sorted(
+                    source.evidence_id
+                    for source in signal.sources
+                    if source.evidence_id is not None
+                )
+            ),
+        )
+        for signal in incident.signals
+        if signal.kind in cited
+    )
+    return True, rested_on, False

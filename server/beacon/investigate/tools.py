@@ -15,7 +15,10 @@ tool returns.
   there is one and how it stands, and a notice is its type from Beacon's own list.
   A field of a row that should hold a tag is told only when it is on its list
   (`_tag`), so a row that holds a sentence there tells Ember nothing.
-- **A medical response is its category and how far away it is**, and nothing else.
+- **A medical response is its id, its category, and how far away it is**, and
+  nothing else: not whether it is going on, and none of its radio calls.
+- **Only what is near the tap is shown.** The radio calls a run can ask for are
+  those of the incidents `nearby_incidents` returned to it, and no others.
 - **What is kept of a call is smaller still** (`Call.returned`): ids, counts, and
   tags. That is what the trace of a run is made of.
 - **The photo and the clip are looked at once each, by a call of their own**
@@ -33,9 +36,11 @@ from datetime import datetime, timedelta
 from typing import Any, get_args
 
 from beacon.ember import EmberClient, EmberResponse
+from beacon.ember.pricing import to_usd
 from beacon.evidence import EvidenceStore, Point
 from beacon.incident import Incident, Snapshot
-from beacon.incident.aircraft import tracks
+from beacon.incident.aircraft import NEAR_M as AIRCRAFT_NEAR_M
+from beacon.incident.aircraft import Track, tracks
 from beacon.incident.model import SignalKind
 from beacon.ingest.opensky import AIRCRAFT_CATEGORIES
 from beacon.notice import NOTICE_TYPES
@@ -123,8 +128,6 @@ class Found:
     incidents: dict[str, float] = field(default_factory=dict)
     # Whether `nearby_incidents` ran at all: only then is "nothing near" known.
     looked: bool = False
-    # Whether an aircraft that circled or came low was within reach of the tap.
-    aircraft: bool = False
     other_taps: int = 0
     # None until the clip was listened to and the photo looked at.
     heard: tuple[str, ...] | None = None
@@ -140,11 +143,16 @@ class Accounting:
     cached_tokens: int
     output_tokens: int
     reasoning_tokens: int
-    cost_usd: float
+    # In whole nano-dollars, as the ledger has it.
+    cost_nanousd: int
     latency_ms: int
     # The ledger row: its file's generation, its id, and its own token
     # (`EmberClient.ledger_calls`).
     ledger: tuple[str, int, str]
+
+    @property
+    def cost_usd(self) -> float:
+        return to_usd(self.cost_nanousd)
 
     @classmethod
     def of(cls, answer: EmberResponse) -> "Accounting":
@@ -155,7 +163,7 @@ class Accounting:
             cached_tokens=answer.usage.cached_tokens,
             output_tokens=answer.usage.output_tokens,
             reasoning_tokens=answer.usage.reasoning_tokens,
-            cost_usd=answer.cost_usd,
+            cost_nanousd=answer.usage.cost_nanousd,
             latency_ms=answer.latency_ms,
             ledger=(str(ref[0]), int(ref[1]), str(ref[2])),
         )
@@ -209,8 +217,8 @@ _DESCRIPTIONS = {
         "what it is, how it stands, and how far away it is. Call this first."
     ),
     "get_radio": (
-        "The dispatch radio calls of the last minutes, as tags, each with the "
-        "incident it belongs to."
+        "The dispatch radio calls of the incidents nearby_incidents returned, as tags, "
+        "each with the incident it belongs to. Call nearby_incidents before it."
     ),
     "get_aircraft": "Aircraft near where the tap came from, and whether one circled or came low.",
     "get_official": (
@@ -257,11 +265,18 @@ def _parameters(name: str) -> dict[str, Any]:
 
 
 def run_tool(
-    ember: EmberClient, scene: Scene, found: Found, name: object, arguments: object
+    ember: EmberClient,
+    scene: Scene,
+    found: Found,
+    name: object,
+    arguments: object,
+    *,
+    limit_nanousd: int | None = None,
 ) -> tuple[Call, dict[str, Any]]:
     """Run one call Ember made, and return what is kept of it and what Ember is
     told. A call that is not one of the tools, or whose arguments are not from the
-    lists, runs nothing.
+    lists, runs nothing. `limit_nanousd` is the most a call to Ember that the tool
+    makes may cost (`EmberClient.respond`).
 
     Raises what `EmberClient.respond` raises, for the clip and the photo."""
     given = _arguments(arguments)
@@ -277,7 +292,7 @@ def run_tool(
     if args is None:
         call = Call(name, thinking, lead, why, {}, False, {"error": "bad_arguments"})
         return call, {"error": "bad_arguments"}
-    told, kept, paid = _TOOLS[name](ember, scene, found, args)
+    told, kept, paid = _TOOLS[name](ember, scene, found, args, limit_nanousd)
     return Call(name, thinking, lead, why, args, "error" not in kept, kept, paid), told
 
 
@@ -310,7 +325,7 @@ _Result = tuple[dict[str, Any], dict[str, Any], Accounting | None]
 
 
 def _nearby_incidents(
-    _ember: EmberClient, scene: Scene, found: Found, args: Mapping[str, Any]
+    _ember: EmberClient, scene: Scene, found: Found, args: Mapping[str, Any], _limit: int | None
 ) -> _Result:
     since = scene.at - timedelta(minutes=args["minutes"])
     near: list[tuple[float, Incident]] = []
@@ -337,7 +352,16 @@ def _nearby_incidents(
         "going_on_with_no_known_place": unlocated,
     }
     kept = {
-        "incidents": [incident.id for _, incident in near],
+        # How far each was then, rounded, and where its point was from: a point
+        # from a closure is 511's, and what is said of the distance carries its credit.
+        "incidents": [
+            {
+                "id": incident.id,
+                "distance_m": _rounded(distance),
+                "point_from": incident.point_from,
+            }
+            for distance, incident in near
+        ],
         "more": more,
         "unlocated": unlocated,
     }
@@ -349,72 +373,97 @@ def _incident_told(scene: Scene, incident: Incident, distance: float) -> dict[st
         "id": incident.id,
         "category": _tag(incident.category, _EVENTS),
         "distance_m": _rounded(distance),
-        "going_on": incident.open,
     }
-    if incident.category == MEDICAL_EVENT:
-        # Its category and how far away it is, and no more.
+    if told["category"] in (None, MEDICAL_EVENT):
+        # A handle to name it by, its category, and how far away it is. No more:
+        # not whether it is going on, and not when anything was said of it. What is
+        # not known not to be a medical response is shown as one is.
         return told
     return told | {
+        "going_on": incident.open,
         "status": _tag(incident.status, STATUSES),
         "alarm": _alarm(incident.alarm),
         "units": len(incident.units),
         "minutes_since_it_began": _minutes(scene.snapshot.as_of - incident.opened_at),
         "minutes_since_last_news": _minutes(scene.snapshot.as_of - incident.updated_at),
         "signals": [signal.kind for signal in incident.signals],
-        "aircraft": len(incident.aircraft),
+        # The aircraft the ground `aircraft_overhead` would rest on.
+        "aircraft_over_it_in_reach_of_the_tap": len(overhead(incident, scene)),
         # Not its taps: the tap that is being looked into can be one of them, and
         # `nearby_taps` counts the others.
     }
 
 
+def overhead(
+    incident: Incident, scene: Scene, *, since: timedelta = timedelta(minutes=15)
+) -> list[Track]:
+    """The aircraft that circled or came low over `incident` and were, shortly
+    before the tap, also within reach of where the tap came from: one track that
+    is over both, not one over each."""
+    start = scene.at - since
+    return [
+        track
+        for track in incident.aircraft
+        if any(
+            row.point is not None
+            and start <= row.occurred_at <= scene.at
+            and row.point.distance_m(scene.point) <= AIRCRAFT_NEAR_M
+            for row in track.rows
+        )
+    ]
+
+
 def _get_radio(
-    _ember: EmberClient, scene: Scene, _found: Found, args: Mapping[str, Any]
+    _ember: EmberClient, scene: Scene, found: Found, args: Mapping[str, Any], _limit: int | None
 ) -> _Result:
-    rows = scene.store.search(
-        kinds=["radio"],
-        start=scene.at - timedelta(minutes=args["minutes"]),
-        end=scene.snapshot.as_of,
-        up_to_id=scene.snapshot.last_id,
-        newest_first=True,
-        limit=MAX_CALLS + 1,
-    )
-    more = len(rows) > MAX_CALLS
-    rows = rows[:MAX_CALLS]
-    of = {
-        evidence_id: incident.id
-        for incident in scene.snapshot.incidents
-        for evidence_id in incident.evidence_ids
-    }
-    calls = []
-    for row in rows:
-        call: dict[str, Any] = {
-            "minutes_ago": _minutes(scene.snapshot.as_of - row.occurred_at),
-            "incident": of.get(row.id),
-            "event": _tag(row.data.get("event"), _EVENTS),
-        }
-        # Only what is known not to be a medical call is shown with more.
-        if call["event"] not in (None, MEDICAL_EVENT):
-            details, units = row.data.get("details"), row.data.get("units")
-            call |= {
-                "status": _tag(row.data.get("status"), STATUSES),
-                "details": [
-                    tag for tag in (details if isinstance(details, list) else []) if tag in DETAILS
-                ],
-                "units": len(units) if isinstance(units, list) else 0,
-                "alarm": _alarm(row.data.get("alarm")),
-                "clarity": _tag(row.data.get("clarity"), _CLARITIES),
-            }
-        calls.append(call)
-    incidents = sorted({of[row.id] for row in rows if row.id in of})
+    """The radio calls of the incidents `nearby_incidents` returned to this run:
+    nothing that is not near the tap, and nothing of a medical response."""
+    since = scene.at - timedelta(minutes=args["minutes"])
+    calls: list[tuple[datetime, dict[str, Any]]] = []
+    for incident in scene.snapshot.incidents:
+        if incident.id not in found.incidents or incident.category == MEDICAL_EVENT:
+            continue
+        for entry in incident.timeline:
+            # A medical call has a kind of its own, and is not one of these.
+            if entry.kind != "radio" or entry.at < since:
+                continue
+            said = entry.details
+            details, units = said.get("details"), said.get("units")
+            calls.append(
+                (
+                    entry.at,
+                    {
+                        "minutes_ago": _minutes(scene.snapshot.as_of - entry.at),
+                        "incident": incident.id,
+                        "event": _tag(said.get("event"), CATEGORIES),
+                        "status": _tag(said.get("status"), STATUSES),
+                        "details": [
+                            tag
+                            for tag in (details if isinstance(details, list) else [])
+                            if tag in DETAILS
+                        ],
+                        "units": len(units) if isinstance(units, list) else 0,
+                        "alarm": _alarm(said.get("alarm")),
+                        "clarity": _tag(said.get("clarity"), _CLARITIES),
+                    },
+                )
+            )
+    calls.sort(key=lambda pair: pair[0], reverse=True)
+    more = len(calls) > MAX_CALLS
+    shown = [call for _, call in calls[:MAX_CALLS]]
     return (
-        {"calls": calls, "more": more},
-        {"calls": len(rows), "incidents": incidents, "more": more},
+        {"calls": shown, "more": more, "of_incidents_found_so_far": len(found.incidents)},
+        {
+            "calls": len(shown),
+            "incidents": sorted({call["incident"] for call in shown}),
+            "more": more,
+        },
         None,
     )
 
 
 def _get_aircraft(
-    _ember: EmberClient, scene: Scene, found: Found, args: Mapping[str, Any]
+    _ember: EmberClient, scene: Scene, _found: Found, args: Mapping[str, Any], _limit: int | None
 ) -> _Result:
     rows = scene.store.search(
         kinds=["aircraft"],
@@ -430,7 +479,6 @@ def _get_aircraft(
     seen = tracks(rows[:MAX_ROWS], scene.point, near_m=float(args["radius_m"]))
     seen.sort(key=lambda track: (not track.circling, not track.low, track.nearest_m))
     shown = seen[:MAX_TRACKS]
-    found.aircraft = found.aircraft or any(track.circling or track.low for track in seen)
     told = {
         "aircraft": [
             {
@@ -456,16 +504,32 @@ def _get_aircraft(
 
 
 def _get_official(
-    _ember: EmberClient, scene: Scene, _found: Found, args: Mapping[str, Any]
+    _ember: EmberClient, scene: Scene, _found: Found, args: Mapping[str, Any], _limit: int | None
 ) -> _Result:
     incident = scene.snapshot.get(str(args["incident"]))
     if incident is None:
         return {"error": "no_such_incident"}, {"error": "no_such_incident"}, None
-    closures = [
-        entry
-        for entry in incident.timeline
-        if entry.kind == "closure" and entry.details.get("state") == "in_force"
-    ]
+    if incident.category == MEDICAL_EVENT:
+        # The engine gives a medical response none of these, and should it ever,
+        # nothing of them is shown here.
+        nothing = {
+            "incident": incident.id,
+            "official": 0,
+            "in_force": 0,
+            "closures": 0,
+            "conflicts": [],
+            "signals": [],
+        }
+        return {"incident": incident.id, "official": [], "signals": []}, nothing, None
+    # The rows the engine's own closure signal rests on: the version in force of
+    # each 511 event that closes a road of the incident's. Not every line of the
+    # timeline about traffic: an event can be in force and close nothing here.
+    closures = {
+        source.evidence_id
+        for signal in incident.signals
+        if signal.kind == "closure"
+        for source in signal.sources
+    }
     told = {
         "incident": incident.id,
         # That there is one and how it stands, and for a notice its type, which is
@@ -496,7 +560,7 @@ def _get_official(
 
 
 def _nearby_taps(
-    _ember: EmberClient, scene: Scene, found: Found, args: Mapping[str, Any]
+    _ember: EmberClient, scene: Scene, found: Found, args: Mapping[str, Any], _limit: int | None
 ) -> _Result:
     rows = scene.store.search(
         kinds=["tap"],
@@ -517,7 +581,7 @@ def _nearby_taps(
 
 
 def _listen_clip(
-    ember: EmberClient, scene: Scene, found: Found, _args: Mapping[str, Any]
+    ember: EmberClient, scene: Scene, found: Found, _args: Mapping[str, Any], limit: int | None
 ) -> _Result:
     if found.heard is not None:
         # Listened to once, and paid for once.
@@ -530,13 +594,13 @@ def _listen_clip(
         "type": "input_audio",
         "input_audio": {"data": base64.b64encode(clip).decode(), "format": "wav"},
     }
-    tags, paid = _media_tags(ember, "listen_clip", _CLIP_QUESTION, content, "heard", SOUNDS)
+    tags, paid = _media_tags(ember, "listen_clip", _CLIP_QUESTION, content, "heard", SOUNDS, limit)
     found.heard = tags
     return {"heard": list(tags)}, {"heard": list(tags)}, paid
 
 
 def _look_photo(
-    ember: EmberClient, scene: Scene, found: Found, _args: Mapping[str, Any]
+    ember: EmberClient, scene: Scene, found: Found, _args: Mapping[str, Any], limit: int | None
 ) -> _Result:
     if found.seen is not None:
         kept = {"seen": list(found.seen), "again": True}
@@ -548,7 +612,7 @@ def _look_photo(
         "type": "input_image",
         "image_url": "data:image/jpeg;base64," + base64.b64encode(photo).decode(),
     }
-    tags, paid = _media_tags(ember, "look_photo", _PHOTO_QUESTION, content, "seen", SIGHTS)
+    tags, paid = _media_tags(ember, "look_photo", _PHOTO_QUESTION, content, "seen", SIGHTS, limit)
     found.seen = tags
     return {"seen": list(tags)}, {"seen": list(tags)}, paid
 
@@ -560,6 +624,7 @@ def _media_tags(
     content: Mapping[str, Any],
     name: str,
     allowed: Sequence[str],
+    limit_nanousd: int | None,
 ) -> tuple[tuple[str, ...], Accounting]:
     """Have Ember say which of `allowed` a tap's clip or photo holds. Only tags
     from the list are read from its answer; an answer that is no form reads as
@@ -570,6 +635,7 @@ def _media_tags(
         max_output_tokens=MEDIA_OUTPUT_TOKENS,
         # A clip can hold a voice and a photo a face.
         sensitive=True,
+        limit_nanousd=limit_nanousd,
         input=[{"role": "user", "content": [{"type": "input_text", "text": question}, content]}],
         text={
             "format": {
@@ -596,7 +662,7 @@ def _media_tags(
     return tuple(tags) or ("none",), Accounting.of(answer)
 
 
-_TOOLS: dict[str, Callable[[EmberClient, Scene, Found, Mapping[str, Any]], _Result]] = {
+_TOOLS: dict[str, Callable[[EmberClient, Scene, Found, Mapping[str, Any], int | None], _Result]] = {
     "nearby_incidents": _nearby_incidents,
     "get_radio": _get_radio,
     "get_aircraft": _get_aircraft,

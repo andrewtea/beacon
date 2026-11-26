@@ -13,7 +13,9 @@ the rules about money are written once:
 - **Trouble with Ember stops the poller, not the server.** After Ember refused an
   item or failed on one, the poller asks nothing for `HELD_INTERVAL_SECONDS`
   (`hold_after`), counted from the failure by the real clock and kept in the
-  poller's state (`Hold`), so that a restart does not shorten it. The same happens
+  poller's state (`Hold`), so that a restart does not shorten it. A hold is never
+  made shorter by a later one: where several items are out at once, a failure that
+  asks for ten minutes does not end the hour an earlier failure asked for. The same happens
   after `UNUSABLE_RUN_LIMIT` answers in a row that were no form, each of which was
   paid for (`count_answer`); after that hold one more such answer holds it again.
 - **A replaced ledger stops the poller for the life of the process.** What was
@@ -197,7 +199,7 @@ class PaidDesk:
         asked = failure.retry_after if isinstance(failure, EmberCallError) else None
         seconds = max(HELD_INTERVAL_SECONDS, min(asked or 0.0, MAX_WAIT_SECONDS))
         # Counted from now, when Ember failed, and kept: a restart does not end it.
-        hold.held_until = self._wall_clock() + timedelta(seconds=seconds)
+        hold.held_until = _later(hold.held_until, self._wall_clock() + timedelta(seconds=seconds))
 
     def count_answer(self, hold: Hold, *, usable: bool) -> PollerHeldError | None:
         """Count an answer Ember gave, and was paid for, in `hold`.
@@ -213,5 +215,12 @@ class PaidDesk:
         if hold.unusable_run < UNUSABLE_RUN_LIMIT:
             return None
         hold.unusable_run = UNUSABLE_RUN_LIMIT - 1
-        hold.held_until = self._wall_clock() + timedelta(seconds=HELD_INTERVAL_SECONDS)
+        hold.held_until = _later(
+            hold.held_until, self._wall_clock() + timedelta(seconds=HELD_INTERVAL_SECONDS)
+        )
         return PollerHeldError(self._unusable, HELD_INTERVAL_SECONDS)
+
+
+def _later(held_until: datetime | None, until: datetime) -> datetime:
+    """The later of a hold that is on and one that is put on."""
+    return until if held_until is None else max(held_until, until)

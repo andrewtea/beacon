@@ -15,13 +15,20 @@ for each.
   person is shown is worded from it when it is read (`beacon.investigate.card`), so
   a change of wording changes nothing that is kept. It does not hold where the tap
   came from, which stays in the tap's own evidence row.
-- **A decision on crisis mode is kept by its incident, without its tap's id**: a
-  tap's id is what its sender reads its answer with, and what is shown of an
-  incident is shown to everyone. The first decision for an incident is the one
-  that is kept.
+- **Crisis mode is turned on for an incident by the first run that decides for it
+  and whose decision stands**, and that decision is the one kept, without its
+  tap's id: a tap's id is what its sender reads its answer with, and what is shown
+  of an incident is shown to everyone. A run that decides against crisis mode
+  turns nothing on and nothing off, and is kept only as its tap's run. With the
+  decision are kept the signals it rested on as they were then: each one's kind,
+  its confidence, and the evidence rows under it.
 - **The live file holds nothing a stand-in had a part in.** `write` refuses such a
   run there.
-- Rows older than `KEPT` are deleted when a tap is claimed.
+- Rows older than `KEPT` are deleted (`sweep`): whenever a tap is claimed or
+  passed over, and by the server every minute, so that they go when no tap comes.
+  A claim goes with its row, so whoever pays for a run refuses a tap older than
+  the desk looks into (`desk.STALE`), which is far less than `KEPT`: a tap whose
+  claim was swept is never claimed again.
 - The file's shape is its `user_version` (`_FORMAT`). When what `_run_json` writes
   changes, raise it and add the old number to `_EARLIER`; `beacon.files.begin_file`
   then drops the runs of an earlier shape and keeps their claims.
@@ -39,7 +46,7 @@ from typing import Any
 
 from beacon.errors import raise_bare
 from beacon.files import Mode, begin_file
-from beacon.investigate.loop import Outcome, Round, Run
+from beacon.investigate.loop import Cited, Outcome, Round, Run
 from beacon.investigate.tools import Accounting, Call
 
 # How long a run is kept: as long as a story is.
@@ -85,8 +92,8 @@ class Decision:
 
     incident_id: str
     decided_at: datetime
-    # The signals of the incident it rests on, as the engine named them then.
-    signals: tuple[str, ...]
+    # The signals of the incident it rested on, as the engine had them then.
+    cited: tuple[Cited, ...]
     # Which kind of Ember client decided, and whether a stand-in had a part in it.
     model: str | None
     stand_in: bool
@@ -135,11 +142,17 @@ class Runs:
             taken = db.execute("SELECT 1 FROM run WHERE tap_id = ?", (tap_id,)).fetchone()
             if taken is not None:
                 return False
-            old = _stamp(now - KEPT)
-            db.execute("DELETE FROM run WHERE claimed_at < ?", (old,))
-            db.execute("DELETE FROM crisis WHERE decided_at < ?", (old,))
+            _sweep(db, now)
             db.execute("INSERT INTO run (tap_id, claimed_at) VALUES (?, ?)", (tap_id, _stamp(now)))
         return True
+
+    def sweep(self, now: datetime) -> int:
+        """Delete the runs and the decisions that are older than `KEPT`, and say
+        how many rows went.
+
+        Raises RunsError when the file is closed."""
+        with self._writing() as db:
+            return _sweep(db, now)
 
     def write(self, run: Run, *, state: Mapping[str, Any] | None = None) -> None:
         """Keep the run made under a claim, and its decision on crisis mode when it
@@ -161,11 +174,11 @@ class Runs:
                 raise_bare(RunsError("A run is written only under a claim, once."))
             if outcome.crisis and outcome.incident_id is not None:
                 decision = {
-                    "signals": list(outcome.crisis_signals),
+                    "cited": [asdict(cited) for cited in outcome.crisis_cited],
                     "model": run.model,
                     "stand_in": run.stand_in,
                 }
-                # The first decision for an incident is the one that holds.
+                # The first decision that turned crisis mode on is the one kept.
                 db.execute(
                     "INSERT OR IGNORE INTO crisis (incident_id, decided_at, decision) "
                     "VALUES (?, ?, ?)",
@@ -186,6 +199,7 @@ class Runs:
             outcome=Outcome(status="unconfirmed", reason="not_investigated"),
         )
         with self._writing() as db:
+            _sweep(db, now)
             db.execute(
                 "INSERT OR IGNORE INTO run (tap_id, claimed_at, finished_at, run) "
                 "VALUES (?, ?, ?, ?)",
@@ -216,7 +230,7 @@ class Runs:
         return Decision(
             incident_id=incident_id,
             decided_at=datetime.strptime(row[0], _STAMP).replace(tzinfo=UTC),
-            signals=tuple(kept["signals"]),
+            cited=tuple(_cited(cited) for cited in kept["cited"]),
             model=kept["model"],
             stand_in=kept["stand_in"],
         )
@@ -262,6 +276,20 @@ def _stamp(moment: datetime) -> str:
     return moment.astimezone(UTC).strftime(_STAMP)
 
 
+def _sweep(db: sqlite3.Connection, now: datetime) -> int:
+    old = _stamp(now - KEPT)
+    runs = db.execute("DELETE FROM run WHERE claimed_at < ?", (old,)).rowcount
+    return runs + db.execute("DELETE FROM crisis WHERE decided_at < ?", (old,)).rowcount
+
+
+def _cited(kept: Mapping[str, Any]) -> Cited:
+    return Cited(
+        kind=kept["kind"],
+        confidence=kept["confidence"],
+        evidence_ids=tuple(kept["evidence_ids"]),
+    )
+
+
 def _save_state(db: sqlite3.Connection, state: Mapping[str, Any]) -> None:
     db.execute(
         "INSERT INTO meta (key, value) VALUES ('state', ?) "
@@ -301,6 +329,8 @@ def _run_json(run: Run) -> dict[str, Any]:
         "stand_in": run.stand_in,
         "cut_short": run.cut_short,
         "as_of": None if run.as_of is None else run.as_of.isoformat(),
+        "last_id": run.last_id,
+        "unaccounted": run.unaccounted,
     }
 
 
@@ -314,7 +344,7 @@ def _run_from(tap_id: str, kept: dict[str, Any]) -> Run:
             **{
                 **outcome,
                 "grounds": tuple(outcome["grounds"]),
-                "crisis_signals": tuple(outcome["crisis_signals"]),
+                "crisis_cited": tuple(_cited(cited) for cited in outcome["crisis_cited"]),
             }
         ),
         rounds=tuple(
@@ -342,6 +372,8 @@ def _run_from(tap_id: str, kept: dict[str, Any]) -> Run:
         stand_in=kept["stand_in"],
         cut_short=kept["cut_short"],
         as_of=None if kept["as_of"] is None else datetime.fromisoformat(kept["as_of"]),
+        last_id=kept["last_id"],
+        unaccounted=kept["unaccounted"],
     )
 
 

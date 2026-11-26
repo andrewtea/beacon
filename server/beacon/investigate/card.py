@@ -4,11 +4,13 @@ A run is kept as ids, counts, and tags (`beacon.investigate.loop.Run`). What a p
 reads is written here, by code, when the run is read: no sentence is kept, so there
 is none that could be in yesterday's words, and none is a model's.
 
-The sentences say what the investigator did and concluded, and call it that. A match
-is "Beacon's investigator took this tap to be about this incident", which is a model's
-reading of the evidence and is said to be one. None of them tells a reader what to
-do: crisis mode is said to be on, and why, and that Beacon relays what authorities
-publish.
+The sentences say what the investigator did and concluded, and call it that: a match
+is "the investigator's reading of the evidence". Who the investigator was is said in
+a sentence of its own (`investigator_text`): a model, whose reading can be wrong, or
+a stand-in that works by rule. A stand-in is never called a model, and evidence
+that is the invented scenario's is said to be that, whoever looked at it
+(`stand_in_text`). None of the sentences tells a reader what to do: crisis mode is
+said to be on, and that Beacon relays what authorities publish.
 """
 
 from collections.abc import Mapping, Sequence
@@ -19,29 +21,45 @@ from beacon.investigate.tools import Call
 
 PENDING = "Beacon is looking into this tap."
 MATCHED = (
-    "Beacon's investigator took this tap to be about this incident. That is a model's "
-    "reading of the evidence, not something a source said."
+    "Beacon's investigator took this tap to be about this incident. That is the "
+    "investigator's reading of the evidence, not something a source said."
 )
-STAND_IN = (
-    "A stand-in for Muse Ember made this investigation, by rule, and what it looked at "
-    "may be the invented scenario's. No model investigated."
+# Who investigated, by the kind of Ember client (`Run.model`).
+_INVESTIGATOR = {
+    "live": "Beacon's investigator is a model, Muse Ember. Its reading can be wrong.",
+    "fake": ("A stand-in for Muse Ember made this investigation, by rule. No model investigated."),
+}
+EVIDENCE_STAND_IN = (
+    "What is shown here is built from Beacon's invented scenario, or from a stand-in's "
+    "rows. It is not a record of anything that happened."
 )
 INCIDENT_GONE = (
     "Beacon no longer has the incident under the name it had when this tap was "
     "investigated: its calls were regrouped, or it is older than Beacon reads."
 )
 CRISIS = (
-    "Beacon's investigator turned on crisis mode for this incident, because of what is "
-    "listed here. That is a model's decision. Beacon relays what authorities publish "
-    "and tells nobody what to do."
+    "Beacon's investigator turned on crisis mode for this incident, because of the "
+    "signals the incident had at that time. That is the investigator's decision, not "
+    "an authority's. Beacon relays what authorities publish and tells nobody what to do."
 )
+# With the signals an incident has now, of the kinds a decision rested on.
+CRISIS_NOW = (
+    "These are the signals of those kinds the incident has now. They can rest on other "
+    "rows than the ones the decision rested on."
+)
+CRISIS_NONE_NOW = "The incident has none of the signals now that the decision rested on."
 NEARBY = (
     "The investigator also found these near where the tap came from, and did not take "
     "the tap to be about them."
 )
 SINCE = (
-    "This began near where the tap came from, after the tap. Beacon has not "
-    "investigated whether it is what the tap was about."
+    "The first radio call of this incident, near where the tap came from, came after "
+    "the tap. Nobody has investigated whether it is what the tap was about."
+)
+COST_INCOMPLETE = (
+    "A call to Muse Ember failed after it may have been sent, and may have been paid "
+    "for. Its cost is in the Ember ledger and not in these totals, which are a lower "
+    "bound."
 )
 _UNCONFIRMED = {
     "nothing_near": (
@@ -103,26 +121,80 @@ def status_text(outcome: Outcome) -> str:
     return _UNCONFIRMED.get(outcome.reason or "", _UNCONFIRMED["cut_short"])
 
 
-def ground_text(ground: str, run: Run, distance_m: float | None) -> str:
+def investigator_text(model: str | None) -> str | None:
+    """Who investigated, for a run made by that kind of Ember client. None when
+    Ember was asked nothing."""
+    if model is None:
+        return None
+    # A kind of client this Beacon does not know is not said to be a model.
+    return _INVESTIGATOR.get(model, _INVESTIGATOR["fake"])
+
+
+def stand_in_text(model: str | None, *, evidence: bool) -> str | None:
+    """What says that a stand-in had a part in what is shown: that a stand-in
+    investigated, when one did, and that what is shown is built from a stand-in's
+    rows, when it is. Each is said only when it is so. None when neither is."""
+    said = [_INVESTIGATOR["fake"]] if model is not None and model != "live" else []
+    said += [EVIDENCE_STAND_IN] if evidence else []
+    return " ".join(said) or None
+
+
+# What each ground was checked against: a tool of the run, or the incident's own
+# aircraft in the run's reading of the evidence.
+GROUND_BASIS = {
+    "near": "nearby_incidents",
+    "going_on": "nearby_incidents",
+    "heard_in_clip": "listen_clip",
+    "seen_in_photo": "look_photo",
+    "aircraft_overhead": "incident_aircraft",
+    "other_taps": "nearby_taps",
+}
+
+
+def found_then(run: Run, incident_id: str | None) -> Mapping[str, Any] | None:
+    """What the run's `nearby_incidents` kept of an incident: how far it was from
+    the tap then, rounded, and where its point was from. None when it kept none."""
+    for round_ in run.rounds:
+        for call in round_.calls:
+            if call.tool != "nearby_incidents":
+                continue
+            for item in call.returned.get("incidents") or []:
+                if isinstance(item, Mapping) and item.get("id") == incident_id:
+                    return item
+    return None
+
+
+def ground_text(ground: str, run: Run) -> str:
     """The sentence for one ground a match rests on, from what the run's tools
-    returned. `distance_m` is how far the incident is from the tap now, or None
-    when Beacon no longer has the incident."""
+    returned then. Nothing in it is from how the incident is now: an incident
+    whose place has since moved is not said to have been where it is."""
     if ground == "near":
-        if distance_m is None:
-            return "The incident was within 500 m of where the tap came from."
-        return f"The incident is about {_metres(distance_m)} from where the tap came from."
+        then = found_then(run, run.outcome.incident_id)
+        distance = None if then is None else then.get("distance_m")
+        if not isinstance(distance, int) or isinstance(distance, bool):
+            return "When Beacon looked, the incident was within 500 m of where the tap came from."
+        return (
+            f"When Beacon looked, the incident was about {_metres(distance)} from where "
+            "the tap came from."
+        )
     if ground == "going_on":
         return "The incident was going on when the tap came, or had been shortly before."
     if ground == "heard_in_clip":
         heard = _listed(_tags(run, "heard"), _SOUNDS)
-        return f"In the clip sent with the tap, the investigator made out: {heard}."
+        return (
+            f"In the clip sent with the tap, the investigator made out: {heard}. That "
+            "fits an incident of this kind."
+        )
     if ground == "seen_in_photo":
         seen = _listed(_tags(run, "seen"), _SIGHTS)
-        return f"In the photo sent with the tap, the investigator made out: {seen}."
+        return (
+            f"In the photo sent with the tap, the investigator made out: {seen}. That "
+            "fits an incident of this kind."
+        )
     if ground == "aircraft_overhead":
         return (
-            "An aircraft was over the incident shortly before the tap, within reach of "
-            "where the tap came from."
+            "An aircraft that was over the incident was also within reach of where the "
+            "tap came from, shortly before the tap."
         )
     if ground == "other_taps":
         others = _taps(_most(run, "taps"))
@@ -187,9 +259,12 @@ def returned_text(call: Call) -> str:
         official = _count(
             got.get("official") or 0, "official alert or notice", "official alerts or notices"
         )
+        closures = got.get("closures") or 0
+        listed = "lists" if closures == 1 else "list"
         return (
-            f"Found {official}, {got.get('in_force') or 0} of them an alert in force, and "
-            f"{_count(got.get('closures') or 0, 'road closure')} in force."
+            f"Found {official}, {got.get('in_force') or 0} of them an alert in force. "
+            f"{_count(closures, '511 event')} in force {listed} a road of the incident's "
+            "as closed."
         )
     if call.tool == "nearby_taps":
         return f"Found {_count(got.get('taps') or 0, 'other tap')}.{more}"

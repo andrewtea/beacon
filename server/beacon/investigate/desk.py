@@ -7,6 +7,12 @@ A tap comes from anybody, and looking into one costs money, so the desk bounds i
   run makes several paid calls, and after a failure it is seldom known that none
   was sent. A run that Ember cut short is kept as "unconfirmed" and is not made
   again.
+- **Only a tap that just came.** A tap older than `STALE` when its turn comes is
+  passed over. Claims are kept for a day (`store.KEPT`), and a tap's row for longer:
+  a tap whose claim is gone is too old to be claimed again, so it is not paid for
+  twice.
+- **As the evidence stood when the tap came** (`Engine.at`), however long the tap
+  waited: what began after it is not what it was about.
 - **Under a budget of its own**: a live client pays under the `SpendScope` labelled
   `SCOPE`, which holds every tap's investigation together, and is refused without
   it. Each tap has a cap of its own as well (`loop.TAP_BUDGET_USD`).
@@ -31,14 +37,14 @@ import queue
 import threading
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from beacon.ember import EmberClient, EmberClosedError, InputTooLargeError
 from beacon.incident import Engine
 from beacon.ingest.paid import Hold, PaidDesk, read_hold
 from beacon.ingest.runner import PollerHeldError
-from beacon.investigate.loop import Outcome, Run, investigate_tap
-from beacon.investigate.store import Runs, RunsError
+from beacon.investigate.loop import Outcome, Run, investigate_tap, never_sent
+from beacon.investigate.store import KEPT, Runs, RunsError
 from beacon.investigate.tools import Scene
 from beacon.taps import Taps
 from beacon.taps.desk import SOURCE as TAP_SOURCE
@@ -48,6 +54,8 @@ SCOPE = "investigate:tap"
 # How many taps are looked into at once, and how many wait for that.
 WORKERS = 2
 QUEUE = 32
+# How old a tap may be when its turn comes. One that is older is passed over.
+STALE = timedelta(minutes=15)
 # How long `stop` waits for a worker that is between two taps to end.
 _JOIN_SECONDS = 5.0
 
@@ -90,6 +98,12 @@ class InvestigationDesk:
         self._holding = threading.Lock()
         self._hold = Hold(*read_hold(runs.state()))
         self._waiting: queue.Queue[str | None] = queue.Queue(maxsize=QUEUE)
+        # The taps that are waiting for a worker, and the ones a run is being made
+        # for. Whoever reads a tap's answer asks (`state_of`), so that a tap is
+        # said to be pending for as long as it is, and no longer.
+        self._tracking = threading.Lock()
+        self._queued: set[str] = set()
+        self._running: set[str] = set()
         self._threads = [
             threading.Thread(target=self._work, name=f"beacon-investigate-{n}", daemon=True)
             for n in range(workers)
@@ -106,15 +120,30 @@ class InvestigationDesk:
         """Whether a tap that is handed in now will be looked into."""
         return not self._closing.is_set()
 
+    def state_of(self, tap_id: str) -> str | None:
+        """`queued` for a tap that waits for a worker, `running` for one a run is
+        being made for, and None for any other: its run is kept, or none is coming
+        from this process."""
+        with self._tracking:
+            if tap_id in self._running:
+                return "running"
+            return "queued" if tap_id in self._queued else None
+
     def submit(self, tap_id: str) -> bool:
         """Hand a tap in to be looked into, and say whether it was taken. It does
         not wait and does not raise. A tap that finds the queue full is passed
         over for good; one that comes while the desk is closing is left alone."""
         if self._closing.is_set():
             return False
+        with self._tracking:
+            # Before it is in the queue, so that a worker that takes it at once
+            # finds it here.
+            self._queued.add(tap_id)
         try:
             self._waiting.put_nowait(tap_id)
         except queue.Full:
+            with self._tracking:
+                self._queued.discard(tap_id)
             with contextlib.suppress(RunsError):
                 self._runs.skip(tap_id, self._clock())
             return False
@@ -126,8 +155,26 @@ class InvestigationDesk:
         leaving Ember alone, or it is closed.
 
         Raises RunsError when the investigations file is closed."""
+        with self._tracking:
+            self._queued.discard(tap_id)
+            self._running.add(tap_id)
+        try:
+            return self._investigate(tap_id)
+        finally:
+            # After the run's row is written, so a reader never finds neither.
+            with self._tracking:
+                self._running.discard(tap_id)
+
+    def _investigate(self, tap_id: str) -> Run | None:
         row = self._taps.store.find(TAP_SOURCE, tap_id)
         if row is None or row.kind != "tap" or row.point is None:
+            return None
+        age = self._clock() - row.occurred_at
+        if age > STALE:
+            # Too old to be looked into, and maybe older than its claim was kept:
+            # it is never claimed, so it is never paid for a second time.
+            if age < KEPT:
+                self._runs.skip(tap_id, self._clock())
             return None
         held = False
         with self._holding:
@@ -153,14 +200,15 @@ class InvestigationDesk:
                 point=row.point,
                 has_photo=row.data.get("photo") is not None,
                 has_clip=row.data.get("clip") is not None,
-                snapshot=self._engine.snapshot(),
+                # As things stood when the tap came, not when its turn did.
+                snapshot=self._engine.at(row.occurred_at),
                 store=self._taps.store,
                 media=self._taps.media,  # type: ignore[arg-type]
             )
             made = investigate_tap(self._ember, scene, clock=self._clock)
             failure = made.failure
             run = made.run
-            if failure is not None and not run.calls and PaidDesk.not_sent(failure):
+            if failure is not None and not run.calls and never_sent(failure):
                 # Ember was asked nothing, and nothing was paid: the tap was not
                 # investigated, and is said not to have been. It stays claimed.
                 run = replace(run, outcome=Outcome(status="unconfirmed", reason="not_investigated"))
@@ -204,6 +252,8 @@ class InvestigationDesk:
         with contextlib.suppress(queue.Empty):
             while True:
                 self._waiting.get_nowait()
+        with self._tracking:
+            self._queued.clear()
         for _ in self._threads:
             with contextlib.suppress(queue.Full):
                 self._waiting.put_nowait(None)
@@ -220,6 +270,10 @@ class InvestigationDesk:
         while True:
             tap_id = self._waiting.get()
             if tap_id is None or self._closing.is_set():
+                if tap_id is not None:
+                    # Left alone: nothing was claimed for it.
+                    with self._tracking:
+                        self._queued.discard(tap_id)
                 return
             failed: str | None = None
             try:
@@ -229,5 +283,9 @@ class InvestigationDesk:
                     # The file was closed under the run: the server is shutting down.
                     return
                 failed = type(error).__name__
+            finally:
+                # Its turn has come and gone, however it ended: it waits no longer.
+                with self._tracking:
+                    self._queued.discard(tap_id)
             if failed is not None:
                 logger.error("A tap could not be looked into (%s).", failed)
