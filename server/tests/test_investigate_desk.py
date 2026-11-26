@@ -55,7 +55,7 @@ from beacon.taps import TapMedia, Taps
 from tests.incident_rows import HAYES, NOON, Rows, at, mock_store
 from tests.test_incident_aircraft import offset
 from tests.test_investigate import BLOCKS, NAMES, TAP, city, form
-from tests.test_taps import PHONE
+from tests.test_taps import PHONE, SHOWN
 
 OTHER = "tap-AAAAAAAA0002"
 THIRD = "tap-AAAAAAAA0003"
@@ -660,7 +660,7 @@ def test_a_tap_is_given_its_receipt_when_a_full_queue_cannot_be_written_down(
 
     # The tap is stored before it is handed to the desk, and its id is the only
     # handle its sender has: it is given, whatever the desk could not write.
-    response = client.post("/api/taps", json={"location": PHONE})
+    response = client.post("/api/taps", headers=SHOWN, json={"location": PHONE})
 
     assert response.status_code == 201
     receipt = response.json()
@@ -800,7 +800,7 @@ def test_a_tap_on_the_mock_scenario_is_answered_with_the_fire_and_every_part_say
     # Twenty minutes into the story: the fire is at its third alarm.
     ingest.catch_up()
 
-    receipt = client.post("/api/taps", json={"location": PHONE}).json()
+    receipt = client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).json()
     waiting = client.get(f"/api/taps/{receipt['id']}").json()
     desk.investigate(receipt["id"])
     answer = client.get(f"/api/taps/{receipt['id']}").json()
@@ -883,6 +883,8 @@ def test_a_tap_on_the_mock_scenario_is_answered_with_the_fire_and_every_part_say
         None,
     )
     assert answer["nearby_text"] == words.NEARBY
+    # Its place is from the list of blocks: nothing listed here is 511's.
+    assert (answer["nearby_credit"], answer["since_credit"]) == (None, None)
     assert (answer["watching"], answer["since"], answer["since_text"]) == (False, [], None)
     assert (answer["ember_calls"], answer["cost_usd"]) == (3, 0.0)
     # The list of incidents carries the decision too, and names no tap.
@@ -973,7 +975,7 @@ def test_a_tap_with_nothing_near_is_unconfirmed_and_beacon_lists_what_begins_the
     where = {"lat": FAR.lat, "lon": FAR.lon}
     hayes = fire_id(world)
 
-    tap_id = client.post("/api/taps", json={"location": where}).json()["id"]
+    tap_id = client.post("/api/taps", headers=SHOWN, json={"location": where}).json()["id"]
     desk.investigate(tap_id)
     answer = client.get(f"/api/taps/{tap_id}").json()
 
@@ -997,6 +999,7 @@ def test_a_tap_with_nothing_near_is_unconfirmed_and_beacon_lists_what_begins_the
     assert since["title"] == "Fire at the 100 block of Oak St"
     assert answer["since_text"] == words.SINCE
     assert "Nobody has investigated" in answer["since_text"]
+    assert (since["point_from"], answer["since_credit"]) == ("blocks", None)
     # The fire on Hayes St began before the tap and is far from it: it is not listed.
     assert since["id"] != hayes
 
@@ -1029,10 +1032,10 @@ def test_a_tap_is_pending_for_as_long_as_the_desk_has_it_however_long_that_is(
 
     monkeypatch.setattr(desk_module, "investigate_tap", investigating)
     client = world.app(desk)
-    first = client.post("/api/taps", json={"location": PHONE}).json()["id"]
+    first = client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).json()["id"]
     try:
         assert under_way.wait(5)
-        second = client.post("/api/taps", json={"location": PHONE}).json()["id"]
+        second = client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).json()["id"]
         # One is being looked into, and one waits for the desk's only thread.
         assert (desk.state_of(first), desk.state_of(second)) == ("running", "queued")
         assert read(client, first) == read(client, second) == ("pending", None, "pending")
@@ -1059,7 +1062,7 @@ def test_a_run_that_was_begun_and_never_kept_is_said_to_be_lost_and_its_cost_unk
 ) -> None:
     desk = world.desk()
     client = world.app(desk)
-    tap_id = client.post("/api/taps", json={"location": PHONE}).json()["id"]
+    tap_id = client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).json()["id"]
     assert read(client, tap_id) == ("pending", None, "pending")
 
     # The server stops with the tap still waiting. Nothing was begun for it.
@@ -1113,7 +1116,7 @@ def test_what_was_investigated_before_is_read_by_a_server_that_investigates_noth
     assert [i["crisis"]["active"] for i in listed if i["id"] == fire] == [True]
     assert client.get(f"/api/incidents/{fire}").json()["incident"]["crisis"]["active"] is True
     # A tap that comes now is taken, and is said to have no investigation.
-    receipt = client.post("/api/taps", json={"location": PHONE}).json()
+    receipt = client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).json()
     assert receipt["investigating"] is False
     assert read(client, receipt["id"]) == ("unconfirmed", "not_investigated", "none")
     # A server with neither reads no decision, and says nothing was investigated.
@@ -1193,6 +1196,54 @@ def test_the_distance_and_the_credit_of_a_match_are_the_runs_and_stay_when_the_i
     assert moved["match"]["grounds"][0] == near
 
 
+def test_what_is_listed_as_near_a_tap_by_a_place_of_511s_carries_511s_credit(
+    world: World,
+) -> None:
+    # With no list of blocks an incident is where 511 says a closure on its street is.
+    engine = Engine(world.rows.store, NO_BLOCKS, names=NAMES, clock=lambda: world.now[0])
+    world = replace(world, engine=engine)
+    credit = {"text": CREDIT_511.text, "url": CREDIT_511.url}
+    # An alarm a street over from the fire, placed by a closure of its own.
+    world.rows.radio(4, "alarm", "on_scene", units=("E21",), street="Fell St", block=300)
+    world.rows.traffic(4.5, "511.org/2", road="Fell St", point=offset(HAYES, 0, 150))
+    world.rows.tap(6, offset(HAYES, 100, 0), ref=TAP)
+    world.rows.tap(6, FAR, ref=OTHER)
+    desk = world.desk()
+    client = world.app(desk)
+
+    desk.investigate(TAP)
+    desk.investigate(OTHER)
+    answer = client.get(f"/api/taps/{TAP}").json()
+
+    assert answer["incident"]["title"].startswith("Fire")
+    assert [(i["title"], i["point_from"]) for i in answer["nearby"]] == [
+        ("Alarm at the 300 block of Fell St", "closure")
+    ]
+    # That the alarm is listed as near rests on a place of 511's.
+    assert (answer["nearby_text"], answer["nearby_credit"]) == (words.NEARBY, credit)
+    assert answer["since_credit"] is None
+
+    # Read later by a Beacon that has the block on its list: the alarm's place is
+    # the list's now, and it was still found near the tap by the place 511 gave.
+    alarm = offset(HAYES, 0, 150)
+    listed = Blocks.of([("Fell St", 300, alarm.lat, alarm.lon)])
+    later = replace(
+        world, engine=Engine(world.rows.store, listed, names=NAMES, clock=lambda: world.now[0])
+    )
+    moved = later.app(None, desk.runs).get(f"/api/taps/{TAP}").json()
+    assert [i["point_from"] for i in moved["nearby"]] == ["blocks"]
+    assert moved["nearby_credit"] == credit
+
+    # Something begins near the far tap, where 511 lists a closure on its street.
+    world.rows.radio(8.5, "fire", "dispatched", units=("E5",), street="Oak St", block=100)
+    world.rows.traffic(8.6, "511.org/3", road="Oak St", point=FAR)
+    world.now[0] = at(9)
+    far = client.get(f"/api/taps/{OTHER}").json()
+    assert (far["status"], [i["point_from"] for i in far["since"]]) == ("unconfirmed", ["closure"])
+    assert (far["since_text"], far["since_credit"]) == (words.SINCE, credit)
+    assert far["nearby_credit"] is None
+
+
 def test_who_investigated_and_what_the_evidence_is_are_said_apart(world: World) -> None:
     fire = fire_id(world)
     client = world.app(world.desk())
@@ -1236,7 +1287,7 @@ def test_an_answer_nobody_investigated_is_a_stand_ins_once_it_lists_a_stand_ins_
 ) -> None:
     client = world.app(None)
     where = {"lat": FAR.lat, "lon": FAR.lon}
-    tap_id = client.post("/api/taps", json={"location": where}).json()["id"]
+    tap_id = client.post("/api/taps", headers=SHOWN, json={"location": where}).json()["id"]
 
     answer = client.get(f"/api/taps/{tap_id}").json()
     assert (answer["stand_in"], answer["stand_in_text"], answer["since"]) == (False, None, [])
@@ -1255,7 +1306,7 @@ def test_a_server_with_no_investigator_takes_the_tap_and_says_it_was_not_investi
 ) -> None:
     client = world.app(None)
 
-    receipt = client.post("/api/taps", json={"location": PHONE}).json()
+    receipt = client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).json()
     answer = client.get(f"/api/taps/{receipt['id']}").json()
 
     assert receipt["investigating"] is False
@@ -1296,7 +1347,7 @@ def test_a_closing_desk_takes_no_tap_and_the_receipt_says_so(world: World) -> No
     client = world.app(desk)
     desk.close()
 
-    receipt = client.post("/api/taps", json={"location": PHONE}).json()
+    receipt = client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).json()
 
     assert receipt["investigating"] is False
     assert client.get(f"/api/taps/{receipt['id']}").json()["reason"] == "not_investigated"
@@ -1481,7 +1532,7 @@ def test_the_server_investigates_a_tap_and_stops_cleanly() -> None:
             ):
                 break
             time.sleep(0.05)
-        receipt = client.post("/api/taps", json={"location": PHONE}).json()
+        receipt = client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).json()
         answer: dict[str, Any] = {}
         for _ in range(200):
             answer = client.get(f"/api/taps/{receipt['id']}").json()
@@ -1586,7 +1637,7 @@ def test_what_was_there_before_the_investigator_looked_is_not_listed_as_begun_si
     desk = world.desk(Script([form()]))
     client = world.app(desk)
 
-    tap_id = client.post("/api/taps", json={"location": PHONE}).json()["id"]
+    tap_id = client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).json()["id"]
     desk.investigate(tap_id)
     world.now[0] = at(8)
     answer = client.get(f"/api/taps/{tap_id}").json()

@@ -1,15 +1,27 @@
 :root {
-  /* Night navy is the brand, and amber is the beacon: the one accent. */
+  /* Night navy is the brand, and amber is the beacon. The other colours each
+     say one thing: what an authority said, what is going on, what is a crisis,
+     and what is invented. */
   --bg: #0b1f33;
   --surface: #12304d;
-  --line: #24476b;
-  --text: #c5d3e2;
+  --surface-2: #183b5e;
+  --line: #2a4f76;
+  --text: #c9d6e4;
   --text-strong: #f4f8fc;
-  --text-soft: #8fa5bd;
+  --text-soft: #9db1c7;
   --accent: #ffb020;
-  --ok: #4ade9a;
-  --error: #ff8a65;
+  --accent-ink: #1c1203;
+  --official: #9ad4ff;
+  --ok: #5fe0a4;
+  --crisis: #ff9478;
+  --crisis-bg: #3a1c24;
+  --crisis-line: #a8483f;
+  --invented: #d4c4ff;
+  --error: #ffa48a;
   --focus: #ffd27a;
+
+  --radius: 0.875rem;
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
 
   font:
     17px/1.5 system-ui,
@@ -20,6 +32,7 @@
   color: var(--text);
   background: var(--bg);
   accent-color: var(--accent);
+  scrollbar-color: var(--line) var(--bg);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -33,7 +46,40 @@ body {
   min-height: 100dvh;
 }
 
+::selection {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
 :focus-visible {
   outline: 3px solid var(--focus);
   outline-offset: 2px;
+}
+
+a {
+  color: var(--official);
+  text-underline-offset: 0.18em;
+}
+
+button,
+input {
+  font: inherit;
+  color: inherit;
+}
+
+time,
+.accounting dd {
+  font-variant-numeric: tabular-nums;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
 }

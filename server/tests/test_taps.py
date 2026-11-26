@@ -46,6 +46,9 @@ NOON = datetime(2026, 11, 27, 20, 0, tzinfo=UTC)
 PHONE = {"lat": 37.776_354_9, "lon": -122.424_412_3, "accuracy_m": 11.4}
 # What must not be found anywhere after a tap: the position as the phone gave it.
 PRECISE = ("37.7763549", "122.4244123", "776354", "424412")
+# The mode a tap's sender was shown, which every tap names: these servers run on
+# the mock store.
+SHOWN = {"Beacon-Mode": "mock"}
 
 
 def b64(file: bytes) -> str:
@@ -97,7 +100,7 @@ def everything_kept(tmp_path: Path) -> bytes:
 def test_a_tap_becomes_a_row_that_says_where_to_a_block_and_when_by_the_servers_clock(
     client: TestClient, store: EvidenceStore
 ) -> None:
-    response = client.post("/api/taps", json={"location": PHONE})
+    response = client.post("/api/taps", headers=SHOWN, json={"location": PHONE})
 
     assert response.status_code == 201
     receipt = response.json()
@@ -126,7 +129,7 @@ def test_a_tap_keeps_its_photo_and_clip_cleaned_and_for_an_hour(
 ) -> None:
     sent = {"location": PHONE, "photo": b64(jpeg()), "clip": b64(wav(2.0))}
 
-    receipt = client.post("/api/taps", json=sent).json()
+    receipt = client.post("/api/taps", headers=SHOWN, json=sent).json()
 
     assert (receipt["photo"], receipt["clip"]) == (True, True)
     assert receipt["media_kept_until"] == "2026-11-27T21:00:00Z"
@@ -167,8 +170,8 @@ def test_nothing_says_who_tapped_or_exactly_where(
         "Cookie": "session=jane-doe",
     }
 
-    first = client.post("/api/taps", json={"location": PHONE}, headers=headers)
-    second = client.post("/api/taps", json={"location": PHONE}, headers=headers)
+    first = client.post("/api/taps", json={"location": PHONE}, headers=headers | SHOWN)
+    second = client.post("/api/taps", json={"location": PHONE}, headers=headers | SHOWN)
 
     # Two taps from one phone have nothing in common but the block and the minute.
     assert first.json()["id"] != second.json()["id"]
@@ -178,7 +181,9 @@ def test_nothing_says_who_tapped_or_exactly_where(
 
 
 def test_the_time_a_phone_gives_is_not_part_of_a_tap(client: TestClient) -> None:
-    response = client.post("/api/taps", json={"location": PHONE, "time": "2026-11-27T19:00:00Z"})
+    response = client.post(
+        "/api/taps", headers=SHOWN, json={"location": PHONE, "time": "2026-11-27T19:00:00Z"}
+    )
 
     assert response.status_code == 422
 
@@ -195,7 +200,9 @@ def test_the_time_a_phone_gives_is_not_part_of_a_tap(client: TestClient) -> None
 def test_a_tap_from_outside_san_francisco_is_refused_and_nothing_of_it_is_kept(
     client: TestClient, store: EvidenceStore, location: dict[str, float]
 ) -> None:
-    response = client.post("/api/taps", json={"location": location, "photo": b64(jpeg())})
+    response = client.post(
+        "/api/taps", headers=SHOWN, json={"location": location, "photo": b64(jpeg())}
+    )
 
     assert response.status_code == 422
     assert response.json() == {
@@ -251,7 +258,7 @@ MEDIA = "A tap's photo and clip are files in base64, of a size Beacon takes."
 def test_what_is_not_a_tap_is_refused_in_a_fixed_sentence_that_repeats_nothing(
     client: TestClient, store: EvidenceStore, tmp_path: Path, sent: Any, detail: str
 ) -> None:
-    response = client.post("/api/taps", json=sent)
+    response = client.post("/api/taps", headers=SHOWN, json=sent)
 
     assert response.status_code == 422
     assert response.json() == {"detail": detail}
@@ -274,7 +281,7 @@ def test_what_is_not_a_tap_is_refused_in_a_fixed_sentence_that_repeats_nothing(
 def test_a_body_that_is_not_json_or_not_a_tap_is_refused_without_being_quoted(
     client: TestClient, body: bytes
 ) -> None:
-    response = client.post("/api/taps", content=body)
+    response = client.post("/api/taps", headers=SHOWN, content=body)
 
     assert response.status_code == 422
     assert response.json()["detail"] in ("A tap is a JSON object.", SHAPE)
@@ -288,14 +295,14 @@ def test_a_body_larger_than_a_tap_may_be_is_refused_by_its_declared_length_or_as
     too_large = {"detail": "A tap is at most ten megabytes, with its photo and its clip."}
     body = b'{"location": "' + b"A" * MAX_BODY_BYTES + b'"}'
 
-    declared = client.post("/api/taps", content=body)
+    declared = client.post("/api/taps", headers=SHOWN, content=body)
 
     def pieces() -> Any:
         # No length is declared for a body that is sent in pieces.
         for start in range(0, len(body), 1_000_000):
             yield body[start : start + 1_000_000]
 
-    streamed = client.post("/api/taps", content=pieces())
+    streamed = client.post("/api/taps", headers=SHOWN, content=pieces())
 
     assert (declared.status_code, declared.json()) == (413, too_large)
     assert (streamed.status_code, streamed.json()) == (413, too_large)
@@ -313,7 +320,7 @@ def test_a_photo_and_a_clip_of_the_largest_sizes_fit_in_the_largest_body(
     }
     assert len(json.dumps(sent)) <= MAX_BODY_BYTES
 
-    response = client.post("/api/taps", json=sent)
+    response = client.post("/api/taps", headers=SHOWN, json=sent)
 
     # Read whole, and refused for what it is and not for its size.
     assert response.status_code == 422
@@ -326,10 +333,12 @@ def test_taps_past_the_limit_for_a_minute_are_asked_to_come_back(
     moment = [1000.0]
     monkeypatch.setattr(tap_desk.time, "monotonic", lambda: moment[0])
     for _ in range(MAX_TAPS_PER_MINUTE):
-        assert client.post("/api/taps", json={"location": PHONE}).status_code == 201
+        assert client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).status_code == 201
     moment[0] = 1020.5
 
-    refused = client.post("/api/taps", json={"location": PHONE, "photo": b64(jpeg())})
+    refused = client.post(
+        "/api/taps", headers=SHOWN, json={"location": PHONE, "photo": b64(jpeg())}
+    )
 
     assert refused.status_code == 429
     assert refused.json() == {
@@ -339,10 +348,10 @@ def test_taps_past_the_limit_for_a_minute_are_asked_to_come_back(
     assert refused.headers["Retry-After"] == "40"
     assert len(store.search()) == MAX_TAPS_PER_MINUTE
     # What is not a tap, or is from elsewhere, takes no place in the minute.
-    assert client.post("/api/taps", json={"location": {}}).status_code == 422
-    assert client.post("/api/taps", json={"location": OAKLAND}).status_code == 422
+    assert client.post("/api/taps", headers=SHOWN, json={"location": {}}).status_code == 422
+    assert client.post("/api/taps", headers=SHOWN, json={"location": OAKLAND}).status_code == 422
     moment[0] = 1060.0
-    assert client.post("/api/taps", json={"location": PHONE}).status_code == 201
+    assert client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).status_code == 201
 
 
 def test_a_tap_takes_its_place_in_the_minute_before_its_photo_is_decoded(
@@ -352,20 +361,27 @@ def test_a_tap_takes_its_place_in_the_minute_before_its_photo_is_decoded(
     not_a_photo = {"location": PHONE, "photo": b64(b"GIF89a" + bytes(64))}
 
     # A tap whose photo is no photo has used its place: looking at it was the work.
-    assert client.post("/api/taps", json=not_a_photo).status_code == 422
+    assert client.post("/api/taps", headers=SHOWN, json=not_a_photo).status_code == 422
     assert (
-        client.post("/api/taps", json={"location": PHONE, "photo": b64(jpeg())}).status_code == 201
+        client.post(
+            "/api/taps", headers=SHOWN, json={"location": PHONE, "photo": b64(jpeg())}
+        ).status_code
+        == 201
     )
     assert len(photos.given) == 1
 
     # Past the limit nothing of a tap is decoded, however often it is sent.
     for _ in range(5):
-        refused = client.post("/api/taps", json={"location": PHONE, "photo": b64(jpeg())})
+        refused = client.post(
+            "/api/taps", headers=SHOWN, json={"location": PHONE, "photo": b64(jpeg())}
+        )
         assert refused.status_code == 429
     assert len(photos.given) == 1
     # Nor is anything of a tap from elsewhere.
     assert (
-        client.post("/api/taps", json={"location": OAKLAND, "photo": b64(jpeg())}).status_code
+        client.post(
+            "/api/taps", headers=SHOWN, json={"location": OAKLAND, "photo": b64(jpeg())}
+        ).status_code
         == 422
     )
     assert len(photos.given) == 1
@@ -374,7 +390,7 @@ def test_a_tap_takes_its_place_in_the_minute_before_its_photo_is_decoded(
 def test_only_so_many_taps_are_received_at_once(client: TestClient, taps: Taps) -> None:
     held = [taps.admit() for _ in range(MAX_TAPS_AT_ONCE)]
 
-    busy = client.post("/api/taps", json={"location": PHONE})
+    busy = client.post("/api/taps", headers=SHOWN, json={"location": PHONE})
 
     assert busy.status_code == 503
     assert busy.json() == {"detail": "Beacon is busy with other taps. Try again in a moment."}
@@ -384,10 +400,13 @@ def test_only_so_many_taps_are_received_at_once(client: TestClient, taps: Taps) 
     give_back = held.pop()
     give_back()
     give_back()
-    assert client.post("/api/taps", json={"location": {}}).status_code == 422
-    assert client.post("/api/taps", content=b"{").status_code == 422
-    assert client.post("/api/taps", content=b"A" * (MAX_BODY_BYTES + 1)).status_code == 413
-    assert client.post("/api/taps", json={"location": PHONE}).status_code == 201
+    assert client.post("/api/taps", headers=SHOWN, json={"location": {}}).status_code == 422
+    assert client.post("/api/taps", headers=SHOWN, content=b"{").status_code == 422
+    assert (
+        client.post("/api/taps", headers=SHOWN, content=b"A" * (MAX_BODY_BYTES + 1)).status_code
+        == 413
+    )
+    assert client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).status_code == 201
     held.append(taps.admit())
     with pytest.raises(TapError):
         taps.admit()
@@ -396,9 +415,13 @@ def test_only_so_many_taps_are_received_at_once(client: TestClient, taps: Taps) 
 
 
 def post_slowly(
-    app: Any, receive: Any, headers: list[tuple[bytes, bytes]] | None = None
+    app: Any,
+    receive: Any,
+    headers: list[tuple[bytes, bytes]] | None = None,
+    mode: bytes | None = b"mock",
 ) -> tuple[int, dict[str, Any]]:
-    """What the app answers a tap whose body arrives as `receive` hands it over."""
+    """What the app answers a tap whose body arrives as `receive` hands it over.
+    `mode` is the mode the tap says its sender was shown, or None to say none."""
     sent: list[dict[str, Any]] = []
     scope = {
         "type": "http",
@@ -410,7 +433,11 @@ def post_slowly(
         "raw_path": b"/api/taps",
         "query_string": b"",
         "root_path": "",
-        "headers": [(b"content-type", b"application/json"), *(headers or [])],
+        "headers": [
+            (b"content-type", b"application/json"),
+            *([] if mode is None else [(b"beacon-mode", mode)]),
+            *(headers or []),
+        ],
         "client": ("203.0.113.77", 50123),
         "server": ("testserver", 80),
     }
@@ -470,7 +497,7 @@ def test_a_tap_whose_row_cannot_be_stored_keeps_no_photo_either(
     monkeypatch.setattr(taps.store, "add", fail)
     sent = {"location": PHONE, "photo": b64(jpeg()), "clip": b64(wav())}
 
-    response = client.post("/api/taps", json=sent)
+    response = client.post("/api/taps", headers=SHOWN, json=sent)
 
     assert response.status_code == 503
     assert response.json() == {"detail": "Beacon could not keep this tap. Try again in a moment."}
@@ -484,7 +511,7 @@ def test_a_tap_whose_photo_cannot_be_kept_stores_no_row_either(
     monkeypatch.setattr(tap_media, "MAX_STORED_BYTES", len(jpeg(extras=False)) + 10)
     sent = {"location": PHONE, "photo": b64(jpeg()), "clip": b64(wav())}
 
-    response = client.post("/api/taps", json=sent)
+    response = client.post("/api/taps", headers=SHOWN, json=sent)
 
     # The photo fitted and the clip did not: neither is kept, and there is no row.
     assert response.status_code == 503
@@ -493,7 +520,7 @@ def test_a_tap_whose_photo_cannot_be_kept_stores_no_row_either(
     }
     assert store.search() == []
     assert list((tmp_path / "taps" / "mock").iterdir()) == []
-    assert client.post("/api/taps", json={"location": PHONE}).status_code == 201
+    assert client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).status_code == 201
 
 
 def test_a_tap_to_a_store_that_is_closed_is_answered_and_not_taken(
@@ -501,7 +528,7 @@ def test_a_tap_to_a_store_that_is_closed_is_answered_and_not_taken(
 ) -> None:
     taps.close()
 
-    response = client.post("/api/taps", json={"location": PHONE})
+    response = client.post("/api/taps", headers=SHOWN, json={"location": PHONE})
 
     assert response.status_code == 503
     assert store.search() == []
@@ -559,7 +586,9 @@ def test_a_server_takes_taps_into_the_store_its_environment_picks_and_sweeps_old
     old.close()
 
     with TestClient(create_app()) as client:
-        response = client.post("/api/taps", json={"location": PHONE, "clip": b64(wav())})
+        response = client.post(
+            "/api/taps", headers=SHOWN, json={"location": PHONE, "clip": b64(wav())}
+        )
         receipt = response.json()
     # The sweep that began with the server was let finish when the server stopped.
     assert list((tmp_path / "taps" / "live").iterdir()) == []
@@ -572,7 +601,7 @@ def test_a_server_takes_taps_into_the_store_its_environment_picks_and_sweeps_old
 
 
 def test_a_server_that_has_not_started_takes_no_taps() -> None:
-    response = TestClient(create_app()).post("/api/taps", json={"location": PHONE})
+    response = TestClient(create_app()).post("/api/taps", headers=SHOWN, json={"location": PHONE})
 
     assert response.status_code == 503
     assert response.json() == {"detail": "This server is not taking taps."}
@@ -668,7 +697,7 @@ def test_media_that_cannot_be_deleted_after_a_failure_does_not_change_the_answer
     monkeypatch.setattr(taps.store, "add", closed)
     monkeypatch.setattr(Path, "unlink", stuck)
 
-    response = client.post("/api/taps", json={"location": PHONE, "clip": b64(wav())})
+    response = client.post("/api/taps", headers=SHOWN, json={"location": PHONE, "clip": b64(wav())})
     monkeypatch.undo()
 
     assert response.status_code == 503
@@ -692,10 +721,79 @@ def test_media_that_cannot_be_deleted_after_a_failure_does_not_change_the_answer
 def test_a_number_too_large_to_be_a_place_is_refused_as_any_other_that_is_no_place(
     client: TestClient, location: str
 ) -> None:
-    response = client.post("/api/taps", content=f'{{"location": {location}}}'.encode())
+    response = client.post(
+        "/api/taps", headers=SHOWN, content=f'{{"location": {location}}}'.encode()
+    )
 
     assert response.status_code == 422
     assert response.json()["detail"].startswith("A tap")
+
+
+class _Handed:
+    """Stands where the investigator's desk is, and keeps what it was handed."""
+
+    def __init__(self) -> None:
+        self.taps: list[str] = []
+
+    def submit(self, tap_id: str) -> bool:
+        self.taps.append(tap_id)
+        return True
+
+
+@pytest.mark.parametrize(
+    ("mode", "shown", "status"),
+    [
+        # An app that was shown the invented scenario, whose server is now on real
+        # sources, and has not asked again since.
+        ("live", b"mock", 409),
+        # And the other way round: a clip meant for a real server.
+        ("mock", b"live", 409),
+        # A tap that names no mode, or something that is none.
+        ("live", None, 400),
+        ("live", b"Mock", 400),
+        ("live", b"", 400),
+    ],
+)
+def test_a_tap_made_for_the_other_mode_is_refused_unread_and_nothing_is_kept_or_investigated(
+    tmp_path: Path, now: list[datetime], photos: Same, mode: Any, shown: bytes | None, status: int
+) -> None:
+    store = EvidenceStore(tmp_path / "evidence" / f"{mode}.sqlite3", mode)
+    taps = Taps(store, TapMedia(tmp_path / "taps", mode), photos=photos, clock=lambda: now[0])
+    desk = _Handed()
+    app = create_app()
+    app.state.taps, app.state.investigations = taps, desk
+
+    async def nothing() -> dict[str, Any]:
+        raise AssertionError("The body of a tap that was to be refused was read.")
+
+    # The mode header alone, as it was sent or not: `post_slowly` adds none here.
+    headers = [] if shown is None else [(b"beacon-mode", shown)]
+    refused, answer = post_slowly(app, nothing, headers=headers, mode=None)
+
+    assert refused == status
+    assert (
+        "nothing of it was read" in answer["detail"]
+        or "Nothing of the tap was read" in (answer["detail"])
+    )
+    # The sentence is fixed, and says nothing of the tap.
+    assert not any(part in answer["detail"] for part in PRECISE)
+    assert store.search(kinds=["tap"]) == []
+    assert desk.taps == []
+    kept = [file for file in (tmp_path / "taps").rglob("*") if file.is_file()]
+    assert [file.name for file in kept] in ([], [".lock"])
+    # No place among the taps being received was held for it.
+    held = [taps.admit() for _ in range(MAX_TAPS_AT_ONCE)]
+    assert len(held) == MAX_TAPS_AT_ONCE
+    for give_back in held:
+        give_back()
+
+    # The same tap, naming the mode the server is in, is taken and handed in.
+    taken = TestClient(app).post(
+        "/api/taps", headers={"Beacon-Mode": mode}, json={"location": PHONE}
+    )
+    assert (taken.status_code, taken.json()["mode"]) == (201, mode)
+    assert desk.taps == [taken.json()["id"]]
+    taps.close()
 
 
 @pytest.mark.parametrize("length", ["9" * 5000, str(MAX_BODY_BYTES + 1), "0" * 30 + "99999999"])
@@ -732,7 +830,7 @@ def test_a_body_with_more_structure_than_a_tap_has_is_refused_before_it_is_parse
     # Only where the taps parse a body, and not where the test reads the answer.
     monkeypatch.setattr(tap_desk, "json", SimpleNamespace(loads=parsed))
 
-    response = client.post("/api/taps", content=body)
+    response = client.post("/api/taps", headers=SHOWN, content=body)
 
     assert response.status_code == 422
     assert response.json() == {"detail": SHAPE}
@@ -745,7 +843,9 @@ def test_a_server_that_cannot_draw_a_photo_again_takes_taps_without_one(
     app.state.taps = Taps(store, TapMedia(tmp_path / "taps", "mock"), photos=None)
     client = TestClient(app)
 
-    refused = client.post("/api/taps", json={"location": PHONE, "photo": b64(jpeg())})
+    refused = client.post(
+        "/api/taps", headers=SHOWN, json={"location": PHONE, "photo": b64(jpeg())}
+    )
 
     # A photo is not kept as it was sent, so it is not kept at all.
     assert refused.status_code == 503
@@ -754,7 +854,12 @@ def test_a_server_that_cannot_draw_a_photo_again_takes_taps_without_one(
     }
     assert store.search() == []
     assert kept(tmp_path / "taps") == []
-    assert client.post("/api/taps", json={"location": PHONE, "clip": b64(wav())}).status_code == 201
+    assert (
+        client.post(
+            "/api/taps", headers=SHOWN, json={"location": PHONE, "clip": b64(wav())}
+        ).status_code
+        == 201
+    )
 
 
 def test_a_tap_whose_photo_is_being_drawn_when_the_server_stops_is_not_taken(
@@ -767,7 +872,9 @@ def test_a_tap_whose_photo_is_being_drawn_when_the_server_stops_is_not_taken(
     app = create_app()
     app.state.taps = Taps(store, TapMedia(tmp_path / "taps", "mock"), photos=Closed())
 
-    response = TestClient(app).post("/api/taps", json={"location": PHONE, "photo": b64(jpeg())})
+    response = TestClient(app).post(
+        "/api/taps", headers=SHOWN, json={"location": PHONE, "photo": b64(jpeg())}
+    )
 
     assert response.status_code == 503
     assert response.json() == {"detail": "This server is not taking taps."}
@@ -784,10 +891,14 @@ def test_a_server_keeps_a_real_photo_as_a_picture_it_drew_itself(
     photo = real[:2] + b"\xff\xe1\x00\x1bExif\x00\x00" + SECRETS[0] + real[2:] + SECRETS[3]
 
     with TestClient(create_app()) as client:
-        response = client.post("/api/taps", json={"location": PHONE, "photo": b64(photo)})
+        response = client.post(
+            "/api/taps", headers=SHOWN, json={"location": PHONE, "photo": b64(photo)}
+        )
         receipt = response.json()
         kept = client.app.state.taps.media(receipt["id"], "photo")  # type: ignore[attr-defined]
-        not_one = client.post("/api/taps", json={"location": PHONE, "photo": b64(jpeg())})
+        not_one = client.post(
+            "/api/taps", headers=SHOWN, json={"location": PHONE, "photo": b64(jpeg())}
+        )
 
     assert response.status_code == 201
     (row,) = EvidenceStore(tmp_path / "data" / "evidence" / "mock.sqlite3", "mock").search()
@@ -821,8 +932,11 @@ def test_a_tap_is_left_out_of_fastapis_telemetry_and_other_routes_are_not(
 
     assert client.get("/api/health?probe=1").status_code == 200
     traced = len(spans)
-    assert client.post("/api/taps?lat=37.7763549", json={"location": PHONE}).status_code == 201
-    assert client.post("/api/taps", json={"location": {}}).status_code == 422
+    assert (
+        client.post("/api/taps?lat=37.7763549", json={"location": PHONE}, headers=SHOWN).status_code
+        == 201
+    )
+    assert client.post("/api/taps", headers=SHOWN, json={"location": {}}).status_code == 422
 
     # The provider is in use, and it is told nothing about a tap.
     assert traced > 0
@@ -931,7 +1045,9 @@ def test_a_host_that_could_not_run_the_converter_is_not_told_its_photo_is_bad(
     app = create_app()
     app.state.taps = Taps(store, TapMedia(tmp_path / "taps", "mock"), photos=Unavailable())
 
-    response = TestClient(app).post("/api/taps", json={"location": PHONE, "photo": b64(jpeg())})
+    response = TestClient(app).post(
+        "/api/taps", headers=SHOWN, json={"location": PHONE, "photo": b64(jpeg())}
+    )
 
     assert response.status_code == 503
     assert response.json() == {
@@ -951,8 +1067,12 @@ def test_a_server_on_a_host_that_collects_core_dumps_takes_no_photos(
     monkeypatch.setattr(beacon_taps, "core_dump_problem", lambda: "This host hands core dumps on.")
 
     with TestClient(create_app()) as client:
-        photo = client.post("/api/taps", json={"location": PHONE, "photo": b64(jpeg())})
-        without = client.post("/api/taps", json={"location": PHONE, "clip": b64(wav())})
+        photo = client.post(
+            "/api/taps", headers=SHOWN, json={"location": PHONE, "photo": b64(jpeg())}
+        )
+        without = client.post(
+            "/api/taps", headers=SHOWN, json={"location": PHONE, "clip": b64(wav())}
+        )
 
     assert (photo.status_code, without.status_code) == (503, 201)
     assert "Taps are taken without photos." in caplog.text
@@ -988,7 +1108,7 @@ def test_a_server_that_cannot_be_marked_runs_where_no_collector_is_handed_a_core
     monkeypatch.setattr(beacon_main, "core_dump_problem", lambda: None)
 
     with TestClient(create_app()) as client:
-        response = client.post("/api/taps", json={"location": PHONE})
+        response = client.post("/api/taps", headers=SHOWN, json={"location": PHONE})
 
     # Its core size limit of nothing is enough where a core would be a file.
     assert response.status_code == 201
@@ -1008,7 +1128,8 @@ def test_a_server_that_takes_taps_is_a_process_the_kernel_makes_no_core_of(
         "before = libc.prctl(3, 0, 0, 0, 0)\n"
         "with TestClient(create_app()) as client:\n"
         "    place = {'location': {'lat': 37.7763, 'lon': -122.4244}}\n"
-        "    status = client.post('/api/taps', json=place).status_code\n"
+        "    shown = {'Beacon-Mode': 'mock'}\n"
+        "    status = client.post('/api/taps', json=place, headers=shown).status_code\n"
         "    core = resource.getrlimit(resource.RLIMIT_CORE)[0]\n"
         "    print(before, libc.prctl(3, 0, 0, 0, 0), core, status)\n"
     )
@@ -1044,7 +1165,7 @@ def test_a_tap_is_left_out_of_telemetry_wherever_the_app_is_served_from(
 
     assert client.get("/beacon/api/health").status_code == 200
     traced = len(spans)
-    tapped = client.post("/beacon/api/taps?lat=37.7763549", json={"location": PHONE})
+    tapped = client.post("/beacon/api/taps?lat=37.7763549", json={"location": PHONE}, headers=SHOWN)
 
     assert tapped.status_code == 201
     assert traced > 0
@@ -1083,8 +1204,8 @@ def test_a_second_server_in_the_same_data_directory_does_not_start(
             TestClient(create_app()),
         ):
             pass
-        assert first.post("/api/taps", json={"location": PHONE}).status_code == 201
+        assert first.post("/api/taps", headers=SHOWN, json={"location": PHONE}).status_code == 201
 
     # The first has stopped and given the directory up.
     with TestClient(create_app()) as second:
-        assert second.post("/api/taps", json={"location": PHONE}).status_code == 201
+        assert second.post("/api/taps", headers=SHOWN, json={"location": PHONE}).status_code == 201

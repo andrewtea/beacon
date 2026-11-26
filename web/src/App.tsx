@@ -1,77 +1,100 @@
 import { useEffect, useState } from 'react'
 import './App.css'
 import { fetchHealth } from './api/health.ts'
-import { ApiError } from './api/http.ts'
+import { Icon } from './components/Icon.tsx'
+import { usePolled } from './lib/poll.ts'
+import { href, type Route, useRoute } from './lib/router.ts'
+import { sweepTaps } from './lib/tapStore.ts'
+import { Home } from './views/Home.tsx'
+import { IncidentView } from './views/IncidentView.tsx'
+import { TapView } from './views/TapView.tsx'
+import { TraceView } from './views/TraceView.tsx'
 
-type ServerState =
-  | { kind: 'checking' }
-  | { kind: 'connected'; version: string }
-  | { kind: 'unreachable'; reason: string }
+const HEALTH_MS = 30_000
 
-function useServerState(): ServerState {
-  const [state, setState] = useState<ServerState>({ kind: 'checking' })
-
-  useEffect(() => {
-    const controller = new AbortController()
-    fetchHealth(controller.signal)
-      .then((health) =>
-        setState({ kind: 'connected', version: health.version }),
+function View({
+  route,
+  mode,
+  onOtherMode,
+}: {
+  route: Route
+  mode: 'live' | 'mock' | null
+  onOtherMode: () => void
+}) {
+  switch (route.view) {
+    case 'home':
+      return <Home mode={mode} onOtherMode={onOtherMode} />
+    case 'tap':
+      return <TapView key={route.id} id={route.id} />
+    case 'trace':
+      return <TraceView key={route.id} id={route.id} />
+    case 'incident':
+      return <IncidentView key={route.id} id={route.id} />
+    case 'unknown':
+      return (
+        <div className="view">
+          <h1>There is nothing at this address</h1>
+          <a className="action" href={href.home}>
+            <Icon name="back" size={16} />
+            Back to the button
+          </a>
+        </div>
       )
-      .catch((error: unknown) => {
-        if (controller.signal.aborted) return
-        setState({
-          kind: 'unreachable',
-          reason:
-            error instanceof ApiError
-              ? error.message
-              : 'The server could not be reached.',
-        })
-      })
-    return () => controller.abort()
-  }, [])
-
-  return state
-}
-
-const serverLabel = (state: ServerState): string => {
-  switch (state.kind) {
-    case 'checking':
-      return 'Checking server…'
-    case 'connected':
-      return `Server connected (v${state.version})`
-    case 'unreachable':
-      return 'Server unreachable'
   }
 }
 
 export default function App() {
-  const server = useServerState()
+  const route = useRoute()
+  // Counted up when the server refused a tap for being in another mode than is
+  // shown here. The health is then asked for anew, under a new key, and until
+  // it answers the mode is not known and no tap is taken.
+  const [asked, setAsked] = useState(0)
+  const health = usePolled(`health:${asked}`, fetchHealth, () => HEALTH_MS)
+  const unreachable = health.error !== null
+  // The mode is what the server said at the latest asking. When that asking
+  // failed, the mode is not known: the last answer is not carried over, because
+  // the server that comes back can be another one, on other sources.
+  const mode = unreachable ? null : (health.data?.mode ?? null)
+  // A tap the server no longer answers for is deleted from this device.
+  useEffect(() => sweepTaps(), [])
 
   return (
     <div className="app">
-      <header className="bar">
-        <img src="/favicon.svg" alt="" width="28" height="28" />
-        <span className="name">Beacon</span>
+      <header className="topbar">
+        <a className="brand" href={href.home}>
+          <img src="/favicon.svg" alt="" width="28" height="28" />
+          <span className="name">Beacon</span>
+        </a>
+        {mode === 'mock' && (
+          <span className="tag stand-in">Invented scenario</span>
+        )}
       </header>
+      {mode === 'mock' && route.view === 'home' && (
+        <p className="mock-banner">
+          Beacon is running on an invented scenario, not real sources. The
+          incidents, alerts, and notices it shows are made up and are not a
+          record of anything that happened.
+        </p>
+      )}
+      {unreachable && (
+        <p className="note problem" role="status">
+          {health.error?.message}
+        </p>
+      )}
       <main>
-        <h1>What’s that?</h1>
-        <p className="lede">
-          You hear a siren or see a helicopter. Beacon will say what is going
-          on, which crews are on it, and roughly where, with a source on every
-          claim.
-        </p>
-        <p className="note">
-          This is the app’s shell. The What’s that? button is not built yet, so
-          there is nothing to tap.
-        </p>
+        <View
+          route={route}
+          mode={mode}
+          onOtherMode={() => setAsked((count) => count + 1)}
+        />
       </main>
       <footer>
-        <p className={`server ${server.kind}`} role="status">
-          <span className="dot" aria-hidden="true" />
-          {serverLabel(server)}
+        <p>
+          Beacon relays what authorities publish and tells nobody what to do.
+          Every line names its source.
         </p>
-        {server.kind === 'unreachable' && (
-          <p className="reason">{server.reason}</p>
+        {health.data !== null && !unreachable && (
+          <p className="server">Server v{health.data.version}</p>
         )}
       </footer>
     </div>

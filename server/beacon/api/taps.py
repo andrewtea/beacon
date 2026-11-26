@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
@@ -28,6 +28,19 @@ _TOO_LARGE = "A tap is at most ten megabytes, with its photo and its clip."
 RECEIVE_SECONDS = 20.0
 _TOO_SLOW = "A tap has to arrive within twenty seconds. Send it again."
 _NO_SUCH_TAP = "There is no such tap."
+# Every tap says which mode its sender was shown: `live`, or `mock` for the
+# invented scenario. It is the one header of a tap that is read for what it
+# says, and it says nothing of who sent the tap.
+MODE_HEADER = "Beacon-Mode"
+_NO_MODE = (
+    "A tap says which mode its sender was shown, in the Beacon-Mode header: live or "
+    "mock. This one does not, and nothing of it was read."
+)
+_OTHER_MODE = (
+    "This server is not in the mode the tap's sender was shown: it runs on real "
+    "sources and the sender was shown the invented scenario, or the other way round. "
+    "Nothing of the tap was read or kept. Look at what Beacon shows now, and tap again."
+)
 # For how long a tap's answer is read. A run is kept for `KEPT`, and a tap that is
 # older is answered as one Beacon does not have, not as one it did not look into.
 ANSWERED = KEPT - timedelta(hours=1)
@@ -131,6 +144,10 @@ class TapAnswer(BaseModel):
     # now. It did not take the tap to be about them, and `nearby_text` says so.
     nearby: list[IncidentSummary]
     nearby_text: str | None
+    # 511's credit, when the place the investigator's tool measured from for one
+    # of `nearby` was a 511 closure's, as it was then: that an incident is listed
+    # as near rests on that place. Show it beside `nearby_text`.
+    nearby_credit: CreditOut | None = None
     # Whether Beacon still lists what begins near the tap: for half an hour after
     # an unconfirmed tap. `since` are the incidents whose first radio call came
     # after the tap, within a kilometre. Nobody investigated whether one is what
@@ -138,6 +155,9 @@ class TapAnswer(BaseModel):
     watching: bool
     since: list[IncidentSummary]
     since_text: str | None
+    # 511's credit, when the place one of `since` is near the tap by is a 511
+    # closure's. Show it beside `since_text`.
+    since_credit: CreditOut | None = None
     # What the investigation cost, and how many calls to Ember it made.
     # `cost_incomplete` is true when a call ended in an error after it may have
     # been sent, or nothing was kept of the run: the totals may then be incomplete,
@@ -271,10 +291,25 @@ class TapRun(BaseModel):
 async def tap(request: Request) -> TapReceipt:
     """Take a tap. The body is JSON, and is read here and not by FastAPI: a tap can
     hold a place, a photo, and a clip, so nothing about it goes through a reader
-    that would repeat it in an error, and no more of it is read than a tap may be."""
+    that would repeat it in an error, and no more of it is read than a tap may be.
+
+    A tap names the mode its sender was shown in the `Beacon-Mode` header, and is
+    refused with 409, unread, by a server in the other mode, and with 400 when it
+    names none."""
     taps: Taps | None = getattr(request.app.state, "taps", None)
     if taps is None:
         raise HTTPException(503, "This server is not taking taps.")
+    # Before a place is held and before any of the body is read: a tap made for
+    # the other mode is not this server's to take. An app that was shown the
+    # invented scenario can outlive it, and its invented place is not to be
+    # stored, or investigated at a price, as a real one; a clip or a photo meant
+    # for a real server is not to go to the scenario unannounced. The app can
+    # only learn of a change by asking, so the check that holds is here.
+    shown = request.headers.get(MODE_HEADER)
+    if shown not in ("live", "mock"):
+        raise HTTPException(400, _NO_MODE)
+    if shown != taps.store.mode:
+        raise HTTPException(409, _OTHER_MODE)
     try:
         # A place among the taps being received is held from before the body is
         # read until the tap is taken or refused, so that only so many are in
@@ -451,9 +486,13 @@ def tap_answer(request: Request, tap_id: str) -> TapAnswer:
         match=None if run is None or outcome is None else _match(run, outcome),
         nearby=[summary_of(request, incident) for incident in nearby],
         nearby_text=words.NEARBY if nearby else None,
+        nearby_credit=_nearby_credit(run, nearby),
         watching=watching,
         since=[summary_of(request, incident) for incident in since],
         since_text=words.SINCE if since else None,
+        since_credit=_credit()
+        if any(incident.point_from == "closure" for incident in since)
+        else None,
         cost_usd=0.0 if run is None else run.cost_usd,
         ember_calls=0 if run is None else len(run.calls),
         cost_incomplete=lost or unaccounted,
@@ -524,6 +563,20 @@ def _nearby(run: Run, snapshot: Snapshot) -> list[Any]:
     ]
     found = [snapshot.get(incident_id) for incident_id in dict.fromkeys(ids) if incident_id]
     return [incident for incident in found if incident is not None]
+
+
+def _nearby_credit(run: Run | None, nearby: Sequence[Any]) -> CreditOut | None:
+    """511's credit for the incidents listed as near a tap, when the place one of
+    them was found near by was a 511 closure's. It is read from what the run's
+    tool kept then, not from the incident now, whose place can have changed
+    since: the listing rests on where the tool measured from."""
+    if run is None:
+        return None
+    for incident in nearby:
+        then = words.found_then(run, incident.id)
+        if then is not None and then.get("point_from") == "closure":
+            return _credit()
+    return None
 
 
 def _since(row: Evidence, snapshot: Snapshot) -> list[Any]:
