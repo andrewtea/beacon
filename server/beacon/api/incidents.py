@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict
 
 from beacon.incident import Engine, Incident
+from beacon.story import StoryDesk
 
 router = APIRouter()
 
@@ -63,15 +64,25 @@ class OfficialOut(_Read):
     until: datetime | None
     issuer: str | None
     headline: str | None
-    # An alert's instruction, in the authority's own words. Beacon adds none.
+    # An alert's instruction, in the authority's own words. Beacon adds none. For
+    # a notice (`reading` is true), Ember's reading of the document's instruction,
+    # when the redaction pass let it through: show it as Beacon's reading, beside
+    # the link, and never as what to do.
     instruction: str | None
-    # True for a notice: Beacon has a model's reading of the document at
-    # `source.url`, and shows none of its words yet.
+    # A notice's summary and the areas it names, as Ember read them. Empty for an alert.
+    summary: str | None
+    areas: list[str]
+    # True for a notice: `issuer`, `headline`, `instruction`, `summary`, and
+    # `areas` are a model's reading of the document at `source.url`, which is the
+    # authority speaking.
     reading: bool
     source: SourceOut
-    # The fields of an alert left out because the stored text may have been cut:
-    # the alert has more, at `source.url`.
+    # The fields that are not all here because there was more than Beacon keeps:
+    # say that the original has more, at `source.url`.
     incomplete: list[str]
+    # The fields of a notice the redaction pass did not let through, which are
+    # left out whole: say that the document has more.
+    withheld: list[str]
 
 
 class SignalOut(_Read):
@@ -80,6 +91,15 @@ class SignalOut(_Read):
     confidence: Literal["official", "high", "medium", "low"]
     # The rows the signal rests on, each with its link and its credit.
     sources: list[SourceOut]
+
+
+class ConflictOut(_Read):
+    # Radio traffic and an official source that do not agree. The official source
+    # holds, and `text` says so and why: show it with the incident.
+    kind: str
+    text: str
+    official: list[SourceOut]
+    radio: list[SourceOut]
 
 
 class TrackOut(_Read):
@@ -120,15 +140,58 @@ class IncidentSummary(_Read):
     # Whether more positions of aircraft were near it than were read.
     aircraft_more: bool
     signals: list[SignalOut]
+    conflicts: list[ConflictOut]
     # True when any row the incident is built from is a stand-in's: the invented
     # scenario, or a fake Ember. It is then to be labeled as one.
     stand_in: bool
+
+
+class ClaimOut(_Read):
+    # A sentence Ember wrote, which the redaction pass let through whole.
+    text: str
+    # The least confidence among the lines it rests on, and those lines' sources.
+    # Code works both out; Ember does not.
+    confidence: Literal["official", "high", "medium", "low"]
+    sources: list[SourceOut]
+    # Words to show beside the sentence, or null: "That is radio traffic, not an
+    # official order." for one about an evacuation, sheltering, or an all-clear.
+    note: str | None
+
+
+class StoryOut(_Read):
+    """What Ember wrote about the incident from its radio, closure, aircraft, and
+    tap lines. It says nothing of alerts or notices: those are in `official`."""
+
+    written_at: datetime
+    # Whether it was written from the lines the incident has now. False while a
+    # newer one is due: the timeline then has lines the story has not read.
+    current: bool = False
+    # Null when Ember gave none that may be shown: use the incident's `title`.
+    headline: str | None
+    claims: list[ClaimOut]
+    # How many of Ember's sentences were left out, and how many of the incident's
+    # older lines Ember was not given.
+    left_out: int
+    lines: int
+    lines_left_out: int
+    # Which kind of Ember client wrote it: `live`, or `fake` for a stand-in.
+    model: str
+    # True when a stand-in wrote it or a line under it is a stand-in's: label it.
+    stand_in: bool
+    input_tokens: int
+    cached_tokens: int
+    output_tokens: int
+    reasoning_tokens: int
+    cost_usd: float
+    latency_ms: int
 
 
 class IncidentDetail(IncidentSummary):
     timeline: list[EntryOut]
     official: list[OfficialOut]
     aircraft: list[TrackOut]
+    # Null when no story has been written: the incident is then its lines.
+    story: StoryOut | None = None
 
 
 class Incidents(BaseModel):
@@ -184,9 +247,16 @@ def incident(request: Request, incident_id: str) -> IncidentAnswer:
     found: Incident | None = snapshot.get(incident_id)
     if found is None:
         raise HTTPException(404, "There is no such incident.")
+    detail = IncidentDetail.model_validate(found)
+    desk: StoryDesk | None = getattr(request.app.state, "stories", None)
+    # Reading a story asks Ember nothing: only the desk's own pass writes one.
+    told = None if desk is None else desk.latest(found)
+    if told is not None:
+        story, current = told
+        detail.story = StoryOut.model_validate(story).model_copy(update={"current": current})
     return IncidentAnswer(
         mode=engine.mode,
         as_of=snapshot.as_of,
         partial=snapshot.partial,
-        incident=IncidentDetail.model_validate(found),
+        incident=detail,
     )

@@ -18,7 +18,9 @@ Each `server/beacon/` package has one concern, so parallel pull requests stay ap
 - `ingest/`: one module per source (`nws`, `opensky`, `traffic511`, `openmhz`, `notices`), the `Runner` that polls them, `paid` (what a poller that pays Ember for each item keeps to), and `setup`, which reads `BEACON_LIVE_SOURCES` once to open the right store (`open_store`) and make the pollers (`build`).
 - `notice/`: what is kept of an official notice (`Notice`), and the Ember call that reads one from its PDF (`read_notice` in `read`).
 - `radio/`: the closed vocabulary a radio call is kept in and the lists a unit or a street has to be on (`vocabulary`), the Ember call that hears one (`extract_transmission` in `extract`), and the in-memory, confined decoding of its audio (`audio`), whose `Ffmpeg` also draws a tap's photo again.
+- `redact/`: the redaction pass. `screen` lets a text a model wrote through only when every word of it is an ordinary word or a listed name (`reading` for a notice's words, `own` for Beacon's voice); `vocabulary` is the words.
 - `scenario/`: the mock scenario, an invented San Francisco fire served to the pollers in each source's own format, with its radio calls and the stand-in for Ember that "hears" them (`radio`), and its notices, written as PDFs (`pdf`), with the stand-in that "reads" them (`notices`).
+- `story/`: what Ember writes about an incident. `merge` is the Ember call (`merge_incident`) and what is kept of its answer, `store` the file stories are kept in (`Stories`), `desk` when one is paid for (`StoryDesk`), `stand_in` the stand-in that writes them with no key, and `setup` opens the desk (`open_stories`).
 - `taps/`: taking a tap. `desk` checks one, rounds its place, and stores its row (`Taps.take`); `media` has a photo drawn again as a new JPEG and a clip written out again as its samples, and keeps them for an hour (`Taps.media` reads them back).
 
 `beacon/errors.py` is a module beside them, with `raise_bare`: how an error about something private is raised with nothing chained under it.
@@ -163,7 +165,7 @@ store.add([NewEvidence(kind="tap", source="app", ref=tap_id, occurred_at=now,
   - `issuer`, `title`, `areas`, `streets`, `instruction`, and `summary` are empty for a `press_release` and for `other`, by design: those rows say that a document of that type was published, when, and where to read it. Do not put text back into them.
   - A notice row has no `place` and no `point`. Match it to an incident by `data["streets"]`, `hazard`, and time. An order's `areas` and `instruction` can name addresses finer than a block, as the order does; they are shown only as part of the reading, and never become a row's or an incident's `place`.
   - Nothing lifts an order but another row: an `all_clear` is a separate notice. Which order it lifts is not worked out from the rows, by the incident engine or by anything else: a row keeps streets and no blocks, so both are shown as published, each with its link.
-  - The redaction pass still reads a notice's text before it is shown: Ember is told to leave private people out, which is not a guarantee.
+  - The redaction pass (`beacon.redact.reading`) reads a notice's text before it is shown: Ember is told to leave private people out, which is not a guarantee. The incident engine applies it (`Official`); read a notice's words from there, not from the row.
 - **A `tap` row** (`source == "app"`) is one press of the button, written by `POST /api/taps` through `beacon.taps.Taps.take`. `row.ref` is the tap's id, `row.occurred_at` the server's time, `row.point` the position rounded to three decimals (about a block), and `row.confidence` is `low`. Its `origin` is `live` in the mock store too: a person's tap is nobody's stand-in, so `row.stand_in` is False, and what makes an answer a stand-in's is the other evidence it is built on and the store's `mode`. `row.data` has `accuracy_m` (metres, or null), `photo` (`{"bytes", "width", "height"}` or null), `clip` (`{"bytes", "seconds"}` or null), and `media_kept_until`. The files themselves are read with `request.app.state.taps.media(tap_id, "photo" | "clip")`, which returns the JPEG Beacon drew from the photo (at most 2048 pixels on a side) or the WAV of the clip, or None once the row's `media_kept_until` has passed, for a tap with no row, and for a kind its row does not say it sent: handle None, do not copy the bytes anywhere that outlives the hour, and keep only what was concluded from them. A call to Ember that sends a tap's photo or clip is `sensitive=True` (it can show or record a person), so it is paid for every time and cannot run in replay-only mode; test it with `EmberClient.fake`. Do not store or log the position a phone sent, and do not add anything to a tap that says who sent it.
 - What `data` holds is documented where it is written: `beacon/ingest/nws.py` (`_alert`), `opensky.py` (`_aircraft`), `traffic511.py` (`_event`), for radio `beacon/radio/extract.py` (`Transmission.as_data`), and for a notice `beacon/notice/read.py` (`Notice.as_data`). Units are SI: metres, metres per second, degrees clockwise from north. A 511 row keeps the event's `schedule` as 511 sent it; the poller asks only for events in effect now.
 - Anything shown from a `511` row carries the words "data provided by 511.org" with a link to https://511.org beside it: 511's data agreement requires it.
@@ -188,11 +190,12 @@ for incident in engine.incidents():  # the last twelve hours, newest first
 engine.get(incident_id)  # one incident, or None
 ```
 
-- **An incident is derived, never stored.** It is a function of the evidence rows (`build_incidents`), worked out again when the store has a new row. Do not add a table of incidents: a second record can disagree with the first. What a model later writes about an incident is kept under the incident's id and the evidence it was written from, beside the engine and not in it.
+- **An incident is derived, never stored.** It is a function of the evidence rows (`build_incidents`), worked out again when the store has a new row. Do not add a table of incidents: a second record can disagree with the first. What a model writes about an incident is kept under the incident's id and a digest of the lines it was written from, beside the engine and not in it (`beacon.story.Stories`).
 - **The engine asks no model.** Grouping, what is in force, circling, and signals are plain code with tests. Change a rule in `calls.py` or `build.py` with a test that fails without the change.
 - **Every line names its rows.** An `Entry`, an `Official`, and a `Signal` carry the sources they rest on (`Source`: the feed, the row's id, its link, its credit), and an entry's confidence is its row's. A new kind of line does the same, with `source_of(row)`; a line that rests on several rows is trusted as little as the weakest (`weakest`).
 - **Medical stays medical.** A medical call is grouped only with medical calls, its entry is "Medical response", units, and block, and its incident has no alarm, no official list, no signals, and no taps. Nothing downstream adds them back.
-- **The engine never shows a notice's words.** `Official.issuer`, `headline`, and `instruction` are None for a notice, and a notice's entry says only that a document of its type was published, with its link. The words are a model's reading and may name a person: they go through the redaction pass, and are shown as a reading beside the link. Of a notice's streets only the incident's own are shown.
+- **A notice's words are shown only through the redaction pass, as a reading.** A notice's timeline entry says only that a document of its type was published, with its link. `Official.issuer`, `headline`, `instruction`, `summary`, and `areas` hold a notice's words only when `beacon.redact.reading` let the whole text through; what did not pass is named in `Official.withheld`, and nothing is read of a type outside `TEXT_TYPES`. Show them as Beacon's reading beside `source.url`, never as the authority's words. Do not show a notice's text by any path that does not go through the pass.
+- **Official outranks radio, and code says so.** `Incident.conflicts` lists where the radio and an official source disagree, with a text that says the official source holds and why. Finding and wording a conflict is code's (`_conflicts` in `build.py`); no model weighs one source against another.
 - **`published` is not `in_force`.** Beacon has read a document; it does not know that an order still holds. Say that an authority published it. An all-clear is another published document, and no code says that it lifts an order: a notice's row keeps streets and no blocks, so an all-clear for one block of a street cannot be told from one for another. Show both with their links; there is no `lifted` state, and do not add one.
 - **`not_listed` is what Beacon saw.** Keep the words "not an official all-clear" with it.
 - **A point from 511 carries 511's credit.** `incident.point_from == "closure"` says the point is a 511 event's, and `incident.point_source` is that row's `Source` with the credit. Show the credit wherever the point is shown, a map included; a point from the list of blocks has no `point_source`.
@@ -203,6 +206,28 @@ engine.get(incident_id)  # one incident, or None
 - **A text that may have been cut is not relayed.** A stored text as long as its poller keeps (`nws.MAX_TEXT`, `nws.MAX_HEADLINE`, `traffic511.MAX_HEADLINE`) is left out whole, and an alert names the field in `Official.incomplete`. An alert applies to a place only when its drawn area holds the place.
 - **`unknown` is not `in_force`.** When the rows that could end an old alert were not all read, the alert's state is `unknown`, the reading is `partial`, and no signal is made of it.
 - **In tests**, `server/tests/incident_rows.py` has `Rows`, which stores one row of each kind in a mock store, and `open_engine({}, store, clock=...)` reads it at a moment of your choosing. `server/tests/test_incident_engine.py` plays the whole mock scenario through the engine.
+
+## Using the redaction pass and stories
+
+```python
+from beacon.redact import own, reading
+from beacon.story import merge_incident
+
+names = engine.names  # the listed streets, units, and public places, or None
+reading(notice_text, names)  # the text, or None when it does not pass
+own(model_text, names)  # as strict, and with no word that tells a reader what to do
+
+desk = request.app.state.stories  # a StoryDesk, or absent when no stories are written
+found = desk.latest(incident)  # (Story, current) or None; asks Ember nothing
+```
+
+- **Text a model wrote reaches a person only through `beacon.redact`.** `reading` for Ember's reading of an authority's notice, `own` for anything Ember writes in Beacon's voice. A text passes whole or is left out whole: never cut one, and never show one that failed. When a word plainly belongs, add it to `vocabulary.py` after asking whether it can describe a person or tell one what to do; never add a way past the lists.
+- **Beacon's own voice gives no instruction.** `ORDER_WORDS` (`leave`, `stay`, `go`, `must`, `you`, `effect`, `lifted`, ...) pass only in a reading. Do not move one into `WORDS`.
+- **A model is given no official text to retell.** `merge_incident` sends only radio, closure, aircraft, and tap lines (`LINE_KINDS`), and leaves out a sentence that speaks of an order, an alert, or a notice. What an authority said is shown by code from `Incident.official`. Keep it so for any new call that writes prose.
+- **Code derives a claim's sources and confidence.** A `Claim` gets them from the lines it cites (`weakest`). Do not let a model state its own confidence or source.
+- **A story is paid for once per basis.** `Stories.claim(incident_id, basis, ...)` before `merge_incident`, as `StoryDesk.refresh` does, and the rules after Ember has been asked are `PaidDesk`'s. `StoryDesk` pays under the scope `story:merge`. Reading a story (`desk.latest`, the incident route) never asks Ember.
+- **Only text that passed is written to the stories file**, and the live file refuses a stand-in's story. `merge_incident` is a `sensitive=True` call: Ember's raw answer is unread text and stays out of the ledger.
+- **In tests**, hand `merge_incident` an `EmberClient.fake` with a `Script` of answers, as `server/tests/test_story.py` does, or use `stand_in_writer`.
 
 ## Conventions
 

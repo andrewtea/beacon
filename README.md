@@ -26,7 +26,9 @@ Inside `server/beacon/`, each package has one concern so pull requests stay apar
 | `ingest/` | One poller per source, the loop that runs them, and how they are built from the environment. |
 | `notice/` | What is kept of an official notice, and the Ember call that reads one from its PDF (`read_notice`). |
 | `radio/` | What is kept of a dispatch radio call, the Ember call that hears one (`extract_transmission`), and the conversion of its audio. |
+| `redact/` | The redaction pass: a text a model wrote is shown only when every word of it is an ordinary word or a listed name. |
 | `scenario/` | The mock scenario: an invented San Francisco fire, served to the pollers in each source's format. |
+| `story/` | What Ember writes about an incident (`merge_incident`), where it is kept, and when it is paid for. |
 | `taps/` | Taking a tap: what is kept of its place, its photo, and its clip, and for how long. |
 
 ## Run locally
@@ -95,6 +97,8 @@ Settings come from the environment. The server does not load the repository-root
 | `BEACON_NOTICES_HOSTS` | Hosts a notice's document may be fetched from besides the feed's own, as a list. | A document anywhere else is not fetched. |
 | `BEACON_INGEST` | `0` starts the server without its pollers. | `1`: the server runs the pollers. |
 | `BEACON_BLOCKS_FILE` | A text file that says where blocks are, one to a line: `Hayes St,400,37.7766,-122.4236` (street, hundred block, latitude, longitude). Read for the live store only. | An incident heard on real radio has a point only when 511 lists a closure on its street; otherwise no tap, alert, or aircraft is matched to it. |
+| `BEACON_PLACES_FILE` | A text file of the public places and bodies a notice may name, one to a line (`Civic Center Plaza`). A reading of a notice that names a place or a street nobody listed is not shown. Read for the live store only. |
+| `BEACON_STORY_BUDGET_USD` | The most, in dollars, that writing incidents' stories may cost over every run. Needed, with a live Ember, for stories on the live store; unset, none is written. No default. |
 
 The server's routes do not build an Ember client yet. Today the Ember settings are read by the two commands under [Ember client](#ember-client), and by the pollers that pay Ember when they are turned on for real: `openmhz` and `notices` in `BEACON_LIVE_SOURCES`, each of which builds a client that can spend, under a budget of its own, in the server or in `python -m beacon.ingest`. The server reads the source settings when it starts, and `BEACON_DATA_DIR` with them. Three places set any of them. `scripts/check`, and so CI, sets `REPLAY=1` and removes `MODEL_API_KEY`. Server pytest does the same, removes the spending settings and every source setting, and points `BEACON_DATA_DIR` at a temporary directory for each test. The orb's API service in [`.amp/services.yaml`](.amp/services.yaml) sets `REPLAY=1`.
 
@@ -260,6 +264,8 @@ Both answers begin with `mode` (`mock` when the evidence is the invented scenari
 - **`timeline`**: one entry for each thing a source said, oldest first. Every entry has a `text` written by code from the row's own fields, a `confidence` (`official`, `high`, `medium`, `low`), and `sources`: the feed, a label for a person, the evidence row's id, a link when the original is public, whether a stand-in produced it, and for 511 the credit its data agreement requires. `details` holds the fields the text was written from, for an app that draws the line its own way.
 - **`official`**: the alerts and notices authorities issued for the place, each with how it stands: `in_force`, `replaced`, `cancelled`, `not_listed`, `ended`, `unknown` (the rows that could have ended it were not all read), and for a notice `published`, or `ended` once the time its own document gave has passed. An alert's `incomplete` names the texts that are left out because the stored text may have been cut.
 - **`aircraft`**: the aircraft that circled or came low over it.
+- **`conflicts`**: where the radio and an official source do not agree, each with a `text` that says the official source holds and why, and the `official` and `radio` sources. Code finds two kinds: crews said all clear while an alert is in force or an order stands (`all_clear_on_radio`), and a notice that names a street of the incident is about another hazard than the radio's calls (`hazard`). It is in the list too.
+- **`story`**: what Ember wrote about the incident, or null ([Stories](#stories)).
 
 How calls are grouped ([`calls.py`](server/beacon/incident/calls.py)):
 
@@ -280,12 +286,35 @@ The engine's wording keeps the product's rules:
 - A medical call is "Medical response", its units, and its block. Whatever else a row held is not read.
 - What crews say on the radio about an evacuation, sheltering, or an all-clear is written as radio traffic, with "That is radio traffic, not an official order."
 - An official alert's `instruction` is the authority's own words and is shown as its own. Beacon writes no instruction. A text as long as the poller keeps (8,000 characters for an instruction) may have been cut, and a cut instruction can lose its exception, so it is left out whole and the alert says `incomplete`.
-- **A notice's words are not shown.** A notice row is a model's reading of a document, so an incident says that an authority published a notice of a type, that this is Beacon's reading, and where the document is (`source.url`). Its issuer, title, areas, instruction, and summary are left out until the redaction pass has read them, and of its streets only the ones the incident's own calls name are shown.
+- **A notice's words are shown only as a reading, and only when they pass the redaction pass.** A notice row is a model's reading of a document. A line of the timeline says that an authority published a notice of a type, that this is Beacon's reading, and where the document is (`source.url`), and shows none of its words. An entry of `official` with `reading: true` carries the reading's `issuer`, `headline`, `instruction`, `summary`, and `areas`, each only when the whole text passed ([Redaction](#redaction)); the fields that did not are named in `withheld` and left out whole. Show them labeled as Beacon's reading, beside the link, and never as the authority's words or as what to do. Nothing is read of a press release.
 - Taps are counted and never listed: a tap's id is what its sender reads the answer with.
 
 **Signals** are what code can say makes an incident more than an everyday call. Each has a `kind` (`alarm`, `evacuation_on_radio`, `many_units`, `official_notice`, `official_alert`, `closure`, `aircraft_circling`, `taps`); `official_notice` covers orders and warnings alike and says which in its text, so do not word it as an order. They are: an alarm level of two or more, an evacuation mentioned on the radio, eight or more units, an official order or warning, named as the type it is (a warning is never called an order; when an all-clear was published too the signal says so, without saying which came first, and cites every document), an official alert in force, a road closed in the version of a 511 event that is in force, when the road is one of the incident's or the closure is within 300 m of its point, a circling aircraft, three or more taps. Each carries the sources it rests on, with 511's credit and a notice's link, and a confidence that is its weakest source's, so a signal shown by itself still says where it is from. The engine lists them and decides nothing from them; whether they add up to crisis mode is the investigator's decision.
 
 Limits: the engine reads the last twelve hours and at most 20,000 rows, the newest first; an incident's `id` is a digest of the row of its that was stored first, so it is this store's own (another store that took the same calls in another order can name it differently) and an incident that runs longer than twelve hours changes its id; at most 5,000 taps and 5,000 aircraft positions are read for one incident; two incidents on one block within 45 minutes are taken for one; and an aircraft is "circling" when it stayed three minutes and went most of the way round, whoever it belongs to.
+
+### Redaction
+
+What a model wrote is read by the redaction pass ([`server/beacon/redact/`](server/beacon/redact)) before a person is shown it. The pass is an allowlist: a text passes only when it is made of the ordinary words in [`vocabulary.py`](server/beacon/redact/vocabulary.py), names somebody listed (the radio's streets and units, public bodies, and the public places in `BEACON_PLACES_FILE`), numbers, and plain punctuation. A word that is not on a list, which is what a person's name is, fails the whole text, and so does an ordinary word written with a capital in the middle of a sentence. **A text is shown whole or left out, never cut.** The vocabulary leaves out the words for who a person is and what happened to them (age, man, injured, hospital).
+
+There are two strengths. `reading` is for Ember's reading of an authority's notice: it may use the words an instruction is made of, and numbers freely, because an order names the addresses it is for. `own` is for what Ember writes in Beacon's voice: no word that tells a reader what to do (`leave`, `stay`, `go`, `must`, `you`), no word that says an order holds (`effect`, `force`, `lifted`), and no number in front of a street. That is how "Beacon never says stay or go" is kept for text a model writes.
+
+What the pass cannot do: it does not understand a text, a listed name passes whatever is meant by it, a name that is also an ordinary word passes at the start of a sentence, and a person can be described without a word the list lacks. It fails safe and often: a notice that names a street nobody listed is not shown, and the fix is the operator's list. On the live store with no lists, no reading that names a street passes.
+
+### Stories
+
+`merge_incident` ([`server/beacon/story/`](server/beacon/story)) has Ember say in a few sentences what an incident's lines add up to. It decides nothing: the engine has already grouped the evidence and written the lines.
+
+- **Ember is given only the lines of radio, 511 events, aircraft, and taps**, as code wrote them, and no alert or notice. What an authority said is shown by code, never in a model's retelling, and a sentence that uses a word for an official act (`order`, `official`, `alert`, `warning`, `notice`) is left out.
+- **Every sentence cites lines, and code gives it its sources and its confidence**: the sources of the lines it cites, and the least confidence among them. A sentence that cites nothing that is there is left out.
+- **Every sentence passes the redaction pass in Beacon's own voice**, or is left out whole. A story says how many sentences were left out (`left_out`).
+- A sentence about an evacuation, sheltering, or an all-clear rests on radio alone, so it carries the `note` "That is radio traffic, not an official order."
+- **A medical response has no story.**
+- Nothing checks that a sentence is true to the lines it cites. Its sources say what it rests on, and the lines are shown beside it.
+
+A story is kept in `data/story/mock.sqlite3` or `data/story/live.sqlite3`, under the incident's id and a digest of the lines it was written from, and holds only sentences that passed. The call is `sensitive=True`, so the Ember ledger keeps its tokens and cost and none of its text. The server looks over the incidents every 15 seconds and has a story written for one that is open, is not medical, has at least three lines, and has lines no story was written from: once for the same lines, at most every two minutes for one incident, and at most three in a pass ([`desk.py`](server/beacon/story/desk.py)). Reading an incident never asks Ember anything. `story.current` is false while the incident has lines its story has not read.
+
+**In mock mode a stand-in writes the stories** ([`stand_in.py`](server/beacon/story/stand_in.py)), by rule from the lines, and a story says so: `model` is `fake` and `stand_in` is true. No real Ember has written one. On the live store stories are written only when `BEACON_STORY_BUDGET_USD` is set, by a live Ember that pays under the spending scope `story:merge`; a refusal or a failure holds the desk for ten minutes, as it holds a paying poller.
 
 ## Ember client
 

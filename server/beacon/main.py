@@ -14,9 +14,11 @@ from fastapi.responses import JSONResponse
 
 from beacon import __version__
 from beacon.api import health, incidents, sources, taps
-from beacon.incident import open_engine
+from beacon.incident import Engine, open_engine
 from beacon.ingest import IngestConfigError, build
+from beacon.ingest.setup import PAID_SECONDS, Ingest
 from beacon.radio import core_dump_problem, forbid_core_dumps
+from beacon.story import StoryDesk, open_stories
 from beacon.taps import Taps, open_taps
 
 _REQUEST_PARTS = frozenset({"body", "query", "path", "header", "cookie"})
@@ -24,6 +26,8 @@ _REQUEST_PARTS = frozenset({"body", "query", "path", "header", "cookie"})
 INGEST_VARIABLE = "BEACON_INGEST"
 # How often the photos and clips whose hour is over are deleted.
 SWEEP_SECONDS = 60.0
+# How often the incidents are looked over for one whose story is due.
+STORY_SECONDS = 15.0
 # The routes that take something private. No log line and no telemetry is written
 # about a request to one: add a route here when it takes what a person sends.
 PRIVATE_PATHS = ("/api/taps",)
@@ -126,6 +130,18 @@ async def _sweep_tap_media(taps: Taps, stop: asyncio.Event) -> None:
             await asyncio.wait_for(stop.wait(), SWEEP_SECONDS)
 
 
+async def _tell_stories(desk: StoryDesk, engine: Engine, stop: asyncio.Event) -> None:
+    """Until `stop` is set, have the stories that are due written, every
+    `STORY_SECONDS`. A pass that fails is logged by its kind and tried again."""
+    while not stop.is_set():
+        try:
+            await asyncio.to_thread(lambda: desk.refresh_all(engine.snapshot()))
+        except Exception as error:
+            logger.error("The incidents' stories could not be written (%s).", type(error).__name__)
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), STORY_SECONDS)
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Take taps for as long as the server runs, and run the pollers on a thread of
@@ -160,6 +176,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     ingest = build(os.environ) if setting == "1" else None
     taps: Taps | None = None
     sweeping: asyncio.Task[None] | None = None
+    stories: StoryDesk | None = None
+    telling: asyncio.Task[None] | None = None
     stop = asyncio.Event()
     # Whatever of this is begun is ended below, however far the beginning got.
     try:
@@ -167,7 +185,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.taps = taps
         # The incidents are read from the same evidence store the taps go to,
         # which is there whether or not this server runs the pollers.
-        app.state.incidents = open_engine(os.environ, taps.store)
+        engine = open_engine(os.environ, taps.store)
+        app.state.incidents = engine
+        # What Ember writes about an incident: a stand-in's on the mock store, and
+        # on the live store written only under a budget somebody set.
+        stories = open_stories(os.environ, engine)
+        if stories is not None:
+            app.state.stories = stories
+            telling = asyncio.create_task(_tell_stories(stories, engine, stop))
         sweeping = asyncio.create_task(_sweep_tap_media(taps, stop))
         if ingest is not None:
             app.state.ingest = ingest
@@ -177,26 +202,44 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Each step in a `finally` of its own, so that one that fails does not keep
         # the ones after it from running.
         try:
+            # Told to stop and waited for, not cancelled: a sweep or a story that
+            # is under way runs on a thread, which a cancellation would leave
+            # running after what it writes to is closed.
+            stop.set()
             if sweeping is not None:
-                # Told to stop and waited for, not cancelled: a sweep that is
-                # under way runs on a thread, which a cancellation would leave
-                # running after the taps are closed.
-                stop.set()
                 await sweeping
         finally:
             try:
-                if taps is not None:
-                    taps.close()
+                if stories is not None:
+                    # Off the event loop. No new story is asked for; one whose
+                    # paid request is out is waited for and kept.
+                    if not await asyncio.to_thread(stories.stop, PAID_SECONDS):
+                        logger.warning(
+                            "A story was still being written when the server shut "
+                            "down. If its paid Ember request was out, it can still "
+                            "be sent and paid for: it is in the Ember ledger, and "
+                            "the story is lost."
+                        )
+                    if telling is not None:
+                        await telling
             finally:
-                # Off the event loop, and not returned from until the pollers can
-                # ask no source and store no row: nothing of theirs outlives the
-                # server. It is safe for pollers that were never started.
-                if ingest is not None and not await asyncio.to_thread(ingest.stop):
-                    logger.warning(
-                        "The pollers had not stopped when the server shut down. If a "
-                        "paid Ember request was out, it can still be sent and paid "
-                        "for: it is in the Ember ledger, and its row is lost."
-                    )
+                try:
+                    if taps is not None:
+                        taps.close()
+                finally:
+                    await _stop_ingest(ingest)
+
+
+async def _stop_ingest(ingest: Ingest | None) -> None:
+    """Stop the pollers. Off the event loop, and not returned from until they can
+    ask no source and store no row: nothing of theirs outlives the server. It is
+    safe for pollers that were never started."""
+    if ingest is not None and not await asyncio.to_thread(ingest.stop):
+        logger.warning(
+            "The pollers had not stopped when the server shut down. If a paid Ember "
+            "request was out, it can still be sent and paid for: it is in the Ember "
+            "ledger, and its row is lost."
+        )
 
 
 async def _validation_error(_request: Request, error: RequestValidationError) -> JSONResponse:

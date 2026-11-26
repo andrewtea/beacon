@@ -46,12 +46,18 @@ The wording here is where the product's rules about words are kept:
   long as its poller keeps may have been cut, so it is left out whole and named in
   `Official.incomplete`: the original is where to read it.
 - A notice is written as a document of its type that was published, with its link.
-  Its words are a model's reading, and none of them is shown here: the redaction
-  pass has to read them first. An order and an all-clear are each a document that
+  Its words are a model's reading. A timeline line shows none of them, and
+  `Official` shows the ones the redaction pass let through whole
+  (`beacon.redact.reading`), as Beacon's reading beside the link; what did not
+  pass is named in `Official.withheld`. With no list of names nothing passes that
+  names a street. An order and an all-clear are each a document that
   was published. Which order an all-clear lifts, and where, is not worked out: a
   notice's row keeps streets and no blocks, so that is read in the documents.
 - That a source stopped listing something is written as what Beacon saw, not as an
   all-clear.
+- Where the radio and an official source disagree, the official source holds, and
+  the incident says so and why (`Incident.conflicts`): crews saying all clear does
+  not end an alert or lift an order, and a notice's hazard outranks the radio's.
 - Everything from 511 carries the credit its data agreement requires.
 """
 
@@ -66,6 +72,7 @@ from beacon.incident.calls import IDLE, CallGroup, group_calls
 from beacon.incident.inforce import Standing, notice_streets, standings
 from beacon.incident.model import (
     CONFIDENCE_RANK,
+    Conflict,
     Credit,
     Entry,
     Incident,
@@ -75,8 +82,9 @@ from beacon.incident.model import (
 )
 from beacon.incident.places import Blocks
 from beacon.ingest import nws, traffic511
-from beacon.notice import ORDERS
+from beacon.notice import ORDERS, TEXT_TYPES
 from beacon.radio.vocabulary import MEDICAL_EVENT, clean_street, place_in_words
+from beacon.redact import Names, reading
 
 # How far from an incident's point a closure and a tap may be.
 CLOSURE_M = 300.0
@@ -173,6 +181,24 @@ _HAZARDS: dict[str, set[str]] = {
     "utility": {"utility"},
     "rescue": {"flood", "earthquake", "weather"},
 }
+# What a notice's hazard and an incident's category are called where the two are
+# set against each other. A hazard that says nothing (`other`, `none`) has no words.
+_HAZARD_WORDS = {
+    "fire": "a fire",
+    "smoke": "smoke",
+    "hazmat": "hazardous materials",
+    "flood": "flooding",
+    "earthquake": "an earthquake",
+    "weather": "weather",
+    "utility": "a utility problem",
+    "police_activity": "police activity",
+}
+_CATEGORY_AS = {
+    "fire": "a fire",
+    "hazmat": "a hazardous materials call",
+    "utility": "a utility call",
+    "rescue": "a rescue",
+}
 _NOT_LISTED = {
     "alert": (
         "NWS no longer lists this alert, before the time it said it would end. That "
@@ -192,6 +218,7 @@ def build_incidents(
     now: datetime,
     nearby: Nearby | None = None,
     unresolved_before: datetime | None = None,
+    names: Names | None = None,
 ) -> list[Incident]:
     """The incidents the rows tell of at `now`, newest first. `rows` holds the
     radio, traffic, alert, and notice rows to read. Taps and aircraft are asked for
@@ -199,7 +226,10 @@ def build_incidents(
 
     `unresolved_before` says that the rows which can end an alert or a closure were
     not all read, and from when they were: a message from that moment or earlier
-    that nothing read here ends is then `unknown`, and is not said to be in force."""
+    that nothing read here ends is then `unknown`, and is not said to be in force.
+
+    `names` are the names a notice's words may hold to be shown as a reading
+    (`beacon.redact`). Without them none of a notice's words is shown."""
     known = [row for row in rows if row.occurred_at <= now]
     states = standings(known, now)
     if unresolved_before is not None:
@@ -214,7 +244,8 @@ def build_incidents(
     events = _events(by_kind.get("traffic", []))
     press = _press_matches(groups, by_kind.get("notice", []))
     incidents = [
-        _incident(group, by_kind, events, states, press, blocks, now, nearby) for group in groups
+        _incident(group, by_kind, events, states, press, blocks, now, nearby, names)
+        for group in groups
     ]
     return sorted(incidents, key=lambda incident: (incident.opened_at, incident.id), reverse=True)
 
@@ -236,6 +267,7 @@ def _incident(
     blocks: Blocks,
     now: datetime,
     nearby: Nearby | None,
+    names: Names | None,
 ) -> Incident:
     place = place_in_words(group.street, group.block, group.cross_street)
     # The row that was stored first names the incident, so a call that is stored
@@ -244,6 +276,7 @@ def _incident(
     entries = [_radio_entry(row) for row in group.rows]
     official: list[Official] = []
     signals: list[Signal] = []
+    conflicts: list[Conflict] = []
     track_list: list[Track] = []
     near_taps: list[Evidence] = []
     taps_more = aircraft_more = False
@@ -296,7 +329,7 @@ def _incident(
         entries += [_change_entry(change) for change in changes]
         for notice in notices:
             entries.append(_notice_entry(notice, streets))
-            official.append(_official_notice(notice, now))
+            official.append(_official_notice(notice, now, names))
         members += [*alerts, *(revision for revision, _ in revisions), *changes, *notices]
         if point is not None and nearby is not None:
             until = min(end, now)
@@ -316,6 +349,7 @@ def _incident(
         signals = _signals(
             group, official, closures, states, track_list, near_taps, taps_more, streets, point
         )
+        conflicts = _conflicts(group, official, notices)
     entries.sort(key=lambda entry: entry.at)
     in_force = any(item.state == "in_force" for item in official)
     updated_at = max(entry.at for entry in entries)
@@ -342,6 +376,7 @@ def _incident(
         taps_more=taps_more,
         aircraft_more=aircraft_more,
         signals=tuple(signals),
+        conflicts=tuple(conflicts),
         stand_in=any(row.stand_in for row in members),
         evidence_ids=tuple(sorted({row.id for row in members})),
     )
@@ -577,24 +612,60 @@ def _official_alert(row: Evidence, standing: Standing) -> Official:
     )
 
 
-def _official_notice(row: Evidence, now: datetime) -> Official:
+def _official_notice(row: Evidence, now: datetime, names: Names | None) -> Official:
     # A notice is a document that was published, and stays one. Nothing here says
     # that an all-clear lifts an order: which order, and where, is in the documents.
     ended = row.until is not None and row.until <= now
+    data = row.data
+    # A notice's issuer, title, areas, instruction, and summary are words a model
+    # wrote. Each is shown only when the redaction pass lets the whole of it
+    # through, and is named in `withheld` otherwise. Of a type whose words ingest
+    # does not keep, none is read here either, whatever the row holds.
+    texts = data.get("notice_type") in TEXT_TYPES
+    shown: dict[str, str | None] = {}
+    withheld: list[str] = []
+    for name, key in (
+        ("headline", "title"),
+        ("instruction", "instruction"),
+        ("summary", "summary"),
+    ):
+        said = data.get(key) if texts else None
+        shown[name] = None if names is None or said is None else reading(said, names)
+        if said is not None and shown[name] is None:
+            withheld.append(name)
+    said = data.get("issuer") if texts else None
+    issuer = None if names is None else names.public_body(said)
+    if said is not None and issuer is None:
+        withheld.append("issuer")
+    listed = data.get("areas") if texts else None
+    listed = listed if isinstance(listed, list) else []
+    areas = [None if names is None else reading(area, names) for area in listed]
+    if None in areas:
+        # The areas are shown all together or not at all: a list with one area
+        # missing would read as the whole of where the notice applies.
+        areas = []
+        withheld.append("areas")
+    said_incomplete = data.get("incomplete") if texts else None
     return Official(
         kind="notice",
-        type=str(row.data.get("notice_type")),
+        type=str(data.get("notice_type")),
         state="ended" if ended else "published",
         ended_by=None,
         issued_at=row.occurred_at,
         until=row.until,
-        # A notice's issuer, title, areas, instruction, and summary are words a
-        # model wrote. None of them is shown before the redaction pass has read them.
-        issuer=None,
-        headline=None,
-        instruction=None,
+        issuer=issuer,
+        headline=shown["headline"],
+        instruction=shown["instruction"],
+        summary=shown["summary"],
+        areas=tuple(area for area in areas if area is not None),
         reading=True,
         source=source_of(row),
+        incomplete=tuple(
+            {"title": "headline"}.get(name, name)
+            for name in (said_incomplete if isinstance(said_incomplete, list) else [])
+            if isinstance(name, str)
+        ),
+        withheld=tuple(withheld),
     )
 
 
@@ -759,6 +830,77 @@ def _signals(
             )
         )
     return signals
+
+
+def _conflicts(
+    group: CallGroup, official: Sequence[Official], notices: Sequence[Evidence]
+) -> list[Conflict]:
+    """Where the incident's radio calls and an official source do not agree. The
+    official source is the one that holds, and each text says so: nothing said on
+    the radio ends an alert or lifts an order, and what a notice says a thing is
+    outranks what a call said it is."""
+    found: list[Conflict] = []
+    clear = [row for row in group.rows if "all_clear" in (row.data.get("details") or [])]
+    if clear:
+        said = "Crews said all clear on the radio."
+        alerts = [item for item in official if item.kind == "alert" and item.state == "in_force"]
+        if alerts:
+            found.append(
+                Conflict(
+                    kind="all_clear_on_radio",
+                    text=f"{said} An official alert whose area holds this place is in "
+                    "force. An official source outranks radio traffic: the alert is "
+                    "what holds, and what crews say on the radio does not end it.",
+                    official=tuple(item.source for item in alerts),
+                    radio=tuple(source_of(row) for row in clear),
+                )
+            )
+        orders = [
+            item
+            for item in official
+            if item.kind == "notice"
+            and item.state == "published"
+            and item.type in ORDERS - {"all_clear"}
+        ]
+        if orders:
+            found.append(
+                Conflict(
+                    kind="all_clear_on_radio",
+                    text=f"{said} {_published(orders)} An official source outranks radio "
+                    "traffic: what crews say on the radio lifts no official notice. "
+                    "Whether the notice still holds is for its authority to say. "
+                    f"{_READING}",
+                    official=tuple(item.source for item in orders),
+                    radio=tuple(source_of(row) for row in clear),
+                )
+            )
+    expected = _HAZARDS.get(group.category)
+    if expected is not None:
+        # The calls that gave the incident its category.
+        calls = [row for row in group.rows if row.data.get("category") == group.category]
+        for notice in notices:
+            hazard = notice.data.get("hazard")
+            if (
+                notice.data.get("notice_type") not in TEXT_TYPES
+                or hazard not in _HAZARD_WORDS
+                or hazard in expected
+            ):
+                continue
+            found.append(
+                Conflict(
+                    kind="hazard",
+                    # A notice is matched by a street's name, so it can be about
+                    # another place on the street: the text does not say it is not.
+                    text=f"Radio traffic calls this {_CATEGORY_AS[group.category]}. A notice "
+                    "an authority published, which names a street of this incident, is "
+                    f"about {_HAZARD_WORDS[hazard]}, as Beacon reads it. Where the two are "
+                    "about the same thing, the official notice outranks radio traffic. "
+                    f"{_READING}",
+                    official=(source_of(notice),),
+                    radio=tuple(source_of(row) for row in calls[:1]),
+                )
+            )
+    return found
 
 
 def _events(traffic: Sequence[Evidence]) -> dict[object, list[Evidence]]:

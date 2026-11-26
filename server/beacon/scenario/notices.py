@@ -63,6 +63,12 @@ def _form(notice_type: str, hazard: str, **fields: Any) -> dict[str, Any]:
     } | fields
 
 
+# The streets and the public places the story's notices name besides the ones its
+# radio calls do. They stand where an operator's lists would for real notices: a
+# reading that names a street or a place nobody listed is not shown.
+STREETS = ("Octavia St", "Franklin St")
+PLACES = ("Civic Center Plaza",)
+
 NOTICES: tuple[MockNotice, ...] = (
     MockNotice(
         19.0,

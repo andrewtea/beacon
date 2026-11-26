@@ -424,7 +424,7 @@ def _radio_poller(env: Mapping[str, str], http: SourceHttp) -> OpenMhzRadio:
     problem = transcoder.problem() or core_dump_problem()
     if problem is not None:
         raise IngestConfigError(f"{names}. {problem}")
-    known = _known(env)
+    known = read_known(env)
     ember = EmberClient.from_env(env, scope=scope)
     if ember.mode != "live":
         raise IngestConfigError(
@@ -447,10 +447,11 @@ def _radio_poller(env: Mapping[str, str], http: SourceHttp) -> OpenMhzRadio:
     )
 
 
-def _known(env: Mapping[str, str]) -> Known:
+def read_known(env: Mapping[str, str]) -> Known:
     """The streets and the units a live radio row may name, from the files the
     environment names: one name to a line. With no file for one of them, a row
-    names none of that kind, and the log says so.
+    names none of that kind, and the log says so. The redaction pass lets a text
+    name the same streets and units (`beacon.incident.setup`).
 
     Raises IngestConfigError when a file that is named cannot be read."""
     names: dict[str, list[str]] = {}

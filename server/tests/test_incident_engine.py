@@ -100,11 +100,25 @@ def test_the_mock_scenario_is_one_fire_two_medical_responses_and_an_alarm(story:
     # The medic sent to Fell St is E21's second call, and is not the fire.
     fell = found[2]
     assert (fell.units, fell.official, fell.signals) == (("E21", "M52"), (), ())
-    # No word a model wrote about a notice is in any incident: the press release's
-    # stand-in form names a person, and the order's gives an instruction.
+    # The order's and the all-clear's words passed the redaction pass, and are
+    # shown as readings. Their titles are in title case, as a name is, and are not.
+    order, clear, release = fire.official[2:]
+    assert order.instruction == (
+        "Leave now, on foot, toward Franklin St. Do not use Hayes St. A reception point "
+        "is open at Civic Center Plaza."
+    )
+    assert order.areas == ("Both sides of Hayes St between Gough St and Octavia St",)
+    assert (order.reading, order.withheld) == (True, ("headline",))
+    assert clear.areas[1] == "400 through 450 Hayes St stay closed"
+    assert (clear.reading, clear.withheld) == (True, ("headline",))
+    # The press release's stand-in form names a person: none of it is anywhere.
+    assert (release.summary, release.areas, release.withheld) == (None, (), ())
     shown = repr(found)
-    for word in ("Jane", "432", "Civic Center", "Leave now"):
+    for word in ("Jane", "432"):
         assert word not in shown
+    # A line of the timeline shows no word of a notice.
+    for entry in fire.timeline:
+        assert "Leave now" not in repr(entry)
     # Every text that is shown from the scenario's sources says it was made up.
     for entry in fire.timeline:
         if entry.kind == "closure" and "change" not in entry.details:
@@ -416,11 +430,15 @@ def test_the_routes_list_incidents_and_give_one_with_a_source_on_every_line(stor
         "url": "https://511.org",
     }
     order = next(item for item in fire["official"] if item["kind"] == "notice")
-    assert (order["type"], order["reading"], order["instruction"]) == (
+    assert (order["type"], order["reading"], order["withheld"]) == (
         "evacuation_order",
         True,
-        None,
+        ["headline"],
     )
+    # Ember's reading of the instruction, which the app shows as a reading.
+    assert order["instruction"].startswith("Leave now, on foot, toward Franklin St.")
+    assert order["areas"] == ["Both sides of Hayes St between Gough St and Octavia St"]
+    assert order["summary"].startswith(INVENTED)
     assert order["source"]["url"].endswith("/documents/evacuation-order-hayes-st.pdf")
     assert order["source"]["model"] == "fake"
     assert fire["aircraft"][0]["circling"] is True
