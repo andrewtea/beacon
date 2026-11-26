@@ -1,25 +1,31 @@
 """Radio: what Beacon keeps of a dispatch radio call, and how Ember hears one.
 
-    from beacon.radio import extract_transmission
+    from beacon.radio import Known, extract_transmission
 
-    heard = extract_transmission(ember, wav, "wav")
+    known = Known.of(streets=["Hayes St"], units=["E36", "T6"])
+    heard = extract_transmission(ember, wav, "wav", known=known)
     heard.event, heard.units, heard.place   # ("fire", ("E36", "T6"), "400 block of Hayes St")
 
-See `vocabulary` for the closed vocabulary a call is kept in, `extract` for the Ember
-call, and `audio` for how a call's audio gets to Ember without touching a disk.
+See `vocabulary` for the closed vocabulary a call is kept in and the lists a unit or
+a street has to be on, `extract` for the Ember call, and `audio` for how a call's
+audio gets to Ember without touching a disk.
 """
 
-from beacon.radio.audio import AudioError, Ffmpeg, Transcoder
+from beacon.radio.audio import AudioError, ConversionStopped, Ffmpeg, Transcoder, plain_wav
 from beacon.radio.extract import ExtractionError, Transmission, extract_transmission, read_form
-from beacon.radio.vocabulary import MEDICAL_EVENT
+from beacon.radio.vocabulary import MEDICAL_EVENT, NOTHING_KNOWN, Known
 
 __all__ = [
     "MEDICAL_EVENT",
+    "NOTHING_KNOWN",
     "AudioError",
+    "ConversionStopped",
     "ExtractionError",
     "Ffmpeg",
+    "Known",
     "Transcoder",
     "Transmission",
     "extract_transmission",
+    "plain_wav",
     "read_form",
 ]

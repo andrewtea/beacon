@@ -18,8 +18,10 @@ A source needs no code change to go live, only its name in that list and what it
               permission to use its audio; BEACON_OPENMHZ_TALKGROUPS, the channels
               to hear; BEACON_OPENMHZ_BUDGET_USD, the most hearing them may cost;
               a live Ember (REPLAY=0, MODEL_API_KEY, EMBER_SPENT_BEFORE_USD); and
-              ffmpeg, on Linux. BEACON_OPENMHZ_EMS_TALKGROUPS and
-              BEACON_OPENMHZ_MEDIA_HOSTS are optional.
+              ffmpeg and bubblewrap, on Linux. BEACON_RADIO_STREETS_FILE and
+              BEACON_RADIO_UNITS_FILE name the lists of streets and units a row
+              may name, and without one a row names none. BEACON_OPENMHZ_EMS_TALKGROUPS
+              and BEACON_OPENMHZ_MEDIA_HOSTS are optional.
 
 Radio is the one source that costs money: every call is heard by Ember. In mock mode
 the calls are tones and a stand-in for Ember "hears" them, which costs nothing.
@@ -33,25 +35,26 @@ the pollers that failed in it poll again.
 """
 
 import logging
-import os
 import re
-import shutil
+import resource
 import threading
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from beacon.ember import EmberClient, SpendScope, Storage
-from beacon.ember.client import default_data_dir
+from beacon.ember.client import REQUEST_TIMEOUT_SECONDS, default_data_dir
 from beacon.ember.pricing import parse_usd
 from beacon.evidence import EvidenceStore, Mode
 from beacon.ingest.http import SourceHttp
 from beacon.ingest.nws import NwsAlerts
 from beacon.ingest.openmhz import OpenMhzRadio
 from beacon.ingest.opensky import SIGNED_IN_INTERVAL_SECONDS, OpenSkyAircraft
-from beacon.ingest.runner import Clock, Poller, PollerStatus, Runner
+from beacon.ingest.runner import Clock, PaidWork, Poller, PollerStatus, Runner
 from beacon.ingest.traffic511 import Traffic511
-from beacon.radio import Ffmpeg
+from beacon.radio import Ffmpeg, Known
+from beacon.radio.vocabulary import read_names
 from beacon.scenario import DURATION, Scenario, scenario_transport, stand_in_ember
 from beacon.scenario import radio as scenario_radio
 
@@ -68,6 +71,8 @@ OPENMHZ_TALKGROUPS_VARIABLE = "BEACON_OPENMHZ_TALKGROUPS"
 OPENMHZ_EMS_TALKGROUPS_VARIABLE = "BEACON_OPENMHZ_EMS_TALKGROUPS"
 OPENMHZ_MEDIA_HOSTS_VARIABLE = "BEACON_OPENMHZ_MEDIA_HOSTS"
 OPENMHZ_BUDGET_VARIABLE = "BEACON_OPENMHZ_BUDGET_USD"
+RADIO_STREETS_VARIABLE = "BEACON_RADIO_STREETS_FILE"
+RADIO_UNITS_VARIABLE = "BEACON_RADIO_UNITS_FILE"
 
 # The label of the spending scope every live radio call is made under.
 RADIO_SCOPE = "ingest:openmhz"
@@ -85,8 +90,12 @@ _SCENARIO_STATE = "scenario"
 _AFTER_THE_STORY = timedelta(minutes=10)
 
 # How long `Ingest.stop` waits for the pollers' thread to end. Nothing it could be
-# doing takes that long once its client and its store are closed.
+# doing takes that long once its clients are closed, except waiting for the answer
+# to a paid request.
 STOP_SECONDS = 5.0
+# How long `Ingest.stop` waits for a paid request that is out: as long as Ember may
+# take to answer one, and a little for settling it.
+PAID_SECONDS = REQUEST_TIMEOUT_SECONDS + 5.0
 
 logger = logging.getLogger("beacon.ingest")
 
@@ -107,11 +116,14 @@ class Ingest:
         clock: Clock,
         http: SourceHttp,
         scenario: Scenario | None,
+        paid: Sequence[PaidWork] = (),
     ) -> None:
         self.store = store
         self.runner = runner
         self.clock = clock
         self.http = http
+        # The pollers that pay for their work, which shutting down has to tell.
+        self.paid = tuple(paid)
         # The story the pollers are fed, in mock mode.
         self.scenario = scenario
         self._stop = threading.Event()
@@ -194,25 +206,44 @@ class Ingest:
         )
         self._thread.start()
 
-    def stop(self, timeout: float = STOP_SECONDS) -> bool:
-        """Stop the pollers, and say whether their thread has ended. It blocks for
-        up to `timeout` seconds, so a server calls it off its event loop.
+    def stop(self, timeout: float = STOP_SECONDS, paid_timeout: float = PAID_SECONDS) -> bool:
+        """Stop the pollers, and say whether they have stopped: no paid work is
+        out, and their thread has ended. It blocks, so a server calls it off its
+        event loop.
 
-        Whatever the thread is doing is called off, not waited for: a request that
-        is out is cancelled, and a write that is waiting for the file gives up. A
-        poll is stored whole or not at all, so nothing is left half done, and the
-        poll is made again when Beacon next runs. Whether or not the thread has
-        ended, it can ask no source and store no row after this returns."""
+        What costs nothing is called off, not waited for: a request to a source is
+        cancelled, a conversion is ended, and a write that is waiting for the file
+        gives up. No paid request is sent that was not already out. Work whose paid
+        request is out is waited for, for up to `paid_timeout` seconds, because it
+        may be paid for whatever is done here and its answer is worth storing. Then
+        the store is closed, and the thread is given `timeout` seconds to end. A
+        poll is stored whole or not at all, so nothing is left half done.
+
+        Whatever it answers, once this returns no source is asked, no paid request
+        is begun, and no row is stored. When it answers False with a paid request
+        still out, that request is settled in the Ember ledger when it ends, its
+        row is lost, and its call is never asked about again."""
         self._stop.set()
-        self.close()
-        if self._thread is None:
-            return True
-        self._thread.join(timeout)
-        return not self._thread.is_alive()
+        for work in self.paid:
+            work.close()
+        self.http.close()
+        drained = True
+        for work in self.paid:
+            drained = work.drain(paid_timeout) and drained
+        self.store.close()
+        ended = True
+        if self._thread is not None:
+            self._thread.join(timeout)
+            ended = not self._thread.is_alive()
+        return drained and ended
 
     def close(self) -> None:
-        """Close the HTTP client, which ends any request a poller has out, and the
-        store, which then takes no more rows."""
+        """Close the pollers that pay for their work, which then begin no paid
+        request; the HTTP client, which ends any request a poller has out; and the
+        store, which then takes no more rows. Nothing is waited for: `stop` is the
+        way to end pollers that run on a thread."""
+        for work in self.paid:
+            work.close()
         self.http.close()
         self.store.close()
 
@@ -256,27 +287,32 @@ def build(env: Mapping[str, str], clock: Clock | None = None) -> Ingest:
         http = SourceHttp()
         pollers = source_pollers(live, env, http)
         store = open_store(env)
-        return Ingest(store, Runner(pollers, store, clock), clock, http, None)
+        paid = [poller for poller in pollers if isinstance(poller, PaidWork)]
+        return Ingest(store, Runner(pollers, store, clock), clock, http, None, paid)
     store = open_store(env)
     scenario = _scenario(store, clock.now())
     http = SourceHttp(scenario_transport(scenario, clock.now))
     # Stands in for Ember: it spends nothing, and what it "hears" in the story's
     # tones is the story's own. Its rows say `model == "fake"`.
     ember = EmberClient.fake(Storage.under(default_data_dir(env)), stand_in_ember)
+    radio = OpenMhzRadio(
+        http,
+        ember,
+        talkgroups=scenario_radio.TALKGROUPS,
+        ems_talkgroups=scenario_radio.EMS_TALKGROUPS,
+        system=scenario_radio.SYSTEM,
+        # The story's own streets and units, where real radio has the city's.
+        known=scenario_radio.KNOWN,
+    )
     pollers = [
         NwsAlerts(http),
         OpenSkyAircraft(http, interval_seconds=SIGNED_IN_INTERVAL_SECONDS),
         Traffic511(http, api_key="mock"),
-        OpenMhzRadio(
-            http,
-            ember,
-            talkgroups=scenario_radio.TALKGROUPS,
-            ems_talkgroups=scenario_radio.EMS_TALKGROUPS,
-            system=scenario_radio.SYSTEM,
-        ),
+        radio,
     ]
     last = _saved_polls(store.state(_SCENARIO_STATE).get("polls"))
-    return Ingest(store, Runner(pollers, store, clock, last=last), clock, http, scenario)
+    runner = Runner(pollers, store, clock, last=last)
+    return Ingest(store, runner, clock, http, scenario, [radio])
 
 
 def source_pollers(
@@ -325,7 +361,7 @@ def _radio_poller(env: Mapping[str, str], http: SourceHttp) -> OpenMhzRadio:
     """The poller for real radio, heard by a live Ember under a budget of its own.
 
     Raises IngestConfigError when permission, the talkgroups, the budget, a live
-    Ember, or ffmpeg is missing."""
+    Ember, or a confined ffmpeg is missing, or a list of names cannot be read."""
     names = f"{LIVE_SOURCES_VARIABLE} names openmhz"
     if env.get(OPENMHZ_PERMITTED_VARIABLE) != "1":
         raise IngestConfigError(
@@ -358,25 +394,60 @@ def _radio_poller(env: Mapping[str, str], http: SourceHttp) -> OpenMhzRadio:
             "hearing radio may cost over every run. It has no default, because every "
             "call is paid for."
         )
-    if shutil.which("ffmpeg") is None or not hasattr(os, "memfd_create"):
-        raise IngestConfigError(
-            f"{names}, whose audio is converted by ffmpeg, in memory, which needs ffmpeg "
-            "installed and Linux."
-        )
+    transcoder = Ffmpeg()
+    problem = transcoder.problem()
+    if problem is not None:
+        raise IngestConfigError(f"{names}. {problem}")
+    known = _known(env)
     ember = EmberClient.from_env(env, scope=scope)
-    if not ember.spends:
+    if ember.mode != "live":
         raise IngestConfigError(
             f"{names}, and a radio call is heard by a live Ember and cannot be replayed: "
             "set REPLAY=0, MODEL_API_KEY, and EMBER_SPENT_BEFORE_USD."
         )
+    # This process will hold real radio audio in memory. It leaves no core dump.
+    resource.setrlimit(resource.RLIMIT_CORE, (0, resource.getrlimit(resource.RLIMIT_CORE)[1]))
     return OpenMhzRadio(
         http,
         ember,
         talkgroups=talkgroups,
         ems_talkgroups=ems_talkgroups,
+        known=known,
         media_hosts=hosts,
-        transcoder=Ffmpeg(),
+        transcoder=transcoder,
     )
+
+
+def _known(env: Mapping[str, str]) -> Known:
+    """The streets and the units a live radio row may name, from the files the
+    environment names: one name to a line. With no file for one of them, a row
+    names none of that kind, and the log says so.
+
+    Raises IngestConfigError when a file that is named cannot be read."""
+    names: dict[str, list[str]] = {}
+    for what, variable in (("streets", RADIO_STREETS_VARIABLE), ("units", RADIO_UNITS_VARIABLE)):
+        path = env.get(variable)
+        text = ""
+        if path:
+            try:
+                text = Path(path).read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as error:
+                raise IngestConfigError(
+                    f"{variable} names a file that cannot be read as text."
+                ) from error
+        names[what] = read_names(text)
+        if not names[what]:
+            logger.warning(
+                "No list of %s (%s): a radio row will name none of them.", what, variable
+            )
+    known, left_out = Known.kept(streets=names["streets"], units=names["units"])
+    if left_out:
+        logger.warning(
+            "%d names in the lists of streets and units are not names Beacon keeps, "
+            "and were left out.",
+            left_out,
+        )
+    return known
 
 
 def _radio_scope(env: Mapping[str, str]) -> SpendScope | None:

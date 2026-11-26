@@ -10,7 +10,15 @@ module (`nws`, `opensky`, `traffic511`, `openmhz`) for what its rows hold.
 """
 
 from beacon.ingest.http import SourceError, SourceHttp
-from beacon.ingest.runner import Clock, Poller, PollerStatus, PollReport, Runner
+from beacon.ingest.runner import (
+    Clock,
+    PaidWork,
+    Poller,
+    PollerHeldError,
+    PollerStatus,
+    PollReport,
+    Runner,
+)
 from beacon.ingest.setup import (
     SOURCES,
     Ingest,
@@ -26,8 +34,10 @@ __all__ = [
     "Clock",
     "Ingest",
     "IngestConfigError",
+    "PaidWork",
     "PollReport",
     "Poller",
+    "PollerHeldError",
     "PollerStatus",
     "Runner",
     "SourceError",

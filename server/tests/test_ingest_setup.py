@@ -3,6 +3,7 @@
 import itertools
 import json
 import logging
+import resource
 import sqlite3
 import threading
 import time as system_time
@@ -34,6 +35,7 @@ from beacon.ingest.listing import listed_again_row, not_listed_row
 from beacon.ingest.nws import NwsAlerts
 from beacon.ingest.opensky import OpenSkyAircraft
 from beacon.ingest.traffic511 import Traffic511
+from beacon.radio import NOTHING_KNOWN, Ffmpeg, Known
 from beacon.scenario import FIRE, INVENTED, Scenario, scenario_transport
 
 NOON = datetime(2026, 11, 27, 20, 0, tzinfo=UTC)
@@ -599,6 +601,13 @@ def test_each_source_is_asked_with_the_settings_the_environment_holds(
     assert list(runner.step()) == ["opensky"]
 
 
+@pytest.fixture(autouse=True)
+def an_ffmpeg_that_can_be_confined(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Building a poller for real radio tries ffmpeg out, confined. These tests are
+    about the settings, on any machine; `test_radio_audio` is about ffmpeg."""
+    monkeypatch.setattr(Ffmpeg, "problem", lambda self: None)
+
+
 RADIO = {
     "BEACON_LIVE_SOURCES": "openmhz",
     "BEACON_OPENMHZ_PERMITTED": "1",
@@ -661,9 +670,14 @@ def test_radio_is_not_polled_for_real_where_its_audio_cannot_be_converted(
     env: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
-    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr(
+        Ffmpeg, "problem", lambda self: "ffmpeg is run confined by bubblewrap, which is missing."
+    )
 
-    with pytest.raises(IngestConfigError, match="needs ffmpeg installed and Linux"):
+    with pytest.raises(
+        IngestConfigError,
+        match=r"^BEACON_LIVE_SOURCES names openmhz\. ffmpeg is run confined by bubblewrap",
+    ):
         build(env | RADIO)
 
     # Refused before a client that can spend was built.
@@ -674,7 +688,6 @@ def test_naming_radio_builds_its_poller_with_a_live_ember_under_its_budget_and_a
     env: dict[str, str], time: Time, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
     built: list[tuple[EmberClient, SpendScope | None]] = []
     from_env = EmberClient.from_env
 
@@ -695,6 +708,72 @@ def test_naming_radio_builds_its_poller_with_a_live_ember_under_its_budget_and_a
     assert scope == SpendScope("ingest:openmhz", 250_000_000)
     assert ember.spent_usd() == 0
     ingest.close()
+
+
+def test_real_radio_names_only_the_streets_and_units_the_operator_listed(
+    env: dict[str, str],
+    time: Time,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+    streets, units = tmp_path / "streets.txt", tmp_path / "units.txt"
+    streets.write_text("# The city's street names\nHAYES ST\nGough St\n\nAVENUE OF THE PALMS\n")
+    units.write_text("E36\nTruck 6\n")
+    lists = {"BEACON_RADIO_STREETS_FILE": str(streets), "BEACON_RADIO_UNITS_FILE": str(units)}
+
+    with caplog.at_level(logging.WARNING):
+        ingest = build(env | RADIO | lists, Clock(time))
+
+    (radio,) = ingest.paid
+    assert radio._known == Known.of(streets=["Hayes St", "Gough St"], units=["E36", "T6"])
+    assert "1 names in the lists of streets and units are not names Beacon keeps" in caplog.text
+    # The process holds real radio audio in memory from here on, and dumps no core.
+    assert resource.getrlimit(resource.RLIMIT_CORE)[0] == 0
+    ingest.close()
+
+
+def test_real_radio_with_no_lists_names_no_street_and_no_unit_and_says_so(
+    env: dict[str, str],
+    time: Time,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+
+    with caplog.at_level(logging.WARNING):
+        ingest = build(env | RADIO, Clock(time))
+
+    (radio,) = ingest.paid
+    assert radio._known == NOTHING_KNOWN
+    assert "No list of streets (BEACON_RADIO_STREETS_FILE)" in caplog.text
+    assert "No list of units (BEACON_RADIO_UNITS_FILE)" in caplog.text
+    ingest.close()
+
+
+def test_a_list_of_names_that_cannot_be_read_is_refused(
+    env: dict[str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+    missing = {"BEACON_RADIO_UNITS_FILE": str(tmp_path / "no-such-file.txt")}
+
+    with pytest.raises(
+        IngestConfigError, match="BEACON_RADIO_UNITS_FILE names a file that cannot be read"
+    ):
+        build(env | RADIO | missing)
+
+    # Refused before a client that can spend was built, or a store was opened.
+    assert not (Path(env["BEACON_DATA_DIR"]) / "ember").exists()
+    assert not (Path(env["BEACON_DATA_DIR"]) / "evidence").exists()
+
+
+def test_the_mock_scenarios_radio_is_closed_and_waited_for_with_the_pollers(
+    env: dict[str, str], time: Time
+) -> None:
+    ingest = build(env, Clock(time))
+
+    assert [work.name for work in ingest.paid] == ["openmhz"]
 
 
 def test_what_a_stand_in_answered_cannot_be_stored_as_a_real_sources(

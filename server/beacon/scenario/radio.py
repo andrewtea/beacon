@@ -10,8 +10,8 @@ The calls tell the fire of `beacon.scenario.fire` from the radio's side, with wh
 real feed would also carry: a medical call nearby and one across town, an alarm
 elsewhere, a call nobody could make out, and a click of a microphone. Some of the
 stand-in's forms are untidy in the ways a model's can be, with a house number where
-the block belongs and details on a medical call, so that what Beacon strips is seen
-to be stripped.
+the block belongs, details on a medical call, and a name that is no street, so that
+what Beacon strips is seen to be stripped.
 
 The talkgroup numbers are invented too. OpenMHz's real ones for San Francisco are
 set through `BEACON_OPENMHZ_TALKGROUPS` when permission to use them exists.
@@ -30,6 +30,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from beacon.ember import fake_response
+from beacon.radio.vocabulary import Known
 
 SYSTEM = "sfp25"
 FIRE_DISPATCH = 9101
@@ -37,6 +38,17 @@ FIRE_TACTICAL = 9102
 EMS = 9103
 TALKGROUPS = (FIRE_DISPATCH, FIRE_TACTICAL, EMS)
 EMS_TALKGROUPS = (EMS,)
+
+# The streets and the units of the story, which stand where a list of the city's
+# streets and the fire department's roster would for real radio. A name the stand-in
+# gives that is not here is dropped, as an unlisted one is from a real call.
+KNOWN = Known.of(
+    streets=("Hayes St", "Gough St", "Fell St", "Geary Blvd", "Irving St"),
+    units=(
+        "B2", "B3", "D2", "E1", "E3", "E5", "E21", "E22", "E29", "E36",
+        "M52", "M78", "RS1", "T1", "T3", "T6", "T12",
+    ),
+)  # fmt: skip
 
 # Where a call's audio is served from, in the mock scenario.
 AUDIO_HOST = "media.openmhz.com"
@@ -114,14 +126,16 @@ CALLS: tuple[RadioCall, ...] = (
         FIRE_DISPATCH,
         5.0,
         # A medical call on the fire channel, a block from the fire. The form has a
-        # status, a detail, and a house number, none of which is kept.
+        # status, a detail, a house number, a reading where a unit belongs, and a
+        # name where the cross street does, none of which is kept.
         _form(
             "medical",
             "on_scene",
             details=["rescue_in_progress"],
-            units=["M52", "E21"],
+            units=["M52", "E21", "BP 180"],
             street="432 Fell Street",
             block=432,
+            cross_street="Jane Doe St",
         ),
     ),
     RadioCall(

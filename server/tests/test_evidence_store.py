@@ -4,6 +4,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -464,3 +465,80 @@ def test_a_file_that_is_not_a_store_is_an_error_and_is_left_as_it_is(tmp_path: P
         EvidenceStore(path, "live")
 
     assert path.read_bytes().startswith(b"This is somebody's notes")
+
+
+def test_an_item_is_claimed_by_one_caller_only_and_for_good(tmp_path: Path) -> None:
+    path = tmp_path / "evidence.sqlite3"
+    store = EvidenceStore(path, "mock")
+    # Another process with the same file.
+    other = EvidenceStore(path, "mock")
+
+    assert store.claim("openmhz", "call-1") is True
+    assert other.claim("openmhz", "call-1") is False
+    assert store.claim("openmhz", "call-1") is False
+    # A claim is on one source's item: the same reference of another source is free.
+    assert other.claim("another", "call-1") is True
+    assert other.claim("openmhz", "call-2") is True
+
+    # It outlasts the process that made it.
+    assert EvidenceStore(path, "mock").claim("openmhz", "call-1") is False
+
+
+def test_of_many_callers_claiming_at_once_exactly_one_gets_the_item(tmp_path: Path) -> None:
+    path = tmp_path / "evidence.sqlite3"
+    EvidenceStore(path, "mock")
+    start = threading.Barrier(8)
+
+    def claim(_caller: int) -> bool:
+        store = EvidenceStore(path, "mock")
+        start.wait(10)
+        return store.claim("openmhz", "call-1")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        claims = list(pool.map(claim, range(8)))
+
+    assert sorted(claims) == [False] * 7 + [True]
+
+
+def test_a_claim_that_is_given_up_can_be_made_again(store: EvidenceStore) -> None:
+    assert store.claim("openmhz", "call-1") is True
+
+    store.release("openmhz", "call-1")
+
+    assert store.taken("openmhz", ["call-1"]) == set()
+    assert store.claim("openmhz", "call-1") is True
+
+
+def test_what_is_taken_is_what_is_claimed_or_stored(store: EvidenceStore) -> None:
+    store.claim("openmhz", "claimed")
+    store.add([row("stored", source="openmhz")])
+    store.add([row("of-another-source")])
+    refs = ["claimed", "stored", "of-another-source", "new", *(f"call-{n}" for n in range(1200))]
+
+    assert store.taken("openmhz", refs) == {"claimed", "stored"}
+    assert store.taken("openmhz", []) == set()
+
+
+def test_a_closed_store_takes_no_claim_and_gives_none_up(store: EvidenceStore) -> None:
+    store.claim("openmhz", "call-1")
+    store.close()
+
+    with pytest.raises(EvidenceStoreError, match="is closed and takes no more rows"):
+        store.claim("openmhz", "call-2")
+    with pytest.raises(EvidenceStoreError, match="is closed and takes no more rows"):
+        store.release("openmhz", "call-1")
+
+    # Reading goes on: the claim that was made is there, and the other is not.
+    assert store.taken("openmhz", ["call-1", "call-2"]) == {"call-1"}
+
+
+def test_a_store_file_from_before_claims_is_given_the_table(tmp_path: Path) -> None:
+    path = tmp_path / "evidence.sqlite3"
+    EvidenceStore(path, "live").add([row("kept")])
+    with sqlite3.connect(path) as db:
+        db.execute("DROP TABLE claims")
+
+    store = EvidenceStore(path, "live")
+
+    assert store.claim("openmhz", "call-1") is True
+    assert refs(store.search()) == ["kept"]

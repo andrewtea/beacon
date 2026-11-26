@@ -2,7 +2,15 @@
 
 import pytest
 
-from beacon.radio.vocabulary import block_of, clean_street, clean_unit, place_in_words
+from beacon.radio.vocabulary import (
+    NOTHING_KNOWN,
+    Known,
+    block_of,
+    clean_street,
+    clean_unit,
+    place_in_words,
+    read_names,
+)
 
 
 @pytest.mark.parametrize(
@@ -99,10 +107,66 @@ def test_what_is_not_shaped_like_one_streets_name_is_not_kept(said: object) -> N
     assert clean_street(said) is None
 
 
-def test_the_limit_of_checking_a_street_by_its_shape_is_known() -> None:
-    # Words shaped like a street name are kept as one. Checking against a list of the
-    # city's streets would close this, and is not done yet.
+def test_shape_alone_keeps_what_is_no_street_and_no_unit() -> None:
+    # Which is why a name is then looked up in `Known`.
     assert clean_street("Jane Doe St") == "Jane Doe St"
+    assert clean_street("One Two Three Hayes St") == "One Two Three Hayes St"
+    assert clean_unit("BP 180") == "BP180"
+    assert clean_unit("Ann 72") == "ANN72"
+
+
+KNOWN = Known.of(streets=["hayes street", "19TH AVE", "Broadway"], units=["Engine 36", "t06"])
+
+
+def test_a_list_holds_each_name_in_its_stored_form() -> None:
+    assert KNOWN.streets == {"Hayes St", "19th Ave", "Broadway"}
+    assert KNOWN.units == {"E36", "T6"}
+
+
+@pytest.mark.parametrize(
+    ("said", "kept"),
+    [("432 Hayes St.", "Hayes St"), ("19th avenue", "19th Ave"), ("BROADWAY", "Broadway")],
+)
+def test_a_listed_street_is_kept_in_its_stored_form(said: str, kept: str) -> None:
+    assert KNOWN.street(said) == kept
+
+
+@pytest.mark.parametrize(
+    "said", ["Jane Doe St", "One Two Three Hayes St", "Fell St", "Hayes", "Hayes at Gough", 7, None]
+)
+def test_a_street_that_is_not_listed_is_not_kept(said: object) -> None:
+    assert KNOWN.street(said) is None
+
+
+def test_a_unit_is_kept_only_when_it_is_listed() -> None:
+    assert (KNOWN.unit("truck 6"), KNOWN.unit("E036")) == ("T6", "E36")
+    for said in ("BP 180", "Ann 72", "M72", "E37", "Jane", None):
+        assert KNOWN.unit(said) is None
+
+
+def test_with_no_list_nothing_is_kept() -> None:
+    assert (NOTHING_KNOWN.street("Hayes St"), NOTHING_KNOWN.unit("E36")) == (None, None)
+
+
+def test_a_list_made_in_code_refuses_a_name_beacon_does_not_keep_without_repeating_it() -> None:
+    with pytest.raises(
+        ValueError, match=r"^Name 2 in the list of streets is not a street Beacon keeps\.$"
+    ):
+        Known.of(streets=["Hayes St", "Jane Doe's house"])
+    with pytest.raises(ValueError, match="Name 1 in the list of units"):
+        Known.of(units=["Jane"])
+
+
+def test_a_list_from_a_file_leaves_out_what_beacon_does_not_keep_and_counts_it() -> None:
+    names = read_names(
+        "# San Francisco street names\n\nHAYES ST\n  Gough St  \n"
+        "AVENUE OF THE PALMS\n# and\nUNNAMED 042\n"
+    )
+    assert names == ["HAYES ST", "Gough St", "AVENUE OF THE PALMS", "UNNAMED 042"]
+
+    known, left_out = Known.kept(streets=names, units=["E36", "the chief"])
+
+    assert (known.streets, known.units, left_out) == ({"Hayes St", "Gough St"}, {"E36"}, 3)
 
 
 @pytest.mark.parametrize(

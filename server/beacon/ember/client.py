@@ -35,6 +35,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -47,6 +48,7 @@ import openai
 from beacon.ember.errors import (
     BudgetExceededError,
     EmberCallError,
+    EmberClosedError,
     EmberConfigError,
     EmberError,
     EmberRequestError,
@@ -126,6 +128,7 @@ _CONTENT_FIELDS = ("input", "instructions", "tools", "text", "prompt_cache_key")
 # that a word the API sent is never copied into the ledger or an error.
 _STATUSES = frozenset({"completed", "incomplete", "failed", "cancelled", "queued", "in_progress"})
 
+_CLOSED = "The Ember client is closed and makes no more calls. Nothing that costs money was sent."
 _LOST_SETTLEMENT = (
     "The Ember ledger file was deleted or replaced while a paid request was out, so the "
     "call is in no ledger. It may have been billed, and no stop counts it: compare "
@@ -327,6 +330,12 @@ class EmberClient:
         self._responder = responder
         self._pacer = pacer
         self._scope = scope
+        # Guards `_closed` and `_out`: whether the client is closed, and how many
+        # calls have their paid request out. One lock for both, so a call is either
+        # counted as out before `close` returns or is refused.
+        self._sending = threading.Condition()
+        self._closed = False
+        self._out = 0
 
     @classmethod
     def from_env(
@@ -415,6 +424,44 @@ class EmberClient:
         return self._sdk is not None
 
     @property
+    def mode(self) -> Source:
+        """Where the client's answers can come from: `live` for one that can make a
+        paid call (it replays what is recorded, too), `fake` for one that answers
+        from a responder, and `replay` for one that only replays, which can answer
+        no sensitive call at all."""
+        if self._sdk is not None:
+            return "live"
+        return "replay" if self._responder is None else "fake"
+
+    def close(self) -> None:
+        """Answer no more calls, for a process that is shutting down. When this
+        returns, no paid request is sent that was not already out: a call that had
+        not sent its paid request, one that is still counting its tokens included,
+        raises EmberClosedError and costs nothing. A paid request that is out is not
+        called off, because it may be paid for whatever is done here; `drain` waits
+        for it."""
+        with self._sending:
+            self._closed = True
+
+    def drain(self, timeout: float) -> bool:
+        """Wait up to `timeout` seconds for the calls whose paid request is out to
+        end, and say whether they have. A call has ended when it is settled in the
+        ledger and is returning to its caller."""
+        with self._sending:
+            return self._sending.wait_for(lambda: self._out == 0, timeout)
+
+    def _begin_sending(self) -> None:
+        with self._sending:
+            if self._closed:
+                raise EmberClosedError(_CLOSED)
+            self._out += 1
+
+    def _end_sending(self) -> None:
+        with self._sending:
+            self._out -= 1
+            self._sending.notify_all()
+
+    @property
     def stop(self) -> SpendingStop | None:
         """Where this client's live spend stops. None for a client that cannot spend."""
         return self._stop
@@ -485,6 +532,8 @@ class EmberClient:
         is then not sent, or while one was out, which may then have been billed and is
         in no ledger. A failed call is not retried, except by a client with a pacer
         after the API answers 429: each such attempt is a call of its own in the ledger.
+        Raises EmberClosedError once `close` has been called, to a call that had not
+        sent its paid request: nothing was sent that costs money.
         A client with a pacer raises RateLimitHoldError when the API asks for a wait
         longer than the pacer makes, to the call that was told so and to every call
         after it until the wait has passed.
@@ -541,6 +590,9 @@ class EmberClient:
             raise EmberRequestError(
                 "task must be a non-empty label, such as 'extract_transmission'."
             )
+        with self._sending:
+            if self._closed:
+                raise EmberClosedError(_CLOSED)
         body = _build_body(
             effort=effort,
             max_output_tokens=max_output_tokens,
@@ -728,6 +780,9 @@ class EmberClient:
             # reservation with it. A request sent now would be paid for and settled
             # nowhere, so it is not sent.
             self._ledger.require_opened_file()
+            # The client can have been closed while the tokens were counted. From
+            # here the call counts as out, until it is settled.
+            self._begin_sending()
         except BaseException:
             # The request was not sent, so it cost nothing.
             self._ledger.settle(
@@ -738,6 +793,22 @@ class EmberClient:
                 error="Not sent: the client stopped before the paid request.",
             )
             raise
+        try:
+            return self._send(sdk, body, call, sensitive, row, reserved, counting)
+        finally:
+            self._end_sending()
+
+    def _send(
+        self,
+        sdk: openai.OpenAI,
+        body: dict[str, Any],
+        call: Call,
+        sensitive: bool,
+        row: RowRef,
+        reserved: int,
+        counting: float,
+    ) -> EmberResponse:
+        """Send the paid request of a call that is reserved in the ledger, and settle it."""
         # The time the two requests took, without the wait between them.
         started = time.perf_counter() - counting
 

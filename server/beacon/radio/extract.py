@@ -1,10 +1,11 @@
 """`extract_transmission`: one radio call, heard by Ember, as a `Transmission`.
 
 Ember is given the audio and a form to fill in, and what comes back is checked field
-by field against the closed vocabulary (`beacon.radio.vocabulary`). A `Transmission`
-holds nothing else: no transcript, no free text, no house number. So whatever Ember
-heard or wrote, a name, a patient's condition, or an address cannot reach anything
-that stores a `Transmission`.
+by field against the closed vocabulary (`beacon.radio.vocabulary`): tags from fixed
+lists, and units and streets that are on the caller's lists of them (`Known`). A
+`Transmission` holds nothing else: no transcript, no free text, no house number. So
+a name, a patient's condition, or an address that Ember heard or wrote has no field
+to arrive in. `beacon.radio.vocabulary` says what little that leaves open.
 
 Every call is made with `sensitive=True`, because any radio call can be EMS traffic
 and nobody knows before it is heard. The Ember client then keeps the call's
@@ -34,10 +35,9 @@ from beacon.radio.vocabulary import (
     STATUSES,
     Category,
     Detail,
+    Known,
     Status,
     block_of,
-    clean_street,
-    clean_unit,
     place_in_words,
 )
 
@@ -111,8 +111,8 @@ class ExtractionError(Exception):
 
 @dataclass(frozen=True)
 class Transmission:
-    """What is kept of one radio call. Every field is from a fixed list, a unit id,
-    a street name of the shape `beacon.radio.vocabulary` allows, or a number."""
+    """What is kept of one radio call. Every field is from a fixed list, a unit or
+    a street on the lists the caller gave (`Known`), or a number."""
 
     clarity: Clarity
     category: Category
@@ -155,11 +155,17 @@ class Transmission:
 
 
 def extract_transmission(
-    ember: EmberClient, audio: bytes, audio_format: EmberFormat, *, ems_channel: bool = False
+    ember: EmberClient,
+    audio: bytes,
+    audio_format: EmberFormat,
+    *,
+    known: Known,
+    ems_channel: bool = False,
 ) -> Transmission:
-    """Have Ember hear one radio call. `audio` is a whole WAV or MP3 file.
-    `ems_channel` says the call is from a channel that carries EMS traffic only, and
-    it is then kept as a medical response whatever Ember made of it.
+    """Have Ember hear one radio call. `audio` is a whole WAV or MP3 file. `known`
+    lists the units and the streets that may be kept of it; one that is not listed
+    is dropped. `ems_channel` says the call is from a channel that carries EMS
+    traffic only, and it is then kept as a medical response whatever Ember made of it.
 
     Raises ExtractionError when the answer is not a form, and what
     `EmberClient.respond` raises: a `beacon.ember.EmberError`, whose text for a
@@ -199,15 +205,15 @@ def extract_transmission(
     form = _form(answer.output_text) if answer.status == "completed" else None
     if form is None:
         raise_bare(ExtractionError("Ember's answer about a radio call was not a filled-in form."))
-    return read_form(form, heard_by=answer.source, ems_channel=ems_channel)
+    return read_form(form, heard_by=answer.source, known=known, ems_channel=ems_channel)
 
 
 def read_form(
-    form: dict[str, Any], *, heard_by: ModelSource, ems_channel: bool = False
+    form: dict[str, Any], *, heard_by: ModelSource, known: Known, ems_channel: bool = False
 ) -> Transmission:
     """A `Transmission` from a filled-in form, keeping only what the vocabulary
-    allows. A field that does not fit is left empty, not passed on: the form is a
-    model's answer, and a model can put anything in it."""
+    allows and `known` lists. A field that does not fit is left empty, not passed
+    on: the form is a model's answer, and a model can put anything in it."""
     clarity = _one_of(form.get("clarity"), CLARITIES, "partial")
     category = _one_of(form.get("category"), CATEGORIES, "other")
     if ems_channel:
@@ -230,7 +236,7 @@ def read_form(
     units = form.get("units")
     details = form.get("details")
     alarm = form.get("alarm")
-    street = clean_street(form.get("street"))
+    street = known.street(form.get("street"))
     return Transmission(
         clarity=clarity,  # type: ignore[arg-type]
         category=category,  # type: ignore[arg-type]
@@ -249,7 +255,7 @@ def read_form(
             dict.fromkeys(
                 unit
                 for value in (units if isinstance(units, list) else [])
-                if (unit := clean_unit(value)) is not None
+                if (unit := known.unit(value)) is not None
             )
         )[:MAX_UNITS],
         alarm=alarm
@@ -261,7 +267,7 @@ def read_form(
         street=street,
         # A block or a cross street without the street says nothing.
         block=None if street is None else block_of(form.get("block")),
-        cross_street=None if street is None else clean_street(form.get("cross_street")),
+        cross_street=None if street is None else known.street(form.get("cross_street")),
         heard_by=heard_by,
     )
 

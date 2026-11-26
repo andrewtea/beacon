@@ -12,6 +12,7 @@ import os
 import shutil
 import sqlite3
 import textwrap
+import threading
 import time
 import traceback
 from collections.abc import Callable
@@ -26,6 +27,7 @@ from beacon.ember import (
     BudgetExceededError,
     EmberCallError,
     EmberClient,
+    EmberClosedError,
     EmberConfigError,
     EmberError,
     EmberRequestError,
@@ -1990,3 +1992,94 @@ def test_a_relative_data_directory_is_refused_so_every_process_shares_one_ledger
     with pytest.raises(EmberConfigError, match="needs an absolute ledger path"):
         MetaApi().client(Storage.under(Path("data")))
     assert not (tmp_path / "data").exists()
+
+
+def test_a_client_says_where_its_answers_can_come_from(storage: Storage) -> None:
+    assert EmberClient.fake(storage, Script([])).mode == "fake"
+    assert EmberClient.replay_only(storage).mode == "replay"
+    assert MetaApi().client(storage).mode == "live"
+
+
+@pytest.mark.parametrize("sensitive", [False, True])
+def test_a_closed_client_makes_no_call_and_says_nothing_was_sent(
+    storage: Storage, sensitive: bool
+) -> None:
+    api = MetaApi()
+    live = api.client(storage)
+    asked: list[Any] = []
+    fake = EmberClient.fake(storage, lambda body: asked.append(body) or fake_response(text="ok"))
+    live.close()
+    fake.close()
+
+    for ember in (live, fake):
+        with pytest.raises(
+            EmberClosedError, match=r"is closed .* Nothing that costs money was sent\.$"
+        ) as closed:
+            ask(ember, sensitive=sensitive)
+        assert (closed.value.__cause__, closed.value.__context__) == (None, None)
+
+    assert (api.paths(), asked, ledger_rows(storage)) == ([], [], [])
+    assert (live.drain(0), fake.drain(0)) == (True, True)
+
+
+@pytest.mark.parametrize("sensitive", [False, True])
+def test_a_client_closed_while_a_calls_tokens_are_counted_does_not_send_the_paid_request(
+    storage: Storage, sensitive: bool
+) -> None:
+    api = MetaApi()
+    built: list[EmberClient] = []
+
+    def close_during_the_count(request: httpx2.Request) -> httpx2.Response:
+        # The process begins to shut down while the free request is out.
+        built[0].close()
+        return api(request)
+
+    ember = EmberClient.live(
+        storage,
+        api_key="test-key",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(close_during_the_count)),
+    )
+    built.append(ember)
+
+    with pytest.raises(EmberClosedError):
+        ask(ember, sensitive=sensitive)
+
+    # The request that costs money never left, and the ledger says so.
+    assert api.paths() == ["/v1/responses/input_tokens"]
+    (row,) = ledger_rows(storage)
+    assert (row["status"], row["cost_nanousd"]) == ("error", 0)
+    assert row["error"] == "Not sent: the client stopped before the paid request."
+    assert ember.spent_usd() == 0
+    assert ember.drain(0) is True
+
+
+def test_a_paid_request_that_is_out_when_the_client_is_closed_is_answered_and_waited_for(
+    storage: Storage,
+) -> None:
+    out, answer = threading.Event(), threading.Event()
+
+    def create(_request: httpx2.Request) -> httpx2.Response:
+        out.set()
+        assert answer.wait(10)
+        return httpx2.Response(200, json=completed())
+
+    api = MetaApi(create=create)
+    ember = api.client(storage)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        call = pool.submit(ask, ember)
+        assert out.wait(10)
+
+        # Closing does not call the request off: it may be paid for either way.
+        ember.close()
+        assert ember.drain(0.05) is False
+        assert not call.done()
+        answer.set()
+
+        assert call.result(10).source == "live"
+        assert ember.drain(10) is True
+    (row,) = ledger_rows(storage)
+    assert row["status"] == "ok"
+    # And nothing new is sent.
+    with pytest.raises(EmberClosedError):
+        ask(ember, input="Another request.")
+    assert api.paths() == ["/v1/responses/input_tokens", "/v1/responses"]

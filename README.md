@@ -28,7 +28,7 @@ Inside `server/beacon/`, each package has one concern so pull requests stay apar
 
 ## Run locally
 
-You need [uv](https://docs.astral.sh/uv/), Node.js 26, and pnpm 12. uv installs Python 3.12 itself. [ffmpeg](https://ffmpeg.org) is needed only to hear real radio, and for the tests of that conversion, which are skipped without it (CI installs it).
+You need [uv](https://docs.astral.sh/uv/), Node.js 26, and pnpm 12. uv installs Python 3.12 itself. [ffmpeg](https://ffmpeg.org) and [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) are needed only to hear real radio, on Linux, and for the tests of that conversion, which are skipped without them (CI installs both).
 
 ```sh
 # The server, on http://127.0.0.1:8000.
@@ -80,11 +80,13 @@ Settings come from the environment. The server does not load the repository-root
 | `BEACON_511_API_KEY` | The [511 SF Bay token](https://511.org/open-data/token). Needed when `BEACON_LIVE_SOURCES` names `511`. | 511 cannot be named. |
 | `BEACON_OPENSKY_PERMITTED` | `1` says OpenSky has given Beacon the written license its terms require. Needed when `BEACON_LIVE_SOURCES` names `opensky`. | OpenSky cannot be named. |
 | `OPENSKY_CLIENT_ID`, `OPENSKY_CLIENT_SECRET` | An OpenSky API client, for 4,000 requests a day in place of 400. Set both or neither. | OpenSky is asked without an account, every four minutes. |
-| `BEACON_OPENMHZ_PERMITTED` | `1` says OpenMHz has given Beacon permission to use its audio. Needed when `BEACON_LIVE_SOURCES` names `openmhz`, with the three settings below, `REPLAY=0`, `MODEL_API_KEY`, `EMBER_SPENT_BEFORE_USD`, and ffmpeg on Linux. | OpenMHz cannot be named. |
+| `BEACON_OPENMHZ_PERMITTED` | `1` says OpenMHz has given Beacon permission to use its audio. Needed when `BEACON_LIVE_SOURCES` names `openmhz`, with the talkgroups and the budget below, `REPLAY=0`, `MODEL_API_KEY`, `EMBER_SPENT_BEFORE_USD`, and ffmpeg and bubblewrap on Linux. | OpenMHz cannot be named. |
 | `BEACON_OPENMHZ_TALKGROUPS` | The talkgroups to hear, as a list of OpenMHz's numbers. Every call on them is paid for. | OpenMHz cannot be named. |
 | `BEACON_OPENMHZ_EMS_TALKGROUPS` | The ones among them that carry EMS traffic only. Every call on one is kept as a medical response. | No talkgroup is treated as EMS-only; a call is medical when Ember hears it as one. |
 | `BEACON_OPENMHZ_BUDGET_USD` | The most, in dollars, that hearing radio may cost over every run. It has no default. | OpenMHz cannot be named. |
 | `BEACON_OPENMHZ_MEDIA_HOSTS` | Hosts a call's audio may be fetched from besides `openmhz.com` and its subdomains, as a list. | Audio anywhere else is not fetched. |
+| `BEACON_RADIO_STREETS_FILE` | A text file of the street names a real radio row may name, one to a line (`Hayes St`); lines that begin with `#` are skipped. | A real radio row names no street, and so has no place. |
+| `BEACON_RADIO_UNITS_FILE` | A text file of the unit ids a real radio row may name, one to a line (`E36`). | A real radio row names no unit. |
 | `BEACON_INGEST` | `0` starts the server without its pollers. | `1`: the server runs the pollers. |
 
 The server's routes do not build an Ember client yet, so today the Ember settings are read by the two commands under [Ember client](#ember-client) and nothing else. The server reads the source settings when it starts, and `BEACON_DATA_DIR` with them. Three places set any of them. `scripts/check`, and so CI, sets `REPLAY=1` and removes `MODEL_API_KEY`. Server pytest does the same, removes the spending settings and every source setting, and points `BEACON_DATA_DIR` at a temporary directory for each test. The orb's API service in [`.amp/services.yaml`](.amp/services.yaml) sets `REPLAY=1`.
@@ -120,15 +122,20 @@ Rows are never changed. A source that revises what it said gets a new row: an NW
 
 A radio call is the one kind of evidence a model makes: the poller downloads a call's audio and Ember hears it (`extract_transmission` in [`server/beacon/radio/`](server/beacon/radio)). Dispatch radio names people, describes patients, and gives house numbers, so this is what ingest guarantees about a call, before any later redaction:
 
-- **Nothing a call said is stored as text.** There is no transcript. Ember fills in a form, and each field is checked against a closed vocabulary before anything is kept: a category, a status, and detail tags from fixed lists, unit ids such as `E36`, a street name of a strict shape, and the hundred block of an address (`1458` is kept as `1400`). What does not fit is dropped, whatever Ember wrote.
+- **Nothing a call said is stored as text.** There is no transcript. Ember fills in a form, and each field is checked against a closed vocabulary before anything is kept: a category, a status, and detail tags from fixed lists, and the hundred block of an address (`1458` is kept as `1400`). A unit id or a street name is kept only when it is **on a list**: `BEACON_RADIO_UNITS_FILE` and `BEACON_RADIO_STREETS_FILE` for real radio, and the story's own units and streets in the mock scenario. A shape is not enough, because `BP 180` has the shape of a unit and `One Two Three Hayes St` the shape of a street. With no list, a row names no unit and no street. What does not fit is dropped, whatever Ember wrote.
 - **A medical call is "medical response", its crews, and its block.** Its status, details, and alarm level are not kept. That holds for a call Ember hears as medical and for every call on a talkgroup named in `BEACON_OPENMHZ_EMS_TALKGROUPS`, whatever Ember made of it.
-- **The audio is never written to disk**, not even while ffmpeg converts it from M4A: it is handed over as a file that exists only in memory.
+- **The audio is never written to a file**, not even while ffmpeg decodes it: it is handed over as a file that exists only in memory. ffmpeg runs confined by bubblewrap, with no network, no environment, and no file to read but the system's own programs and libraries, and under limits on its memory, time, and output. What that leaves to the operator is swap: run real radio with swap off or encrypted. Beacon turns its own core dumps off when it is built to hear real radio.
+- **Ember is sent a WAV file Beacon made itself**, whatever the call arrived as, so Beacon knows how long the audio really plays before it pays, and nothing else a file carried is sent.
 - **The Ember call is a sensitive one**, so the Ember ledger and trace hold its tokens and cost and none of its audio or its answer, and it is never recorded for replay.
 - A radio row has a place in words and no point: nothing in ingest knows where on the map a block is.
 
-The limit of this: a street is checked by its shape, not against a list of the city's streets, so a name that Ember put in the street field with a street type after it (`Jane Doe St`) would be kept. And the form is only as good as Ember's hearing, which has not been measured: a row heard `clear` is `medium` confidence, and anything less is `low`.
+The limits of this: a name that is on a list is kept whatever Ember meant by it, so `M72` is kept as Medic 72 even if what was said was a man of 72, and the hundred block is a number Ember gave. And the form is only as good as Ember's hearing, which has not been measured: a row heard `clear` is `medium` confidence, and anything less is `low`. No list of San Francisco's streets or of its fire department's units is in the repository, and nobody has put one together yet: whoever turns real radio on supplies both and names the files. The city's open-data portal, [DataSF](https://datasf.org/opendata/), is the place to look first.
 
-Every call is paid for, once. The poller hears only the talkgroups it is given, passes over a call shorter than a second or longer than two minutes, hears at most 20 calls every 30 seconds, never asks about the same call twice, and makes its calls under a budget of its own (`BEACON_OPENMHZ_BUDGET_USD`, the spending scope `ingest:openmhz`) inside the client's spending stop. When either refuses a call, or Ember fails on one, the poller waits ten minutes before it looks again, and calls that grew older than fifteen minutes meanwhile are passed over. A call Ember was asked about is never asked about again, whether or not an answer came.
+Every call is paid for, once. The poller hears only the talkgroups it is given, passes over a call shorter than a second or longer than two minutes (by its listing, and then by its decoded audio), hears at most 20 calls every 30 seconds, and makes its calls under a budget of its own (`BEACON_OPENMHZ_BUDGET_USD`, the spending scope `ingest:openmhz`) inside the client's spending stop. Before Ember is asked about a call, the call is **claimed** in the evidence store, and a claimed call is never asked about again, by this process or another: not after a crash, a row that could not be stored, or an answer that was no form. The claim is given up only when the paid request is known not to have been sent. So a process that dies between Ember's answer and the row loses that call, and does not pay for it twice.
+
+When the spending stop or the budget refuses a call, or Ember fails on one, the poller asks nothing for ten minutes, counted from the failure and kept in the store, so a restart does not shorten it; the same after three answers in a row that were no form. Calls that grew older than fifteen minutes meanwhile are passed over. If the Ember ledger is replaced while it runs, the poller stops until Beacon is started again. Each poll asks again for the five minutes before the newest call it has finished with, because OpenMHz lists a call only when its upload arrives; calls it has already taken are told apart by their ids.
+
+Shutting the server down sends nothing new: no paid request is begun, a download or a conversion is called off, and a paid request that is already out is waited for, for up to about two minutes, so that its answer is stored.
 
 ### Mock and live
 
@@ -150,6 +157,7 @@ BEACON_LIVE_SOURCES=nws,511 BEACON_511_API_KEY=... \
 ```sh
 BEACON_LIVE_SOURCES=nws,openmhz BEACON_OPENMHZ_PERMITTED=1 \
   BEACON_OPENMHZ_TALKGROUPS=... BEACON_OPENMHZ_EMS_TALKGROUPS=... BEACON_OPENMHZ_BUDGET_USD=0.25 \
+  BEACON_RADIO_STREETS_FILE=/path/to/streets.txt BEACON_RADIO_UNITS_FILE=/path/to/units.txt \
   REPLAY=0 MODEL_API_KEY=... EMBER_SPENT_BEFORE_USD=... \
   uv run uvicorn beacon.main:app
 ```

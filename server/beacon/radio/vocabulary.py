@@ -2,17 +2,26 @@
 
 Dispatch radio names people, describes patients, and gives house numbers, and none of
 that may be stored. So nothing a transmission said is stored as free text. What is
-kept of it is a category, a status, and detail tags from the fixed lists here, unit
-ids and street names that fit a strict pattern, and a block number rounded down to
-the hundred. Whatever does not fit is dropped by `beacon.radio.extract` before a
-`Transmission` exists, whatever Ember answered.
+kept of it is a category, a status, and detail tags from the fixed lists here, a
+block number rounded down to the hundred, and unit ids and street names that are
+**on a list** (`Known`). Whatever does not fit is dropped by `beacon.radio.extract`
+before a `Transmission` exists, whatever Ember answered.
 
-The limit of this: a street is checked by its shape, not against a list of the
-city's streets, so words shaped like a street name would be kept as one. A name has
-to end in a street type, so `Jane Doe` is not kept and `Jane Doe St` would be.
+A unit or a street is checked twice. First by its shape, which also gives it its one
+stored form: `truck 6` is `T6`, and `432 hayes street` is `Hayes St`. Shape is not
+enough, though, because a model's answer is shaped by the model: `BP 180` has the
+shape of a unit, and `One Two Three Hayes St` the shape of a street. So the name is
+then looked up in `Known`, the units and the streets somebody listed, and one that
+is not listed is dropped. With no list, no unit and no street is kept at all.
+
+What is left after that: a listed name is kept whatever Ember meant by it. `M72` on
+the list of units is kept as Medic 72 even if what was said was a man of 72, and the
+hundred block is a number Ember gave. Nothing here can tell.
 """
 
 import re
+from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Literal, get_args
 
 Category = Literal[
@@ -159,6 +168,71 @@ def clean_street(value: object) -> str | None:
             return None
     street = " ".join([*(_name_word(word) for word in named), suffix])
     return street if len(street) <= _MAX_STREET else None
+
+
+@dataclass(frozen=True)
+class Known:
+    """The units and the streets a transmission may name: a department's roster and
+    a city's street names, each in its stored form. Build one with `Known.of`."""
+
+    streets: frozenset[str] = frozenset()
+    units: frozenset[str] = frozenset()
+
+    @classmethod
+    def of(cls, *, streets: Iterable[str] = (), units: Iterable[str] = ()) -> "Known":
+        """The lists, each name put in its stored form.
+
+        Raises ValueError when a name is not one `clean_street` or `clean_unit`
+        keeps, and says which place in its list it has, not what it is."""
+        return cls(
+            streets=frozenset(_listed(streets, clean_street, "street")),
+            units=frozenset(_listed(units, clean_unit, "unit")),
+        )
+
+    @classmethod
+    def kept(cls, *, streets: Iterable[str] = (), units: Iterable[str] = ()) -> "tuple[Known, int]":
+        """The lists as `of` makes them, with the names it would refuse left out,
+        and how many those were. A city's own list of its streets has entries that
+        are no street name Beacon keeps, such as `Avenue of the Palms`."""
+        stored_streets = [clean_street(name) for name in streets]
+        stored_units = [clean_unit(name) for name in units]
+        known = cls(
+            streets=frozenset(name for name in stored_streets if name is not None),
+            units=frozenset(name for name in stored_units if name is not None),
+        )
+        left_out = stored_streets.count(None) + stored_units.count(None)
+        return known, left_out
+
+    def street(self, value: object) -> str | None:
+        """A listed street in its stored form, or None."""
+        name = clean_street(value)
+        return name if name in self.streets else None
+
+    def unit(self, value: object) -> str | None:
+        """A listed unit in its stored form, or None."""
+        name = clean_unit(value)
+        return name if name in self.units else None
+
+
+# With this, a transmission keeps no unit and no street.
+NOTHING_KNOWN = Known()
+
+
+def read_names(text: str) -> list[str]:
+    """The names in a list file: one to a line, with blank lines and lines that
+    begin with `#` left out."""
+    lines = (line.strip() for line in text.splitlines())
+    return [line for line in lines if line and not line.startswith("#")]
+
+
+def _listed(names: Iterable[str], clean, what: str) -> list[str]:  # type: ignore[no-untyped-def]
+    kept = []
+    for place, name in enumerate(names, start=1):
+        stored = clean(name)
+        if stored is None:
+            raise ValueError(f"Name {place} in the list of {what}s is not a {what} Beacon keeps.")
+        kept.append(stored)
+    return kept
 
 
 def _name_word(word: str) -> str:

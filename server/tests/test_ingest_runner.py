@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from beacon.evidence import EvidenceStore, EvidenceStoreError
-from beacon.ingest import Clock, PollerStatus, PollReport, Runner, SourceError
+from beacon.ingest import Clock, PollerHeldError, PollerStatus, PollReport, Runner, SourceError
 
 NOON = datetime(2026, 11, 27, 20, 0, tzinfo=UTC)
 
@@ -108,6 +108,26 @@ def test_a_source_that_asks_for_a_longer_wait_than_the_interval_gets_it(
 
     assert limited.polled == [seconds(0), seconds(600)]
     assert patient.polled == [seconds(0), seconds(300), seconds(600)]
+
+
+def test_a_poller_that_is_holding_off_is_left_alone_for_as_long_as_it_says(
+    store: EvidenceStore, time: Time, caplog: pytest.LogCaptureFixture
+) -> None:
+    held = FakePoller("radio", 30)
+    held.failures = [PollerHeldError("The radio poller is leaving Ember alone for a while.", 600)]
+    runner = Runner([held], store, Clock(time))
+
+    with caplog.at_level(logging.WARNING):
+        (outcome,) = runner.step().values()
+
+    # Its own fixed sentence is logged, and its last poll is not counted as a good one.
+    assert isinstance(outcome, PollerHeldError)
+    assert "The radio poller is leaving Ember alone for a while." in caplog.text
+    assert runner.status() == [PollerStatus("radio", seconds(0), False)]
+    for count in (30, 599, 600):
+        time.moment = seconds(count)
+        runner.step()
+    assert held.polled == [seconds(0), seconds(600)]
 
 
 def test_an_unexpected_failure_is_logged_by_its_kind_and_nothing_of_its_text(

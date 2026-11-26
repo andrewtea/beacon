@@ -22,6 +22,11 @@ class LedgerReplacedError(BudgetExceededError):
     opened: what has been spent is not known from it, so the stop cannot be kept."""
 
 
+class EmberClosedError(EmberError):
+    """The client was closed before this call's paid request was sent. Nothing was
+    sent that costs money, and nothing was paid."""
+
+
 class RateLimitHoldError(EmberError):
     """The API asked for a wait longer than a paced client waits. Nothing is sent
     through that client's pacer until the wait has passed."""

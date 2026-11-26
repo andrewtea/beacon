@@ -15,3 +15,9 @@ step() {
 # uv downloads the Python pinned in server/.python-version when it is missing.
 step "server: uv sync" uv sync --locked --project "$root/server"
 step "web: pnpm install" pnpm --dir "$root/web" install --frozen-lockfile
+
+# The tests of the radio audio conversion run ffmpeg confined by bubblewrap, and are
+# skipped without it. CI installs it; an orb may or may not let this through.
+command -v bwrap >/dev/null ||
+  sudo -n apt-get install -y bubblewrap >/dev/null 2>&1 ||
+  echo "    bubblewrap is not installed: the radio conversion tests will be skipped."
