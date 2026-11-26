@@ -32,6 +32,16 @@ from beacon.evidence import Point
 # The middle of the 400 block of Hayes St.
 FIRE = Point(37.7766, -122.4236)
 
+# Where the blocks the story's radio calls name are: the middle of each, to about
+# a block. The streets are real and the positions are Beacon's own estimates. They
+# stand where a list of the city's blocks would for real radio.
+BLOCK_POINTS: tuple[tuple[str, int, float, float], ...] = (
+    ("Hayes St", 400, FIRE.lat, FIRE.lon),
+    ("Fell St", 400, 37.7757, -122.4234),
+    ("Geary Blvd", 5200, 37.7805, -122.4760),
+    ("Irving St", 1900, 37.7636, -122.4783),
+)
+
 # The words every invented text carries, so that it cannot be mistaken for a real
 # one wherever it ends up.
 INVENTED = "Invented for Beacon's mock scenario."

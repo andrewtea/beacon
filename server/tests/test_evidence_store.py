@@ -542,3 +542,19 @@ def test_a_store_file_from_before_claims_is_given_the_table(tmp_path: Path) -> N
 
     assert store.claim("openmhz", "call-1") is True
     assert refs(store.search()) == ["kept"]
+
+
+def test_a_reader_that_notes_the_last_id_sees_the_same_rows_whatever_is_stored_after(
+    store: EvidenceStore,
+) -> None:
+    assert store.last_id() == 0
+    store.add([row("first"), row("second", occurred_at=minutes(5))])
+    noted = store.last_id()
+    assert noted == 2
+
+    # A row that happened earlier and is stored later is still a later row.
+    store.add([row("late", occurred_at=minutes(-5))])
+
+    assert refs(store.search(up_to_id=noted)) == ["first", "second"]
+    assert refs(store.search()) == ["late", "first", "second"]
+    assert store.last_id() == 3

@@ -59,7 +59,7 @@ _PAGE = 500
 # The whole Bay Area has a few hundred events in effect. Past this many pages the
 # answer is taken as not read in full, and nothing counts as missing from it.
 _MAX_PAGES = 4
-_MAX_TEXT = 1_000
+MAX_HEADLINE = 1_000
 # A schedule is kept as 511 sent it when it is no longer than this as JSON.
 _MAX_SCHEDULE = 4_000
 _EVENT_TYPES = frozenset(
@@ -216,7 +216,7 @@ def _following(pagination: Any, offset: int) -> Literal["more", "none", "unclear
 
 def _event(item: dict[str, Any], origin: Origin) -> NewEvidence | None:
     event_id = _text(item.get("id"), 200)
-    headline = _text(item.get("headline"), _MAX_TEXT)
+    headline = _text(item.get("headline"), MAX_HEADLINE)
     created = _time(item.get("created"))
     updated = _time(item.get("updated")) or created
     if event_id is None or headline is None or updated is None:

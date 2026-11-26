@@ -92,5 +92,6 @@ def offline_environment(
         "BEACON_NOTICES_FEED_URL",
         "BEACON_NOTICES_HOSTS",
         "BEACON_NOTICES_BUDGET_USD",
+        "BEACON_BLOCKS_FILE",
     ):
         monkeypatch.delenv(name, raising=False)
