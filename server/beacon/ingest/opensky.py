@@ -80,8 +80,6 @@ class OpenSkyAircraft:
         if (client_id is None) != (client_secret is None):
             raise ValueError("An OpenSky client id and secret are given together.")
         self._http = http
-        # What a stand-in for the network answered is a stand-in's, whoever asks.
-        self.origin: Origin = http.origin
         self._credentials = None if client_id is None else (client_id, client_secret)
         self._bounds = bounds
         self._monotonic = monotonic
@@ -91,6 +89,13 @@ class OpenSkyAircraft:
         self.interval_seconds = interval_seconds or (
             ANONYMOUS_INTERVAL_SECONDS if client_id is None else SIGNED_IN_INTERVAL_SECONDS
         )
+
+    @property
+    def origin(self) -> Origin:
+        """Where this poller's rows come from, which is where its client's answers
+        come from and cannot be set: what a stand-in for the network answered is a
+        stand-in's, whoever asks."""
+        return self._http.origin
 
     def poll(self, store: EvidenceStore, now: datetime) -> PollReport:
         store.refuse_stand_in(self.origin)

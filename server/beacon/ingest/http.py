@@ -27,6 +27,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import ssl
 import threading
 import zlib
@@ -102,6 +103,13 @@ class SourceError(Exception):
 
 
 _PACKED_ANOTHER_WAY = "packed its reply in a way Beacon does not read"
+
+# `Sun Nov  6 08:49:37 1994`: a day with one digit has a space in front of it.
+_ASCTIME = re.compile(
+    r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"(?:\d{2}| \d) \d{2}:\d{2}:\d{2} \d{4}"
+)
 
 
 class _AsFromTheNetwork(httpx2.AsyncBaseTransport):
@@ -409,9 +417,13 @@ def _seconds_until(when: str, sent: str | None) -> float | None:
 
 
 def _http_date(value: str) -> datetime | None:
+    """An HTTP date in any of the three forms RFC 9110 allows, or None."""
     try:
         moment = parsedate_to_datetime(value)
     except (TypeError, ValueError):
         return None
-    # A date with no zone is not an HTTP date, which is always in GMT.
-    return moment if moment.utcoffset() is not None else None
+    if moment.utcoffset() is not None:
+        return moment
+    # The oldest form, C's asctime, names no zone and is in GMT like the others. Any
+    # other date with no zone is not an HTTP date.
+    return moment.replace(tzinfo=UTC) if _ASCTIME.fullmatch(value.strip()) else None

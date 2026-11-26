@@ -53,9 +53,14 @@ class NwsAlerts:
         zones: tuple[str, ...] = SAN_FRANCISCO_ZONES,
     ) -> None:
         self._http = http
-        # What a stand-in for the network answered is a stand-in's, whoever asks.
-        self.origin: Origin = http.origin
         self._zones = zones
+
+    @property
+    def origin(self) -> Origin:
+        """Where this poller's rows come from, which is where its client's answers
+        come from and cannot be set: what a stand-in for the network answered is a
+        stand-in's, whoever asks."""
+        return self._http.origin
 
     def poll(self, store: EvidenceStore, now: datetime) -> PollReport:
         store.refuse_stand_in(self.origin)

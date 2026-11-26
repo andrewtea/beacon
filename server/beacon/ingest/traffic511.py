@@ -85,12 +85,17 @@ class Traffic511:
             raise ValueError("511 needs an API token.")
         self._http = http
         self._api_key = api_key
-        # What a stand-in for the network answered is a stand-in's, whoever asks.
-        self.origin: Origin = http.origin
         self._bounds = bounds
         # How long to wait before the next poll. It is set after each poll from the
         # number of requests the poll made, so the quota is kept by requests.
         self.interval_seconds = SECONDS_PER_REQUEST
+
+    @property
+    def origin(self) -> Origin:
+        """Where this poller's rows come from, which is where its client's answers
+        come from and cannot be set: what a stand-in for the network answered is a
+        stand-in's, whoever asks."""
+        return self._http.origin
 
     def poll(self, store: EvidenceStore, now: datetime) -> PollReport:
         store.refuse_stand_in(self.origin)

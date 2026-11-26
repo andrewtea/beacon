@@ -91,8 +91,9 @@ def compare_listing(
 def not_listed_row(row: Evidence, now: datetime, origin: Origin) -> dict[str, Any]:
     """The fields every "no longer listed" row shares. Its reference holds the
     moment, so an item that goes, comes back, and goes again has a row for each.
-    `origin` is the origin of the poller that saw it, not of the row it is about:
-    what is recorded is this poll's observation."""
+    `origin` is the origin of the poller that saw it. The row is a stand-in's when
+    either is: what the poller saw, or the row it is about, whose place and words
+    the new row repeats."""
     return {
         "kind": row.kind,
         "source": row.source,
@@ -103,7 +104,9 @@ def not_listed_row(row: Evidence, now: datetime, origin: Origin) -> dict[str, An
         # The source is an authority, and it did not say this: Beacon saw the item
         # missing from two of its answers.
         "confidence": "medium",
-        "origin": origin,
+        "origin": "mock" if "mock" in (origin, row.origin) else "live",
+        # A fake Ember's part in the row this is about is a part in this one.
+        "model": "fake" if row.model == "fake" else None,
     }
 
 

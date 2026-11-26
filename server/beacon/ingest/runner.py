@@ -49,8 +49,13 @@ class PollerStatus:
 class Poller(Protocol):
     # Names the poller in the log and in the state it saves.
     name: str
-    # Where its rows come from: `live` only for a poller that asks the real source.
-    origin: Origin
+
+    @property
+    def origin(self) -> Origin:
+        """Where its rows come from: `live` only for a poller that asks the real
+        source. A poller reads it from its HTTP client and offers no way to set it."""
+        ...
+
     # How long to wait after a poll before the next. It is read after each poll, so
     # a poller can ask for longer after a poll that cost more.
     interval_seconds: float

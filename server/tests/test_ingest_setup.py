@@ -28,6 +28,7 @@ from beacon.ingest import (
     source_pollers,
 )
 from beacon.ingest.http import SourceHttp, fetch
+from beacon.ingest.listing import listed_again_row, not_listed_row
 from beacon.ingest.nws import NwsAlerts
 from beacon.ingest.opensky import OpenSkyAircraft
 from beacon.ingest.traffic511 import Traffic511
@@ -656,6 +657,60 @@ def test_a_change_row_has_the_origin_of_the_poller_that_saw_the_change(
         ("listed_again", "mock"),
         ("not_listed", "mock"),
     ]
+
+
+def test_a_change_about_a_stand_ins_row_is_a_stand_ins_whoever_saw_it(tmp_path: Path) -> None:
+    mock = EvidenceStore(tmp_path / "mock.sqlite3", "mock")
+    live = EvidenceStore(tmp_path / "live.sqlite3", "live")
+    invented, heard_by_a_fake = mock.add(
+        [
+            NewEvidence(
+                kind="alert",
+                source="nws",
+                ref="urn:oid:invented.1",
+                occurred_at=NOON,
+                place="San Francisco",
+                confidence="official",
+                origin="mock",
+                data={"event": "Shelter In Place Warning"},
+            ),
+            NewEvidence(
+                kind="radio",
+                source="openmhz",
+                ref="call-1",
+                occurred_at=NOON,
+                confidence="medium",
+                origin="live",
+                model="fake",
+            ),
+        ]
+    )
+
+    # A poller that asks the real source sees that the item is not listed. The row
+    # that says so repeats the invented row's place, so it is a stand-in's too.
+    for about in (invented, heard_by_a_fake):
+        for build_row in (not_listed_row, listed_again_row):
+            change = NewEvidence(**build_row(about, NOON + timedelta(minutes=4), "live"))
+
+            assert (change.origin, change.model) == (about.origin, about.model)
+            assert change.stand_in
+            with pytest.raises(EvidenceStoreError, match="holds nothing a stand-in produced"):
+                live.add([change])
+    assert live.search() == []
+
+
+def test_a_pollers_origin_is_its_clients_and_cannot_be_set() -> None:
+    stand_in = SourceHttp(httpx2.MockTransport(lambda request: httpx2.Response(200)))
+
+    for poller in (
+        NwsAlerts(stand_in),
+        OpenSkyAircraft(stand_in),
+        Traffic511(stand_in, api_key="token"),
+    ):
+        assert poller.origin == "mock"
+        with pytest.raises(AttributeError):
+            poller.origin = "live"  # type: ignore[misc]
+        assert poller.origin == "mock"
 
 
 class Silent:

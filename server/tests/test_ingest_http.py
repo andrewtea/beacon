@@ -179,6 +179,16 @@ def test_a_reply_packed_another_way_is_refused(server: Server) -> None:
         # A date that has passed by this machine's clock, with no date to count from.
         ({"Retry_After": "Fri, 27 Nov 2020 20:30:00 GMT"}, 0.0),
         ({"Retry_After": "27 Nov 2099 20:30:00"}, None),
+        # The two older forms of an HTTP date. The oldest names no zone and is GMT.
+        (
+            {"Retry_After": "Sun Nov  6 09:49:37 1994", "Date": "Sun, 06 Nov 1994 08:49:37 GMT"},
+            3600.0,
+        ),
+        (
+            {"Retry_After": "Sunday, 06-Nov-94 08:59:37 GMT", "Date": "Sun Nov  6 08:49:37 1994"},
+            600.0,
+        ),
+        ({"Retry_After": "Sun Nov 6 09:49:37 1994", "Date": "Sun, 06 Nov 1994 08:49:37 GMT"}, None),
         # OpenSky's own header is a number and nothing else.
         ({"X_Rate_Limit_Retry_After_Seconds": "Fri, 27 Nov 2099 20:30:00 GMT"}, None),
         ({"Retry_After": "inf"}, None),
