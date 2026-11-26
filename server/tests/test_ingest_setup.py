@@ -1,6 +1,7 @@
 """Building the pollers from the environment, and the mock scenario played through them."""
 
 import itertools
+import json
 import logging
 import sqlite3
 import threading
@@ -697,6 +698,70 @@ def test_a_change_about_a_stand_ins_row_is_a_stand_ins_whoever_saw_it(tmp_path: 
             with pytest.raises(EvidenceStoreError, match="holds nothing a stand-in produced"):
                 live.add([change])
     assert live.search() == []
+
+
+def test_in_the_mock_store_a_change_is_a_stand_ins_whichever_poller_saw_the_last_of_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    listed = [True]
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            features = [
+                {
+                    "id": "https://api.weather.gov/alerts/urn:oid:wind.1",
+                    "geometry": None,
+                    "properties": {
+                        "id": "urn:oid:wind.1",
+                        "status": "Actual",
+                        "messageType": "Alert",
+                        "event": "Wind Advisory",
+                        "sent": "2026-11-27T11:00:00-08:00",
+                        "ends": "2026-11-27T22:00:00-08:00",
+                    },
+                }
+            ]
+            body = json.dumps(
+                {"type": "FeatureCollection", "features": features if listed[0] else []}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
+    # A poller that asks the network, which here is a server on this machine, and
+    # one that a stand-in answers with an empty list. They share a mock store.
+    monkeypatch.setattr("beacon.ingest.nws.URL", f"http://127.0.0.1:{server.server_port}/alerts")
+    over_the_network = NwsAlerts(SourceHttp())
+    answered_by_a_stand_in = NwsAlerts(
+        SourceHttp(
+            httpx2.MockTransport(
+                lambda request: httpx2.Response(
+                    200, json={"type": "FeatureCollection", "features": []}
+                )
+            )
+        )
+    )
+    store = EvidenceStore(tmp_path / "mock.sqlite3", "mock")
+
+    over_the_network.poll(store, NOON)
+    listed[0] = False
+    # The first answer without the alert is the stand-in's, and the second the network's.
+    answered_by_a_stand_in.poll(store, NOON + timedelta(minutes=2))
+    over_the_network.poll(store, NOON + timedelta(minutes=4))
+    server.shutdown()
+    server.server_close()
+
+    alert, change = store.search()
+    assert (alert.origin, over_the_network.origin) == ("live", "live")
+    # One of the two answers it rests on was a stand-in's, and the store does not
+    # keep which: a change worked out in the mock store is a stand-in's.
+    assert (change.data["change"], change.origin, change.stand_in) == ("not_listed", "mock", True)
 
 
 def test_a_pollers_origin_is_its_clients_and_cannot_be_set() -> None:

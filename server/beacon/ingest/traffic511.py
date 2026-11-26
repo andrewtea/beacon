@@ -145,9 +145,10 @@ class Traffic511:
             listed={event.data["event_id"]: event.ref for event in events},
             complete=complete and unreadable == 0,
             now=now,
+            origin=self.origin,
         )
-        changes = [_change(row, now, "not_listed", self.origin) for row in listing.gone]
-        changes += [_change(row, now, "listed_again", self.origin) for row in listing.back]
+        changes = [_change(row, now, "not_listed", listing.origin) for row in listing.gone]
+        changes += [_change(row, now, "listed_again", listing.origin) for row in listing.back]
         added = store.add([*events, *changes], state=(self.name, listing.state), now=now)
         return PollReport(added=len(added), unreadable=unreadable, partial=not complete)
 
