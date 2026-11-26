@@ -951,6 +951,27 @@ def test_what_a_poll_that_ended_in_an_error_counted_is_in_the_next_report(
     assert poller.poll(store, minutes(17)).unreadable == 0
 
 
+def test_the_answer_that_holds_the_poller_is_counted_with_the_ones_before_it(
+    store: EvidenceStore, site: Site, storage: Storage, wall: list[datetime]
+) -> None:
+    for number in range(1, UNUSABLE_RUN_LIMIT + 1):
+        site.notice(number, minutes(-60 + number), "A sentence, and no form.")
+    poller = build(site, storage, wall_clock=lambda: wall[0])
+
+    # The last of them holds the poller, and the poll makes no report.
+    with pytest.raises(PollerHeldError):
+        poller.poll(store, NOON)
+    assert len(site.asked) == UNUSABLE_RUN_LIMIT
+
+    wall[0] = NOON + timedelta(seconds=HELD_INTERVAL_SECONDS)
+    report = poller.poll(store, wall[0])
+
+    # Every one of them was paid for and is finished with, the last one too.
+    assert (report.added, report.unreadable) == (0, UNUSABLE_RUN_LIMIT)
+    assert len(site.asked) == UNUSABLE_RUN_LIMIT
+    assert poller.poll(store, wall[0] + timedelta(minutes=2)).unreadable == 0
+
+
 def test_what_was_counted_is_remembered_for_the_last_two_thousand_and_no_more(
     site: Site, poller: NoticeFeed
 ) -> None:

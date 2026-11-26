@@ -259,7 +259,6 @@ class NoticeFeed:
             with self._paid.working():
                 reading = self._read(store, notice, pdf, hold, now)
                 if reading is None:
-                    self._new([notice.ref])
                     continue
                 # The row and what the poller remembers are saved together.
                 state = (self.name, hold.hold_state())
@@ -302,8 +301,8 @@ class NoticeFeed:
     ) -> Notice | None:
         """What Ember read in a document that is claimed, or None when its answer
         came to nothing: it was no form, or the document is more than Ember takes.
-        The document is finished with either way, and what the poller remembers is
-        saved.
+        The document is finished with either way and counted as unreadable, and
+        what the poller remembers is saved.
 
         Raises what Ember raised when it refused the document or failed on it, with
         the poller held, and PollerHeldError when answers that are no form have
@@ -328,6 +327,9 @@ class NoticeFeed:
         if unusable or reading is not None:
             held = self._paid.count_answer(hold, usable=reading is not None)
         if reading is None:
+            # Counted here, before anything that can end the poll: the document
+            # stays claimed, so no later poll would count it.
+            self._new([listed.ref])
             store.add([], state=(self.name, hold.hold_state()), now=now)
         if held is not None:
             raise_bare(held)
