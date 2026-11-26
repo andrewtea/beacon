@@ -82,5 +82,10 @@ def offline_environment(
         "BEACON_OPENSKY_PERMITTED",
         "OPENSKY_CLIENT_ID",
         "OPENSKY_CLIENT_SECRET",
+        "BEACON_OPENMHZ_PERMITTED",
+        "BEACON_OPENMHZ_TALKGROUPS",
+        "BEACON_OPENMHZ_EMS_TALKGROUPS",
+        "BEACON_OPENMHZ_MEDIA_HOSTS",
+        "BEACON_OPENMHZ_BUDGET_USD",
     ):
         monkeypatch.delenv(name, raising=False)

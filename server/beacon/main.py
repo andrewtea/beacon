@@ -41,7 +41,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Off the event loop, and not returned from until the pollers can ask no
         # source and store no row: nothing of theirs outlives the server.
         if not await asyncio.to_thread(ingest.stop):
-            logger.warning("The pollers' thread had not ended when the server shut down.")
+            logger.warning(
+                "The pollers had not stopped when the server shut down. If a paid Ember "
+                "request was out, it can still be sent and paid for: it is in the Ember "
+                "ledger, and its row is lost."
+            )
 
 
 async def _validation_error(_request: Request, error: RequestValidationError) -> JSONResponse:

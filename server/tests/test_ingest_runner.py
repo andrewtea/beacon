@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from beacon.evidence import EvidenceStore, EvidenceStoreError
-from beacon.ingest import Clock, PollerStatus, PollReport, Runner, SourceError
+from beacon.ingest import Clock, PollerHeldError, PollerStatus, PollReport, Runner, SourceError
 
 NOON = datetime(2026, 11, 27, 20, 0, tzinfo=UTC)
 
@@ -108,6 +108,26 @@ def test_a_source_that_asks_for_a_longer_wait_than_the_interval_gets_it(
 
     assert limited.polled == [seconds(0), seconds(600)]
     assert patient.polled == [seconds(0), seconds(300), seconds(600)]
+
+
+def test_a_poller_that_is_holding_off_is_left_alone_for_as_long_as_it_says(
+    store: EvidenceStore, time: Time, caplog: pytest.LogCaptureFixture
+) -> None:
+    held = FakePoller("radio", 30)
+    held.failures = [PollerHeldError("The radio poller is leaving Ember alone for a while.", 600)]
+    runner = Runner([held], store, Clock(time))
+
+    with caplog.at_level(logging.WARNING):
+        (outcome,) = runner.step().values()
+
+    # Its own fixed sentence is logged, and its last poll is not counted as a good one.
+    assert isinstance(outcome, PollerHeldError)
+    assert "The radio poller is leaving Ember alone for a while." in caplog.text
+    assert runner.status() == [PollerStatus("radio", seconds(0), False)]
+    for count in (30, 599, 600):
+        time.moment = seconds(count)
+        runner.step()
+    assert held.polled == [seconds(0), seconds(600)]
 
 
 def test_an_unexpected_failure_is_logged_by_its_kind_and_nothing_of_its_text(
@@ -252,18 +272,29 @@ def test_a_poll_that_read_only_part_of_an_answer_is_logged_and_shown_as_partial(
     store: EvidenceStore, time: Time, caplog: pytest.LogCaptureFixture
 ) -> None:
     paged = FakePoller("511", 120)
-    reports = [PollReport(added=3, partial=True), PollReport(added=0)]
+    partial = PollReport(added=3, partial=True)
+    reports = [partial, partial, PollReport(added=0), partial]
     paged.poll = lambda store, now: reports.pop(0)  # type: ignore[method-assign]
     runner = Runner([paged], store, Clock(time))
+    said = "511's answer was not read to its end, so items it lists may be missing."
 
-    assert runner.step() == {"511": PollReport(added=3, partial=True)}
+    assert runner.step() == {"511": partial}
 
     # It is a poll that worked, and it may have missed what the source lists.
     assert runner.status() == [PollerStatus("511", NOON, True, partial=True)]
-    assert "511's answer was not read to its end, so items it lists may be missing." in caplog.text
+    assert caplog.text.count(said) == 1
+    # The next one is partial too, which is shown, and is not said again.
     time.moment = seconds(120)
     runner.step()
-    assert runner.status() == [PollerStatus("511", seconds(120), True, partial=False)]
+    assert runner.status() == [PollerStatus("511", seconds(120), True, partial=True)]
+    assert caplog.text.count(said) == 1
+    time.moment = seconds(240)
+    runner.step()
+    assert runner.status() == [PollerStatus("511", seconds(240), True, partial=False)]
+    # It is said again when it begins again.
+    time.moment = seconds(360)
+    runner.step()
+    assert caplog.text.count(said) == 2
 
 
 def test_a_runner_on_the_live_store_takes_no_poller_that_a_stand_in_feeds(

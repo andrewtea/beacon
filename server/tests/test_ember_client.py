@@ -12,6 +12,7 @@ import os
 import shutil
 import sqlite3
 import textwrap
+import threading
 import time
 import traceback
 from collections.abc import Callable
@@ -26,6 +27,7 @@ from beacon.ember import (
     BudgetExceededError,
     EmberCallError,
     EmberClient,
+    EmberClosedError,
     EmberConfigError,
     EmberError,
     EmberRequestError,
@@ -1854,6 +1856,35 @@ def test_the_output_limit_reaches_embers_largest_output_and_no_further(storage: 
         )
 
 
+@pytest.mark.parametrize(
+    "output",
+    [
+        None,
+        "Jane Doe",
+        [None, "Jane Doe", 7],
+        [{"type": "message", "content": None}],
+        [{"type": "message", "content": "Jane Doe"}],
+        [{"type": "message", "content": [None]}],
+        [{"type": "message", "content": [{"type": "output_text", "text": None}]}],
+        [{"type": "message", "content": [{"type": "output_text", "text": ["Jane Doe"]}]}],
+    ],
+)
+def test_an_answer_that_is_not_shaped_as_a_message_has_no_text_and_raises_nothing(
+    storage: Storage, output: Any
+) -> None:
+    response = completed() | {"output": output}
+    ember = EmberClient.fake(storage, lambda _body: response)
+
+    assert ask(ember, sensitive=True).output_text == ""
+
+
+def test_the_text_of_an_answer_is_read_past_a_part_that_is_not_text(storage: Storage) -> None:
+    content = [None, {"type": "output_text", "text": "Two units."}, {"type": "refusal"}]
+    response = completed() | {"output": [{"type": "message", "content": content}]}
+
+    assert ask(EmberClient.fake(storage, lambda _body: response)).output_text == "Two units."
+
+
 def test_output_text_is_the_final_answer_without_tool_call_commentary(storage: Storage) -> None:
     response = fake_response(text='{"units": 2}')
     response["output"].insert(
@@ -1990,3 +2021,295 @@ def test_a_relative_data_directory_is_refused_so_every_process_shares_one_ledger
     with pytest.raises(EmberConfigError, match="needs an absolute ledger path"):
         MetaApi().client(Storage.under(Path("data")))
     assert not (tmp_path / "data").exists()
+
+
+def test_a_client_says_where_its_answers_can_come_from(storage: Storage) -> None:
+    assert EmberClient.fake(storage, Script([])).mode == "fake"
+    assert EmberClient.replay_only(storage).mode == "replay"
+    assert MetaApi().client(storage).mode == "live"
+
+
+@pytest.mark.parametrize("sensitive", [False, True])
+def test_a_closed_client_makes_no_call_and_says_nothing_was_sent(
+    storage: Storage, sensitive: bool
+) -> None:
+    api = MetaApi()
+    live = api.client(storage)
+    asked: list[Any] = []
+    fake = EmberClient.fake(storage, lambda body: asked.append(body) or fake_response(text="ok"))
+    live.close()
+    fake.close()
+
+    for ember in (live, fake):
+        with pytest.raises(
+            EmberClosedError, match=r"is closed .* Nothing that costs money was sent\.$"
+        ) as closed:
+            ask(ember, sensitive=sensitive)
+        assert (closed.value.__cause__, closed.value.__context__) == (None, None)
+
+    assert (api.paths(), asked, ledger_rows(storage)) == ([], [], [])
+    assert (live.drain(0), fake.drain(0)) == (True, True)
+
+
+@pytest.mark.parametrize("sensitive", [False, True])
+def test_a_client_closed_while_a_calls_tokens_are_counted_does_not_send_the_paid_request(
+    storage: Storage, sensitive: bool
+) -> None:
+    api = MetaApi()
+    built: list[EmberClient] = []
+
+    def close_during_the_count(request: httpx2.Request) -> httpx2.Response:
+        # The process begins to shut down while the free request is out.
+        built[0].close()
+        return api(request)
+
+    ember = EmberClient.live(
+        storage,
+        api_key="test-key",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(close_during_the_count)),
+    )
+    built.append(ember)
+
+    with pytest.raises(EmberClosedError):
+        ask(ember, sensitive=sensitive)
+
+    # The request that costs money never left, and the ledger says so.
+    assert api.paths() == ["/v1/responses/input_tokens"]
+    (row,) = ledger_rows(storage)
+    assert (row["status"], row["cost_nanousd"]) == ("error", 0)
+    assert row["error"] == "Not sent: the client stopped before the paid request."
+    assert ember.spent_usd() == 0
+    assert ember.drain(0) is True
+
+
+def test_a_paid_request_that_is_out_when_the_client_is_closed_is_answered_and_waited_for(
+    storage: Storage,
+) -> None:
+    out, answer = threading.Event(), threading.Event()
+
+    def create(_request: httpx2.Request) -> httpx2.Response:
+        out.set()
+        assert answer.wait(10)
+        return httpx2.Response(200, json=completed())
+
+    api = MetaApi(create=create)
+    ember = api.client(storage)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        call = pool.submit(ask, ember)
+        assert out.wait(10)
+
+        # Closing does not call the request off: it may be paid for either way.
+        ember.close()
+        assert ember.drain(0.05) is False
+        assert not call.done()
+        answer.set()
+
+        assert call.result(10).source == "live"
+        assert ember.drain(10) is True
+    (row,) = ledger_rows(storage)
+    assert row["status"] == "ok"
+    # And nothing new is sent.
+    with pytest.raises(EmberClosedError):
+        ask(ember, input="Another request.")
+    assert api.paths() == ["/v1/responses/input_tokens", "/v1/responses"]
+
+
+def test_a_refusal_of_a_second_attempt_does_not_say_that_nothing_was_sent(
+    storage: Storage,
+) -> None:
+    api = MetaApi(create=lambda _request: _rate_limited())
+    clock = Clock()
+    # The scope has room for one attempt at the most it can cost, and not for two.
+    scope = SpendScope("ingest:openmhz", RESERVED_NANOUSD + 1)
+    ember = api.client(storage, scope=scope, pacer=Pacer(3000, clock=clock, sleep=clock.sleep))
+
+    with pytest.raises(EmberCallError) as raised:
+        ask(ember)
+
+    # The first attempt was sent and answered 429, and booked as it may have cost.
+    # The second was refused by the budget before it was sent. What the caller is
+    # told is the first: a refusal alone would say that the call cost nothing.
+    assert not isinstance(raised.value, BudgetExceededError)
+    assert raised.value.status_code == 429
+    assert api.paths().count("/v1/responses") == 1
+    assert Ledger(storage.ledger_db).spent_nanousd() == RESERVED_NANOUSD
+    # A call that has sent nothing yet is told of the budget as before.
+    with pytest.raises(BudgetExceededError):
+        ask(ember, input="Another question.")
+
+
+def test_a_second_attempt_that_counts_too_many_tokens_reports_the_attempt_that_was_sent(
+    storage: Storage,
+) -> None:
+    api = MetaApi(input_tokens=150_000, create=lambda _request: _rate_limited())
+
+    def grow(request: httpx2.Request) -> httpx2.Response:
+        # The count is asked for again on the second attempt, and comes back one
+        # token over the limit.
+        if api.paths().count("/v1/responses") == 1:
+            api.input_tokens = 150_001
+        return api(request)
+
+    clock = Clock()
+    ember = EmberClient.live(
+        storage,
+        api_key="test-key",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(grow)),
+        pacer=Pacer(3000, clock=clock, sleep=clock.sleep),
+    )
+
+    with pytest.raises(EmberCallError) as raised:
+        ask(ember)
+
+    # "Too large" alone would say that nothing of the call was sent. One paid
+    # request was, and what it may have cost stays booked.
+    assert not isinstance(raised.value, InputTooLargeError)
+    assert raised.value.status_code == 429
+    assert api.paths().count("/v1/responses") == 1
+    assert Ledger(storage.ledger_db).spent_nanousd() > 0
+    # A call of which nothing was sent is still told that it is too large.
+    with pytest.raises(InputTooLargeError):
+        ask(ember, input="Another question.")
+    assert api.paths().count("/v1/responses") == 1
+
+
+def test_a_client_closed_between_attempts_reports_the_attempt_that_was_sent(
+    storage: Storage,
+) -> None:
+    built: list[EmberClient] = []
+
+    def refuse_and_close(_request: httpx2.Request) -> httpx2.Response:
+        built[0].close()
+        return _rate_limited()
+
+    api = MetaApi(create=refuse_and_close)
+    clock = Clock()
+    built.append(api.client(storage, pacer=Pacer(3000, clock=clock, sleep=clock.sleep)))
+
+    with pytest.raises(EmberCallError) as raised:
+        ask(built[0])
+
+    assert not isinstance(raised.value, EmberClosedError)
+    assert raised.value.status_code == 429
+    assert api.paths().count("/v1/responses") == 1
+
+
+def test_a_client_says_whether_it_makes_a_call_again(storage: Storage) -> None:
+    api = MetaApi()
+    assert api.client(storage).retries is False
+    assert api.client(storage, pacer=Pacer(3000)).retries is True
+    assert EmberClient.fake(storage, Script([])).retries is False
+
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+@pytest.mark.parametrize("redirected", ["/v1/responses/input_tokens", "/v1/responses"])
+def test_a_redirect_from_the_api_is_not_followed_with_the_request(
+    storage: Storage, status: int, redirected: str
+) -> None:
+    requests: list[httpx2.Request] = []
+    api = MetaApi()
+
+    def redirecting(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        if request.url.path == redirected and request.url.host != "elsewhere.example":
+            return httpx2.Response(
+                status, headers={"location": f"https://elsewhere.example{request.url.path}"}
+            )
+        # Wherever a followed redirect would take the request, it would be answered.
+        return api(request)
+
+    # A client as a caller could hand it over, set to follow redirects.
+    http_client = httpx2.Client(transport=httpx2.MockTransport(redirecting), follow_redirects=True)
+    ember = EmberClient.live(storage, api_key="test-key", http_client=http_client)
+    audio = encoded(b"RIFF generated tone")
+
+    with pytest.raises(EmberError):
+        ask(
+            ember,
+            sensitive=True,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_audio", "input_audio": {"data": audio, "format": "wav"}}
+                    ],
+                }
+            ],
+        )
+
+    # Nothing was sent anywhere but to Meta, and the redirected request once.
+    assert {request.url.host for request in requests} == {"api.meta.ai"}
+    assert [request.url.path for request in requests].count(redirected) == 1
+
+
+def test_the_client_built_without_an_http_client_follows_no_redirect(storage: Storage) -> None:
+    ember = EmberClient.live(storage, api_key="test-key")
+
+    assert ember._sdk is not None
+    assert ember._sdk._client.follow_redirects is False
+
+
+def test_a_rate_limited_token_count_is_not_taken_for_an_attempt_that_was_sent(
+    storage: Storage,
+) -> None:
+    counts = [_rate_limited(), None]
+    api = MetaApi()
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == "/v1/responses/input_tokens":
+            refused = counts.pop(0) if counts else None
+            if refused is not None:
+                api.requests.append(request)
+                return refused
+        return api(request)
+
+    clock = Clock()
+    ember = EmberClient.live(
+        storage,
+        api_key="test-key",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
+        # No room for even one attempt at the most it can cost.
+        scope=SpendScope("ingest:openmhz", RESERVED_NANOUSD - 1),
+        pacer=Pacer(3000, clock=clock, sleep=clock.sleep),
+    )
+
+    # The first count is answered 429 and the second succeeds, and then the budget
+    # refuses the call. No paid request was ever sent, and the caller is told so.
+    with pytest.raises(BudgetExceededError):
+        ask(ember)
+
+    assert api.paths() == ["/v1/responses/input_tokens"] * 2
+    assert Ledger(storage.ledger_db).spent_nanousd() == 0
+
+
+def test_a_sent_attempt_is_still_reported_when_a_later_attempts_count_fails(
+    storage: Storage,
+) -> None:
+    counts = [None, httpx2.Response(500, json={"error": {"message": "x"}})]
+    api = MetaApi(create=lambda _request: _rate_limited())
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == "/v1/responses/input_tokens":
+            failed = counts.pop(0) if counts else None
+            if failed is not None:
+                api.requests.append(request)
+                return failed
+        return api(request)
+
+    clock = Clock()
+    ember = EmberClient.live(
+        storage,
+        api_key="test-key",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
+        pacer=Pacer(3000, clock=clock, sleep=clock.sleep),
+    )
+
+    with pytest.raises(EmberCallError) as raised:
+        ask(ember)
+
+    # The paid request of the first attempt was sent and answered 429. The second
+    # attempt's count failed, which says nothing was sent only of that attempt.
+    assert raised.value.status_code == 429
+    assert "was not sent" not in str(raised.value)
+    assert api.paths().count("/v1/responses") == 1
+    assert Ledger(storage.ledger_db).spent_nanousd() == RESERVED_NANOUSD

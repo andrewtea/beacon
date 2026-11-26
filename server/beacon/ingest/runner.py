@@ -11,7 +11,7 @@ import threading
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from beacon.evidence import EvidenceStore, Origin
 from beacon.ingest.http import SourceError
@@ -44,6 +44,34 @@ class PollerStatus:
     ok: bool | None
     # Whether that poll read only part of what the source lists.
     partial: bool = False
+
+
+class PollerHeldError(Exception):
+    """A poller is leaving its source alone for a while, for a reason of its own,
+    and did not ask it. The text is fixed. `retry_after` is the seconds until it
+    will ask again, which the runner waits before it polls again."""
+
+    def __init__(self, message: str, retry_after: float) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+@runtime_checkable
+class PaidWork(Protocol):
+    """What a poller that pays for its work offers, so that shutting down neither
+    starts a paid request nor loses the answer to one that is out."""
+
+    def close(self) -> None:
+        """Admit no more paid work, and call off work that has cost nothing yet.
+        Work that was admitted before goes on, and can send its paid request after
+        this returns: only `drain` says when none is left."""
+        ...
+
+    def drain(self, timeout: float) -> bool:
+        """Wait up to `timeout` seconds for work whose paid request is out to be
+        finished with, and say whether it has been: the request is answered, and
+        what came of it is stored. The store is closed only after this."""
+        ...
 
 
 class Poller(Protocol):
@@ -146,8 +174,8 @@ class Runner:
                     # Stopping is what cut the poll short. That is no news about the
                     # source, and the poll is made again when Beacon next runs.
                     break
-                if isinstance(error, SourceError):
-                    # A source's error has a fixed text.
+                if isinstance(error, SourceError | PollerHeldError):
+                    # Both have a fixed text, and can say how long to wait.
                     logger.warning("%s", error)
                     asked = error.retry_after
                 else:
@@ -160,7 +188,10 @@ class Runner:
                     logger.warning(
                         "%s sent %d items Beacon could not read.", poller.name, report.unreadable
                     )
-                if report.partial:
+                before = self._last.get(poller.name)
+                # Said when it begins, and not at every poll of a source whose
+                # polls are partial for a long while, as real radio's are.
+                if report.partial and not (before is not None and before.partial):
                     logger.warning(
                         "%s's answer was not read to its end, so items it lists may be missing.",
                         poller.name,

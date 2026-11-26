@@ -15,6 +15,12 @@ it has to be doubted on that account. `beacon.ingest.open_store` picks the file 
 Rows are never changed. A source that revises what it said, as 511 does when it
 updates an event, gets a new row under a new reference.
 
+Beside the rows the store keeps *claims*. A poller that pays to work an item out, as
+radio does to have a call heard, claims the item before it pays (`claim`). A claim is
+taken by one caller only, in this process or another, and is kept for good, so an
+item is paid for once whatever happens after: a crash, a write that failed, an
+answer that came to nothing.
+
 The file is in SQLite's write-ahead mode, so reading never waits for a write, and a
 write waits only for another write. While the store is in use there are two more
 files beside it, ending `-wal` and `-shm`, and they belong to it.
@@ -25,8 +31,8 @@ import math
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable, Mapping, Sequence
-from contextlib import closing
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -80,6 +86,12 @@ CREATE TABLE IF NOT EXISTS poller_state (
     updated_ms INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS claims (
+    source TEXT NOT NULL,
+    ref TEXT NOT NULL,
+    claimed_ms INTEGER NOT NULL,
+    PRIMARY KEY (source, ref)
+) WITHOUT ROWID;
 """
 
 _SCHEMA_STATEMENTS = tuple(part.strip() for part in _SCHEMA.split(";") if part.strip())
@@ -191,8 +203,9 @@ class EvidenceStore:
         # Held to close the store, and by a write from its last look at whether the
         # store is closed to its commit, so that no write lands after `close` returns.
         self._closing = threading.Lock()
-        # Whether this store has seen its file in write-ahead mode yet.
-        self._write_ahead = False
+        # Whether this store has seen its file in write-ahead mode, with every
+        # table it uses, yet.
+        self._prepared = False
         path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()):
             pass
@@ -236,31 +249,90 @@ class EvidenceStore:
         rows = [self._row(item, recorded_ms) for item in items]
         saved = None if state is None else (state[0], _json(state[1], "A poller's state"))
         added: list[Evidence] = []
+        with self._writing() as db:
+            for row in rows:
+                cursor = db.execute(
+                    "INSERT INTO evidence (kind, source, ref, url, occurred_ms, until_ms, "
+                    "lat, lon, place, confidence, origin, model, data, recorded_ms) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT (source, ref) DO NOTHING",
+                    row,
+                )
+                if cursor.rowcount:
+                    stored = db.execute(
+                        f"SELECT {_COLUMNS} FROM evidence WHERE id = ?", (cursor.lastrowid,)
+                    ).fetchone()
+                    added.append(_evidence(stored))
+            if saved is not None:
+                db.execute(
+                    "INSERT INTO poller_state (name, state, updated_ms) VALUES (?, ?, ?) "
+                    "ON CONFLICT (name) DO UPDATE SET state = excluded.state, "
+                    "updated_ms = excluded.updated_ms",
+                    (*saved, recorded_ms),
+                )
+        return added
+
+    def claim(self, source: str, ref: str, *, now: datetime | None = None) -> bool:
+        """Claim an item of a source's, and say whether the claim is this caller's.
+        It is True for the one caller that claims an item first, and False for every
+        caller after, in this process or another, for good.
+
+        A poller claims an item before it pays to work it out, and pays only when
+        the claim is its own. It does not give up a claim because the work failed:
+        after a paid request was sent, nobody knows it cost nothing.
+
+        Raises EvidenceStoreError when the store is closed."""
+        claimed_ms = _to_ms(datetime.now(UTC) if now is None else now)
+        with self._writing() as db:
+            cursor = db.execute(
+                "INSERT INTO claims (source, ref, claimed_ms) VALUES (?, ?, ?) "
+                "ON CONFLICT (source, ref) DO NOTHING",
+                (source, ref, claimed_ms),
+            )
+            mine = cursor.rowcount == 1
+        return mine
+
+    def release(self, source: str, ref: str) -> None:
+        """Give a claim up, so the item can be claimed again. Only the caller whose
+        claim it is does this, and only when it knows that nothing was paid under
+        it: the request that costs money was never sent.
+
+        Raises EvidenceStoreError when the store is closed. The claim then stays."""
+        with self._writing() as db:
+            db.execute("DELETE FROM claims WHERE source = ? AND ref = ?", (source, ref))
+
+    def taken(self, source: str, refs: Iterable[str]) -> set[str]:
+        """Which of these items of a source's are claimed or stored as rows."""
+        wanted = list(dict.fromkeys(refs))
+        found: set[str] = set()
+        with closing(self._connect()) as db:
+            # In pieces, under the number of values SQLite takes in one statement.
+            for start in range(0, len(wanted), 500):
+                piece = wanted[start : start + 500]
+                marks = ", ".join("?" * len(piece))
+                for table in ("claims", "evidence"):
+                    found.update(
+                        row[0]
+                        for row in db.execute(
+                            f"SELECT ref FROM {table} WHERE source = ? AND ref IN ({marks})",
+                            (source, *piece),
+                        )
+                    )
+        return found
+
+    @contextmanager
+    def _writing(self) -> Iterator[sqlite3.Connection]:
+        """One write transaction. It is committed when the block ends, unless the
+        store was closed meanwhile, and rolled back when the block raises.
+
+        Raises EvidenceStoreError when the store is closed, before or during the
+        write: nothing of the block is then kept."""
         with closing(self._connect()) as db:
             if not self._begin_write(db):
                 raise_bare(EvidenceStoreError(_CLOSED))
             closed = False
             try:
-                for row in rows:
-                    cursor = db.execute(
-                        "INSERT INTO evidence (kind, source, ref, url, occurred_ms, until_ms, "
-                        "lat, lon, place, confidence, origin, model, data, recorded_ms) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                        "ON CONFLICT (source, ref) DO NOTHING",
-                        row,
-                    )
-                    if cursor.rowcount:
-                        stored = db.execute(
-                            f"SELECT {_COLUMNS} FROM evidence WHERE id = ?", (cursor.lastrowid,)
-                        ).fetchone()
-                        added.append(_evidence(stored))
-                if saved is not None:
-                    db.execute(
-                        "INSERT INTO poller_state (name, state, updated_ms) VALUES (?, ?, ?) "
-                        "ON CONFLICT (name) DO UPDATE SET state = excluded.state, "
-                        "updated_ms = excluded.updated_ms",
-                        (*saved, recorded_ms),
-                    )
+                yield db
                 with self._closing:
                     closed = self._closed.is_set()
                     db.execute("ROLLBACK" if closed else "COMMIT")
@@ -270,7 +342,6 @@ class EvidenceStore:
                 raise
         if closed:
             raise_bare(EvidenceStoreError(_CLOSED))
-        return added
 
     def state(self, name: str) -> dict[str, Any]:
         """What the poller of that name saved last, or an empty mapping."""
@@ -424,10 +495,12 @@ class EvidenceStore:
             if begun is None:
                 _begin_file(db, self._mode)
                 begun = _begun(db)
-            elif not self._write_ahead:
-                # A file from before the store used write-ahead mode is put in it.
+            elif not self._prepared:
+                # A file from before the store used write-ahead mode is put in it,
+                # and one from before a table was added is given the table.
                 _write_ahead(db)
-            self._write_ahead = True
+                _add_missing_tables(db)
+            self._prepared = True
         except BaseException:
             db.close()
             raise
@@ -465,6 +538,23 @@ def _begin_file(db: sqlite3.Connection, mode: Mode) -> None:
         for statement in _SCHEMA_STATEMENTS:
             db.execute(statement)
         db.execute("INSERT OR IGNORE INTO store_meta (key, value) VALUES ('mode', ?)", (mode,))
+        db.execute("COMMIT")
+    except BaseException:
+        if db.in_transaction:
+            db.execute("ROLLBACK")
+        raise
+
+
+def _add_missing_tables(db: sqlite3.Connection) -> None:
+    """Give a store file from an earlier version the tables it lacks. A file that
+    has them all is only read, so opening it takes no write lock."""
+    tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    if {"evidence", "poller_state", "store_meta", "claims"} <= tables:
+        return
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        for statement in _SCHEMA_STATEMENTS:
+            db.execute(statement)
         db.execute("COMMIT")
     except BaseException:
         if db.in_transaction:
