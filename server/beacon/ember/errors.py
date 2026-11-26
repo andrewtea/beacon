@@ -37,7 +37,8 @@ class RateLimitHoldError(EmberError):
 
 
 class InputTooLargeError(EmberError):
-    """The call was refused because its input is over the per-request token limit."""
+    """The call was refused because its input is over the per-request token limit.
+    No paid request of the call was sent."""
 
 
 class ReplayMissError(EmberError):

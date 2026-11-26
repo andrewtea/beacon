@@ -231,6 +231,11 @@ CALLS: tuple[RadioCall, ...] = (
 )
 
 
+# How many calls one answer of the story's listing holds at most. The poller is told
+# this number, which is known of a listing Beacon wrote and of no other.
+PAGE_SIZE = 50
+
+
 def call_id(index: int) -> str:
     return f"mock-call-{index:04d}"
 
@@ -240,7 +245,8 @@ def calls_answer(
 ) -> dict[str, Any]:
     """What OpenMHz would answer to `/calls/newer?time=<after_ms>` at the moment
     `at`, for a story that began at `start`: the calls after that time that have
-    been made by now, newest first, as its site lists them."""
+    been made by now, at most `PAGE_SIZE` of them, newest first, as its site lists
+    them."""
     calls = []
     for index, call in enumerate(CALLS):
         time = start + timedelta(minutes=call.minute)
@@ -263,7 +269,9 @@ def calls_answer(
                 "patches": [],
             }
         )
-    return {"calls": calls[::-1], "direction": "newer"}
+    # The calls nearest after the moment asked about, and no more than a page of them.
+    calls.sort(key=lambda listed: listed["time"])
+    return {"calls": calls[:PAGE_SIZE][::-1], "direction": "newer"}
 
 
 def call_audio(name: str) -> bytes | None:

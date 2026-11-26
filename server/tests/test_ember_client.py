@@ -1856,6 +1856,35 @@ def test_the_output_limit_reaches_embers_largest_output_and_no_further(storage: 
         )
 
 
+@pytest.mark.parametrize(
+    "output",
+    [
+        None,
+        "Jane Doe",
+        [None, "Jane Doe", 7],
+        [{"type": "message", "content": None}],
+        [{"type": "message", "content": "Jane Doe"}],
+        [{"type": "message", "content": [None]}],
+        [{"type": "message", "content": [{"type": "output_text", "text": None}]}],
+        [{"type": "message", "content": [{"type": "output_text", "text": ["Jane Doe"]}]}],
+    ],
+)
+def test_an_answer_that_is_not_shaped_as_a_message_has_no_text_and_raises_nothing(
+    storage: Storage, output: Any
+) -> None:
+    response = completed() | {"output": output}
+    ember = EmberClient.fake(storage, lambda _body: response)
+
+    assert ask(ember, sensitive=True).output_text == ""
+
+
+def test_the_text_of_an_answer_is_read_past_a_part_that_is_not_text(storage: Storage) -> None:
+    content = [None, {"type": "output_text", "text": "Two units."}, {"type": "refusal"}]
+    response = completed() | {"output": [{"type": "message", "content": content}]}
+
+    assert ask(EmberClient.fake(storage, lambda _body: response)).output_text == "Two units."
+
+
 def test_output_text_is_the_final_answer_without_tool_call_commentary(storage: Storage) -> None:
     response = fake_response(text='{"units": 2}')
     response["output"].insert(
@@ -2107,6 +2136,41 @@ def test_a_refusal_of_a_second_attempt_does_not_say_that_nothing_was_sent(
     # A call that has sent nothing yet is told of the budget as before.
     with pytest.raises(BudgetExceededError):
         ask(ember, input="Another question.")
+
+
+def test_a_second_attempt_that_counts_too_many_tokens_reports_the_attempt_that_was_sent(
+    storage: Storage,
+) -> None:
+    api = MetaApi(input_tokens=150_000, create=lambda _request: _rate_limited())
+
+    def grow(request: httpx2.Request) -> httpx2.Response:
+        # The count is asked for again on the second attempt, and comes back one
+        # token over the limit.
+        if api.paths().count("/v1/responses") == 1:
+            api.input_tokens = 150_001
+        return api(request)
+
+    clock = Clock()
+    ember = EmberClient.live(
+        storage,
+        api_key="test-key",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(grow)),
+        pacer=Pacer(3000, clock=clock, sleep=clock.sleep),
+    )
+
+    with pytest.raises(EmberCallError) as raised:
+        ask(ember)
+
+    # "Too large" alone would say that nothing of the call was sent. One paid
+    # request was, and what it may have cost stays booked.
+    assert not isinstance(raised.value, InputTooLargeError)
+    assert raised.value.status_code == 429
+    assert api.paths().count("/v1/responses") == 1
+    assert Ledger(storage.ledger_db).spent_nanousd() > 0
+    # A call of which nothing was sent is still told that it is too large.
+    with pytest.raises(InputTooLargeError):
+        ask(ember, input="Another question.")
+    assert api.paths().count("/v1/responses") == 1
 
 
 def test_a_client_closed_between_attempts_reports_the_attempt_that_was_sent(

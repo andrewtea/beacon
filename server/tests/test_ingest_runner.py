@@ -272,18 +272,29 @@ def test_a_poll_that_read_only_part_of_an_answer_is_logged_and_shown_as_partial(
     store: EvidenceStore, time: Time, caplog: pytest.LogCaptureFixture
 ) -> None:
     paged = FakePoller("511", 120)
-    reports = [PollReport(added=3, partial=True), PollReport(added=0)]
+    partial = PollReport(added=3, partial=True)
+    reports = [partial, partial, PollReport(added=0), partial]
     paged.poll = lambda store, now: reports.pop(0)  # type: ignore[method-assign]
     runner = Runner([paged], store, Clock(time))
+    said = "511's answer was not read to its end, so items it lists may be missing."
 
-    assert runner.step() == {"511": PollReport(added=3, partial=True)}
+    assert runner.step() == {"511": partial}
 
     # It is a poll that worked, and it may have missed what the source lists.
     assert runner.status() == [PollerStatus("511", NOON, True, partial=True)]
-    assert "511's answer was not read to its end, so items it lists may be missing." in caplog.text
+    assert caplog.text.count(said) == 1
+    # The next one is partial too, which is shown, and is not said again.
     time.moment = seconds(120)
     runner.step()
-    assert runner.status() == [PollerStatus("511", seconds(120), True, partial=False)]
+    assert runner.status() == [PollerStatus("511", seconds(120), True, partial=True)]
+    assert caplog.text.count(said) == 1
+    time.moment = seconds(240)
+    runner.step()
+    assert runner.status() == [PollerStatus("511", seconds(240), True, partial=False)]
+    # It is said again when it begins again.
+    time.moment = seconds(360)
+    runner.step()
+    assert caplog.text.count(said) == 2
 
 
 def test_a_runner_on_the_live_store_takes_no_poller_that_a_stand_in_feeds(

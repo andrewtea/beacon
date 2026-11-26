@@ -258,14 +258,25 @@ class EmberResponse:
     @property
     def output_text(self) -> str:
         """The final answer's text. Commentary the model writes before a tool call is
-        left out, so a structured output parses as JSON."""
-        return "".join(
-            part.get("text", "")
-            for item in self.output
-            if item.get("type") == "message" and item.get("phase") != "commentary"
-            for part in item.get("content") or []
-            if part.get("type") == "output_text"
-        )
+        left out, so a structured output parses as JSON.
+
+        Never raises: the API's answer is not Beacon's to shape, and whatever in it
+        is not shaped as a message's text adds nothing here. An answer with no such
+        text reads as the empty string, which no caller takes for a filled-in form."""
+        output = self.raw.get("output")
+        texts = []
+        for item in output if isinstance(output, list) else ():
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "message" or item.get("phase") == "commentary":
+                continue
+            content = item.get("content")
+            for part in content if isinstance(content, list) else ():
+                if isinstance(part, dict) and part.get("type") == "output_text":
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        texts.append(text)
+        return "".join(texts)
 
     @property
     def cost_usd(self) -> float:
@@ -687,10 +698,11 @@ class EmberClient:
             began = _Attempt()
             try:
                 return self._call_live(sdk, stop, body, call, sensitive, began)
-            except (BudgetExceededError, EmberClosedError) as refusal:
+            except (BudgetExceededError, EmberClosedError, InputTooLargeError) as refusal:
                 # Raised before a paid request is sent, which says that nothing was
-                # sent only when no earlier attempt was. A replaced ledger is told
-                # as it is.
+                # sent only when no earlier attempt was. The count of a request's
+                # tokens is asked for again on each attempt, and can come back
+                # larger. A replaced ledger is told as it is.
                 if sent is None or isinstance(refusal, LedgerReplacedError):
                     raise
             except EmberCallError as error:

@@ -61,13 +61,18 @@ rests on two assumptions about an API nobody has asked yet, which it keeps apart
   answer prove that all of its calls were shown. The listing has ended only when a
   page that asks for what is strictly after a moment comes back empty; a short
   page proves nothing.
-- **An answer holds up to a fixed number of calls.** This one is used for a single
-  thing: when the last moment's page holds only calls of that moment, it is taken
-  to be all of them if it holds fewer calls than the fullest answer ever seen
-  (`page_floor`, kept between polls). When it holds as many, one call included,
-  nobody can say that more are not hidden behind it, and the poll is reported as
-  partial. So is a poll in which calls turned up after a page that should not have
-  been full.
+- **An answer holds up to a fixed number of calls.** Nothing is concluded from
+  this unless the poller is told the number (`page_size`), and for OpenMHz itself
+  nobody knows it yet (`PAGE_SIZE`). It would settle one thing: whether the page
+  of the listing's last moment, which holds only calls of that moment, holds all
+  of them. Told the number, the poller takes a page with fewer calls to be whole.
+  Not told, it cannot say that more calls of that moment are not hidden behind the
+  page, and reports the poll as partial: every poll whose listing ends in a call,
+  which for a busy system is every poll, until the number has been checked against
+  a real answer. Guessing the number from the fullest answer seen was tried and
+  dropped: an API whose answers shrink would hide a call and say nothing. A poll
+  in which calls turned up after a page that should not have been full is partial
+  as well.
 
 A poll reads at most `SCAN_PAGES` pages from where the overlap begins, and when
 that does not reach the end, `SCAN_PAGES` more from where it had got to before, so
@@ -111,6 +116,10 @@ SOURCE = "openmhz"
 API = "https://api.openmhz.com"
 # San Francisco's P25 system, by the short name OpenMHz gives it.
 SAN_FRANCISCO = "sfp25"
+# How many calls a full answer of OpenMHz's holds. Nobody has asked it yet, so
+# nobody knows, and a poll of the real API says so (the module's docstring). Set
+# it once a real answer has shown the number and that it does not change.
+PAGE_SIZE: int | None = None
 
 INTERVAL_SECONDS = 30.0
 # How long the poller leaves Ember alone after Ember refused a call or failed on one.
@@ -189,15 +198,12 @@ class _Progress:
     held_until: datetime | None = None
     # How many of Ember's last answers in a row were no form.
     unusable_run: int = 0
-    # The most calls one answer of OpenMHz's has ever held.
-    page_floor: int = 0
 
     def as_state(self) -> dict[str, Any]:
         return {
             "after_ms": self.after_ms,
             "held_until": None if self.held_until is None else self.held_until.isoformat(),
             "unusable_run": self.unusable_run,
-            "page_floor": self.page_floor,
         }
 
 
@@ -215,6 +221,7 @@ class OpenMhzRadio:
         ems_talkgroups: Collection[int] = (),
         system: str = SAN_FRANCISCO,
         media_hosts: Collection[str] = (),
+        page_size: int | None = None,
         transcoder: Transcoder | None = None,
         wall_clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -222,7 +229,9 @@ class OpenMhzRadio:
         `ems_talkgroups` the ones among them that carry EMS traffic only: every call
         on one is kept as a medical response, whatever Ember makes of it. `known`
         lists the units and the streets a row may name. `media_hosts` are hosts a
-        call's audio may be on besides OpenMHz's own. `transcoder` decodes a call
+        call's audio may be on besides OpenMHz's own. `page_size` is how many calls a
+        full answer of the listing holds, for a source of which that is known; left
+        out, a poll whose listing ends in a call is reported as partial. `transcoder` decodes a call
         that is M4A or MP3; without one only a WAV call is heard, and any other is
         counted as unreadable. `wall_clock` is the time a hold is counted by, which
         is the real time even while the mock scenario is played on a clock of its own.
@@ -235,6 +244,8 @@ class OpenMhzRadio:
             raise ValueError("The radio poller needs the numbers of the talkgroups to hear.")
         if not set(ems_talkgroups) <= set(talkgroups):
             raise ValueError("An EMS talkgroup is one of the talkgroups that are heard.")
+        if page_size is not None and (isinstance(page_size, bool) or page_size < 1):
+            raise ValueError("A full answer of the listing holds at least one call.")
         if ember.mode != ("live" if http.origin == "live" else "fake"):
             # Real radio is not handed to a stand-in for Ember, whose answer would
             # be an invention about a real call, and a real Ember is not paid to
@@ -251,6 +262,7 @@ class OpenMhzRadio:
         self._ems_talkgroups = frozenset(ems_talkgroups)
         self._known = known
         self._media_hosts = frozenset(host.lower() for host in media_hosts)
+        self._page_size = page_size
         self._transcoder = transcoder
         self._wall_clock = (lambda: datetime.now(UTC)) if wall_clock is None else wall_clock
         # Set when the Ember ledger was replaced under this process. Nothing is
@@ -306,7 +318,6 @@ class OpenMhzRadio:
                 raise_bare(PollerHeldError(_HELD, left))
             progress.held_until = None
         listing = self._listing(progress, now, first=not saved)
-        progress.page_floor = listing.floor
         calls = [call for call in listing.calls.values() if call.time_ms <= _ms(now)]
         unreadable = listing.unreadable
         taken = store.taken(SOURCE, [call.ref for call in calls])
@@ -359,7 +370,7 @@ class OpenMhzRadio:
         again, begins at that moment, and nothing older than `MAX_AGE` is asked for."""
         after_ms = progress.after_ms
         begin_ms = after_ms if first else max(after_ms - _ms_of(OVERLAP), _ms(now - MAX_AGE))
-        listing = _Listing(reached_ms=after_ms, floor=progress.page_floor)
+        listing = _Listing(reached_ms=after_ms)
         whole, reached_ms = self._scan(listing, begin_ms - 1)
         if not whole:
             # The scan ran out of pages. When it stopped short of where the poller
@@ -401,7 +412,7 @@ class OpenMhzRadio:
             if not items:
                 # Nothing is after that moment: the listing ends here. The page of
                 # the moment itself may have been full, with more calls behind it.
-                listing.cut = listing.cut or (tied is not None and tied >= listing.floor)
+                listing.cut = listing.cut or self._may_be_full(tied)
                 return True, reached_ms
             if newest_ms is None or newest_ms <= asked_ms:
                 # Items, and none that says it is later: no telling how far it reaches.
@@ -413,6 +424,14 @@ class OpenMhzRadio:
             boundary_ms, tied = newest_ms, None
         # Out of pages. A moment that was not asked for again is not read yet.
         return False, reached_ms if boundary_ms is None else boundary_ms - 1
+
+    def _may_be_full(self, tied: int | None) -> bool:
+        """Whether a page that held `tied` calls, all of one moment, can have been
+        as full as an answer gets, with more calls of that moment behind it. An
+        empty page hides nothing. Of any other, only a known `page_size` can say."""
+        if not tied:
+            return False
+        return self._page_size is None or tied >= self._page_size
 
     def _page(self, since_ms: int) -> "list[Listed]":
         """One answer: what OpenMHz lists after a moment, on the talkgroups heard."""
@@ -588,9 +607,6 @@ class _Listing:
     calls: dict[str, Call] = field(default_factory=dict)
     unreadable: int = 0
     _unreadable_keys: set[str] = field(default_factory=set)
-    # The most items one answer has ever held, in this poll or an earlier one. An
-    # answer with fewer is taken not to be full.
-    floor: int = 0
     # Whether calls may be hidden behind a page that was full of one moment.
     cut: bool = False
     # Whether everything from the start of the overlap to the listing's end was
@@ -600,7 +616,6 @@ class _Listing:
     def take(self, items: "list[Listed]", asked_ms: int) -> None:
         """Add a page's calls. A page that asks for a moment again lists items
         again, and each call and each unreadable item is taken once."""
-        self.floor = max(self.floor, len(items))
         for item in items:
             if item.call is not None:
                 if item.call.time_ms > asked_ms:
@@ -720,7 +735,6 @@ def _progress(saved: dict[str, Any], now: datetime) -> _Progress:
     the first poll hears the calls of the last few minutes and not the archive, and
     it never goes back further than `MAX_AGE`."""
     after_ms, held, run = saved.get("after_ms"), saved.get("held_until"), saved.get("unusable_run")
-    floor = saved.get("page_floor")
     if isinstance(after_ms, bool) or not isinstance(after_ms, int):
         after_ms = _ms(now - OVERLAP)
     held_until = None
@@ -734,9 +748,6 @@ def _progress(saved: dict[str, Any], now: datetime) -> _Progress:
         held_until=held_until,
         unusable_run=run
         if isinstance(run, int) and not isinstance(run, bool) and 0 <= run <= UNUSABLE_RUN_LIMIT
-        else 0,
-        page_floor=floor
-        if isinstance(floor, int) and not isinstance(floor, bool) and 0 <= floor <= 100_000
         else 0,
     )
 

@@ -188,7 +188,10 @@ class Runner:
                     logger.warning(
                         "%s sent %d items Beacon could not read.", poller.name, report.unreadable
                     )
-                if report.partial:
+                before = self._last.get(poller.name)
+                # Said when it begins, and not at every poll of a source whose
+                # polls are partial for a long while, as real radio's are.
+                if report.partial and not (before is not None and before.partial):
                     logger.warning(
                         "%s's answer was not read to its end, so items it lists may be missing.",
                         poller.name,

@@ -48,6 +48,7 @@ from beacon.ember.pricing import parse_usd
 from beacon.evidence import EvidenceStore, Mode
 from beacon.ingest.http import SourceHttp
 from beacon.ingest.nws import NwsAlerts
+from beacon.ingest.openmhz import PAGE_SIZE as OPENMHZ_PAGE_SIZE
 from beacon.ingest.openmhz import OpenMhzRadio
 from beacon.ingest.opensky import SIGNED_IN_INTERVAL_SECONDS, OpenSkyAircraft
 from beacon.ingest.runner import Clock, PaidWork, Poller, PollerStatus, Runner
@@ -302,6 +303,7 @@ def build(env: Mapping[str, str], clock: Clock | None = None) -> Ingest:
         talkgroups=scenario_radio.TALKGROUPS,
         ems_talkgroups=scenario_radio.EMS_TALKGROUPS,
         system=scenario_radio.SYSTEM,
+        page_size=scenario_radio.PAGE_SIZE,
         # The story's own streets and units, where real radio has the city's.
         known=scenario_radio.KNOWN,
     )
@@ -419,6 +421,8 @@ def _radio_poller(env: Mapping[str, str], http: SourceHttp) -> OpenMhzRadio:
         ems_talkgroups=ems_talkgroups,
         known=known,
         media_hosts=hosts,
+        # Not known of the real API yet, so a poll that ends in a call says "partial".
+        page_size=OPENMHZ_PAGE_SIZE,
         transcoder=transcoder,
     )
 

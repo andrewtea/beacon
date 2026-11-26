@@ -168,6 +168,9 @@ class Radio:
         heard = self.heard[clip]
         if isinstance(heard, Exception):
             raise heard
+        if callable(heard):
+            # A whole response, for an answer that is not shaped as the API's are.
+            return heard()
         return fake_response(text=heard if isinstance(heard, str) else json.dumps(heard))
 
     @property
@@ -216,7 +219,15 @@ def build(radio: Radio, storage: Storage, responder: Any = None, **options: Any)
     return OpenMhzRadio(
         SourceHttp(httpx2.MockTransport(radio.http)),
         EmberClient.fake(storage, radio.ember if responder is None else responder),
-        **{"talkgroups": (FIRE, TACTICAL, EMS), "ems_talkgroups": (EMS,), "known": KNOWN} | options,
+        **{
+            "talkgroups": (FIRE, TACTICAL, EMS),
+            "ems_talkgroups": (EMS,),
+            "known": KNOWN,
+            # The poller is told how many calls the stand-in's answers hold, as it
+            # is of the mock scenario's. A test of the real API's case passes None.
+            "page_size": radio.page_size,
+        }
+        | options,
     )
 
 
@@ -461,18 +472,19 @@ def test_calls_already_taken_take_no_place_among_the_calls_a_poll_may_hear(
 
 
 def test_a_listing_is_read_in_pages_until_one_that_asks_what_follows_is_empty(
-    store: EvidenceStore, radio: Radio, poller: OpenMhzRadio
+    store: EvidenceStore, radio: Radio, storage: Storage
 ) -> None:
     radio.page_size = 2
     for number in range(1, 6):
         radio.call(number, seconds(-60 + number))
 
-    report = poller.poll(store, NOON)
+    report = build(radio, storage).poll(store, NOON)
 
     assert (report.added, report.partial) == (5, False)
     # Each page asks for the moment of the newest call of the page before again.
-    # The last of those holds one call where two have fitted, so it is taken to be
-    # all of that moment's, and the page after it, which is empty, ends the listing.
+    # The last of those holds one call where the poller was told that two fit, so
+    # it is all of that moment's, and the page after it, which is empty, ends the
+    # listing.
     assert [int(request.url.params["time"]) for request in radio.listings] == [
         ms(NOON - OVERLAP) - 1,
         ms(seconds(-58)) - 1,
@@ -481,18 +493,18 @@ def test_a_listing_is_read_in_pages_until_one_that_asks_what_follows_is_empty(
         ms(seconds(-55)) - 1,
         ms(seconds(-55)),
     ]
-    assert store.state("openmhz")["page_floor"] == 2
 
 
 def test_a_short_page_does_not_end_the_listing(
-    store: EvidenceStore, radio: Radio, poller: OpenMhzRadio
+    store: EvidenceStore, radio: Radio, storage: Storage
 ) -> None:
-    # A source whose answers hold four calls, and then only one.
+    # A source whose answers hold four calls, and then only one, whatever the
+    # poller was told.
     radio.page_sizes = [4, 1, 1, 1, 1, 1]
     for number in range(1, 6):
         radio.call(number, seconds(-60 + number))
 
-    report = poller.poll(store, NOON)
+    report = build(radio, storage, page_size=4).poll(store, NOON)
 
     # The fifth call is behind a page of one. It is heard, because only an empty
     # answer ends the listing, and the poll says that calls may have been hidden:
@@ -500,42 +512,71 @@ def test_a_short_page_does_not_end_the_listing(
     assert (report.added, report.partial) == (5, True)
 
 
-def test_one_call_on_a_page_that_never_held_more_may_hide_another_of_its_moment(
-    store: EvidenceStore, radio: Radio, poller: OpenMhzRadio
+def test_with_no_page_size_a_listing_that_ends_in_a_call_is_partial_and_an_empty_one_is_not(
+    store: EvidenceStore, radio: Radio, storage: Storage
+) -> None:
+    # What is known of the real API: nothing about how many calls an answer holds.
+    poller = build(radio, storage, page_size=None)
+    assert poller.poll(store, seconds(-30)).partial is False
+
+    radio.call(1, seconds(-10))
+    report = poller.poll(store, NOON)
+
+    # The page of the last moment holds one call, and one may be all a page holds.
+    assert (report.added, report.partial) == (1, True)
+    # And it stays so while that call is the last one listed, however many calls
+    # an earlier answer held.
+    radio.call(2, seconds(-20))
+    assert poller.poll(store, seconds(30)).partial is True
+
+    # Fifteen minutes on, nothing is listed any more, and nothing can be hidden.
+    assert poller.poll(store, seconds(1200)).partial is False
+
+
+def test_answers_that_shrink_do_not_hide_a_call_silently(
+    store: EvidenceStore, radio: Radio, storage: Storage
+) -> None:
+    # Four calls, the last two of one moment, from a source whose answers hold
+    # three calls and then one: the second of the two is never shown.
+    radio.page_sizes = [3, 1, 1]
+    radio.call(1, seconds(-50))
+    radio.call(2, seconds(-40))
+    radio.call(3, seconds(-30))
+    radio.call(4, seconds(-30), talkgroup=TACTICAL)
+
+    report = build(radio, storage, page_size=None).poll(store, NOON)
+
+    # Nothing in the answers tells that from a moment with one call. The poll does
+    # not claim to have read everything.
+    assert (report.added, report.partial) == (3, True)
+
+
+def test_a_page_as_full_as_the_poller_was_told_a_page_gets_may_hide_calls_of_its_moment(
+    store: EvidenceStore, radio: Radio, storage: Storage
 ) -> None:
     radio.page_size = 1
     radio.call(1, seconds(-30))
     radio.call(2, seconds(-30), talkgroup=TACTICAL)
 
-    report = poller.poll(store, NOON)
+    report = build(radio, storage).poll(store, NOON)
 
-    # One of the two is all a one-call page will ever show, and nothing says so.
+    # One of the two is all a one-call page will ever show.
     assert (report.added, report.partial) == (1, True)
 
 
-def test_the_newest_calls_page_is_taken_to_be_whole_once_a_fuller_answer_has_been_seen(
-    store: EvidenceStore, radio: Radio, storage: Storage
+@pytest.mark.parametrize("page_size", [0, -1, True])
+def test_a_page_size_that_is_no_number_of_calls_is_refused(
+    radio: Radio, storage: Storage, page_size: Any
 ) -> None:
-    radio.call(1, seconds(-30))
-
-    # The first answer the poller ever sees holds one call. It cannot be told
-    # from a full page of one.
-    assert build(radio, storage).poll(store, NOON).partial is True
-
-    # An answer that holds two shows that one is not a full page, from then on,
-    # which is remembered in the store and not in the poller.
-    radio.call(2, seconds(10))
-    assert build(radio, storage).poll(store, seconds(30)).partial is False
-    radio.call(3, seconds(400))
-    assert build(radio, storage).poll(store, seconds(420)).partial is False
-    # The fullest answer so far held the three calls of the last five minutes.
-    assert store.state("openmhz")["page_floor"] == 3
+    with pytest.raises(ValueError, match="holds at least one call"):
+        build(radio, storage, page_size=page_size)
 
 
 def test_a_listing_longer_than_a_poll_reads_is_partial_and_every_poll_moves_forward(
-    store: EvidenceStore, radio: Radio, poller: OpenMhzRadio
+    store: EvidenceStore, radio: Radio, storage: Storage
 ) -> None:
     radio.page_size = 2
+    poller = build(radio, storage)
     for number in range(1, 25):
         radio.call(number, seconds(-60 + number))
 
@@ -556,9 +597,10 @@ def test_a_listing_longer_than_a_poll_reads_is_partial_and_every_poll_moves_forw
 
 
 def test_calls_that_share_a_moment_are_all_heard_though_a_page_ends_among_them(
-    store: EvidenceStore, radio: Radio, poller: OpenMhzRadio
+    store: EvidenceStore, radio: Radio, storage: Storage
 ) -> None:
     radio.page_size = 4
+    poller = build(radio, storage)
     radio.call(1, seconds(-50))
     radio.call(2, seconds(-40))
     radio.call(3, seconds(-30))
@@ -576,9 +618,10 @@ def test_calls_that_share_a_moment_are_all_heard_though_a_page_ends_among_them(
 
 
 def test_a_page_full_of_one_moment_is_reported_as_partial(
-    store: EvidenceStore, radio: Radio, poller: OpenMhzRadio
+    store: EvidenceStore, radio: Radio, storage: Storage
 ) -> None:
     radio.page_size = 2
+    poller = build(radio, storage)
     for number, talkgroup in enumerate((FIRE, TACTICAL, EMS, FIRE), start=1):
         radio.call(number, seconds(-30), talkgroup=talkgroup)
 
@@ -595,9 +638,10 @@ def test_a_page_full_of_one_moment_is_reported_as_partial(
 
 
 def test_a_page_of_calls_beacon_cannot_use_does_not_hide_the_calls_after_it(
-    store: EvidenceStore, radio: Radio, poller: OpenMhzRadio
+    store: EvidenceStore, radio: Radio, storage: Storage
 ) -> None:
     radio.page_size = 2
+    poller = build(radio, storage)
     elsewhere = "https://calls.example.org/sfp25/call.m4a"
     radio.call(1, seconds(-50), url=elsewhere)
     radio.call(2, seconds(-40), url=elsewhere)
@@ -613,9 +657,10 @@ def test_a_page_of_calls_beacon_cannot_use_does_not_hide_the_calls_after_it(
 
 
 def test_a_page_that_does_not_say_how_far_it_reaches_is_reported_as_partial(
-    store: EvidenceStore, radio: Radio, poller: OpenMhzRadio
+    store: EvidenceStore, radio: Radio, storage: Storage
 ) -> None:
     radio.page_size = 1
+    poller = build(radio, storage)
     radio.call(1, seconds(-30), time="half past seven")
     radio.call(2, seconds(-20))
     # The stand-in lists by the time it was given, so the item with no time is first.
@@ -779,6 +824,32 @@ def test_answers_that_are_no_form_several_times_running_hold_the_poller(
     report = poller.poll(store, wall[0])
     assert (report.added, refs(store)) == (1, ["call0007"])
     assert store.state("openmhz")["unusable_run"] == 0
+
+
+def test_answers_that_are_not_shaped_as_answers_hold_the_poller_as_well(
+    store: EvidenceStore, radio: Radio, storage: Storage, wall: list[datetime]
+) -> None:
+    def no_content() -> dict[str, Any]:
+        # Completed, with its token counts, and a message with nothing in it.
+        response = fake_response(text="{}")
+        response["output"][0]["content"] = [None]
+        return response
+
+    for number in range(1, 7):
+        radio.call(number, seconds(-60 + number), no_content)
+    poller = build(radio, storage, wall_clock=lambda: wall[0])
+
+    with pytest.raises(PollerHeldError) as held:
+        poller.poll(store, NOON)
+
+    # Each was paid for, as an answer in a sentence is, and counts the same.
+    assert len(radio.asked) == UNUSABLE_RUN_LIMIT
+    assert "not filled-in forms" in str(held.value)
+    assert store.state("openmhz")["unusable_run"] == UNUSABLE_RUN_LIMIT - 1
+    assert store.state("openmhz")["held_until"] is not None
+    with pytest.raises(PollerHeldError):
+        poller.poll(store, seconds(30))
+    assert len(radio.asked) == UNUSABLE_RUN_LIMIT
 
 
 def test_audio_that_cannot_be_used_does_not_count_against_ember(
