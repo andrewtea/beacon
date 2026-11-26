@@ -55,7 +55,7 @@ from beacon.taps import TapMedia, Taps
 from tests.incident_rows import HAYES, NOON, Rows, at, mock_store
 from tests.test_incident_aircraft import offset
 from tests.test_investigate import BLOCKS, NAMES, TAP, city, form
-from tests.test_taps import PHONE
+from tests.test_taps import PHONE, SHOWN
 
 OTHER = "tap-AAAAAAAA0002"
 THIRD = "tap-AAAAAAAA0003"
@@ -660,7 +660,7 @@ def test_a_tap_is_given_its_receipt_when_a_full_queue_cannot_be_written_down(
 
     # The tap is stored before it is handed to the desk, and its id is the only
     # handle its sender has: it is given, whatever the desk could not write.
-    response = client.post("/api/taps", json={"location": PHONE})
+    response = client.post("/api/taps", headers=SHOWN, json={"location": PHONE})
 
     assert response.status_code == 201
     receipt = response.json()
@@ -800,7 +800,7 @@ def test_a_tap_on_the_mock_scenario_is_answered_with_the_fire_and_every_part_say
     # Twenty minutes into the story: the fire is at its third alarm.
     ingest.catch_up()
 
-    receipt = client.post("/api/taps", json={"location": PHONE}).json()
+    receipt = client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).json()
     waiting = client.get(f"/api/taps/{receipt['id']}").json()
     desk.investigate(receipt["id"])
     answer = client.get(f"/api/taps/{receipt['id']}").json()
@@ -975,7 +975,7 @@ def test_a_tap_with_nothing_near_is_unconfirmed_and_beacon_lists_what_begins_the
     where = {"lat": FAR.lat, "lon": FAR.lon}
     hayes = fire_id(world)
 
-    tap_id = client.post("/api/taps", json={"location": where}).json()["id"]
+    tap_id = client.post("/api/taps", headers=SHOWN, json={"location": where}).json()["id"]
     desk.investigate(tap_id)
     answer = client.get(f"/api/taps/{tap_id}").json()
 
@@ -1032,10 +1032,10 @@ def test_a_tap_is_pending_for_as_long_as_the_desk_has_it_however_long_that_is(
 
     monkeypatch.setattr(desk_module, "investigate_tap", investigating)
     client = world.app(desk)
-    first = client.post("/api/taps", json={"location": PHONE}).json()["id"]
+    first = client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).json()["id"]
     try:
         assert under_way.wait(5)
-        second = client.post("/api/taps", json={"location": PHONE}).json()["id"]
+        second = client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).json()["id"]
         # One is being looked into, and one waits for the desk's only thread.
         assert (desk.state_of(first), desk.state_of(second)) == ("running", "queued")
         assert read(client, first) == read(client, second) == ("pending", None, "pending")
@@ -1062,7 +1062,7 @@ def test_a_run_that_was_begun_and_never_kept_is_said_to_be_lost_and_its_cost_unk
 ) -> None:
     desk = world.desk()
     client = world.app(desk)
-    tap_id = client.post("/api/taps", json={"location": PHONE}).json()["id"]
+    tap_id = client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).json()["id"]
     assert read(client, tap_id) == ("pending", None, "pending")
 
     # The server stops with the tap still waiting. Nothing was begun for it.
@@ -1116,7 +1116,7 @@ def test_what_was_investigated_before_is_read_by_a_server_that_investigates_noth
     assert [i["crisis"]["active"] for i in listed if i["id"] == fire] == [True]
     assert client.get(f"/api/incidents/{fire}").json()["incident"]["crisis"]["active"] is True
     # A tap that comes now is taken, and is said to have no investigation.
-    receipt = client.post("/api/taps", json={"location": PHONE}).json()
+    receipt = client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).json()
     assert receipt["investigating"] is False
     assert read(client, receipt["id"]) == ("unconfirmed", "not_investigated", "none")
     # A server with neither reads no decision, and says nothing was investigated.
@@ -1287,7 +1287,7 @@ def test_an_answer_nobody_investigated_is_a_stand_ins_once_it_lists_a_stand_ins_
 ) -> None:
     client = world.app(None)
     where = {"lat": FAR.lat, "lon": FAR.lon}
-    tap_id = client.post("/api/taps", json={"location": where}).json()["id"]
+    tap_id = client.post("/api/taps", headers=SHOWN, json={"location": where}).json()["id"]
 
     answer = client.get(f"/api/taps/{tap_id}").json()
     assert (answer["stand_in"], answer["stand_in_text"], answer["since"]) == (False, None, [])
@@ -1306,7 +1306,7 @@ def test_a_server_with_no_investigator_takes_the_tap_and_says_it_was_not_investi
 ) -> None:
     client = world.app(None)
 
-    receipt = client.post("/api/taps", json={"location": PHONE}).json()
+    receipt = client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).json()
     answer = client.get(f"/api/taps/{receipt['id']}").json()
 
     assert receipt["investigating"] is False
@@ -1347,7 +1347,7 @@ def test_a_closing_desk_takes_no_tap_and_the_receipt_says_so(world: World) -> No
     client = world.app(desk)
     desk.close()
 
-    receipt = client.post("/api/taps", json={"location": PHONE}).json()
+    receipt = client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).json()
 
     assert receipt["investigating"] is False
     assert client.get(f"/api/taps/{receipt['id']}").json()["reason"] == "not_investigated"
@@ -1532,7 +1532,7 @@ def test_the_server_investigates_a_tap_and_stops_cleanly() -> None:
             ):
                 break
             time.sleep(0.05)
-        receipt = client.post("/api/taps", json={"location": PHONE}).json()
+        receipt = client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).json()
         answer: dict[str, Any] = {}
         for _ in range(200):
             answer = client.get(f"/api/taps/{receipt['id']}").json()
@@ -1637,7 +1637,7 @@ def test_what_was_there_before_the_investigator_looked_is_not_listed_as_begun_si
     desk = world.desk(Script([form()]))
     client = world.app(desk)
 
-    tap_id = client.post("/api/taps", json={"location": PHONE}).json()["id"]
+    tap_id = client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).json()["id"]
     desk.investigate(tap_id)
     world.now[0] = at(8)
     answer = client.get(f"/api/taps/{tap_id}").json()

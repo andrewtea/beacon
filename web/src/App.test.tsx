@@ -201,6 +201,46 @@ test('a tap that was waiting when the server’s mode changed is called off, and
   expect(posts()).toEqual([])
 })
 
+test('a tap the server refuses for being in another mode is said in its sentence, and the mode is asked for again at once', async () => {
+  // The app was told the invented scenario. The server has since gone over to
+  // real sources, and the app has not asked again yet.
+  const refusal =
+    'This server is not in the mode the tap’s sender was shown. Nothing of the tap was read or kept.'
+  let health = MOCK_HEALTH
+  const asked = serve({
+    'GET /api/health': () => Response.json(health),
+    'POST /api/taps': () => Response.json({ detail: refusal }, { status: 409 }),
+  })
+  render(<App />)
+  const spot = await screen.findByRole('button', {
+    name: 'Near the invented fire, Hayes Valley',
+  })
+  const healthAsks = () =>
+    asked.filter((request) => request.key === 'GET /api/health').length
+  expect(healthAsks()).toBe(1)
+  health = { ...MOCK_HEALTH, mode: 'live' }
+
+  click(spot)
+
+  // The server's own sentence, and no tap kept.
+  expect(await screen.findByRole('alert')).toHaveTextContent(refusal)
+  const sent = asked.find((request) => request.key === 'POST /api/taps')
+  expect(sent?.headers['beacon-mode']).toBe('mock')
+  expect(keptTaps()).toEqual([])
+  // Asked again now, not at the next half minute, and shown as it is: no
+  // invented scenario, and none of its places to tap from.
+  await waitFor(() => expect(healthAsks()).toBe(2))
+  await waitFor(() =>
+    expect(screen.queryByText(/invented/i)).not.toBeInTheDocument(),
+  )
+  expect(
+    screen.queryByRole('button', { name: /Near the invented fire/ }),
+  ).not.toBeInTheDocument()
+  // Why the tap was not taken is still on the screen.
+  expect(screen.getByRole('alert')).toHaveTextContent(refusal)
+  expect(screen.getByRole('button', { name: ASK })).toBeEnabled()
+})
+
 test('a tap that ran out is taken off the list at that moment, though storage will not delete it', async () => {
   // The button's view alone, with the sweep the app starts: nothing else draws
   // the view again, so the list changes only if it is told that a tap ran out.
@@ -271,6 +311,8 @@ test('sends a tap, keeps its id on the device, and shows the incident it was mat
   // Only a place went with the tap: nothing was added to it.
   const sent = asked.find((request) => request.key === 'POST /api/taps')
   expect(sent?.body).toEqual({ location: { lat: 37.776, lon: -122.424 } })
+  // The tap names the mode that was on the screen when it was made.
+  expect(sent?.headers['beacon-mode']).toBe('mock')
   expect(keptTaps().map((tap) => tap.id)).toEqual([FIRE_TAP])
 })
 

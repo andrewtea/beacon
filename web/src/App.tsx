@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import './App.css'
 import { fetchHealth } from './api/health.ts'
 import { Icon } from './components/Icon.tsx'
@@ -12,10 +12,18 @@ import { TraceView } from './views/TraceView.tsx'
 
 const HEALTH_MS = 30_000
 
-function View({ route, mode }: { route: Route; mode: 'live' | 'mock' | null }) {
+function View({
+  route,
+  mode,
+  onOtherMode,
+}: {
+  route: Route
+  mode: 'live' | 'mock' | null
+  onOtherMode: () => void
+}) {
   switch (route.view) {
     case 'home':
-      return <Home mode={mode} />
+      return <Home mode={mode} onOtherMode={onOtherMode} />
     case 'tap':
       return <TapView key={route.id} id={route.id} />
     case 'trace':
@@ -37,7 +45,11 @@ function View({ route, mode }: { route: Route; mode: 'live' | 'mock' | null }) {
 
 export default function App() {
   const route = useRoute()
-  const health = usePolled('health', fetchHealth, () => HEALTH_MS)
+  // Counted up when the server refused a tap for being in another mode than is
+  // shown here. The health is then asked for anew, under a new key, and until
+  // it answers the mode is not known and no tap is taken.
+  const [asked, setAsked] = useState(0)
+  const health = usePolled(`health:${asked}`, fetchHealth, () => HEALTH_MS)
   const unreachable = health.error !== null
   // The mode is what the server said at the latest asking. When that asking
   // failed, the mode is not known: the last answer is not carried over, because
@@ -70,7 +82,11 @@ export default function App() {
         </p>
       )}
       <main>
-        <View route={route} mode={mode} />
+        <View
+          route={route}
+          mode={mode}
+          onOtherMode={() => setAsked((count) => count + 1)}
+        />
       </main>
       <footer>
         <p>

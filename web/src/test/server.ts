@@ -1,6 +1,11 @@
 import { vi } from 'vitest'
 
-export type Asked = { key: string; body: unknown }
+export type Asked = {
+  key: string
+  body: unknown
+  // The request's headers, by their names in lower case.
+  headers: Record<string, string>
+}
 
 /**
  * Stands where the server is: answers `fetch` from `routes`, which are keyed by
@@ -17,6 +22,7 @@ export function serve(routes: Record<string, unknown>): Asked[] {
       asked.push({
         key,
         body: typeof init?.body === 'string' ? JSON.parse(init.body) : null,
+        headers: Object.fromEntries(new Headers(init?.headers).entries()),
       })
       if (!(key in routes))
         return Response.json(

@@ -28,6 +28,19 @@ _TOO_LARGE = "A tap is at most ten megabytes, with its photo and its clip."
 RECEIVE_SECONDS = 20.0
 _TOO_SLOW = "A tap has to arrive within twenty seconds. Send it again."
 _NO_SUCH_TAP = "There is no such tap."
+# Every tap says which mode its sender was shown: `live`, or `mock` for the
+# invented scenario. It is the one header of a tap that is read for what it
+# says, and it says nothing of who sent the tap.
+MODE_HEADER = "Beacon-Mode"
+_NO_MODE = (
+    "A tap says which mode its sender was shown, in the Beacon-Mode header: live or "
+    "mock. This one does not, and nothing of it was read."
+)
+_OTHER_MODE = (
+    "This server is not in the mode the tap's sender was shown: it runs on real "
+    "sources and the sender was shown the invented scenario, or the other way round. "
+    "Nothing of the tap was read or kept. Look at what Beacon shows now, and tap again."
+)
 # For how long a tap's answer is read. A run is kept for `KEPT`, and a tap that is
 # older is answered as one Beacon does not have, not as one it did not look into.
 ANSWERED = KEPT - timedelta(hours=1)
@@ -278,10 +291,25 @@ class TapRun(BaseModel):
 async def tap(request: Request) -> TapReceipt:
     """Take a tap. The body is JSON, and is read here and not by FastAPI: a tap can
     hold a place, a photo, and a clip, so nothing about it goes through a reader
-    that would repeat it in an error, and no more of it is read than a tap may be."""
+    that would repeat it in an error, and no more of it is read than a tap may be.
+
+    A tap names the mode its sender was shown in the `Beacon-Mode` header, and is
+    refused with 409, unread, by a server in the other mode, and with 400 when it
+    names none."""
     taps: Taps | None = getattr(request.app.state, "taps", None)
     if taps is None:
         raise HTTPException(503, "This server is not taking taps.")
+    # Before a place is held and before any of the body is read: a tap made for
+    # the other mode is not this server's to take. An app that was shown the
+    # invented scenario can outlive it, and its invented place is not to be
+    # stored, or investigated at a price, as a real one; a clip or a photo meant
+    # for a real server is not to go to the scenario unannounced. The app can
+    # only learn of a change by asking, so the check that holds is here.
+    shown = request.headers.get(MODE_HEADER)
+    if shown not in ("live", "mock"):
+        raise HTTPException(400, _NO_MODE)
+    if shown != taps.store.mode:
+        raise HTTPException(409, _OTHER_MODE)
     try:
         # A place among the taps being received is held from before the body is
         # read until the tap is taken or refused, so that only so many are in

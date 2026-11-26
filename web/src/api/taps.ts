@@ -147,13 +147,25 @@ export type TapRun = {
   cost_text: string | null
 }
 
+/** The header in which a tap names the mode its sender was shown. */
+export const MODE_HEADER = 'Beacon-Mode'
+/** The status a server in the other mode refuses a tap with, unread. */
+export const OTHER_MODE = 409
+
+/**
+ * Sends a tap. `shown` is the mode the app was showing when the button was
+ * pressed: the server refuses the tap, before it reads it, when it is in the
+ * other one. The app learns of a change of mode only by asking, so a tap made
+ * between two askings is held to what its sender was told by the server itself.
+ */
 export function sendTap(
   body: TapBody,
+  shown: Mode,
   signal?: AbortSignal,
 ): Promise<TapReceipt> {
   return fetchJson<TapReceipt>('/api/taps', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', [MODE_HEADER]: shown },
     body: JSON.stringify(body),
     signal,
   })

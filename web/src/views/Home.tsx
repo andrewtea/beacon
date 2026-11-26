@@ -1,7 +1,7 @@
 import { useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { ApiError } from '../api/http.ts'
 import type { Mode } from '../api/incidents.ts'
-import { sendTap, type TapBody } from '../api/taps.ts'
+import { OTHER_MODE, sendTap, type TapBody } from '../api/taps.ts'
 import { Icon } from '../components/Icon.tsx'
 import { locate, LocationError, MOCK_SPOTS, type Place } from '../lib/geo.ts'
 import { drawPhoto, PhotoError } from '../lib/photo.ts'
@@ -80,7 +80,17 @@ function YourTaps() {
   )
 }
 
-export function Home({ mode }: { mode: Mode | null }) {
+export function Home({
+  mode,
+  onOtherMode,
+}: {
+  // The mode the server said it is in at the latest asking, or null when that
+  // is not known.
+  mode: Mode | null
+  // Called when the server refused a tap because it is in another mode than
+  // the app was showing: whoever knows the mode asks for it again.
+  onOtherMode?: () => void
+}) {
   const [phase, setPhase] = useState<Phase>({ kind: 'idle' })
   const [withClip, setWithClip] = useState(false)
   const [photo, setPhoto] = useState<Blob | null>(null)
@@ -99,7 +109,9 @@ export function Home({ mode }: { mode: Mode | null }) {
   // the change is drawn and not a frame after.
   useLayoutEffect(
     () => () => {
-      sending.current?.abort()
+      // Only a tap that is under way: why an earlier one failed stays shown.
+      if (sending.current === null) return
+      sending.current.abort()
       sending.current = null
       setPhase({ kind: 'idle' })
     },
@@ -113,7 +125,10 @@ export function Home({ mode }: { mode: Mode | null }) {
   const ready = mode !== null
 
   const tap = async (from?: Place) => {
-    if (busy !== null || !ready) return
+    if (busy !== null || mode === null) return
+    // The mode that was on the screen when the button was pressed. The tap
+    // names it, and a server in the other mode refuses the tap unread.
+    const shown = mode
     const controller = new AbortController()
     sending.current = controller
     // Asked after every wait: a tap that was called off while it waited for
@@ -138,7 +153,7 @@ export function Home({ mode }: { mode: Mode | null }) {
         body.photo = toBase64(new Uint8Array(await photo.arrayBuffer()))
         unlessCalledOff()
       }
-      const receipt = await sendTap(body, controller.signal)
+      const receipt = await sendTap(body, shown, controller.signal)
       keepTap({
         id: receipt.id,
         at: receipt.received_at,
@@ -152,6 +167,12 @@ export function Home({ mode }: { mode: Mode | null }) {
       // is let go of when the place could not be had.
       controller.abort()
       if (!calledOff) setPhase({ kind: 'failed', message: reason(error) })
+      // The server is in another mode than was shown: what is shown is wrong,
+      // and is asked for again before another tap is taken.
+      if (error instanceof ApiError && error.status === OTHER_MODE)
+        onOtherMode?.()
+    } finally {
+      if (sending.current === controller) sending.current = null
     }
   }
 
