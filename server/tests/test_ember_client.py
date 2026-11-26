@@ -43,7 +43,7 @@ from beacon.ember import (
 )
 from beacon.ember.__main__ import main
 from beacon.ember.client import default_data_dir
-from beacon.ember.ledger import Call, Ledger
+from beacon.ember.ledger import Call, Ledger, RowRef
 
 # The usage example from https://dev.meta.ai/docs/prompt-caching.
 USAGE = {
@@ -202,6 +202,7 @@ def test_a_live_call_is_sent_to_ember_with_an_output_limit_and_logged(storage: S
     assert row["latency_ms"] >= 0
     assert json.loads(row.pop("request"))["input"] == "Summarize the transmission."
     assert json.loads(row.pop("response"))["id"] == "resp_abc123"
+    assert len(row.pop("token")) == 16
     assert {key: row[key] for key in row if key not in ("id", "started_at", "latency_ms")} == {
         "source": "live",
         "status": "ok",
@@ -263,9 +264,13 @@ def test_each_response_names_its_ledger_row_and_the_rows_read_back_by_id(
     reader = EmberClient.replay_only(storage)
     generation = live.ledger_generation
     assert replayed.ledger_generation == fake.ledger_generation == generation
+    assert fake.ledger_ref == RowRef(generation, fake.ledger_id, fake.ledger_token)
     first, second = reader.ledger_calls(
-        [(generation, fake.ledger_id), (generation, 999), (generation, live.ledger_id)]
+        [fake.ledger_ref, RowRef(generation, 999, fake.ledger_token), live.ledger_ref]
     )
+    # A row is named by its token as well as its id, so one call's id beside
+    # another's token names no row.
+    assert reader.ledger_calls([RowRef(generation, live.ledger_id, fake.ledger_token)]) == []
     assert (first.id, first.source, first.status, first.task) == (
         live.ledger_id,
         "live",
@@ -295,9 +300,7 @@ def test_a_client_that_outlives_its_ledger_file_never_reads_the_next_files_rows(
 
     survivor = EmberClient.fake(storage, answer)
     old = ask(survivor)
-    assert [
-        call.id for call in survivor.ledger_calls([(old.ledger_generation, old.ledger_id)])
-    ] == [old.ledger_id]
+    assert [call.id for call in survivor.ledger_calls([old.ledger_ref])] == [old.ledger_id]
 
     # The ledger file is deleted while the first client lives, and another client
     # begins the next one with the same request: the same row id and the same hash.
@@ -306,13 +309,11 @@ def test_a_client_that_outlives_its_ledger_file_never_reads_the_next_files_rows(
 
     assert (new.ledger_id, new.request_hash) == (old.ledger_id, old.request_hash)
     assert new.ledger_generation != old.ledger_generation
-    assert survivor.ledger_calls([(old.ledger_generation, old.ledger_id)]) == []
+    assert survivor.ledger_calls([old.ledger_ref]) == []
     # What the surviving client writes from now on belongs to the file it is written in.
     later = ask(survivor)
     assert later.ledger_generation == new.ledger_generation
-    assert [
-        call.id for call in survivor.ledger_calls([(later.ledger_generation, later.ledger_id)])
-    ] == [later.ledger_id]
+    assert [call.id for call in survivor.ledger_calls([later.ledger_ref])] == [later.ledger_id]
 
 
 def test_a_client_whose_ledger_file_is_deleted_begins_a_new_one(storage: Storage) -> None:
@@ -320,7 +321,7 @@ def test_a_client_whose_ledger_file_is_deleted_begins_a_new_one(storage: Storage
     old = ask(ember)
     storage.ledger_db.unlink()
 
-    assert ember.ledger_calls([(old.ledger_generation, old.ledger_id)]) == []
+    assert ember.ledger_calls([old.ledger_ref]) == []
     assert ember.spent_usd() == 0
     new = ask(ember)
 
@@ -810,9 +811,15 @@ def test_a_reservation_is_not_settled_into_an_older_copys_row_of_the_same_id(
     os.replace(backup, storage.ledger_db)
     restored = Ledger(storage.ledger_db)
     theirs = restored.reserve(call, reserved_nanousd=30, budget_nanousd=100)
-    assert theirs == lost
+    assert (theirs.generation, theirs.id) == (lost.generation, lost.id)
 
+    # The call that is gone is not looked up as the one now at its id, by a ledger
+    # that outlived the file or by one opened since,
+    assert ledger.calls([lost]) == restored.calls([lost]) == []
+    assert [shown.id for shown in restored.calls([lost, theirs])] == [theirs.id]
+    # nor settled into it.
     assert ledger.settle(lost, status="ok", cost_nanousd=1, latency_ms=5) is False
+    assert restored.settle(lost, status="ok", cost_nanousd=1, latency_ms=5) is False
     # The other call's reservation is as it was.
     assert restored.spent_nanousd() == 10 + 30
     with pytest.raises(LedgerReplacedError):
@@ -981,6 +988,17 @@ def _says_the_name(http_status: int, /, **body: Any) -> httpx2.Response:
         (None, httpx2.Response(200, content=b"Jane Doe is not JSON"), None, "unknown"),
         (_says_the_name(400), None, 400, None),
         (httpx2.Response(200, json={"input_tokens": "Jane Doe"}), None, None, None),
+        # The SDK's decoder raises an error of its own, which holds the whole reply.
+        (
+            httpx2.Response(
+                200,
+                content=b'{"input_tokens": Jane Doe',
+                headers={"content-type": "application/json"},
+            ),
+            None,
+            None,
+            None,
+        ),
     ],
     ids=[
         "failed",
@@ -991,6 +1009,7 @@ def _says_the_name(http_status: int, /, **body: Any) -> httpx2.Response:
         "not-json",
         "count-rejected",
         "count-of-words",
+        "count-not-json",
     ],
 )
 def test_a_sensitive_call_that_fails_says_nothing_of_what_was_said_anywhere(
@@ -1023,11 +1042,107 @@ def test_a_sensitive_call_that_fails_says_nothing_of_what_was_said_anywhere(
         assert ledger_rows(storage)[0]["error"] == f"HTTP {status_code}"
     # and not in the error, which a caller may print or log, or under it.
     error = raised.value
+    assert type(error) is EmberCallError
     assert error.status_code == status_code
     assert (error.__cause__, error.__context__) == (None, None)
+    assert "jane" not in repr(vars(error)).lower()
     shown = "".join(traceback.format_exception(error)).lower()
     assert "jane" not in shown
     assert "heel" not in shown
+
+    # The same failure of an ordinary call is a failed call too, and not an error
+    # of the SDK's or a decoder's.
+    with pytest.raises(EmberCallError):
+        ask(ember, input="An ordinary request.")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"tools": [{"type": "web_search", "description": SAID}]},
+        {"input": [{"type": SAID}]},
+        {"input": [SAID]},
+        {"effort": SAID},
+        {"max_output_tokens": SAID},
+        {"parallel_tool_calls": SAID},
+        {"task": ""},
+        {"input": [{"role": "user", "content": [{"image_url": "https://example.com/" + SAID}]}]},
+        {"input": [{"role": "user", "content": [{SAID + "_url": "https://example.com/a"}]}]},
+        {"input": [{"role": "user", "content": {SAID: b"bytes"}}]},
+        {"input": [{"role": "user", "content": {SAID: float("nan")}, "more": {1, 2}}]},
+    ],
+    ids=[
+        "tool",
+        "item-type",
+        "bare-string",
+        "effort",
+        "output-limit",
+        "parallel",
+        "task",
+        "remote-media",
+        "remote-media-key",
+        "bytes",
+        "set",
+    ],
+)
+def test_a_sensitive_request_that_is_refused_is_not_repeated_in_the_refusal(
+    storage: Storage, overrides: dict[str, Any]
+) -> None:
+    api = MetaApi()
+    for ember in (api.client(storage), EmberClient.fake(storage, Script([fake_response()]))):
+        with pytest.raises(EmberRequestError) as raised:
+            ask(ember, **({"sensitive": True, "input": SAID} | overrides))
+
+        error = raised.value
+        assert (error.__cause__, error.__context__) == (None, None)
+        shown = "".join(traceback.format_exception(error)).lower()
+        assert "jane" not in shown
+        assert "heel" not in shown
+    assert api.requests == []
+    assert ledger_rows(storage) == []
+
+
+def test_a_stand_in_that_fails_on_a_sensitive_call_is_not_quoted(storage: Storage) -> None:
+    def fails(body: dict[str, Any]) -> dict[str, Any]:
+        raise RuntimeError(f"cannot answer {body['input']}")
+
+    def refuses(body: dict[str, Any]) -> dict[str, Any]:
+        raise EmberCallError(f"refused: {body['input']}")
+
+    for responder in (fails, refuses, lambda body: [body["input"]]):
+        with pytest.raises(EmberError) as raised:
+            ask(EmberClient.fake(storage, responder), sensitive=True, input=SAID)
+
+        error = raised.value
+        assert type(error) is EmberError
+        assert "The fake responder failed on a sensitive call" in str(error)
+        assert (error.__cause__, error.__context__) == (None, None)
+        assert "jane" not in "".join(traceback.format_exception(error)).lower()
+    assert ledger_rows(storage) == []
+
+    # An ordinary call's stand-in fails as itself, which is what a test wants to see.
+    with pytest.raises(RuntimeError, match="cannot answer Summarize"):
+        ask(EmberClient.fake(storage, fails))
+
+
+def test_an_error_that_is_not_the_clients_own_is_not_passed_on_from_a_sensitive_call(
+    storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ember = EmberClient.fake(storage, Script([fake_response(), fake_response()]))
+
+    def breaks(*_arguments: Any, **_options: Any) -> None:
+        raise sqlite3.OperationalError(f"near {SAID!r}: syntax error")
+
+    monkeypatch.setattr(Ledger, "record", breaks)
+
+    with pytest.raises(EmberError) as raised:
+        ask(ember, sensitive=True, input=SAID)
+    assert str(raised.value).startswith("A sensitive call failed (OperationalError).")
+    assert (raised.value.__cause__, raised.value.__context__) == (None, None)
+    assert "jane" not in "".join(traceback.format_exception(raised.value)).lower()
+    # An ordinary call's is.
+    with pytest.raises(sqlite3.OperationalError):
+        ask(ember)
 
 
 def test_a_sensitive_call_is_waited_out_after_a_rate_limit_like_any_other(
@@ -1624,7 +1739,7 @@ def test_an_answer_cut_short_by_the_output_limit_is_returned_as_incomplete(
         ({"parallel_tool_calls": 1}, "parallel_tool_calls must be True or False"),
         ({"effort": "none"}, "effort must be one of"),
         ({"task": ""}, "task"),
-        ({"tools": [{"type": "web_search"}]}, "Only function tools"),
+        ({"tools": [{"type": "web_search"}]}, r"tools\[0\] is not a function tool"),
         # Items that belong to hosted tools, one of which carries tool definitions.
         (
             {
@@ -1638,10 +1753,13 @@ def test_an_answer_cut_short_by_the_output_limit_is_returned_as_incomplete(
                     }
                 ]
             },
-            "input item of type 'tool_search_output' is not allowed",
+            r"input\[0\] is not an allowed kind of item",
         ),
-        ({"input": [{"type": "web_search_call"}]}, "type 'web_search_call' is not allowed"),
-        ({"input": ["a bare string"]}, "type None is not allowed"),
+        (
+            {"input": [{"role": "user", "content": "hi"}, {"type": "web_search_call"}]},
+            r"input\[1\] is not an allowed kind of item",
+        ),
+        ({"input": ["a bare string"]}, r"input\[0\] is not an allowed kind of item"),
         ({"input": [{"role": "user", "content": b"bytes"}]}, "not JSON"),
         # The bytes behind a web address can change after they are counted or recorded.
         (

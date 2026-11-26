@@ -110,6 +110,9 @@ _NEVER_SENT = (httpx2.ConnectError, httpx2.ConnectTimeout, httpx2.PoolTimeout)
 # so every request asks for it. That makes `EmberResponse.output` safe to resend.
 _INCLUDE = ("reasoning.encrypted_content",)
 
+# The fields Meta fetches when they hold a web address.
+_MEDIA_URL_FIELDS = frozenset({"image_url", "video_url", "audio_url", "file_url"})
+
 # The kinds of item `input` may hold, besides messages given by their `role`.
 _INPUT_ITEM_TYPES = frozenset({"message", "reasoning", "function_call", "function_call_output"})
 
@@ -225,10 +228,17 @@ class EmberResponse:
     latency_ms: int
     source: Source
     request_hash: str
-    # The call's row in the ledger, and the generation of the ledger file it is in.
-    # The id names the call only beside the generation.
+    # The call's row in the ledger, the generation of the ledger file it is in, and
+    # the row's own token. Only the three together name the call: see `ledger_ref`.
     ledger_id: int
     ledger_generation: str
+    ledger_token: str
+
+    @property
+    def ledger_ref(self) -> RowRef:
+        """What names this call's ledger row, to keep and hand to
+        `EmberClient.ledger_calls`."""
+        return RowRef(self.ledger_generation, self.ledger_id, self.ledger_token)
 
     @property
     def status(self) -> str | None:
@@ -427,11 +437,12 @@ class EmberClient:
         number of calls in it."""
         return self._storage.trace, self._ledger.export_trace(self._storage.trace)
 
-    def ledger_calls(self, refs: Sequence[tuple[str, int]]) -> list[LedgerCall]:
+    def ledger_calls(self, refs: Sequence[RowRef]) -> list[LedgerCall]:
         """The ledger's rows for these calls, each named by its response's
-        `(ledger_generation, ledger_id)`: tokens, cost, and latency, without the
-        requests and responses. A call made in a ledger file that has since been
-        deleted and begun again has no row, whatever row now has its id."""
+        `ledger_ref`: tokens, cost, and latency, without the requests and responses.
+        A call whose row is not in the ledger file as it is now has none, whatever
+        row now has its id: the file may have been deleted and begun again, or put
+        back from an older copy."""
         return self._ledger.calls([RowRef(*ref) for ref in refs])
 
     def respond(
@@ -463,7 +474,9 @@ class EmberClient:
         the answer is neither recorded for replay nor replayed: made again, the call
         is paid for again, and replay-only mode refuses it. An error from a sensitive
         call says what kind of failure it was, with the HTTP status when there is
-        one, and carries neither the API's message nor the error under it.
+        one. It is one of the client's own errors with a fixed text, with no error
+        chained under it, whatever failed: the API, a stand-in, or the request's own
+        check.
 
         Raises BudgetExceededError or InputTooLargeError when a live call is refused,
         ReplayMissError when replay-only mode has no recording, and EmberCallError when
@@ -476,14 +489,50 @@ class EmberClient:
         longer than the pacer makes, to the call that was told so and to every call
         after it until the wait has passed.
         """
+        if not isinstance(sensitive, bool):
+            raise EmberRequestError(
+                "sensitive must be True or False: True when the request or the answer "
+                "can hold what Beacon must not store."
+            )
+        request: dict[str, Any] = {
+            "task": task,
+            "effort": effort,
+            "max_output_tokens": max_output_tokens,
+            "input": input,
+            "instructions": instructions,
+            "tools": tools,
+            "text": text,
+            "parallel_tool_calls": parallel_tool_calls,
+            "prompt_cache_key": prompt_cache_key,
+        }
+        if not sensitive:
+            return self._respond(sensitive=False, **request)
+        try:
+            return self._respond(sensitive=True, **request)
+        except Exception as error:
+            failure = error
+        # Raised outside the handler, so that nothing is chained under it. Whatever
+        # failed, the error under it can hold the request or the API's reply: an SDK
+        # error holds the API's message, and a decoder's holds the whole document.
+        raise _withheld_failure(failure)
+
+    def _respond(
+        self,
+        *,
+        task: str,
+        effort: Effort,
+        max_output_tokens: int,
+        sensitive: bool,
+        input: str | Sequence[Mapping[str, Any]],
+        instructions: str | None,
+        tools: Sequence[Mapping[str, Any]] | None,
+        text: Mapping[str, Any] | None,
+        parallel_tool_calls: bool | None,
+        prompt_cache_key: str | None,
+    ) -> EmberResponse:
         if not isinstance(task, str) or not task:
             raise EmberRequestError(
                 "task must be a non-empty label, such as 'extract_transmission'."
-            )
-        if not isinstance(sensitive, bool):
-            raise EmberRequestError(
-                f"sensitive must be True or False, not {sensitive!r}: True when the "
-                "request or the answer can hold what Beacon must not store."
             )
         body = _build_body(
             effort=effort,
@@ -508,7 +557,7 @@ class EmberClient:
 
         if self._responder is not None:
             started = time.perf_counter()
-            response = _as_json(self._responder(body), "The fake Ember response")
+            response = _ask(self._responder, body, sensitive)
             return self._record_free(call, "fake", response, _elapsed_ms(started), sensitive)
 
         if sensitive:
@@ -520,15 +569,7 @@ class EmberClient:
                     f"{task!r}) is never recorded, so there is nothing to replay. Make it "
                     "with REPLAY=0 and MODEL_API_KEY, or use a fake client."
                 )
-            try:
-                return self._call_until_answered(self._sdk, self._stop, body, call, sensitive)
-            except Exception as error:
-                failure = error
-            # Raised again outside the handler, with nothing under it. The errors a
-            # failure is chained to are the SDK's, which hold the API's own message
-            # and the request, and a traceback that is printed or logged shows them.
-            failure.__cause__ = failure.__context__ = None
-            raise failure
+            return self._call_until_answered(self._sdk, self._stop, body, call, sensitive)
 
         recording = self._cache.get(call.request_hash)
         if recording is not None:
@@ -605,7 +646,14 @@ class EmberClient:
             call, source=source, usage=usage, latency_ms=latency_ms, response=safe
         )
         return EmberResponse(
-            response, usage, latency_ms, source, call.request_hash, row.id, row.generation
+            response,
+            usage,
+            latency_ms,
+            source,
+            call.request_hash,
+            row.id,
+            row.generation,
+            row.token,
         )
 
     def _settle_sent(self, row: RowRef, **outcome: Any) -> None:
@@ -706,7 +754,7 @@ class EmberClient:
                 raise LedgerReplacedError(_LOST_SETTLEMENT) from error
             raise EmberCallError(
                 _describe(error, sensitive),
-                status_code=getattr(error, "status_code", None),
+                status_code=_status_code(error),
                 retry_after=_retry_after(error),
             ) from error
 
@@ -754,7 +802,14 @@ class EmberClient:
         # recording must be exact to be replayed and must hold neither, so this
         # answer is not recorded.
         return EmberResponse(
-            response, usage, latency_ms, "live", call.request_hash, row.id, row.generation
+            response,
+            usage,
+            latency_ms,
+            "live",
+            call.request_hash,
+            row.id,
+            row.generation,
+            row.token,
         )
 
 
@@ -765,8 +820,10 @@ def _build_body(
     input: str | Sequence[Mapping[str, Any]],
     optional: Mapping[str, Any],
 ) -> dict[str, Any]:
+    # None of these messages repeats the value it refuses. A request can hold what
+    # must not be stored, and the refusal may be printed or logged.
     if effort not in get_args(Effort):
-        raise EmberRequestError(f"effort must be one of {get_args(Effort)}, not {effort!r}.")
+        raise EmberRequestError(f"effort must be one of {get_args(Effort)}.")
     if (
         not isinstance(max_output_tokens, int)
         or isinstance(max_output_tokens, bool)
@@ -774,18 +831,18 @@ def _build_body(
     ):
         raise EmberRequestError(
             f"max_output_tokens must be an integer from {MIN_OUTPUT_TOKENS} to "
-            f"{MAX_OUTPUT_TOKENS:,}, not {max_output_tokens!r}."
+            f"{MAX_OUTPUT_TOKENS:,}."
         )
     parallel = optional.get("parallel_tool_calls")
     if parallel is not None and not isinstance(parallel, bool):
         raise EmberRequestError("parallel_tool_calls must be True or False when it is given.")
-    for tool in optional.get("tools") or ():
+    for place, tool in enumerate(optional.get("tools") or ()):
         if not isinstance(tool, Mapping) or tool.get("type") != "function":
             # Hosted tools bill outside the token prices (web search is $2.50 per 1,000
             # queries) and run extra model rounds the reservation does not cover.
             raise EmberRequestError(
-                f"Only function tools are allowed, not {tool!r}: a hosted tool spends "
-                "money the ledger cannot see."
+                f"tools[{place}] is not a function tool. Only function tools are allowed: "
+                "a hosted tool spends money the ledger cannot see."
             )
     body = {
         "model": MODEL,
@@ -803,15 +860,17 @@ def _build_body(
         # whether the caller passed lists or tuples.
         body = json.loads(json.dumps(body))
     except (TypeError, ValueError) as error:
-        raise EmberRequestError(f"The request is not JSON: {error}") from error
+        raise EmberRequestError(
+            "The request is not JSON: it holds a value that JSON has no form for."
+        ) from error
     if isinstance(body["input"], list):
-        for item in body["input"]:
-            _check_input_item(item)
+        for place, item in enumerate(body["input"]):
+            _check_input_item(item, place)
     _reject_remote_media(body["input"], None)
     return body
 
 
-def _check_input_item(item: Any) -> None:
+def _check_input_item(item: Any, place: int) -> None:
     """Only messages, reasoning, and function calls with their results go in as input.
     Other item types belong to hosted tools: a `tool_search_output` item, for one,
     declares tools of its own, which would get around the function-only rule."""
@@ -819,9 +878,38 @@ def _check_input_item(item: Any) -> None:
     is_message = isinstance(item, Mapping) and kind is None and "role" in item
     if kind not in _INPUT_ITEM_TYPES and not is_message:
         raise EmberRequestError(
-            f"An input item of type {kind!r} is not allowed. Input items are messages or "
+            f"input[{place}] is not an allowed kind of item. Input items are messages or "
             f"one of {sorted(_INPUT_ITEM_TYPES)}."
         )
+
+
+def _ask(responder: Responder, body: dict[str, Any], sensitive: bool) -> dict[str, Any]:
+    """A stand-in's answer. When it fails on a sensitive call, the failure is the
+    client's own to report: what a responder raises can repeat the request it was
+    handed."""
+    try:
+        return _as_json(responder(body), "The fake Ember response")
+    except Exception as error:
+        if not sensitive:
+            raise
+        kind = type(error).__name__
+    raise EmberError(
+        f"The fake responder failed on a sensitive call ({kind}). What it raised is withheld."
+    )
+
+
+def _withheld_failure(error: Exception) -> EmberError:
+    """The error a sensitive call's failure is reported as. One of the client's own
+    has a fixed text when the call is sensitive, and is raised as it is with nothing
+    chained under it. Any other is not the client's to vouch for, so only its kind
+    is passed on."""
+    if isinstance(error, EmberError):
+        error.__cause__ = error.__context__ = None
+        return error
+    return EmberError(
+        f"A sensitive call failed ({type(error).__name__}). The error's own text is "
+        "withheld, because it can repeat what was sent or answered."
+    )
 
 
 def _stored(response: Mapping[str, Any], sensitive: bool) -> tuple[dict[str, Any], bool]:
@@ -939,8 +1027,9 @@ def _reject_remote_media(value: Any, key: str | None) -> None:
     behind it could change under a recording, or grow after the token count."""
     if isinstance(value, str):
         if key is not None and key.endswith("_url") and value[:5].lower() != "data:":
+            field = key if key in _MEDIA_URL_FIELDS else "A field whose name ends in _url"
             raise EmberRequestError(
-                f"{key} must be an inline data: URL, not a remote URL. Send the bytes "
+                f"{field} must be an inline data: URL, not a remote URL. Send the bytes "
                 "inline or upload the file and pass its file_id, so that the request "
                 "fixes exactly what the model sees."
             )
@@ -959,11 +1048,13 @@ def _count_input_tokens(sdk: openai.OpenAI, body: Mapping[str, Any], sensitive: 
         count = sdk.responses.input_tokens.count(
             **{field: body[field] for field in _COUNTED_FIELDS if field in body}
         ).input_tokens
-    except openai.OpenAIError as error:
+    except Exception as error:
+        # Not only the SDK's own errors. A reply it cannot decode raises the decoder's
+        # error, which holds the whole reply.
         raise EmberCallError(
             "Could not count the request's input tokens, so it was not sent: "
             + _describe(error, sensitive),
-            status_code=getattr(error, "status_code", None),
+            status_code=_status_code(error),
             retry_after=_retry_after(error),
         ) from error
     if not _is_count(count):
@@ -972,6 +1063,12 @@ def _count_input_tokens(sdk: openai.OpenAI, body: Mapping[str, Any], sensitive: 
             f"The token count endpoint returned {shown}; the request was not sent."
         )
     return count
+
+
+def _status_code(error: Exception) -> int | None:
+    """The HTTP status an error carries, when it is a number."""
+    status = getattr(error, "status_code", None)
+    return status if isinstance(status, int) and not isinstance(status, bool) else None
 
 
 def _retry_after(error: Exception) -> float | None:

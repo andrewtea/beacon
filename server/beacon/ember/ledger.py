@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS ember_calls (
     error TEXT,
     request TEXT NOT NULL,
     response TEXT,
-    scope TEXT
+    scope TEXT,
+    token TEXT NOT NULL
 )
 """
 # A ledger's row ids start again when its file is replaced. The generation is drawn
@@ -83,19 +84,23 @@ _GENERATION = "SELECT value FROM ledger_meta WHERE key = 'generation'"
 
 
 class RowRef(NamedTuple):
-    """One row of one ledger file. A row id alone does not name a call, because a
-    ledger file that is deleted and begun again counts its rows from one again."""
+    """One call's row. A row id alone does not name a call, because a ledger file that
+    is deleted and begun again counts its rows from one again, and neither does the
+    id beside the file's generation, because an older copy of a file that is put back
+    has the same generation and gives the same ids to different calls. The token is
+    drawn for each row when it is written, so two rows are never told apart by less."""
 
     generation: str
     id: int
+    token: str
 
 
 _INSERT = """
 INSERT INTO ember_calls (
     started_at, source, status, task, model, effort, max_output_tokens, request_hash,
     input_tokens, cached_tokens, output_tokens, reasoning_tokens,
-    cost_nanousd, latency_ms, response_id, request, response, scope
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    cost_nanousd, latency_ms, response_id, request, response, scope, token
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _LIVE_SPEND = "SELECT COALESCE(SUM(cost_nanousd), 0) FROM ember_calls WHERE source = 'live'"
@@ -228,10 +233,12 @@ class Ledger:
                         f"${to_usd(reserved_nanousd):.6f}, which would pass its "
                         f"${to_usd(scope_budget_nanousd):.6f} budget."
                     )
+            token = secrets.token_hex(8)
             cursor = db.execute(
-                _INSERT, _values(call, "live", "pending", None, reserved_nanousd, None, None)
+                _INSERT,
+                _values(call, "live", "pending", None, reserved_nanousd, None, None, token),
             )
-            return RowRef(_generation(db), cursor.lastrowid)
+            return RowRef(_generation(db), cursor.lastrowid, token)
 
     def require_opened_file(self) -> None:
         """Raise LedgerReplacedError when the file is not the one this ledger was
@@ -267,7 +274,8 @@ class Ledger:
         was written. `response` must already be redacted. A reservation made in a
         ledger file that has since been replaced went with that file: nothing is
         written, and the answer is False. That holds when the file now at the path
-        has a row of the same id, as an older copy that was put back can."""
+        has a row of the same id, as an older copy that was put back can: the row
+        is another call's and has another token."""
         with self._transaction() as db:
             if not self._is_opened_file(db):
                 return False
@@ -277,7 +285,8 @@ class Ledger:
                     status = ?, cost_nanousd = ?, latency_ms = ?, input_tokens = ?,
                     cached_tokens = ?, output_tokens = ?, reasoning_tokens = ?,
                     response_id = ?, response = ?, error = ?
-                WHERE id = ? AND ? = (SELECT value FROM ledger_meta WHERE key = 'generation')
+                WHERE id = ? AND token = ?
+                    AND ? = (SELECT value FROM ledger_meta WHERE key = 'generation')
                 """,
                 (
                     status,
@@ -288,6 +297,7 @@ class Ledger:
                     _json(response),
                     error,
                     row.id,
+                    row.token,
                     row.generation,
                 ),
             )
@@ -307,32 +317,38 @@ class Ledger:
         numbers; only rows with source 'live' count as spend. `response` must already
         be redacted."""
         with self._transaction() as db:
+            token = secrets.token_hex(8)
             cursor = db.execute(
                 _INSERT,
-                _values(call, source, "ok", usage, usage.cost_nanousd, latency_ms, response),
+                _values(call, source, "ok", usage, usage.cost_nanousd, latency_ms, response, token),
             )
-            return RowRef(_generation(db), cursor.lastrowid)
+            return RowRef(_generation(db), cursor.lastrowid, token)
 
     def calls(self, refs: Sequence[RowRef]) -> list[LedgerCall]:
         """The rows these name, in the order the calls started. One with no row is
         left out, and so is one from another ledger file than the one at this path
         now: the file's generation is read on the connection its rows are read on, so
-        a row is never taken from a file other than the one it was checked against."""
+        a row is never taken from a file other than the one it was checked against.
+        A row that has the id and not the token is another call's, written at that id
+        in an older copy of the file that was put back, and is left out too."""
         if not refs:
             return []
         with closing(self._connect()) as db:
             generation = _generation(db)
-            ids = [ref.id for ref in refs if ref.generation == generation]
-            if not ids:
+            wanted = {(ref.id, ref.token) for ref in refs if ref.generation == generation}
+            if not wanted:
                 return []
+            ids = sorted({row_id for row_id, _token in wanted})
             marks = ", ".join("?" * len(ids))
             rows = db.execute(
-                f"SELECT {_SHOWN} FROM ember_calls WHERE id IN ({marks}) ORDER BY id", tuple(ids)
+                f"SELECT {_SHOWN}, token FROM ember_calls WHERE id IN ({marks}) ORDER BY id",
+                tuple(ids),
             ).fetchall()
         calls = []
         for row in rows:
             shown = dict(row)
-            calls.append(LedgerCall(cost_usd=to_usd(shown.pop("cost_nanousd")), **shown))
+            if (shown["id"], shown.pop("token")) in wanted:
+                calls.append(LedgerCall(cost_usd=to_usd(shown.pop("cost_nanousd")), **shown))
         return calls
 
     def export_trace(self, path: Path) -> int:
@@ -420,6 +436,7 @@ def _values(
     cost_nanousd: int,
     latency_ms: int | None,
     response: Mapping[str, Any] | None,
+    token: str,
 ) -> tuple[Any, ...]:
     return (
         datetime.now(UTC).isoformat(timespec="milliseconds"),
@@ -437,6 +454,7 @@ def _values(
         _json(call.request),
         _json(response),
         call.scope,
+        token,
     )
 
 
