@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -643,6 +644,41 @@ def test_a_tap_that_finds_the_queue_full_is_passed_over_and_costs_nothing(
     _claimed, skipped = desk.runs.get(f"tap-AAAAAAAA2{QUEUE:03d}")  # type: ignore[misc]
     assert skipped.outcome == Outcome(status="unconfirmed", reason="not_investigated")
     assert asked == []
+
+
+def test_a_tap_is_given_its_receipt_when_a_full_queue_cannot_be_written_down(
+    world: World, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    desk = world.desk()
+    client = world.app(desk)
+    assert all(desk.submit(f"tap-AAAAAAAA2{n:03d}") for n in range(QUEUE))
+
+    def locked(*_given: Any) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(desk.runs, "skip", locked)
+
+    # The tap is stored before it is handed to the desk, and its id is the only
+    # handle its sender has: it is given, whatever the desk could not write.
+    response = client.post("/api/taps", json={"location": PHONE})
+
+    assert response.status_code == 201
+    receipt = response.json()
+    assert receipt["investigating"] is False
+    assert desk.state_of(receipt["id"]) is None
+    assert read(client, receipt["id"]) == ("unconfirmed", "not_investigated", "none")
+    assert (
+        "A tap that found the queue full could not be recorded as passed over "
+        "(OperationalError). Its answer says it was not investigated."
+    ) in caplog.text
+    assert receipt["id"] not in caplog.text
+    assert "locked" not in caplog.text
+    # A file that is closed, as at a shutdown, is no news.
+    caplog.clear()
+    monkeypatch.undo()
+    desk.runs.close()
+    assert desk.submit("tap-AAAAAAAA2999") is False
+    assert "could not be recorded" not in caplog.text
 
 
 def test_the_desks_threads_look_into_the_taps_handed_in_and_outlive_one_that_fails(

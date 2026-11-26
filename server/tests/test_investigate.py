@@ -786,6 +786,30 @@ def test_an_answer_that_names_nothing_or_is_no_form_is_unconfirmed(
     assert "Hayes" not in repr(made.run)
 
 
+@pytest.mark.parametrize("field", ["outcome", "incident", "grounds", "crisis", "crisis_signals"])
+def test_a_form_with_any_field_left_out_is_no_answer_though_null_is_one(
+    rows: Rows, storage: Storage, field: str
+) -> None:
+    city(rows)
+    scene = scene_of(rows, rows.tap(6, offset(HAYES, 3000, 0), ref=TAP))
+    left_out = {name: value for name, value in WHOLE.items() if name != field}
+
+    def answered(said: dict[str, Any]) -> Any:
+        script = Script([asks(NEAR), fake_response(text=json.dumps(said))])
+        return investigate_tap(EmberClient.fake(storage, script), scene)
+
+    made = answered(left_out)
+
+    # A field that is not there is not a field that says null or nothing: the
+    # answer is not the form, and counts as one Beacon could not use.
+    assert made.run.outcome == Outcome(status="unconfirmed", reason="no_answer")
+    assert made.usable is False
+    # With every field there, `incident: null` included, it is an answer.
+    whole = answered(WHOLE)
+    assert whole.run.outcome == Outcome(status="unconfirmed", reason="nothing_near")
+    assert whole.usable is True
+
+
 def test_with_nothing_near_the_answer_is_unconfirmed_and_says_so(
     rows: Rows, storage: Storage
 ) -> None:

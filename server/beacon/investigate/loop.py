@@ -487,9 +487,11 @@ def _whole(said: object) -> Mapping[str, Any] | None:
     schema Ember is given requires, or None. A value that is not on a field's list
     is another matter: it is dropped from a form that is whole. An answer that
     says "incident" and names none is not whole."""
-    if not isinstance(said, Mapping):
+    # Every field is there. One that is left out is not one that says null: an
+    # answer of "unconfirmed" with no `incident` at all is not the form.
+    if not isinstance(said, Mapping) or any(field not in said for field in SCHEMA["required"]):
         return None
-    outcome, named = said.get("outcome"), said.get("incident")
+    outcome, named = said["outcome"], said["incident"]
     whole = (
         outcome in ("incident", "unconfirmed")
         and (isinstance(named, str) or (named is None and outcome == "unconfirmed"))

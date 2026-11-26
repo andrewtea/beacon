@@ -134,8 +134,13 @@ class InvestigationDesk:
 
     def submit(self, tap_id: str) -> bool:
         """Hand a tap in to be looked into, and say whether it was taken. It does
-        not wait and does not raise. A tap that finds the queue full is passed
-        over for good; one that comes while the desk is closing is left alone."""
+        not wait for a thread of the desk's, and it does not raise: whoever took
+        the tap still has a receipt to give. A tap that comes while the desk is
+        closing is left alone. One that finds the queue full is passed over for
+        good, which is written to the investigations file here, in one write that
+        can wait for the file for a few seconds; when it cannot be written, the
+        log says so, and the tap's answer says it was not investigated all the
+        same, because it has no run and none is coming."""
         with self._tracking:
             # Looked at under the lock a stop empties the queue under: a tap that
             # is taken in is either emptied out by the stop or was never taken.
@@ -153,8 +158,25 @@ class InvestigationDesk:
                 full = False
                 self._queued.add(tap_id)
         if full:
-            with contextlib.suppress(RunsError):
+            failed: str | None = None
+            try:
                 self._runs.skip(tap_id, self._clock())
+            except RunsError:
+                # The file is closed: the server is shutting down.
+                pass
+            except Exception as error:
+                # The file is locked, or cannot be written. The tap was taken and
+                # stored before it was handed in here, and its sender is still to
+                # be given its id.
+                failed = type(error).__name__
+            if failed is not None:
+                # Only the kind of error, and not the tap's id, which is what its
+                # sender reads its answer with.
+                logger.warning(
+                    "A tap that found the queue full could not be recorded as passed "
+                    "over (%s). Its answer says it was not investigated.",
+                    failed,
+                )
         return not full
 
     def investigate(self, tap_id: str) -> Run | None:

@@ -242,7 +242,7 @@ from beacon.investigate import open_investigations
 # investigated (the live store with no budget). In the server they are
 # request.app.state.runs, which is always there, and request.app.state.investigations.
 runs, desk = open_investigations(os.environ, engine, taps)
-desk.submit(tap_id)  # hand a tap in; never waits, never raises
+desk.submit(tap_id)  # hand a tap in; never raises, and waits for no worker (a full queue costs one write)
 desk.state_of(tap_id)  # "queued", "running", or None: whether its answer is still coming
 found = runs.get(tap_id)  # (claimed_at, Run | None) or None; asks Ember nothing
 runs.crisis(incident_id)  # the decision that turned crisis mode on (Decision), or None
