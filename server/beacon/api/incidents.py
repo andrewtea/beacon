@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict
 
 from beacon.incident import Engine, Incident
-from beacon.incident.build import CREDIT_511
+from beacon.incident.build import CREDIT_511, STATUS_WORDS
 from beacon.investigate import Runs
 from beacon.investigate import card as words
 from beacon.radio.vocabulary import MEDICAL_EVENT
@@ -175,6 +175,9 @@ class IncidentSummary(_Read):
     category: str
     title: str
     status: str
+    # The status in a sentence, as what the radio said: show it as it is. Null for
+    # a medical response, of which no status is shown, and when the radio gave none.
+    status_text: str | None = None
     open: bool
     opened_at: datetime
     updated_at: datetime
@@ -322,9 +325,24 @@ def cited_credit(kind: str) -> CreditOut | None:
     return CreditOut.model_validate(CREDIT_511) if kind == "closure" else None
 
 
+def status_text_of(incident: Incident) -> str | None:
+    """An incident's status in a sentence. The status is the furthest along that a
+    call on the radio gave, so it is said as what the radio said, and by nobody in
+    particular: a radio row keeps no speaker. None for a medical response, which
+    is its crews and its block, and for an incident whose calls gave no status."""
+    if incident.category == MEDICAL_EVENT or incident.status == "unknown":
+        return None
+    if incident.status == "clearing":
+        # A call cleared or cancelled units while others had been named lately.
+        return "The radio said some units were cleared or cancelled."
+    words_for = STATUS_WORDS.get(incident.status)
+    return None if words_for is None else f"The radio said: {words_for}."
+
+
 def summary_of(request: Request, incident: Incident) -> IncidentSummary:
-    """An incident as the list has it, with its crisis mode."""
+    """An incident as the list has it, with its status in words and its crisis mode."""
     summary = IncidentSummary.model_validate(incident)
+    summary.status_text = status_text_of(incident)
     summary.crisis = crisis_of(request, incident)
     return summary
 
@@ -365,6 +383,7 @@ def incident(request: Request, incident_id: str) -> IncidentAnswer:
     if found is None:
         raise HTTPException(404, "There is no such incident.")
     detail = IncidentDetail.model_validate(found)
+    detail.status_text = status_text_of(found)
     detail.crisis = crisis_of(request, found)
     desk: StoryDesk | None = getattr(request.app.state, "stories", None)
     # Reading a story asks Ember nothing: only the desk's own pass writes one.

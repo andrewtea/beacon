@@ -1,77 +1,77 @@
-import { useEffect, useState } from 'react'
 import './App.css'
 import { fetchHealth } from './api/health.ts'
-import { ApiError } from './api/http.ts'
+import { Icon } from './components/Icon.tsx'
+import { usePolled } from './lib/poll.ts'
+import { href, type Route, useRoute } from './lib/router.ts'
+import { Home } from './views/Home.tsx'
+import { IncidentView } from './views/IncidentView.tsx'
+import { TapView } from './views/TapView.tsx'
+import { TraceView } from './views/TraceView.tsx'
 
-type ServerState =
-  | { kind: 'checking' }
-  | { kind: 'connected'; version: string }
-  | { kind: 'unreachable'; reason: string }
+const HEALTH_MS = 30_000
 
-function useServerState(): ServerState {
-  const [state, setState] = useState<ServerState>({ kind: 'checking' })
-
-  useEffect(() => {
-    const controller = new AbortController()
-    fetchHealth(controller.signal)
-      .then((health) =>
-        setState({ kind: 'connected', version: health.version }),
+function View({ route, mode }: { route: Route; mode: 'live' | 'mock' | null }) {
+  switch (route.view) {
+    case 'home':
+      return <Home mode={mode} />
+    case 'tap':
+      return <TapView key={route.id} id={route.id} />
+    case 'trace':
+      return <TraceView key={route.id} id={route.id} />
+    case 'incident':
+      return <IncidentView key={route.id} id={route.id} />
+    case 'unknown':
+      return (
+        <div className="view">
+          <h1>There is nothing at this address</h1>
+          <a className="action" href={href.home}>
+            <Icon name="back" size={16} />
+            Back to the button
+          </a>
+        </div>
       )
-      .catch((error: unknown) => {
-        if (controller.signal.aborted) return
-        setState({
-          kind: 'unreachable',
-          reason:
-            error instanceof ApiError
-              ? error.message
-              : 'The server could not be reached.',
-        })
-      })
-    return () => controller.abort()
-  }, [])
-
-  return state
-}
-
-const serverLabel = (state: ServerState): string => {
-  switch (state.kind) {
-    case 'checking':
-      return 'Checking server…'
-    case 'connected':
-      return `Server connected (v${state.version})`
-    case 'unreachable':
-      return 'Server unreachable'
   }
 }
 
 export default function App() {
-  const server = useServerState()
+  const route = useRoute()
+  const health = usePolled('health', fetchHealth, () => HEALTH_MS)
+  const mode = health.data?.mode ?? null
+  const unreachable = health.error !== null
 
   return (
     <div className="app">
-      <header className="bar">
-        <img src="/favicon.svg" alt="" width="28" height="28" />
-        <span className="name">Beacon</span>
+      <header className="topbar">
+        <a className="brand" href={href.home}>
+          <img src="/favicon.svg" alt="" width="28" height="28" />
+          <span className="name">Beacon</span>
+        </a>
+        {mode === 'mock' && (
+          <span className="tag stand-in">Invented scenario</span>
+        )}
       </header>
+      {mode === 'mock' && route.view === 'home' && (
+        <p className="mock-banner">
+          Beacon is running on an invented scenario, not real sources. The
+          incidents, alerts, and notices it shows are made up and are not a
+          record of anything that happened.
+        </p>
+      )}
+      {unreachable && (
+        <p className="note problem" role="status">
+          {health.error?.message}
+        </p>
+      )}
       <main>
-        <h1>What’s that?</h1>
-        <p className="lede">
-          You hear a siren or see a helicopter. Beacon will say what is going
-          on, which crews are on it, and roughly where, with a source on every
-          claim.
-        </p>
-        <p className="note">
-          This is the app’s shell. The What’s that? button is not built yet, so
-          there is nothing to tap.
-        </p>
+        <View route={route} mode={mode} />
       </main>
       <footer>
-        <p className={`server ${server.kind}`} role="status">
-          <span className="dot" aria-hidden="true" />
-          {serverLabel(server)}
+        <p>
+          Beacon relays what authorities publish and tells nobody what to do.
+          Every line names its source.
         </p>
-        {server.kind === 'unreachable' && (
-          <p className="reason">{server.reason}</p>
+        {health.data !== null && !unreachable && (
+          <p className="server">Server v{health.data.version}</p>
         )}
       </footer>
     </div>
