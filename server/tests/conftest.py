@@ -79,6 +79,7 @@ def offline_environment(
         "BEACON_LIVE_SOURCES",
         "BEACON_INGEST",
         "BEACON_511_API_KEY",
+        "BEACON_OPENSKY_PERMITTED",
         "OPENSKY_CLIENT_ID",
         "OPENSKY_CLIENT_SECRET",
     ):

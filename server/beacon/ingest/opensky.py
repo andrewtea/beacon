@@ -2,9 +2,16 @@
 
 `GET https://opensky-network.org/api/states/all` with a bounding box answers with one
 state vector for each aircraft in it: where it is, how high, how fast, and which way.
-OpenSky is free for non-commercial use. It works without an account at 400 requests
-a day, and with an API client's id and secret (OAuth2 client credentials) at 4,000.
-The API is documented at https://openskynetwork.github.io/opensky-api/rest.html.
+The API is documented at https://openskynetwork.github.io/opensky-api/rest.html. It
+answers without an account at 400 requests a day, and with an API client's id and
+secret (OAuth2 client credentials) at 4,000.
+
+**Being able to call it is not permission to.** OpenSky's terms
+(https://opensky-network.org/about/terms-of-use) license the REST API for non-profit
+research and education only, and say that using it "in any operational capacity",
+which a running Beacon is, needs a written license from OpenSky whoever asks.
+`beacon.ingest.setup` therefore builds this poller for the real API only when
+`BEACON_OPENSKY_PERMITTED=1` says that license has been given.
 
 Each position of an aircraft is one row. Only aircraft a person on the street could
 notice are kept: airborne and below `MAX_ALTITUDE_M`. An airliner at cruise is not
@@ -92,6 +99,8 @@ class OpenSkyAircraft:
         except SourceError as error:
             if error.status != 401 or self._credentials is None:
                 raise
+            body = None
+        if body is None:
             # The token ran out early. One new token, one more try.
             self._token = None
             body = self._states()
@@ -183,7 +192,7 @@ def _aircraft(state: list[Any], origin: Origin) -> NewEvidence | None:
     # The height above the ellipsoid is nearer the height above the street than the
     # barometric one, which moves with the weather.
     altitude = geo_altitude if _is_number(geo_altitude) else baro_altitude
-    if on_ground is not False or not _is_number(altitude) or altitude > MAX_ALTITUDE_M:
+    if on_ground is not False or not _is_number(altitude) or altitude >= MAX_ALTITUDE_M:
         return None
     try:
         point = Point(lat, lon)

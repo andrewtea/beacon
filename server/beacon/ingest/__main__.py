@@ -27,17 +27,21 @@ def main() -> None:
         ingest = build(os.environ)
     except (IngestConfigError, EvidenceStoreError, EmberConfigError) as error:
         raise SystemExit(str(error)) from error
-    ingest.catch_up()
-    ingest.runner.step()
-    print(f"Evidence store: {ingest.store.path} ({ingest.store.mode})")
-    counts = ingest.store.count_by_source()
-    for status in ingest.runner.status():
-        # Why a poll failed is in the log above.
-        outcome = "ok" if status.ok else "failed"
-        print(f"  {status.name:<8} {counts.get(status.name, 0):>6} rows  {outcome}")
-    if options.follow:
-        with contextlib.suppress(KeyboardInterrupt):
-            ingest.runner.run(threading.Event())
+    try:
+        ingest.catch_up()
+        if ingest.scenario is None:
+            ingest.runner.step()
+        print(f"Evidence store: {ingest.store.path} ({ingest.store.mode})")
+        counts = ingest.store.count_by_source()
+        for status in ingest.runner.status():
+            # Why a poll failed is in the log above.
+            outcome = {True: "ok", False: "failed", None: "not polled"}[status.ok]
+            print(f"  {status.name:<8} {counts.get(status.name, 0):>6} rows  {outcome}")
+        if options.follow:
+            with contextlib.suppress(KeyboardInterrupt):
+                ingest.run(threading.Event())
+    finally:
+        ingest.close()
 
 
 if __name__ == "__main__":

@@ -167,8 +167,9 @@ def test_only_aircraft_a_person_on_the_street_could_notice_are_kept() -> None:
         {
             "time": SECONDS,
             "states": [
-                state("aaaaa1", geo_altitude=MAX_ALTITUDE_M),
-                state("aaaaa2", geo_altitude=MAX_ALTITUDE_M + 0.1),
+                state("aaaaa1", geo_altitude=MAX_ALTITUDE_M - 0.1),
+                # Below the ceiling is kept, and at it is not.
+                state("aaaaa2", geo_altitude=MAX_ALTITUDE_M),
                 state("aaaaa3", on_ground=True),
                 state("aaaaa4", latitude=None),
                 state("aaaaa5", time_position=None),

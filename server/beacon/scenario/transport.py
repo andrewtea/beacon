@@ -38,6 +38,9 @@ def scenario_transport(scenario: Scenario, now: Callable[[], datetime]) -> httpx
         if place == ("GET", "api.511.org", "/traffic/events"):
             if not url.params.get("api_key"):
                 return httpx2.Response(401, text="Unauthorized")
+            if url.params.get("in_effect_on") != "now":
+                # Without it 511 also lists work that is planned and has not begun.
+                return httpx2.Response(400, text="The mock scenario answers for now only.")
             # 511 begins its replies with a byte order mark.
             return _json(scenario.traffic_events(now()), bom=True)
         return httpx2.Response(404, text="The mock scenario has no such source.")

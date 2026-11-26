@@ -11,7 +11,15 @@ module (`nws`, `opensky`, `traffic511`) for what its rows hold.
 
 from beacon.ingest.http import SourceError
 from beacon.ingest.runner import Clock, Poller, PollerStatus, PollReport, Runner
-from beacon.ingest.setup import SOURCES, Ingest, IngestConfigError, build, live_sources
+from beacon.ingest.setup import (
+    SOURCES,
+    Ingest,
+    IngestConfigError,
+    build,
+    live_sources,
+    open_store,
+    source_pollers,
+)
 
 __all__ = [
     "SOURCES",
@@ -25,4 +33,6 @@ __all__ = [
     "SourceError",
     "build",
     "live_sources",
+    "open_store",
+    "source_pollers",
 ]

@@ -9,7 +9,7 @@ stand-in produced it.
 There are two stores, and a file is one or the other for life. The *mock* store holds
 what the invented scenario and stand-ins produce. The *live* store holds what real
 sources and Ember produce, and refuses a row a stand-in had a part in, so nothing in
-it has to be doubted on that account. `EvidenceStore.from_env` picks the file from
+it has to be doubted on that account. `beacon.ingest.open_store` picks the file from
 `BEACON_LIVE_SOURCES`, the setting that turns real sources on.
 
 Rows are never changed. A source that revises what it said, as 511 does when it
@@ -26,8 +26,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, get_args
 
-from beacon.ember.client import default_data_dir
-
 # What a row is about. A kind can have more than one source over time: aircraft can
 # come from OpenSky or airplanes.live.
 Kind = Literal["radio", "aircraft", "alert", "traffic", "notice", "tap"]
@@ -39,8 +37,6 @@ Origin = Literal["live", "mock"]
 # Which kind of Ember client wrote the row's data, when a model did.
 ModelSource = Literal["live", "replay", "fake"]
 Mode = Literal["live", "mock"]
-
-LIVE_SOURCES_VARIABLE = "BEACON_LIVE_SOURCES"
 
 _EARTH_RADIUS_M = 6_371_008.8
 
@@ -180,13 +176,6 @@ class EvidenceStore:
         with closing(self._connect()):
             pass
 
-    @classmethod
-    def from_env(cls, env: Mapping[str, str]) -> "EvidenceStore":
-        """The live store when `BEACON_LIVE_SOURCES` names a source, else the mock
-        store, each in a file of its own under the data directory."""
-        mode: Mode = "live" if env.get(LIVE_SOURCES_VARIABLE, "").strip() else "mock"
-        return cls(default_data_dir(env) / "evidence" / f"{mode}.sqlite3", mode)
-
     @property
     def mode(self) -> Mode:
         return self._mode
@@ -259,16 +248,6 @@ class EvidenceStore:
             ).fetchone()
         return None if row is None else _evidence(row)
 
-    def last_recorded_at(self) -> datetime | None:
-        """The latest moment anything was stored: a row, or a poller's state. None
-        for a store that holds nothing."""
-        with closing(self._connect()) as db:
-            (latest,) = db.execute(
-                "SELECT MAX(ms) FROM (SELECT MAX(recorded_ms) AS ms FROM evidence "
-                "UNION ALL SELECT MAX(updated_ms) FROM poller_state)"
-            ).fetchone()
-        return None if latest is None else _from_ms(latest)
-
     def count_by_source(self) -> dict[str, int]:
         """How many rows each source has."""
         with closing(self._connect()) as db:
@@ -300,6 +279,10 @@ class EvidenceStore:
         `until` is in the window when its span from `occurred_at` to `until` touches
         it, so an alert issued an hour ago that still applies is found. Any other row
         is in it when it happened inside it. Both ends are included.
+
+        What comes back is what was said, not what is in force. Nothing here applies
+        a later row that replaces, cancels, or withdraws an earlier one, and that
+        later row can lie outside the window or the radius asked for.
 
         `near` with `radius_m` keeps the rows whose point is within that many metres.
         A row with no point, such as a city-wide alert or a transmission whose
@@ -413,8 +396,10 @@ def _json(value: Mapping[str, Any], what: str) -> str:
     try:
         return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
     except (TypeError, ValueError):
-        # The value is not repeated: it can be what a source or a person sent.
-        raise EvidenceStoreError(f"{what} is not JSON.") from None
+        pass
+    # Raised outside the handler, so the encoder's error is not kept under it, and
+    # the value is not repeated: it can be what a source or a person sent.
+    raise EvidenceStoreError(f"{what} is not JSON.")
 
 
 def _evidence(row: Sequence[Any]) -> Evidence:

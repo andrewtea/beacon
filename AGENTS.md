@@ -14,7 +14,7 @@ Each `server/beacon/` package has one concern, so parallel pull requests stay ap
 - `api/`: HTTP routes, one module per resource, each exposing a `router` that `beacon.main` mounts under `/api`.
 - `ember/`: the Meta Model API client, its ledger, replay cache, and trace.
 - `evidence/`: the evidence store. Every poller writes to it and every reader of what a source said reads from it. See [Using the evidence store](#using-the-evidence-store).
-- `ingest/`: one module per source (`nws`, `opensky`, `traffic511`), the `Runner` that polls them, and `setup.build`, which makes them from the environment.
+- `ingest/`: one module per source (`nws`, `opensky`, `traffic511`), the `Runner` that polls them, and `setup`, which reads `BEACON_LIVE_SOURCES` once to open the right store (`open_store`) and make the pollers (`build`).
 - `scenario/`: the mock scenario, an invented San Francisco fire served to the pollers in each source's own format.
 
 ## Commands
@@ -35,7 +35,8 @@ Run one server test with `cd server && uv run pytest tests/test_health.py -k nam
 - **Never commit secrets, raw radio audio, or downloaded source data.** The repository is public. Keys come from the environment (`MODEL_API_KEY`). Runtime data stays under the Git-ignored `data/`. Beacon publishes summaries, never raw radio audio.
 - **Say what is mocked.** Until real keys and permissions exist, features run on mock data. Anything a stand-in produced is labeled as such in the API reply and in the app, and the README's status says so. Never present a stand-in's output as Ember's. An evidence row says it itself: `row.stand_in` is true when it came from the mock scenario (`origin == "mock"`) or a fake Ember wrote it (`model == "fake"`), and whatever is built from such a row is a stand-in's too. The live evidence store refuses those rows; do not add a way around that.
 - **Mock data is invented, never copied.** The repository is public and holds no real radio traffic, transcript, recording, or notice. What the mock scenario says is made up and says so in its text (`beacon.scenario.INVENTED`).
-- **A poller's request goes through `beacon.ingest.http.fetch`,** which caps what is read, follows no redirect, and fails with a `SourceError` whose text is fixed. Never log or raise a request's address (511's holds the token), a reply's body, or an exception from the HTTP library.
+- **A poller's request goes through `beacon.ingest.http.fetch`,** which caps what is read, follows no redirect, and fails with a `SourceError` whose text is fixed. Never log or raise a request's address (511's holds the token), a reply's body, or an exception from the HTTP library, and never leave one chained under your own error: `raise ... from None` only hides it from a printed traceback and keeps it in `__context__`. Raise outside the `except` block, with `beacon.ingest.http.raise_bare`.
+- **A source is polled for real only with the right to.** OpenSky's terms require a written license for calling its REST API from a running service, so `setup.source_pollers` refuses it without `BEACON_OPENSKY_PERMITTED=1`. Do not remove that check, and give a new source one like it when its terms ask for permission. A key is not permission.
 - **Product lines that keep Beacon inside the hackathon rules** (see HACKATHON.md, "Constraints for Beacon"):
   - The answer to a tap is the product. The map is secondary and opened from an incident card.
   - A photo only adds evidence to a tap and its incident. There is no "analyze this photo" feature.
@@ -114,8 +115,9 @@ import os
 from datetime import timedelta
 
 from beacon.evidence import EvidenceStore, NewEvidence, Point
+from beacon.ingest import open_store
 
-store = EvidenceStore.from_env(os.environ)  # the mock store unless BEACON_LIVE_SOURCES names a source
+store = open_store(os.environ)  # the mock store unless BEACON_LIVE_SOURCES names a source
 
 # Read: what any source said near a place in the last ten minutes, plus rows with no
 # point, such as a city-wide alert. Oldest first.
@@ -140,14 +142,16 @@ store.add([NewEvidence(kind="tap", source="app", ref=tap_id, occurred_at=now,
                        confidence="low", origin="live", point=where)])
 ```
 
-- **A row is one thing one source said, and it is never changed.** A revision is a new row: an NWS update names the alerts it replaces in `data["replaces"]`, and each version of a 511 event is a row whose `data["event_id"]` is the same. A row whose `data["clears"]` holds another row's `ref` says that alert or event is over. To know what is in force, read the rows and apply those three; the store does not do it for you.
+- **A row is one thing one source said, and it is never changed.** A revision is a new row: an NWS update names the alerts it replaces in `data["replaces"]`, and each version of a 511 event is a row whose `data["event_id"]` is the same.
+- **`search` returns history, not what is in force.** The store applies no revision for you, and the rows that end something can lie outside your window or your radius: an alert issued an hour ago is found by its span long after a later row said it was replaced, cancelled, or no longer listed. To decide what is in force at a moment, take the candidate rows and then look up, with no upper bound on age and no distance filter, the later rows of the same source that name them: `data["replaces"]` (NWS), a later version with the same `data["event_id"]` (511), an NWS row whose `data["message_type"]` is `Cancel`, and rows with `data["change"]`.
+- **NWS and 511 never say that something ended.** When an item has been missing from two complete answers in a row, the poller stores a row with `data["change"] == "not_listed"` and `data["about"]` holding the `ref` of the row it is about. It records what Beacon saw, at `medium` confidence: it is not an official all-clear, and must not be shown as one. If the item is listed again, a `"listed_again"` row follows, and the latest change row about a `ref` is the one that holds. An alert that simply ran to its `until` gets no change row.
 - **Rows carry what the source said, not a judgment.** Grouping rows into incidents, deciding that an aircraft is circling, and weighing a notice against radio are the incident engine's, and stay deterministic and tested.
 - `search` finds a row with an `until` when its span touches the window, and any other row when it happened inside it. Pass `include_unlocated=True` with `near` unless you want only rows that have a point. Aircraft are one row per position, about every 30 seconds each, so give an aircraft query a short window or a larger `limit` (default 500).
-- What `data` holds is documented where it is written: `beacon/ingest/nws.py` (`_alert`), `opensky.py` (`_aircraft`), and `traffic511.py` (`_event`). Units are SI: metres, metres per second, degrees clockwise from north.
+- What `data` holds is documented where it is written: `beacon/ingest/nws.py` (`_alert`), `opensky.py` (`_aircraft`), and `traffic511.py` (`_event`). Units are SI: metres, metres per second, degrees clockwise from north. A 511 row keeps the event's `schedule` as 511 sent it; the poller asks only for events in effect now.
 - Anything shown from a `511` row carries the words "data provided by 511.org" with a link to https://511.org beside it: 511's data agreement requires it.
-- The mock store and the live store are separate files, and a store is one or the other for life. Code that reads evidence takes an `EvidenceStore` as an argument; only an entry point (the server's startup, a script) calls `from_env`.
-- **In tests**, make a store with `EvidenceStore(tmp_path / "evidence.sqlite3", "mock")` and add rows, or play the scenario: `build({"BEACON_DATA_DIR": str(tmp_path)}, Clock(lambda: moment)).catch_up()` from `beacon.ingest` stores everything the invented fire's sources said up to `moment`. `server/tests/test_ingest_setup.py` shows the whole story and when each row appears.
-- **A new source** is a module in `beacon/ingest/` that copies `nws.py`: a class with `name`, `interval_seconds`, and `poll(store, now)`, a pure `parse_...` function that turns the source's reply into `NewEvidence` and counts what it could not read, the source's answers added to `beacon/scenario/`, and its name added to `SOURCES` and `_live_pollers` in `setup.py`. Its tests answer through `httpx2.MockTransport`.
+- The mock store and the live store are separate files, and a store is one or the other for life. Code that reads evidence takes an `EvidenceStore` as an argument; only an entry point (the server's startup, a script) calls `open_store`. In the server, the store the pollers write to is `request.app.state.ingest.store`.
+- **In tests**, make a store with `EvidenceStore(tmp_path / "evidence.sqlite3", "mock")` and add rows, or play the scenario: `build({"BEACON_DATA_DIR": str(tmp_path)}, Clock(lambda: moment)).catch_up()` from `beacon.ingest` stores everything the invented fire's sources said up to `moment`, where the story began twenty minutes before the `build`. `server/tests/test_ingest_setup.py` shows the whole story and when each row appears.
+- **A new source** is a module in `beacon/ingest/` that copies `nws.py`: a class with `name`, `interval_seconds`, and `poll(store, now)`, a pure `parse_...` function that turns the source's reply into `NewEvidence` and counts what it could not read, the source's answers added to `beacon/scenario/`, and its name added to `SOURCES`, `source_pollers`, and the mock pollers in `setup.py`. Its tests answer through `httpx2.MockTransport`, and build its poller with the origin `mock`: what a stand-in answers is never stored as `live`.
 
 ## Conventions
 

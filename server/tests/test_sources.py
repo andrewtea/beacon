@@ -1,5 +1,6 @@
 """The sources route, and the pollers the server runs."""
 
+import threading
 import time as system_time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -54,8 +55,13 @@ def test_the_server_runs_the_pollers_on_the_mock_scenario_while_it_is_up() -> No
             assert system_time.monotonic() < deadline, "The pollers stored nothing in 20 s."
             system_time.sleep(0.05)
 
+        ingest = client.app.state.ingest
+
     assert answer["mode"] == "mock"
     assert [source["name"] for source in answer["sources"]] == ["nws", "opensky", "511"]
+    # When the server has shut down, the pollers have stopped and can ask nothing more.
+    assert ingest.http.is_closed
+    assert "beacon-ingest" not in [thread.name for thread in threading.enumerate()]
 
 
 def test_a_server_told_not_to_ingest_runs_no_pollers_and_says_so(

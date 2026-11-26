@@ -6,8 +6,10 @@ relays for local authorities, such as a shelter-in-place warning. The API needs 
 key, only a User-Agent that says who is asking, and its data is public domain.
 
 Each alert message is one row. An update is a new message with a new id that names
-the one it replaces, so it is a new row. When an alert stops being listed before the
-time it said it would end, a row says it cleared.
+the one it replaces, so it is a new row. NWS does not say when an alert is dropped:
+when one stops being listed before the time it said it would end, a row records that
+Beacon no longer sees it listed, and another if it is listed again
+(`beacon.ingest.listing`).
 """
 
 from datetime import datetime
@@ -18,7 +20,7 @@ import httpx2
 from beacon.evidence import Evidence, EvidenceStore, NewEvidence, Origin
 from beacon.ingest.area import centre
 from beacon.ingest.http import SourceError, fetch, read_json
-from beacon.ingest.listing import no_longer_listed
+from beacon.ingest.listing import compare_listing, listed_again_row, not_listed_row
 from beacon.ingest.runner import PollReport
 
 SOURCE = "nws"
@@ -36,6 +38,8 @@ _SEVERITIES = frozenset({"Extreme", "Severe", "Moderate", "Minor", "Unknown"})
 _URGENCIES = frozenset({"Immediate", "Expected", "Future", "Past", "Unknown"})
 _CERTAINTIES = frozenset({"Observed", "Likely", "Possible", "Unlikely", "Unknown"})
 _MESSAGE_TYPES = frozenset({"Alert", "Update", "Cancel"})
+# The statuses of a message that is not a real alert.
+_NOT_ACTUAL = frozenset({"Exercise", "System", "Test", "Draft"})
 
 
 class NwsAlerts:
@@ -66,7 +70,7 @@ class NwsAlerts:
         )
         alerts, unreadable = parse_alerts(read_json(body, SOURCE), self._origin)
         replaced = {ref for alert in alerts for ref in alert.data["replaces"]}
-        gone, state = no_longer_listed(
+        listing = compare_listing(
             store,
             poller=self.name,
             source=SOURCE,
@@ -79,14 +83,17 @@ class NwsAlerts:
             complete=unreadable == 0,
             now=now,
         )
-        cleared = [_cleared(row, now) for row in gone]
-        added = store.add([*alerts, *cleared], state=(self.name, state), now=now)
+        changes = [_change(row, now, "not_listed") for row in listing.gone]
+        changes += [_change(row, now, "listed_again") for row in listing.back]
+        added = store.add([*alerts, *changes], state=(self.name, listing.state), now=now)
         return PollReport(added=len(added), unreadable=unreadable)
 
 
 def parse_alerts(payload: Any, origin: Origin) -> tuple[list[NewEvidence], int]:
     """The alerts of an `/alerts/active` answer, and how many of its features could
-    not be read. A message whose status is not `Actual` is left out and not counted.
+    not be read. A test, exercise, system, or draft message is left out and not
+    counted. A feature with no status, or one NWS does not document, is counted as
+    unreadable: it may be a real alert.
 
     Raises SourceError when the answer is not a feature collection."""
     features = payload.get("features") if isinstance(payload, dict) else None
@@ -96,9 +103,10 @@ def parse_alerts(payload: Any, origin: Origin) -> tuple[list[NewEvidence], int]:
     unreadable = 0
     for feature in features:
         properties = feature.get("properties") if isinstance(feature, dict) else None
-        if isinstance(properties, dict) and properties.get("status") != "Actual":
+        status = properties.get("status") if isinstance(properties, dict) else None
+        if isinstance(status, str) and status in _NOT_ACTUAL:
             continue
-        alert = None if not isinstance(properties, dict) else _alert(feature, properties, origin)
+        alert = _alert(feature, properties, origin) if status == "Actual" else None
         if alert is None:
             unreadable += 1
         else:
@@ -163,23 +171,19 @@ def _alert(
     )
 
 
-def _cleared(alert: Evidence, now: datetime) -> NewEvidence:
-    """The row that says an alert stopped being listed before it was due to end."""
+def _change(alert: Evidence, now: datetime, change: str) -> NewEvidence:
+    """The row that says an alert stopped being listed before it was due to end, or
+    is listed again after that. Beacon saw it; NWS did not announce it."""
+    fields = (not_listed_row if change == "not_listed" else listed_again_row)(alert, now)
     return NewEvidence(
-        kind="alert",
-        source=SOURCE,
-        ref=f"{alert.ref}#cleared",
+        **fields,
         url=alert.url,
-        occurred_at=now,
-        point=alert.point,
-        place=alert.place,
-        confidence="official",
-        origin=alert.origin,
         data={
+            "change": change,
+            # The reference of the alert this is about.
+            "about": alert.ref,
             "event": alert.data.get("event"),
             "sender": alert.data.get("sender"),
-            # The reference of the alert that is no longer in force.
-            "clears": alert.ref,
         },
     )
 

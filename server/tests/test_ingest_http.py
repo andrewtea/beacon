@@ -1,92 +1,231 @@
-"""How a poller's request fails: with a fixed sentence, and nothing of what was asked."""
+"""How a poller's request fails: with a fixed sentence, and nothing of what was asked.
 
+The exchanges here are real ones with a server on this machine, so the HTTP library
+and the transport under it do everything they do on the network, logging included.
+"""
+
+import gzip
 import logging
+import threading
+from collections.abc import Callable, Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx2
 import pytest
 
 from beacon.ingest.http import SourceError, fetch, http_client, read_json
 
-URL = "https://api.511.org/traffic/events"
-KEY = {"api_key": "secret-token-123"}
+TOKEN = "secret-token-123"
+
+Reply = Callable[[BaseHTTPRequestHandler], None]
 
 
-def client(handler) -> httpx2.Client:
-    return http_client(httpx2.MockTransport(handler))
+class Server:
+    """A loopback HTTP server that answers every request with `reply`."""
+
+    def __init__(self) -> None:
+        self.reply: Reply = lambda handler: send(handler, 200, b"{}")
+        self.paths: list[str] = []
+        self.headers: list[dict[str, str]] = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                outer.paths.append(self.path)
+                outer.headers.append({name.lower(): value for name, value in self.headers.items()})
+                outer.reply(self)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self._server.server_port}/traffic/events"
+        threading.Thread(target=self._server.serve_forever, args=(0.01,), daemon=True).start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
 
 
-def get(handler, *, max_bytes: int = 1000) -> bytes:
-    return fetch(client(handler), "GET", URL, source="511", max_bytes=max_bytes, params=KEY)
+def send(handler: BaseHTTPRequestHandler, status: int, body: bytes = b"", **headers: str) -> None:
+    handler.send_response(status)
+    for name, value in headers.items():
+        handler.send_header(name.replace("_", "-"), value)
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
 
 
-def test_a_reply_is_returned_whole_up_to_the_cap() -> None:
-    assert get(lambda request: httpx2.Response(200, content=b"x" * 1000)) == b"x" * 1000
+@pytest.fixture
+def server() -> Iterator[Server]:
+    server = Server()
+    yield server
+    server.close()
 
+
+def get(server: Server, *, max_bytes: int = 1000) -> bytes:
+    with http_client() as http:
+        return fetch(
+            http, "GET", server.url, source="511", max_bytes=max_bytes, params={"api_key": TOKEN}
+        )
+
+
+def test_a_reply_is_returned_whole_up_to_the_cap(server: Server) -> None:
+    server.reply = lambda handler: send(handler, 200, b"x" * 1000)
+    assert get(server) == b"x" * 1000
+
+    server.reply = lambda handler: send(handler, 200, b"x" * 1001)
     with pytest.raises(SourceError, match=r"^511 sent more than Beacon reads from it\.$"):
-        get(lambda request: httpx2.Response(200, content=b"x" * 1001))
+        get(server)
+
+
+def test_a_gzipped_reply_is_unpacked_no_further_than_the_cap(server: Server) -> None:
+    packed = gzip.compress(b"x" * 1000)
+    server.reply = lambda handler: send(handler, 200, packed, Content_Encoding="gzip")
+    assert get(server) == b"x" * 1000
+    # Beacon asks for gzip or nothing, whatever the library would have offered.
+    assert server.headers[-1]["accept-encoding"] == "gzip"
+
+    # A hundred megabytes of zeros is a hundred kilobytes packed. It is given up on
+    # at the cap, and the rest is never unpacked.
+    bomb = gzip.compress(bytes(100_000_000))
+    assert len(bomb) < 200_000
+    server.reply = lambda handler: send(handler, 200, bomb, Content_Encoding="gzip")
+    with pytest.raises(SourceError, match="sent more than Beacon reads") as failure:
+        get(server)
+    (reading,) = [entry for entry in failure.traceback if entry.name == "fetch"]
+    assert len(reading.frame.f_locals["body"]) == 1001
+
+    server.reply = lambda handler: send(handler, 200, b"not gzip", Content_Encoding="gzip")
+    with pytest.raises(SourceError, match=r"^511 could not be reached\.$"):
+        get(server)
+
+
+def test_a_reply_packed_another_way_is_refused(server: Server) -> None:
+    server.reply = lambda handler: send(handler, 200, b"\x00\x01", Content_Encoding="br")
+
+    with pytest.raises(SourceError, match="packed its reply in a way Beacon does not read"):
+        get(server)
 
 
 @pytest.mark.parametrize(
     ("headers", "retry_after"),
     [
         ({}, None),
-        ({"Retry-After": "7"}, 7.0),
-        ({"X-Rate-Limit-Retry-After-Seconds": "412"}, 412.0),
-        ({"Retry-After": "soon", "X-Rate-Limit-Retry-After-Seconds": "30"}, 30.0),
-        ({"Retry-After": "-5"}, None),
-        ({"Retry-After": "inf"}, None),
+        ({"Retry_After": "7"}, 7.0),
+        ({"X_Rate_Limit_Retry_After_Seconds": "412"}, 412.0),
+        ({"Retry_After": "soon", "X_Rate_Limit_Retry_After_Seconds": "30"}, 30.0),
+        ({"Retry_After": "-5"}, None),
+        ({"Retry_After": "inf"}, None),
+        ({"Retry_After": "nan"}, None),
     ],
 )
 def test_an_error_status_is_reported_with_the_wait_the_source_asked_for(
-    headers: dict[str, str], retry_after: float | None
+    server: Server, headers: dict[str, str], retry_after: float | None
 ) -> None:
-    def refuses(request: httpx2.Request) -> httpx2.Response:
-        return httpx2.Response(429, headers=headers, text=f"Too many from {request.url}")
+    server.reply = lambda handler: send(
+        handler, 429, f"Too many from {handler.path}".encode(), **headers
+    )
 
     with pytest.raises(SourceError) as failure:
-        get(refuses)
+        get(server)
 
     assert str(failure.value) == "511 answered HTTP 429."
     assert (failure.value.source, failure.value.status) == ("511", 429)
     assert failure.value.retry_after == retry_after
 
 
-def test_a_redirect_is_reported_and_not_followed() -> None:
-    asked: list[str] = []
-
-    def redirects(request: httpx2.Request) -> httpx2.Response:
-        asked.append(request.url.host)
-        return httpx2.Response(302, headers={"Location": "https://elsewhere.example/"})
+def test_a_redirect_is_reported_and_not_followed(server: Server) -> None:
+    server.reply = lambda handler: send(handler, 302, Location=server.url + "/elsewhere")
 
     with pytest.raises(SourceError, match="answered HTTP 302"):
-        get(redirects)
-    assert asked == ["api.511.org"]
+        get(server)
+
+    assert server.paths == [f"/traffic/events?api_key={TOKEN}"]
 
 
-def test_a_failure_to_connect_does_not_repeat_the_address_with_its_key() -> None:
-    def unreachable(request: httpx2.Request) -> httpx2.Response:
-        raise httpx2.ConnectError(f"Could not reach {request.url}", request=request)
+def _everything_under(error: BaseException) -> list[BaseException]:
+    found = []
+    while error is not None:
+        found.append(error)
+        error = error.__cause__ or error.__context__
+    return found
+
+
+def test_a_failure_to_connect_keeps_nothing_of_the_address_with_its_key(server: Server) -> None:
+    server.close()
 
     with pytest.raises(SourceError) as failure:
-        get(unreachable)
+        get(server)
 
     assert str(failure.value) == "511 could not be reached."
-    # The library's own error names the address, so it is not kept under this one.
-    assert failure.value.__cause__ is None
-    assert failure.value.__suppress_context__
+    # The library's own error holds the request, so it is not kept under this one,
+    # as a cause or as the error that was being handled.
+    assert _everything_under(failure.value) == [failure.value]
     assert failure.value.status is None
 
 
-def test_no_log_line_holds_the_address_of_a_request(caplog: pytest.LogCaptureFixture) -> None:
+def _while_handling(error: Exception, call: Callable[[], object]) -> None:
+    """Make a call the way a caller does who is itself handling an error."""
+    try:
+        raise error
+    except type(error):
+        call()
+
+
+def test_a_failure_keeps_nothing_of_an_error_the_caller_was_handling(server: Server) -> None:
+    server.reply = lambda handler: send(handler, 500)
+
+    with pytest.raises(SourceError) as failure:
+        _while_handling(ValueError(f"api_key={TOKEN}"), lambda: get(server))
+    assert _everything_under(failure.value) == [failure.value]
+
+    with pytest.raises(SourceError) as failure:
+        _while_handling(ValueError("Jane Doe"), lambda: read_json(b"not json", "nws"))
+    assert _everything_under(failure.value) == [failure.value]
+
+
+def test_no_log_line_at_any_level_holds_the_address_of_a_request(
+    server: Server, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Every logger at its most talkative, as a developer chasing a bug would set it.
     caplog.set_level(logging.DEBUG)
+    for name in ("httpx2", "httpcore2", "httpcore2.http11", "httpcore2.connection"):
+        caplog.set_level(logging.DEBUG, logger=name)
 
-    get(lambda request: httpx2.Response(200, content=b"{}"))
+    get(server)
+    # A redirect's Location header is the address again, token and all.
+    server.reply = lambda handler: send(
+        handler, 302, Location=f"{server.url}?api_key={TOKEN}", Retry_After="5"
+    )
     with pytest.raises(SourceError):
-        get(lambda request: httpx2.Response(401))
+        get(server)
+    server.reply = lambda handler: send(handler, 401, f"Bad key {TOKEN}".encode())
+    with pytest.raises(SourceError):
+        get(server)
 
-    # The HTTP library logs each request's address at INFO unless it is stopped.
-    assert "secret-token-123" not in caplog.text
+    assert len(server.paths) == 3
+    assert TOKEN not in caplog.text
     assert "api_key" not in caplog.text
+
+
+def test_a_stand_in_for_the_network_is_read_the_way_the_network_is() -> None:
+    packed = gzip.compress(b'{"events": []}')
+
+    def stand_in(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == "/packed":
+            return httpx2.Response(
+                200, stream=httpx2.ByteStream(packed), headers={"Content-Encoding": "gzip"}
+            )
+        return httpx2.Response(200, json={"events": []}, headers={"Retry-After": "3"})
+
+    http = http_client(httpx2.MockTransport(stand_in))
+
+    for path in ("/plain", "/packed"):
+        body = fetch(http, "GET", f"https://api.511.org{path}", source="511", max_bytes=100)
+        assert read_json(body, "511") == {"events": []}
+    with pytest.raises(SourceError, match="sent more than Beacon reads"):
+        fetch(http, "GET", "https://api.511.org/plain", source="511", max_bytes=5)
 
 
 def test_json_is_read_past_a_byte_order_mark() -> None:
@@ -95,10 +234,10 @@ def test_json_is_read_past_a_byte_order_mark() -> None:
 
 
 @pytest.mark.parametrize("body", [b"<html>Jane Doe</html>", b"\xff\xfe", b""])
-def test_a_reply_that_is_not_json_is_reported_without_repeating_it(body: bytes) -> None:
+def test_a_reply_that_is_not_json_is_reported_without_keeping_it(body: bytes) -> None:
     with pytest.raises(SourceError) as failure:
         read_json(body, "nws")
 
     assert str(failure.value) == "nws sent a reply that is not JSON."
-    assert failure.value.__cause__ is None
-    assert failure.value.__suppress_context__
+    # The decoder's error holds the whole reply.
+    assert _everything_under(failure.value) == [failure.value]

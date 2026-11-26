@@ -170,6 +170,8 @@ def test_a_message_that_is_not_an_actual_alert_is_left_out() -> None:
         collection(
             feature("test.1", status="Test"),
             feature("exercise.1", status="Exercise"),
+            feature("system.1", status="System"),
+            feature("draft.1", status="Draft"),
             feature("real.1"),
         ),
         "live",
@@ -177,6 +179,19 @@ def test_a_message_that_is_not_an_actual_alert_is_left_out() -> None:
 
     assert [alert.ref for alert in alerts] == ["urn:oid:real.1"]
     assert unreadable == 0
+
+
+def test_a_message_whose_status_cannot_be_told_is_unreadable_and_not_left_out() -> None:
+    without = feature("no-status.1")
+    del without["properties"]["status"]
+
+    alerts, unreadable = parse_alerts(
+        collection(without, feature("odd.1", status="Actuel"), feature("null.1", status=None)),
+        "live",
+    )
+
+    # Any of them may be a real alert, so the answer was not read in full.
+    assert (alerts, unreadable) == ([], 3)
 
 
 def test_an_alert_beacon_cannot_read_is_counted_and_the_rest_are_kept() -> None:
@@ -218,7 +233,11 @@ def test_an_alert_that_stays_listed_is_stored_once(
     assert refs(store) == ["urn:oid:wind.1"]
 
 
-def test_an_alert_dropped_before_its_end_is_reported_cleared_after_two_polls_without_it(
+def at(ref: str, change: str, count: float) -> str:
+    return f"{ref}#{change}@{minutes(count).isoformat()}"
+
+
+def test_an_alert_dropped_before_its_end_is_recorded_as_no_longer_listed_after_two_polls(
     store: EvidenceStore, feed: Feed, poller: NwsAlerts
 ) -> None:
     feed.listed = [feature("wind.1"), feature("shelter.1", event="Shelter In Place Warning")]
@@ -231,22 +250,76 @@ def test_an_alert_dropped_before_its_end_is_reported_cleared_after_two_polls_wit
 
     twice = poller.poll(store, minutes(4))
     assert twice.added == 1
-    cleared = store.find("nws", "urn:oid:shelter.1#cleared")
-    assert cleared is not None
-    assert cleared.occurred_at == minutes(4)
-    assert (cleared.kind, cleared.confidence, cleared.until) == ("alert", "official", None)
-    assert cleared.data == {
+    gone = store.find("nws", at("urn:oid:shelter.1", "not-listed", 4))
+    assert gone is not None
+    assert gone.occurred_at == minutes(4)
+    # Nobody announced an all-clear. Beacon saw the alert missing, and says no more.
+    assert (gone.kind, gone.confidence, gone.until) == ("alert", "medium", None)
+    assert gone.data == {
+        "change": "not_listed",
+        "about": "urn:oid:shelter.1",
         "event": "Shelter In Place Warning",
         "sender": "NWS San Francisco CA",
-        "clears": "urn:oid:shelter.1",
     }
 
     # It is said once, and the alert that is still listed is not touched.
     assert poller.poll(store, minutes(6)).added == 0
-    assert refs(store) == ["urn:oid:wind.1", "urn:oid:shelter.1", "urn:oid:shelter.1#cleared"]
+    assert refs(store) == [
+        "urn:oid:wind.1",
+        "urn:oid:shelter.1",
+        at("urn:oid:shelter.1", "not-listed", 4),
+    ]
 
 
-def test_an_alert_that_comes_back_after_one_missed_answer_is_not_cleared(
+def test_an_alert_that_is_listed_again_and_dropped_again_has_a_row_for_each_change(
+    store: EvidenceStore, feed: Feed, poller: NwsAlerts
+) -> None:
+    shelter = feature("shelter.1")
+    feed.listed = [shelter]
+    poller.poll(store, NOON)
+    feed.listed = []
+    poller.poll(store, minutes(2))
+    poller.poll(store, minutes(4))
+
+    # The same message, under the same id, is back.
+    feed.listed = [shelter]
+    assert poller.poll(store, minutes(6)).added == 1
+    assert poller.poll(store, minutes(8)).added == 0
+    back = store.find("nws", at("urn:oid:shelter.1", "listed-again", 6))
+    assert back.data["change"] == "listed_again"
+    assert back.data["about"] == "urn:oid:shelter.1"
+    # NWS lists it, which is NWS speaking, and it runs to the end it gave.
+    assert (back.confidence, back.until) == ("official", datetime(2026, 11, 28, 6, 0, tzinfo=UTC))
+
+    feed.listed = []
+    poller.poll(store, minutes(10))
+    poller.poll(store, minutes(12))
+
+    assert refs(store) == [
+        "urn:oid:shelter.1",
+        at("urn:oid:shelter.1", "not-listed", 4),
+        at("urn:oid:shelter.1", "listed-again", 6),
+        at("urn:oid:shelter.1", "not-listed", 12),
+    ]
+
+
+def test_an_alert_listed_twice_without_a_status_is_not_taken_as_gone(
+    store: EvidenceStore, feed: Feed, poller: NwsAlerts
+) -> None:
+    feed.listed = [feature("shelter.1")]
+    poller.poll(store, NOON)
+
+    # Still in the answer, with a status Beacon cannot read.
+    broken = feature("shelter.1")
+    del broken["properties"]["status"]
+    feed.listed = [broken]
+    for count in (2, 4, 6):
+        assert poller.poll(store, minutes(count)).unreadable == 1
+
+    assert refs(store) == ["urn:oid:shelter.1"]
+
+
+def test_an_alert_that_comes_back_after_one_missed_answer_is_not_taken_as_gone(
     store: EvidenceStore, feed: Feed, poller: NwsAlerts
 ) -> None:
     feed.listed = [feature("wind.1")]
@@ -262,7 +335,7 @@ def test_an_alert_that_comes_back_after_one_missed_answer_is_not_cleared(
     assert refs(store) == ["urn:oid:wind.1"]
 
 
-def test_an_alert_that_ran_to_its_end_is_not_reported_cleared(
+def test_an_alert_that_ran_to_its_end_is_not_recorded_as_dropped(
     store: EvidenceStore, feed: Feed, poller: NwsAlerts
 ) -> None:
     feed.listed = [feature("wind.1")]
@@ -277,7 +350,7 @@ def test_an_alert_that_ran_to_its_end_is_not_reported_cleared(
     assert refs(store) == ["urn:oid:wind.1"]
 
 
-def test_an_update_is_a_new_row_and_the_message_it_replaces_is_not_cleared(
+def test_an_update_is_a_new_row_and_the_message_it_replaces_is_not_taken_as_gone(
     store: EvidenceStore, feed: Feed, poller: NwsAlerts
 ) -> None:
     feed.listed = [feature("shelter.1")]
@@ -300,11 +373,11 @@ def test_an_update_is_a_new_row_and_the_message_it_replaces_is_not_cleared(
     assert update.data["message_type"] == "Update"
     assert update.data["replaces"] == ["urn:oid:shelter.1"]
 
-    # The update itself is watched, and clears when it is dropped in its turn.
+    # The update itself is watched, and its being dropped in its turn is recorded.
     feed.listed = []
     poller.poll(store, minutes(8))
     poller.poll(store, minutes(10))
-    assert refs(store)[-1] == "urn:oid:shelter.2#cleared"
+    assert refs(store)[-1] == at("urn:oid:shelter.2", "not-listed", 10)
 
 
 def test_a_cancellation_is_a_row_and_its_own_leaving_the_list_is_not_news(
@@ -346,7 +419,7 @@ def test_nothing_counts_as_missing_from_an_answer_that_was_not_read_in_full(
     poller.poll(store, minutes(8))
     assert refs(store) == ["urn:oid:shelter.1"]
     poller.poll(store, minutes(10))
-    assert refs(store) == ["urn:oid:shelter.1", "urn:oid:shelter.1#cleared"]
+    assert refs(store) == ["urn:oid:shelter.1", at("urn:oid:shelter.1", "not-listed", 10)]
 
 
 def test_a_failed_poll_stores_nothing_and_forgets_nothing(store: EvidenceStore, feed: Feed) -> None:
@@ -365,4 +438,4 @@ def test_a_failed_poll_stores_nothing_and_forgets_nothing(store: EvidenceStore, 
     poller.poll(store, minutes(4))
     assert refs(store) == ["urn:oid:shelter.1"]
     poller.poll(store, minutes(6))
-    assert refs(store) == ["urn:oid:shelter.1", "urn:oid:shelter.1#cleared"]
+    assert refs(store) == ["urn:oid:shelter.1", at("urn:oid:shelter.1", "not-listed", 6)]

@@ -139,42 +139,71 @@ def test_two_pollers_cannot_share_a_name(store: EvidenceStore, time: Time) -> No
         Runner([FakePoller("nws", 30), FakePoller("nws", 60)], store, Clock(time))
 
 
-def test_catching_up_polls_a_past_span_as_often_as_running_through_it_would_have(
-    store: EvidenceStore, time: Time
+@pytest.mark.parametrize("asked", [1e300, 1e12, float("inf"), float("nan")])
+def test_a_wait_too_long_to_be_a_date_does_not_stop_the_other_pollers(
+    store: EvidenceStore, time: Time, asked: float
 ) -> None:
-    fast, slow = FakePoller("fast", 30), FakePoller("slow", 120)
-    clock = Clock(time)
-    runner = Runner([fast, slow], store, clock)
-    time.moment = seconds(10_000)
+    limited, fine = FakePoller("limited", 30), FakePoller("fine", 30)
+    limited.failures = [SourceError("limited", "answered HTTP 429", status=429, retry_after=asked)]
+    runner = Runner([limited, fine], store, Clock(time))
 
-    runner.catch_up(seconds(0), seconds(125))
+    assert sorted(runner.step()) == ["fine", "limited"]
 
-    assert fast.polled == [seconds(0), seconds(30), seconds(60), seconds(90), seconds(120)]
-    assert slow.polled == [seconds(0), seconds(120)]
-    # The clock is let go afterwards, and the pollers are due by the real time.
-    assert clock.now() == seconds(10_000)
-    assert sorted(runner.step()) == ["fast", "slow"]
+    time.moment = seconds(30)
+    runner.step()
+    # The longest any source is left alone is six hours, whatever it asked for. A
+    # wait that is no number at all counts as none.
+    time.moment = seconds(6 * 3600)
+    runner.step()
+    assert fine.polled == [seconds(0), seconds(30), seconds(6 * 3600)]
+    usable = asked == asked and asked != float("inf")
+    assert limited.polled == [seconds(0)] + ([] if usable else [seconds(30)]) + [seconds(6 * 3600)]
 
 
-def test_catching_up_leaves_off_when_it_is_told_to_stop(store: EvidenceStore, time: Time) -> None:
-    stop = threading.Event()
-    poller = FakePoller("nws", 10)
-    poller.failures = [None, None, SourceError("nws", "answered HTTP 500")]
-    clock = Clock(time)
-    runner = Runner([poller], store, clock)
+def test_the_interval_is_read_after_each_poll(store: EvidenceStore, time: Time) -> None:
+    poller = FakePoller("511", 120)
     original = poller.poll
 
-    def poll_and_stop(store: EvidenceStore, now: datetime) -> PollReport:
-        if len(poller.polled) == 2:
-            stop.set()
+    def poll_three_pages(store: EvidenceStore, now: datetime) -> PollReport:
+        # A poll that cost three requests asks for three intervals.
+        poller.interval_seconds = 360
         return original(store, now)
 
-    poller.poll = poll_and_stop  # type: ignore[method-assign]
+    poller.poll = poll_three_pages  # type: ignore[method-assign]
+    runner = Runner([poller], store, Clock(time))
 
-    runner.catch_up(seconds(0), seconds(1000), stop)
+    for count in (0, 120, 359, 360):
+        time.moment = seconds(count)
+        runner.step()
 
-    assert poller.polled == [seconds(0), seconds(10), seconds(20)]
-    assert clock.now() == NOON
+    assert poller.polled == [seconds(0), seconds(360)]
+
+
+def test_no_poll_is_begun_once_the_runner_is_told_to_stop(store: EvidenceStore, time: Time) -> None:
+    stop = threading.Event()
+    first, second = FakePoller("first", 30), FakePoller("second", 30)
+    original = first.poll
+
+    def poll_and_stop(store: EvidenceStore, now: datetime) -> PollReport:
+        stop.set()
+        return original(store, now)
+
+    first.poll = poll_and_stop  # type: ignore[method-assign]
+    runner = Runner([first, second], store, Clock(time))
+
+    assert list(runner.step(stop)) == ["first"]
+    assert second.polled == []
+
+
+def test_a_held_clock_stays_at_its_moment_until_it_is_let_go(time: Time) -> None:
+    clock = Clock(time)
+
+    clock.hold(seconds(-600))
+    time.moment = seconds(5)
+    assert clock.now() == seconds(-600)
+
+    clock.hold(None)
+    assert clock.now() == seconds(5)
 
 
 def test_running_sleeps_until_the_next_poller_is_due_and_ends_when_stopped(

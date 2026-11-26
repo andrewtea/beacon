@@ -1,12 +1,12 @@
 """Runs the pollers: each one when it is due, and none of them takes the others down.
 
 A poller is anything with a name, an interval, and a `poll` that writes what it finds
-to the evidence store. The runner is one loop on one thread. It can also be stepped
-through a span of time that has already passed, which is how the mock scenario is
-caught up to the present and how tests play it.
+to the evidence store. The runner is one loop on one thread. Its clock can be held at
+a moment, which is how the mock scenario is played (`beacon.ingest.setup`).
 """
 
 import logging
+import math
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -18,9 +18,8 @@ from beacon.ingest.http import SourceError
 
 logger = logging.getLogger("beacon.ingest")
 
-# How far apart the moments of a caught-up span are. It is the shortest interval a
-# poller has, so catching up polls as often as running live would have.
-CATCH_UP_STEP = timedelta(seconds=10)
+# The longest a poller is left alone, whatever wait a source asks for.
+MAX_WAIT_SECONDS = 6 * 3600.0
 
 
 @dataclass(frozen=True)
@@ -43,6 +42,8 @@ class PollerStatus:
 class Poller(Protocol):
     # Names the poller in the log and in the state it saves.
     name: str
+    # How long to wait after a poll before the next. It is read after each poll, so
+    # a poller can ask for longer after a poll that cost more.
     interval_seconds: float
 
     def poll(self, store: EvidenceStore, now: datetime) -> PollReport:
@@ -86,8 +87,9 @@ class Runner:
             last.get(poller.name, PollerStatus(poller.name, None, None)) for poller in self._pollers
         ]
 
-    def step(self) -> dict[str, PollReport | Exception]:
-        """Poll every poller that is due now, and return what each one did.
+    def step(self, stop: threading.Event | None = None) -> dict[str, PollReport | Exception]:
+        """Poll every poller that is due now, and return what each one did. No
+        further poller is begun once `stop` is set.
 
         A poller that fails is tried again after its interval, or after the wait the
         source asked for when that is longer. Its failure is logged by its kind, and
@@ -95,16 +97,18 @@ class Runner:
         now = self._clock.now()
         results: dict[str, PollReport | Exception] = {}
         for poller in self._pollers:
+            if stop is not None and stop.is_set():
+                break
             due = self._due.get(poller.name)
             if due is not None and now < due:
                 continue
-            wait = poller.interval_seconds
+            asked = 0.0
             try:
                 report = poller.poll(self._store, now)
             except SourceError as error:
                 # A source's error has a fixed text.
                 logger.warning("%s", error)
-                wait = max(wait, error.retry_after or 0.0)
+                asked = error.retry_after or 0.0
                 results[poller.name] = error
             except Exception as error:
                 # Only the kind of error is logged. Its text and its traceback can
@@ -117,30 +121,29 @@ class Runner:
                         "%s sent %d items Beacon could not read.", poller.name, report.unreadable
                     )
                 results[poller.name] = report
-            self._due[poller.name] = now + timedelta(seconds=wait)
+            self._due[poller.name] = now + timedelta(seconds=_wait(poller, asked))
             self._last[poller.name] = PollerStatus(
                 poller.name, now, isinstance(results[poller.name], PollReport)
             )
         return results
 
-    def catch_up(self, start: datetime, end: datetime, stop: threading.Event | None = None) -> None:
-        """Step through the span from `start` to `end`, holding the clock at each
-        moment, as if the runner had been running all along. It leaves off early
-        when `stop` is set."""
-        moment = start
-        try:
-            while moment <= end and not (stop is not None and stop.is_set()):
-                self._clock.hold(moment)
-                self.step()
-                moment += CATCH_UP_STEP
-        finally:
-            self._clock.hold(None)
-
     def run(self, stop: threading.Event, *, sleep: Callable[[float], object] | None = None) -> None:
         """Step until `stop` is set, sleeping until the next poller is due."""
         wait = stop.wait if sleep is None else sleep
         while not stop.is_set():
-            self.step()
+            self.step(stop)
             now = self._clock.now()
             soonest = min(self._due.values(), default=now)
             wait(max(1.0, (soonest - now).total_seconds()))
+
+
+def _wait(poller: Poller, asked: float) -> float:
+    """How long until the poller's next poll: its interval, or the wait the source
+    asked for when that is longer, and never more than `MAX_WAIT_SECONDS`. A wait
+    that is not a usable number, from the poller or the source, counts as none."""
+    waits = [
+        seconds
+        for seconds in (poller.interval_seconds, asked)
+        if isinstance(seconds, int | float) and math.isfinite(seconds) and seconds > 0
+    ]
+    return min(max(waits, default=1.0), MAX_WAIT_SECONDS)

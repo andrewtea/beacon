@@ -121,18 +121,6 @@ def test_a_store_is_the_mock_one_or_the_live_one_for_life(tmp_path: Path) -> Non
     assert refs(EvidenceStore(path, "mock").search()) == ["invented"]
 
 
-def test_the_environment_picks_the_store_by_whether_any_source_is_live(tmp_path: Path) -> None:
-    env = {"BEACON_DATA_DIR": str(tmp_path)}
-
-    mock = EvidenceStore.from_env(env)
-    blank = EvidenceStore.from_env(env | {"BEACON_LIVE_SOURCES": "  "})
-    live = EvidenceStore.from_env(env | {"BEACON_LIVE_SOURCES": "nws"})
-
-    assert (mock.mode, mock.path) == ("mock", tmp_path / "evidence" / "mock.sqlite3")
-    assert blank.path == mock.path
-    assert (live.mode, live.path) == ("live", tmp_path / "evidence" / "live.sqlite3")
-
-
 def test_a_pollers_state_is_saved_with_its_rows_or_not_at_all(store: EvidenceStore) -> None:
     assert store.state("nws") == {}
     store.add([row("a")], state=("nws", {"listed": ["a"]}))
@@ -152,8 +140,9 @@ def test_data_that_is_not_json_is_refused_without_being_repeated(store: Evidence
         store.add([row("a", data={"speed": float("nan"), "patient": "Jane Doe"})])
 
     assert str(refused.value) == "A row's data is not JSON."
+    # The encoder's error, which names the value, is not kept under it.
     assert refused.value.__cause__ is None
-    assert refused.value.__suppress_context__
+    assert refused.value.__context__ is None
 
 
 def test_search_finds_rows_whose_time_or_span_touches_the_window(store: EvidenceStore) -> None:
@@ -241,19 +230,6 @@ def test_search_filters_by_kind_and_source_and_orders_and_limits(store: Evidence
 def test_search_refuses_arguments_it_cannot_use(store: EvidenceStore, arguments: dict) -> None:
     with pytest.raises(ValueError, match=r"radius_m|limit"):
         store.search(**arguments)
-
-
-def test_the_latest_moment_anything_was_stored_counts_rows_and_state(
-    store: EvidenceStore,
-) -> None:
-    assert store.last_recorded_at() is None
-
-    store.add([row("a")], now=minutes(5))
-    assert store.last_recorded_at() == minutes(5)
-
-    # A poll that found nothing new still happened.
-    store.add([], state=("nws", {}), now=minutes(7))
-    assert store.last_recorded_at() == minutes(7)
 
 
 @pytest.mark.parametrize(
