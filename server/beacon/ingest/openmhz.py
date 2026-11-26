@@ -51,18 +51,29 @@ row for the call. What follows from what the audio is:
   `close` returns, and `drain` waits until its row is stored. Only a `drain` that
   answers True says that nothing more is sent.
 
-The listing is read in pages (`_scan`), on the one assumption that an answer holds
-the calls nearest after the moment asked about, however many of them it holds. How
-far a page reaches is read from the times of everything it lists, whether or not
-Beacon can use the item. Because a page can end in the middle of a moment that
-several calls share, the next page asks for that moment again, and the calls that
-follow it prove that all of that moment's calls were shown. When a page holds only
-calls of one moment and looks full, nothing can prove that, and the poll is reported
-as partial. A poll reads at most `SCAN_PAGES` pages from where the overlap begins,
-and when that does not reach the end, `SCAN_PAGES` more from where it had got to
-before, so that a long overlap never keeps it from going forward. If OpenMHz
-answers with only the newest calls instead, calls in between are missed in a busy
-minute: one of the things to check with the first real answer.
+The listing is read in pages (`_scan`), and what the poller concludes from them
+rests on two assumptions about an API nobody has asked yet, which it keeps apart:
+
+- **An answer holds the calls nearest after the moment asked about.** From that
+  alone: how far a page reaches is the newest time among everything it lists,
+  usable or not. Because a page can end in the middle of a moment that several
+  calls share, that moment is asked for again, and calls later than it in the
+  answer prove that all of its calls were shown. The listing has ended only when a
+  page that asks for what is strictly after a moment comes back empty; a short
+  page proves nothing.
+- **An answer holds up to a fixed number of calls.** This one is used for a single
+  thing: when the last moment's page holds only calls of that moment, it is taken
+  to be all of them if it holds fewer calls than the fullest answer ever seen
+  (`page_floor`, kept between polls). When it holds as many, one call included,
+  nobody can say that more are not hidden behind it, and the poll is reported as
+  partial. So is a poll in which calls turned up after a page that should not have
+  been full.
+
+A poll reads at most `SCAN_PAGES` pages from where the overlap begins, and when
+that does not reach the end, `SCAN_PAGES` more from where it had got to before, so
+a long overlap never keeps it from going forward. If OpenMHz answers with only the
+newest calls instead, calls in between are missed in a busy minute: one of the
+things to check with the first real answer.
 """
 
 import contextlib
@@ -178,12 +189,15 @@ class _Progress:
     held_until: datetime | None = None
     # How many of Ember's last answers in a row were no form.
     unusable_run: int = 0
+    # The most calls one answer of OpenMHz's has ever held.
+    page_floor: int = 0
 
     def as_state(self) -> dict[str, Any]:
         return {
             "after_ms": self.after_ms,
             "held_until": None if self.held_until is None else self.held_until.isoformat(),
             "unusable_run": self.unusable_run,
+            "page_floor": self.page_floor,
         }
 
 
@@ -291,7 +305,8 @@ class OpenMhzRadio:
             if left > 0:
                 raise_bare(PollerHeldError(_HELD, left))
             progress.held_until = None
-        listing = self._listing(progress.after_ms, now, first=not saved)
+        listing = self._listing(progress, now, first=not saved)
+        progress.page_floor = listing.floor
         calls = [call for call in listing.calls.values() if call.time_ms <= _ms(now)]
         unreadable = listing.unreadable
         taken = store.taken(SOURCE, [call.ref for call in calls])
@@ -338,12 +353,13 @@ class OpenMhzRadio:
             added=added, unreadable=unreadable, partial=more_waiting or not listing.complete
         )
 
-    def _listing(self, after_ms: int, now: datetime, *, first: bool) -> "_Listing":
-        """What OpenMHz lists from `OVERLAP` before `after_ms` on. The very first
-        poll, which has nothing behind it to read again, begins at `after_ms`, and
-        nothing older than `MAX_AGE` is asked for."""
+    def _listing(self, progress: _Progress, now: datetime, *, first: bool) -> "_Listing":
+        """What OpenMHz lists from `OVERLAP` before the newest call the poller has
+        finished with. The very first poll, which has nothing behind it to read
+        again, begins at that moment, and nothing older than `MAX_AGE` is asked for."""
+        after_ms = progress.after_ms
         begin_ms = after_ms if first else max(after_ms - _ms_of(OVERLAP), _ms(now - MAX_AGE))
-        listing = _Listing(reached_ms=after_ms)
+        listing = _Listing(reached_ms=after_ms, floor=progress.page_floor)
         whole, reached_ms = self._scan(listing, begin_ms - 1)
         if not whole:
             # The scan ran out of pages. When it stopped short of where the poller
@@ -359,46 +375,44 @@ class OpenMhzRadio:
     def _scan(self, listing: "_Listing", since_ms: int) -> tuple[bool, int]:
         """Read up to `SCAN_PAGES` pages of the calls after `since_ms` into
         `listing`. Returns whether the listing was read to its end, and the moment
-        it was read up to. The module's docstring says how the pages are told to
-        be complete."""
-        # The listing is read up to `reached_ms`, as far as its pages show.
+        up to which everything it lists was read. The module's docstring says what
+        is concluded from a page, and on which assumption."""
+        # Everything the listing has up to here was shown, or is flagged as cut.
         reached_ms = since_ms
-        # Whether the next page asks for the moment `reached_ms` itself again.
-        again = False
-        # How many calls the page before held, when it held only calls of the one
-        # moment `reached_ms` and may have been full of them.
-        of_one_moment: int | None = None
+        # A moment the last page reached, whose calls the next page asks for again.
+        boundary_ms: int | None = None
+        # How many calls the page held that asked for a moment again and was shown
+        # no later call. The next page asks what is strictly after that moment.
+        tied: int | None = None
         for _ in range(SCAN_PAGES):
-            asked_ms = reached_ms - 1 if again else reached_ms
+            asked_ms = reached_ms if boundary_ms is None else boundary_ms - 1
             items = self._page(asked_ms)
             listing.take(items, asked_ms)
             newest_ms = max(
                 (item.time_ms for item in items if item.time_ms is not None), default=None
             )
-            if again:
-                if newest_ms is not None and newest_ms > reached_ms:
+            if boundary_ms is not None:
+                if newest_ms is not None and newest_ms > boundary_ms:
                     # Later calls follow, so every call of that moment was shown.
-                    reached_ms = newest_ms
-                    continue
-                if len(items) < listing.largest:
-                    # A page shorter than another was is not full: nothing follows.
-                    return True, reached_ms
-                # It may be full of the one moment. What is after that moment?
-                of_one_moment, again = len(items), False
+                    boundary_ms = newest_ms
+                else:
+                    reached_ms, boundary_ms, tied = boundary_ms, None, len(items)
                 continue
             if not items:
-                # A page that looked full of one moment of several calls, and
-                # nothing after it: more of that moment's calls may be hidden.
-                listing.cut = listing.cut or (of_one_moment is not None and of_one_moment >= 2)
+                # Nothing is after that moment: the listing ends here. The page of
+                # the moment itself may have been full, with more calls behind it.
+                listing.cut = listing.cut or (tied is not None and tied >= listing.floor)
                 return True, reached_ms
             if newest_ms is None or newest_ms <= asked_ms:
                 # Items, and none that says it is later: no telling how far it reaches.
                 return False, reached_ms
-            # Calls follow a page that showed only one moment, so that page was
-            # full, and more of that moment's calls may be hidden behind it.
-            listing.cut = listing.cut or of_one_moment is not None
-            of_one_moment, again, reached_ms = None, True, newest_ms
-        return False, reached_ms
+            # Calls follow a page that showed only one moment. Either that page
+            # was full, and more of the moment's calls may be hidden behind it, or
+            # these were listed since. Nothing here can tell which.
+            listing.cut = listing.cut or tied is not None
+            boundary_ms, tied = newest_ms, None
+        # Out of pages. A moment that was not asked for again is not read yet.
+        return False, reached_ms if boundary_ms is None else boundary_ms - 1
 
     def _page(self, since_ms: int) -> "list[Listed]":
         """One answer: what OpenMHz lists after a moment, on the talkgroups heard."""
@@ -574,8 +588,9 @@ class _Listing:
     calls: dict[str, Call] = field(default_factory=dict)
     unreadable: int = 0
     _unreadable_keys: set[str] = field(default_factory=set)
-    # The most items one answer held, which tells a page that is not full.
-    largest: int = 0
+    # The most items one answer has ever held, in this poll or an earlier one. An
+    # answer with fewer is taken not to be full.
+    floor: int = 0
     # Whether calls may be hidden behind a page that was full of one moment.
     cut: bool = False
     # Whether everything from the start of the overlap to the listing's end was
@@ -585,7 +600,7 @@ class _Listing:
     def take(self, items: "list[Listed]", asked_ms: int) -> None:
         """Add a page's calls. A page that asks for a moment again lists items
         again, and each call and each unreadable item is taken once."""
-        self.largest = max(self.largest, len(items))
+        self.floor = max(self.floor, len(items))
         for item in items:
             if item.call is not None:
                 if item.call.time_ms > asked_ms:
@@ -705,6 +720,7 @@ def _progress(saved: dict[str, Any], now: datetime) -> _Progress:
     the first poll hears the calls of the last few minutes and not the archive, and
     it never goes back further than `MAX_AGE`."""
     after_ms, held, run = saved.get("after_ms"), saved.get("held_until"), saved.get("unusable_run")
+    floor = saved.get("page_floor")
     if isinstance(after_ms, bool) or not isinstance(after_ms, int):
         after_ms = _ms(now - OVERLAP)
     held_until = None
@@ -718,6 +734,9 @@ def _progress(saved: dict[str, Any], now: datetime) -> _Progress:
         held_until=held_until,
         unusable_run=run
         if isinstance(run, int) and not isinstance(run, bool) and 0 <= run <= UNUSABLE_RUN_LIMIT
+        else 0,
+        page_floor=floor
+        if isinstance(floor, int) and not isinstance(floor, bool) and 0 <= floor <= 100_000
         else 0,
     )
 

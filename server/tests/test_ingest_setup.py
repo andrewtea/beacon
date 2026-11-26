@@ -686,7 +686,7 @@ def test_radio_is_not_polled_for_real_where_its_audio_cannot_be_converted(
     assert not (Path(env["BEACON_DATA_DIR"]) / "ember").exists()
 
 
-def test_radio_is_not_polled_for_real_on_a_host_that_pipes_core_dumps_to_a_collector(
+def test_radio_is_not_polled_for_real_on_a_host_that_hands_core_dumps_to_a_collector(
     env: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")

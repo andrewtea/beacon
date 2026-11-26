@@ -308,12 +308,16 @@ def test_a_path_that_is_hidden_is_covered_over_inside_a_directory_ffmpeg_is_show
         ("core\n", None),
         ("/var/crash/core.%p\n", None),
         # Piped to a collector, which Linux hands the core whatever the limit is.
-        ("|/usr/lib/systemd/systemd-coredump %P %u %g %s %t %c %h\n", "pipes core dumps"),
-        ("|/usr/share/apport/apport -p%p -s%s -c%c\n", "pipes core dumps"),
-        (" |/bin/false\n", "pipes core dumps"),
+        ("|/usr/lib/systemd/systemd-coredump %P %u %g %s %t %c %h\n", "to a collector"),
+        ("|/usr/share/apport/apport -p%p -s%s -c%c\n", "to a collector"),
+        (" |/bin/false\n", "to a collector"),
+        # Sent to a collector's socket, in both forms Linux has, which also get the
+        # core whatever the limit is.
+        ("@/run/systemd/coredump.socket\n", "to a collector"),
+        ("@@/run/systemd/coredump.socket\n", "to a collector"),
     ],
 )
-def test_a_host_that_pipes_core_dumps_to_a_collector_is_a_problem(
+def test_a_host_that_hands_core_dumps_to_a_collector_is_a_problem(
     tmp_path: Path, setting: str, problem: str | None
 ) -> None:
     pattern = tmp_path / "core_pattern"

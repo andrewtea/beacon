@@ -273,6 +273,15 @@ class EmberResponse:
         return to_usd(self.usage.cost_nanousd)
 
 
+@dataclass
+class _Attempt:
+    """How far one attempt at a live call got."""
+
+    # Whether it got as far as its paid request. Until then nothing of it can
+    # have cost anything, whatever error it ended with.
+    paid_request: bool = False
+
+
 class EmberClient:
     def __init__(
         self,
@@ -671,32 +680,41 @@ class EmberClient:
         sensitive: bool,
     ) -> EmberResponse:
         attempt = 0
-        # The answer to the last attempt that was sent, when there has been one.
+        # The answer to the last attempt whose paid request was sent, when there
+        # has been one. A failure of the free token count is not such an answer.
         sent: EmberCallError | None = None
         while True:
+            began = _Attempt()
             try:
-                return self._call_live(sdk, stop, body, call, sensitive)
+                return self._call_live(sdk, stop, body, call, sensitive, began)
             except (BudgetExceededError, EmberClosedError) as refusal:
                 # Raised before a paid request is sent, which says that nothing was
-                # sent only for a first attempt. A replaced ledger is told as it is.
+                # sent only when no earlier attempt was. A replaced ledger is told
+                # as it is.
                 if sent is None or isinstance(refusal, LedgerReplacedError):
                     raise
             except EmberCallError as error:
+                # An error from before the paid request, which the count of the
+                # tokens can raise, is no answer to a paid request.
+                counting = not began.paid_request
+                if not counting:
+                    sent = error
                 # Only a rate limit is waited out. Any other failure may have been
                 # billed and may fail the same way again. A wait too long to sit
                 # through is raised by `back_off` as a RateLimitHoldError.
                 if (
-                    self._pacer is None
-                    or error.status_code != _RATE_LIMITED
-                    or not self._pacer.back_off(attempt, error.retry_after)
+                    self._pacer is not None
+                    and error.status_code == _RATE_LIMITED
+                    and self._pacer.back_off(attempt, error.retry_after)
                 ):
+                    attempt += 1
+                    continue
+                if sent is None or not counting:
                     raise
-                sent = error
-                attempt += 1
-                continue
-            # A later attempt was refused before it was sent. The call as a whole
-            # was sent, and answered 429: that is what its caller is told, so that
-            # a refusal always means nothing of the call was sent.
+            # A later attempt ended before its paid request: it was refused, or
+            # its tokens could not be counted. The call as a whole was sent, and
+            # answered 429: that is what its caller is told, so that a refusal
+            # always means that nothing of the call was sent.
             raise sent
 
     def _pace(self) -> None:
@@ -753,6 +771,7 @@ class EmberClient:
         body: dict[str, Any],
         call: Call,
         sensitive: bool,
+        began: "_Attempt",
     ) -> EmberResponse:
         # Before any request at all, as the stop below is. A replaced ledger holds
         # none of what was spent.
@@ -817,6 +836,7 @@ class EmberClient:
                 error="Not sent: the client stopped before the paid request.",
             )
             raise
+        began.paid_request = True
         try:
             return self._send(sdk, body, call, sensitive, row, reserved, counting)
         finally:

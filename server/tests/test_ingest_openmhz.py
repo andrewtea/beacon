@@ -93,6 +93,8 @@ class Radio:
         self.asked: list[bytes] = []
         # How many calls an answer lists at most: the ones nearest after the time asked.
         self.page_size = 1000
+        # The same for the next answers, one by one, for a source that is not steady.
+        self.page_sizes: list[int] = []
         # What Ember's client refuses a call with before anything is sent, by its audio.
         self.refused: dict[bytes, Exception] = {}
         # When a call was made, for a call whose own `time` field does not say.
@@ -146,7 +148,7 @@ class Radio:
                     if ms(self.made(call)) > after and call["talkgroupNum"] in wanted
                 ),
                 key=self.made,
-            )[: self.page_size]
+            )[: self.page_sizes.pop(0) if self.page_sizes else self.page_size]
             # Newest first, as its site lists them.
             return httpx2.Response(200, json={"calls": listed[::-1], "direction": "newer"})
         clip = self.audio.get(str(url), 404)
@@ -412,15 +414,18 @@ def test_a_call_is_heard_once_however_often_it_is_listed(
     assert radio.asked == [tone(1), tone(2), tone(3)]
     assert radio.downloads == ["call0001", "call0002", "call0003"]
     # Each poll reads again from five minutes before the newest call it finished
-    # with, and then asks for the moment of the newest call it was shown once more:
-    # a page shorter than the one before shows that nothing follows.
+    # with, asks for the moment of the newest call it was shown once more, and then
+    # for what is strictly after it: only an empty answer ends the listing.
     assert [int(request.url.params["time"]) for request in radio.listings] == [
         ms(NOON - OVERLAP) - 1,
         ms(seconds(-10)) - 1,
+        ms(seconds(-10)),
         ms(seconds(-10) - OVERLAP) - 1,
         ms(seconds(20)) - 1,
+        ms(seconds(20)),
         ms(seconds(20) - OVERLAP) - 1,
         ms(seconds(20)) - 1,
+        ms(seconds(20)),
     ]
 
 
@@ -455,7 +460,7 @@ def test_calls_already_taken_take_no_place_among_the_calls_a_poll_may_hear(
     assert len(radio.asked) == MAX_CALLS_PER_POLL + 1
 
 
-def test_a_listing_is_read_in_pages_until_one_shows_that_nothing_follows(
+def test_a_listing_is_read_in_pages_until_one_that_asks_what_follows_is_empty(
     store: EvidenceStore, radio: Radio, poller: OpenMhzRadio
 ) -> None:
     radio.page_size = 2
@@ -465,15 +470,66 @@ def test_a_listing_is_read_in_pages_until_one_shows_that_nothing_follows(
     report = poller.poll(store, NOON)
 
     assert (report.added, report.partial) == (5, False)
-    # Each page asks for the moment of the newest call of the page before again,
-    # and the last, with one call where two would fit, ends the listing.
+    # Each page asks for the moment of the newest call of the page before again.
+    # The last of those holds one call where two have fitted, so it is taken to be
+    # all of that moment's, and the page after it, which is empty, ends the listing.
     assert [int(request.url.params["time"]) for request in radio.listings] == [
         ms(NOON - OVERLAP) - 1,
         ms(seconds(-58)) - 1,
         ms(seconds(-57)) - 1,
         ms(seconds(-56)) - 1,
         ms(seconds(-55)) - 1,
+        ms(seconds(-55)),
     ]
+    assert store.state("openmhz")["page_floor"] == 2
+
+
+def test_a_short_page_does_not_end_the_listing(
+    store: EvidenceStore, radio: Radio, poller: OpenMhzRadio
+) -> None:
+    # A source whose answers hold four calls, and then only one.
+    radio.page_sizes = [4, 1, 1, 1, 1, 1]
+    for number in range(1, 6):
+        radio.call(number, seconds(-60 + number))
+
+    report = poller.poll(store, NOON)
+
+    # The fifth call is behind a page of one. It is heard, because only an empty
+    # answer ends the listing, and the poll says that calls may have been hidden:
+    # a page that should not have been full was.
+    assert (report.added, report.partial) == (5, True)
+
+
+def test_one_call_on_a_page_that_never_held_more_may_hide_another_of_its_moment(
+    store: EvidenceStore, radio: Radio, poller: OpenMhzRadio
+) -> None:
+    radio.page_size = 1
+    radio.call(1, seconds(-30))
+    radio.call(2, seconds(-30), talkgroup=TACTICAL)
+
+    report = poller.poll(store, NOON)
+
+    # One of the two is all a one-call page will ever show, and nothing says so.
+    assert (report.added, report.partial) == (1, True)
+
+
+def test_the_newest_calls_page_is_taken_to_be_whole_once_a_fuller_answer_has_been_seen(
+    store: EvidenceStore, radio: Radio, storage: Storage
+) -> None:
+    radio.call(1, seconds(-30))
+
+    # The first answer the poller ever sees holds one call. It cannot be told
+    # from a full page of one.
+    assert build(radio, storage).poll(store, NOON).partial is True
+
+    # An answer that holds two shows that one is not a full page, from then on,
+    # which is remembered in the store and not in the poller.
+    radio.call(2, seconds(10))
+    assert build(radio, storage).poll(store, seconds(30)).partial is False
+    radio.call(3, seconds(400))
+    assert build(radio, storage).poll(store, seconds(420)).partial is False
+    # The fullest answer so far held the three calls of the last five minutes.
+    assert store.state("openmhz")["page_floor"] == 3
 
 
 def test_a_listing_longer_than_a_poll_reads_is_partial_and_every_poll_moves_forward(
@@ -650,7 +706,7 @@ def test_a_spending_stop_ends_the_poll_and_holds_the_poller_without_losing_a_cal
     assert isinstance(held, PollerHeldError)
     assert held.retry_after == 1.0
     # Held, it asks OpenMHz nothing either.
-    assert len(radio.listings) == 2
+    assert len(radio.listings) == 3
     assert runner.step() == {}
 
     # The stop is lifted. The call it refused was never sent, and is heard now.
@@ -912,7 +968,7 @@ def test_a_replaced_ledger_keeps_the_claim_and_stops_the_poller_for_the_process(
     with pytest.raises(PollerHeldError, match="Compare Meta's Usage page with the ledger"):
         poller.poll(store, wall[0])
     assert radio.asked == []
-    assert len(radio.listings) == 2
+    assert len(radio.listings) == 3
 
 
 def test_a_poller_that_is_closed_sends_ember_nothing_and_gives_up_its_claim(

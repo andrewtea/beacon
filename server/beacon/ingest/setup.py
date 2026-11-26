@@ -362,7 +362,7 @@ def _radio_poller(env: Mapping[str, str], http: SourceHttp) -> OpenMhzRadio:
     """The poller for real radio, heard by a live Ember under a budget of its own.
 
     Raises IngestConfigError when permission, the talkgroups, the budget, a live
-    Ember, or a confined ffmpeg is missing, when the host pipes core dumps to a
+    Ember, or a confined ffmpeg is missing, when the host hands core dumps to a
     collector, or when a list of names cannot be read."""
     names = f"{LIVE_SOURCES_VARIABLE} names openmhz"
     if env.get(OPENMHZ_PERMITTED_VARIABLE) != "1":
@@ -410,7 +410,7 @@ def _radio_poller(env: Mapping[str, str], http: SourceHttp) -> OpenMhzRadio:
             "set REPLAY=0, MODEL_API_KEY, and EMBER_SPENT_BEFORE_USD."
         )
     # This process will hold real radio audio in memory. It writes no core file,
-    # and the host was just seen not to pipe cores to a collector.
+    # and the host was just seen not to hand cores to a collector.
     forbid_core_dumps()
     return OpenMhzRadio(
         http,

@@ -2183,3 +2183,69 @@ def test_the_client_built_without_an_http_client_follows_no_redirect(storage: St
 
     assert ember._sdk is not None
     assert ember._sdk._client.follow_redirects is False
+
+
+def test_a_rate_limited_token_count_is_not_taken_for_an_attempt_that_was_sent(
+    storage: Storage,
+) -> None:
+    counts = [_rate_limited(), None]
+    api = MetaApi()
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == "/v1/responses/input_tokens":
+            refused = counts.pop(0) if counts else None
+            if refused is not None:
+                api.requests.append(request)
+                return refused
+        return api(request)
+
+    clock = Clock()
+    ember = EmberClient.live(
+        storage,
+        api_key="test-key",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
+        # No room for even one attempt at the most it can cost.
+        scope=SpendScope("ingest:openmhz", RESERVED_NANOUSD - 1),
+        pacer=Pacer(3000, clock=clock, sleep=clock.sleep),
+    )
+
+    # The first count is answered 429 and the second succeeds, and then the budget
+    # refuses the call. No paid request was ever sent, and the caller is told so.
+    with pytest.raises(BudgetExceededError):
+        ask(ember)
+
+    assert api.paths() == ["/v1/responses/input_tokens"] * 2
+    assert Ledger(storage.ledger_db).spent_nanousd() == 0
+
+
+def test_a_sent_attempt_is_still_reported_when_a_later_attempts_count_fails(
+    storage: Storage,
+) -> None:
+    counts = [None, httpx2.Response(500, json={"error": {"message": "x"}})]
+    api = MetaApi(create=lambda _request: _rate_limited())
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == "/v1/responses/input_tokens":
+            failed = counts.pop(0) if counts else None
+            if failed is not None:
+                api.requests.append(request)
+                return failed
+        return api(request)
+
+    clock = Clock()
+    ember = EmberClient.live(
+        storage,
+        api_key="test-key",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
+        pacer=Pacer(3000, clock=clock, sleep=clock.sleep),
+    )
+
+    with pytest.raises(EmberCallError) as raised:
+        ask(ember)
+
+    # The paid request of the first attempt was sent and answered 429. The second
+    # attempt's count failed, which says nothing was sent only of that attempt.
+    assert raised.value.status_code == 429
+    assert "was not sent" not in str(raised.value)
+    assert api.paths().count("/v1/responses") == 1
+    assert Ledger(storage.ledger_db).spent_nanousd() == RESERVED_NANOUSD

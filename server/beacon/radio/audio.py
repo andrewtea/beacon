@@ -31,10 +31,13 @@ operator has to see to both kinds:
 - **Swap.** Run live radio with swap off or encrypted. Nothing here checks it.
 - **Core dumps.** Beacon's own process and ffmpeg both run with a core size limit
   of nothing, which stops a core that is written to a file. Linux ignores that
-  limit when cores are piped to a collector (`kernel.core_pattern` beginning with
-  `|`, as systemd-coredump and apport set it), and a collector runs on the host,
+  limit when cores are handed to a collector: piped to a program
+  (`kernel.core_pattern` beginning with `|`, as systemd-coredump and apport set
+  it) or sent to a socket (beginning with `@`). A collector runs on the host,
   outside any confinement. `core_dump_problem` reads the setting, and
-  `beacon.ingest.setup` refuses to hear real radio on a host that pipes cores.
+  `beacon.ingest.setup` refuses to hear real radio on a host that has one. The
+  setting is read once, when Beacon starts: it has to stay as it was for as long
+  as real radio is heard, and nothing here watches it.
 
 On a system without `memfd_create` or without a working `bwrap`, nothing is
 converted. The mock scenario's calls are WAV and need no ffmpeg anywhere.
@@ -197,8 +200,8 @@ def core_dump_problem(pattern: Path = CORE_PATTERN) -> str | None:
     """Why a crash could leave radio audio on a disk on this host, in a sentence,
     or None. A core size limit of nothing, which `forbid_core_dumps` and the
     confinement set, stops a core that is written to a file. Linux ignores the
-    limit when cores are piped to a collector, so a host that pipes them is a
-    problem, and so is one whose setting cannot be read."""
+    limit when cores go to a collector, by a pipe (`|`) or a socket (`@`), so a
+    host with one is a problem, and so is one whose setting cannot be read."""
     try:
         setting = pattern.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -206,11 +209,12 @@ def core_dump_problem(pattern: Path = CORE_PATTERN) -> str | None:
             f"Where this host sends core dumps ({pattern}) cannot be read, so nothing "
             "says that a crash would leave no radio audio on a disk."
         )
-    if setting.lstrip().startswith("|"):
+    if setting.lstrip().startswith(("|", "@")):
         return (
-            "This host pipes core dumps to a collector (kernel.core_pattern begins with "
-            "|), which ignores the limit Beacon sets and could keep radio audio from a "
-            "crash. Set kernel.core_pattern to a file name, such as core."
+            "This host hands core dumps to a collector (kernel.core_pattern begins with "
+            "| or @), which ignores the limit Beacon sets and could keep radio audio "
+            "from a crash. Set kernel.core_pattern to a file name, such as core, and "
+            "leave it so while real radio is heard."
         )
     return None
 
