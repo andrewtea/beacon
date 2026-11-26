@@ -708,7 +708,7 @@ def _signals(
         )
         signals.append(
             _signal(
-                "official_order",
+                "official_notice",
                 f"{_published(orders)} {also}{_READING}",
                 [item.source for item in (*orders, *clears)],
             )

@@ -220,7 +220,7 @@ def test_an_all_clear_is_published_beside_the_order_and_is_not_said_to_lift_it(r
     ]
     # The order is still a signal, and the all-clear is said beside it.
     (signal,) = incident.signals
-    assert signal.kind == "official_order"
+    assert signal.kind == "official_notice"
     assert "An all-clear was also published by an authority." in signal.text
     assert "Beacon does not work out what an all-clear covers" in signal.text
     assert [source.evidence_id for source in signal.sources] == [order.id, clear.id]
@@ -492,7 +492,7 @@ def test_a_notice_that_names_no_street_is_nobodys_unless_it_is_a_press_release(
         (order.id, "published"),
         (press.id, "published"),
     ]
-    assert [signal.kind for signal in incident.signals] == ["official_order"]
+    assert [signal.kind for signal in incident.signals] == ["official_notice"]
 
 
 def test_notices_are_not_said_to_have_come_one_after_another(rows: Rows) -> None:
@@ -526,6 +526,8 @@ def test_a_warning_is_named_as_a_warning_and_never_as_an_order(rows: Rows) -> No
         "reading of the document. Read the document for what it says."
     )
     assert "order" not in signal.text
+    # What an app branches on does not call it an order either.
+    assert signal.kind == "official_notice"
 
     rows.notice(6, "shelter_in_place")
     (signal,) = incidents(rows, 10)[0].signals
@@ -552,7 +554,7 @@ def test_a_signal_carries_its_sources_its_confidence_and_what_its_source_require
     assert {kind: signal.confidence for kind, signal in by_kind.items()} == {
         "alarm": "medium",
         "evacuation_on_radio": "medium",
-        "official_order": "high",
+        "official_notice": "high",
         "official_alert": "official",
         "closure": "official",
         "taps": "low",
@@ -562,9 +564,9 @@ def test_a_signal_carries_its_sources_its_confidence_and_what_its_source_require
     (source,) = by_kind["closure"].sources
     assert (source.evidence_id, source.credit) == (closure.id, CREDIT_511)
     # The order is a reading, said to be one, with the document's link.
-    (source,) = by_kind["official_order"].sources
+    (source,) = by_kind["official_notice"].sources
     assert (source.evidence_id, source.url, source.model) == (notice.id, notice.url, "fake")
-    assert "This is Beacon's reading of the document." in by_kind["official_order"].text
+    assert "This is Beacon's reading of the document." in by_kind["official_notice"].text
     assert by_kind["official_alert"].sources[0].evidence_id == alert.id
     # Taps are one source that names none of them.
     (source,) = by_kind["taps"].sources

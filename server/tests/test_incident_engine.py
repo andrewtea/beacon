@@ -123,7 +123,7 @@ def test_the_fire_grows_and_its_signals_with_it(story: Story) -> None:
         "alarm",
         "evacuation_on_radio",
         "many_units",
-        "official_order",
+        "official_notice",
         "official_alert",
         "closure",
         "aircraft_circling",
@@ -134,7 +134,7 @@ def test_the_fire_grows_and_its_signals_with_it(story: Story) -> None:
         "alarm",
         "evacuation_on_radio",
         "many_units",
-        "official_order",
+        "official_notice",
         "closure",
         "aircraft_circling",
     ]
@@ -335,6 +335,20 @@ def test_a_point_taken_from_511_goes_with_511s_credit_in_both_routes(tmp_path: P
             "text": "data provided by 511.org",
             "url": "https://511.org",
         }
+
+
+def test_a_warning_is_not_called_an_order_anywhere_in_the_list(tmp_path: Path) -> None:
+    rows = Rows(mock_store(tmp_path))
+    rows.radio(0, "fire", "working", units=("E36",), street="Hayes St", block=400)
+    rows.notice(3, "evacuation_warning")
+    app = create_app()
+    app.state.incidents = Engine(rows.store, BLOCKS, clock=lambda: at(5))
+
+    answer = TestClient(app).get("/api/incidents")
+
+    (summary,) = answer.json()["incidents"]
+    assert [signal["kind"] for signal in summary["signals"]] == ["official_notice"]
+    assert "order" not in answer.text
 
 
 def test_an_alert_older_than_the_horizon_is_still_ended_by_what_replaced_it(tmp_path: Path) -> None:

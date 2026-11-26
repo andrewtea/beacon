@@ -21,7 +21,10 @@ EntryKind = Literal["radio", "medical", "closure", "alert", "notice", "aircraft"
 SignalKind = Literal[
     "alarm",
     "evacuation_on_radio",
-    "official_order",
+    # A notice that tells people to do something was published: an order or a
+    # warning. The kind says no more than that; the signal's text names each type,
+    # and `Incident.official` lists them.
+    "official_notice",
     "official_alert",
     "closure",
     "many_units",
