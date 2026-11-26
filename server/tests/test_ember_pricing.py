@@ -1,7 +1,13 @@
 import pytest
 
 from beacon.ember import EmberConfigError, SpendingStop
-from beacon.ember.pricing import Usage, parse_usd, price_nanousd, read_stop_settings
+from beacon.ember.pricing import (
+    Usage,
+    parse_usd,
+    price_nanousd,
+    read_stop_settings,
+    usd_text,
+)
 
 
 def test_cached_input_is_billed_at_the_cached_rate_instead_of_the_input_rate() -> None:
@@ -50,8 +56,11 @@ def test_the_stop_defaults_to_three_dollars_and_what_was_spent_before_has_no_def
     # $0.00 would admit $3.00 more: there is no stop until the page has been read.
     # A variable that is set and empty, as an unfilled line of a .env file is, is unset.
     for env in ({}, {"EMBER_STOP_USD": "1"}, {"EMBER_STOP_USD": "", "EMBER_SPENT_BEFORE_USD": " "}):
-        with pytest.raises(EmberConfigError, match="EMBER_SPENT_BEFORE_USD is not set"):
+        with pytest.raises(EmberConfigError, match="EMBER_SPENT_BEFORE_USD is not set") as raised:
             SpendingStop.from_env(env)
+        # The credit pays for every model, so the total asked for is not Ember's alone.
+        assert "total spend against the $10.00 credit" in str(raised.value)
+        assert "every model, with no model filter" in str(raised.value)
     # What reads the settings without spending tells an unset amount from zero.
     assert read_stop_settings({}) == (3_000_000_000, None)
     assert read_stop_settings({"EMBER_STOP_USD": "1", "EMBER_SPENT_BEFORE_USD": "0"}) == (
@@ -125,9 +134,37 @@ def test_an_amount_a_hair_from_nine_dollars_is_never_rounded_to_it() -> None:
         SpendingStop.from_env(at | {"EMBER_STOP_USD": "9.000000001"})
     with pytest.raises(EmberConfigError, match=r"would pass \$9\.00"):
         SpendingStop.from_env(at | {"EMBER_SPENT_BEFORE_USD": "0.000000001"})
-    # More digits than a float holds are still counted, not rounded.
-    with pytest.raises(EmberConfigError, match=r"would pass \$9\.00"):
-        SpendingStop.from_env(at | {"EMBER_STOP_USD": "1" + "0" * 30})
+    with pytest.raises(EmberConfigError, match=r"\$999999999\.00 .* would pass \$9\.00"):
+        SpendingStop.from_env(at | {"EMBER_STOP_USD": "999999999"})
+
+
+def test_an_amount_too_large_to_print_is_refused_as_a_setting_and_not_as_a_crash() -> None:
+    # More digits than a float holds: an OverflowError if the amount is ever divided.
+    huge = "9" * 320
+    for text in ("1000000000", huge, huge + ".5"):
+        with pytest.raises(ValueError, match="too large to be a dollar amount"):
+            parse_usd(text)
+    with pytest.raises(ValueError, match="too large") as raised:
+        parse_usd(huge)
+    assert len(str(raised.value)) < 100
+    for name in ("EMBER_STOP_USD", "EMBER_SPENT_BEFORE_USD"):
+        with pytest.raises(EmberConfigError, match=f"^{name}: .*too large"):
+            read_stop_settings({name: huge})
+        with pytest.raises(EmberConfigError, match=f"^{name}: .*too large"):
+            SpendingStop.from_env({"EMBER_SPENT_BEFORE_USD": "0"} | {name: huge})
+    # Leading zeros are not size.
+    assert parse_usd("0" * 320 + "3") == 3_000_000_000
+
+    # An amount given as a number is printed in whole numbers too.
+    with pytest.raises(ValueError, match=r"would pass \$9\.00") as raised:
+        SpendingStop(ledger_nanousd=10**400, spent_before_nanousd=0)
+    assert str(raised.value).startswith("A stop of $1" + "0" * 391 + ".00 on top of $0.00")
+    assert [usd_text(amount) for amount in (0, 4_999_999, 5_000_000, 6_010_000_000)] == [
+        "$0.00",
+        "$0.00",
+        "$0.01",
+        "$6.01",
+    ]
 
 
 @pytest.mark.parametrize(

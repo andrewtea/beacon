@@ -50,7 +50,8 @@ STOP_VARIABLE = "EMBER_STOP_USD"
 # What the page said before Beacon's first call has no default. The ledger cannot see
 # that spend, and a guess of $0.00 on an account that had spent $8.00 would let the
 # $3.00 stop take the account past its credit. A live client is refused until someone
-# has read the page and set this, to 0 when that is what the page says.
+# has read the page and set this, to 0 when that is what the page says. It is the spend
+# of every model, because every model is paid for from the one credit.
 SPENT_BEFORE_VARIABLE = "EMBER_SPENT_BEFORE_USD"
 
 
@@ -74,9 +75,9 @@ class SpendingStop:
                 raise ValueError("An amount is a whole number of nano-dollars, zero or more.")
         if self.ledger_nanousd + self.spent_before_nanousd > ACCOUNT_CEILING_NANOUSD:
             raise ValueError(
-                f"A stop of ${to_usd(self.ledger_nanousd):.2f} on top of "
-                f"${to_usd(self.spent_before_nanousd):.2f} spent before the ledger began "
-                f"would pass ${to_usd(ACCOUNT_CEILING_NANOUSD):.2f} of the $10.00 credit. "
+                f"A stop of {usd_text(self.ledger_nanousd)} on top of "
+                f"{usd_text(self.spent_before_nanousd)} spent before the ledger began "
+                f"would pass {usd_text(ACCOUNT_CEILING_NANOUSD)} of the $10.00 credit. "
                 f"Lower {STOP_VARIABLE}."
             )
 
@@ -91,10 +92,11 @@ class SpendingStop:
         if spent_before is None:
             raise EmberConfigError(
                 f"{SPENT_BEFORE_VARIABLE} is not set. A paid Ember call needs the total "
-                "that Meta's Usage page (https://dev.meta.ai/usage, Muse Ember, from "
-                "Nov 23) showed before Beacon's first call, because the stop is counted on "
-                "top of it. Read it off the page and set the variable to it, or to 0 when "
-                "the page shows no spend."
+                "spend against the $10.00 credit that Meta's Usage page "
+                "(https://dev.meta.ai/usage) showed before Beacon's first call, because "
+                "the stop is counted on top of it. Read the total for every model, with "
+                "no model filter, and set the variable to it, or to 0 when the page shows "
+                "no spend."
             )
         return cls(ledger_nanousd=ledger, spent_before_nanousd=spent_before)
 
@@ -127,13 +129,32 @@ def parse_usd(text: str) -> int:
     fraction, or is finer than a nano-dollar, raises ValueError and is never rounded."""
     match = _USD.fullmatch(text.strip())
     if match is None:
-        raise ValueError(f"{text!r} is not a dollar amount, such as 3 or 0.50.")
+        raise ValueError(f"{_shown(text)} is not a dollar amount, such as 3 or 0.50.")
     # Read digit by digit, in whole numbers. A decimal type rounds a long fraction to
     # its working precision before it can be checked, which reads 8.99...9 as 9.
     fraction = (match[2] or "").rstrip("0")
     if len(fraction) > 9:
-        raise ValueError(f"{text!r} is a dollar amount finer than a nano-dollar.")
+        raise ValueError(f"{_shown(text)} is a dollar amount finer than a nano-dollar.")
+    if len(match[1].lstrip("0")) > _MOST_DOLLAR_DIGITS:
+        # Far past anything the credit holds, and past what can be printed back.
+        raise ValueError(f"{_shown(text)} is too large to be a dollar amount.")
     return int(match[1]) * NANOUSD_PER_USD + int(fraction.ljust(9, "0"))
+
+
+_MOST_DOLLAR_DIGITS = 9
+
+
+def _shown(text: str) -> str:
+    """A setting as an error message repeats it, cut short when it is very long."""
+    text = text.strip()
+    return repr(text if len(text) <= 40 else text[:40] + "...")
+
+
+def usd_text(nanousd: int) -> str:
+    """An amount as dollars and cents, such as `$3.00`. It is worked out in whole
+    numbers, so an amount of any size can be printed in an error about it."""
+    cents = (nanousd + 5_000_000) // 10_000_000
+    return f"${cents // 100}.{cents % 100:02d}"
 
 
 def _usd_setting(env: Mapping[str, str], name: str) -> int | None:

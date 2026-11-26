@@ -8,9 +8,10 @@ import wave
 from pathlib import Path
 from typing import Any
 
+import httpx2
 import pytest
 
-from beacon.ember import EmberClient, Storage, fake_response
+from beacon.ember import EmberClient, SpendScope, Storage, fake_response
 from beacon.ember.audio_rate import (
     AudioRate,
     Measurement,
@@ -116,13 +117,11 @@ def test_a_folder_of_wav_files_is_read_shortest_first_with_each_files_length(
 
     clips = read_clips(tmp_path)
 
-    assert [(clip.name, clip.seconds) for clip in clips] == [
-        ("b-short.wav", 1.0),
-        ("a-long.wav", 3.0),
-    ]
+    # Named for their place by file name, and not by the file names themselves.
+    assert [(clip.name, clip.seconds) for clip in clips] == [("clip-2", 1.0), ("clip-1", 3.0)]
 
     (tmp_path / "c-broken.wav").write_bytes(b"not a wav file")
-    with pytest.raises(ValueError, match=r"c-broken\.wav is not a WAV file"):
+    with pytest.raises(ValueError, match=r"^clip-3 is not a WAV file"):
         read_clips(tmp_path)
 
 
@@ -210,11 +209,20 @@ def test_the_command_stores_the_answers_about_tones_and_not_about_a_folders_clip
         ),
         ([], {"BEACON_DATA_DIR": "data"}, "BEACON_DATA_DIR must be an absolute path"),
         ([], {"EMBER_STOP_USD": "three"}, "EMBER_STOP_USD"),
+        ([], {"EMBER_STOP_USD": "9" * 320}, "EMBER_STOP_USD: '9999"),
+        (["--budget", "9" * 320], {}, "too large to be a dollar amount"),
     ],
 )
 def test_the_command_reports_a_setting_it_cannot_use(
-    tmp_path: Path, arguments: list[str], env: dict[str, str], message: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: list[str],
+    env: dict[str, str],
+    message: str,
 ) -> None:
+    # The spending settings are the process's, whatever mapping the command is given.
+    for name in [name for name in env if name.startswith("EMBER_")]:
+        monkeypatch.setenv(name, env.pop(name))
     out = io.StringIO()
 
     status = main(arguments, env={"BEACON_DATA_DIR": str(tmp_path)} | env, out=out)
@@ -234,3 +242,83 @@ def test_the_command_refuses_a_folder_with_fewer_than_two_lengths(tmp_path: Path
 
     assert status == 1
     assert "two different lengths" in out.getvalue()
+
+
+def _named_clips(tmp_path: Path) -> Path:
+    """A folder named for an address, of recordings named for a patient."""
+    clips = tmp_path / "1458-hayes-street"
+    clips.mkdir()
+    for seconds in (1, 2):
+        (clips / f"jane-doe-{seconds}.wav").write_bytes(tone_clip(seconds).wav)
+    return clips
+
+
+def _rejects_by_name(status: int) -> httpx2.Response:
+    error = {"message": "Bad audio: 'Jane Doe, 1458 Hayes'", "type": "JaneDoe", "code": "hayes"}
+    return httpx2.Response(status, json={"error": error})
+
+
+@pytest.mark.parametrize("failing", ["count", "create", None])
+def test_nothing_the_command_prints_about_a_folders_clips_says_what_is_in_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing: str | None
+) -> None:
+    clips = _named_clips(tmp_path)
+    storage = Storage.under(tmp_path / "data")
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+
+    def api(request: httpx2.Request) -> httpx2.Response:
+        counting = request.url.path == "/v1/responses/input_tokens"
+        if failing == ("count" if counting else "create"):
+            return _rejects_by_name(400)
+        if counting:
+            return httpx2.Response(200, json={"input_tokens": 1200})
+        usage = {"input_tokens": 1200, "output_tokens": 16, "total_tokens": 1216}
+        said = [{"type": "message", "content": [{"type": "output_text", "text": "Jane Doe"}]}]
+        return httpx2.Response(200, json={"status": "completed", "output": said, "usage": usage})
+
+    def live(cls: type[EmberClient], env: object, scope: SpendScope) -> EmberClient:
+        http_client = httpx2.Client(transport=httpx2.MockTransport(api))
+        return cls.live(storage, api_key="test-key", http_client=http_client, scope=scope)
+
+    monkeypatch.setattr(EmberClient, "from_env", classmethod(live))
+    out = io.StringIO()
+
+    status = main(["--clips", str(clips)], env={}, out=out)
+
+    printed = out.getvalue()
+    assert status == (1 if failing else 0)
+    for word in ("jane", "doe", "hayes", "1458"):
+        assert word not in printed.lower()
+    assert "Clips are numbered in the order of their file names" in printed
+    if failing:
+        assert "HTTP 400" in printed
+    else:
+        assert "clip-1" in printed
+        assert "clip-2" in printed
+    stored = (
+        sqlite3.connect(storage.ledger_db).execute("SELECT * FROM ember_calls").fetchall()
+        if storage.ledger_db.exists()
+        else []
+    )
+    assert "jane" not in json.dumps(stored).lower()
+
+
+def test_a_file_or_folder_the_command_cannot_read_is_not_named_in_what_it_prints(
+    tmp_path: Path,
+) -> None:
+    clips = _named_clips(tmp_path)
+    (clips / "jane-doe-0.wav").write_bytes(b"not a wav file")
+    out = io.StringIO()
+
+    assert main(["--clips", str(clips)], env={"BEACON_DATA_DIR": str(tmp_path)}, out=out) == 1
+
+    assert out.getvalue().startswith("Not measured: clip-1 is not a WAV file")
+    assert "Clips are numbered in the order of their file names" in out.getvalue()
+    assert "jane" not in out.getvalue().lower()
+
+    # A file that is a folder cannot be read at all, which is the system's error.
+    (clips / "jane-doe-0.wav").unlink()
+    (clips / "jane-doe-0.wav").mkdir()
+    out = io.StringIO()
+    assert main(["--clips", str(clips)], env={"BEACON_DATA_DIR": str(tmp_path)}, out=out) == 1
+    assert out.getvalue() == "Not measured: Is a directory\n"

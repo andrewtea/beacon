@@ -96,9 +96,11 @@ def tone_clip(seconds: int) -> Clip:
     return Clip(f"tone-{seconds}s", float(seconds), file.getvalue())
 
 
-def read_clip(path: Path) -> Clip:
-    """A WAV file and its length. Raises ValueError when it is not one, holds no
-    audio, or is cut short of the length its header declares."""
+def read_clip(path: Path, name: str | None = None) -> Clip:
+    """A WAV file and its length, under `name` or else its file name. Raises ValueError
+    when it is not one, holds no audio, or is cut short of the length its header
+    declares."""
+    name = path.name if name is None else name
     data = path.read_bytes()
     try:
         with wave.open(io.BytesIO(data), "rb") as file:
@@ -106,22 +108,25 @@ def read_clip(path: Path) -> Clip:
             frame_bytes = file.getnchannels() * file.getsampwidth()
             held = len(file.readframes(declared))
     except (wave.Error, EOFError) as error:
-        raise ValueError(f"{path.name} is not a WAV file: {error}") from error
+        raise ValueError(f"{name} is not a WAV file: {error}") from error
     if declared <= 0 or rate <= 0 or frame_bytes <= 0:
-        raise ValueError(f"{path.name} holds no audio.")
+        raise ValueError(f"{name} holds no audio.")
     if held != declared * frame_bytes:
         # The length would be the header's and the audio sent would be shorter, which
         # puts a wrong point on the line.
         raise ValueError(
-            f"{path.name} is cut short: its header declares {declared:,} frames and it "
+            f"{name} is cut short: its header declares {declared:,} frames and it "
             f"holds {held // frame_bytes:,}."
         )
-    return Clip(path.name, declared / rate, data)
+    return Clip(name, declared / rate, data)
 
 
 def read_clips(directory: Path) -> list[Clip]:
-    """Every `.wav` file in a folder, shortest first."""
-    clips = [read_clip(path) for path in sorted(directory.glob("*.wav"))]
+    """Every `.wav` file in a folder, shortest first. A clip is named for its place
+    among them by file name, `clip-1` for the first, and not by its file name: the
+    name of a recording can say who or where it is about, and the names are printed."""
+    paths = sorted(directory.glob("*.wav"))
+    clips = [read_clip(path, f"clip-{place}") for place, path in enumerate(paths, start=1)]
     return sorted(clips, key=lambda clip: clip.seconds)
 
 
@@ -224,19 +229,26 @@ def main(
         f"(default {DEFAULT_BUDGET})",
     )
     options = parser.parse_args(argv)
+    from_folder = options.clips is not None
+    # Nothing printed about a folder's clips repeats a file name or the folder's.
+    numbering = (
+        "\nClips are numbered in the order of their file names: clip-1 is the first."
+        if from_folder
+        else ""
+    )
     try:
         budget = parse_usd(options.budget)
         clips = (
             [tone_clip(seconds) for seconds in TONE_SECONDS]
-            if options.clips is None
+            if not from_folder
             else read_clips(options.clips)
         )
         ember = EmberClient.from_env(env, scope=SpendScope(SCOPE, budget))
-        rate = measure(ember, clips, sensitive=options.clips is not None)
+        rate = measure(ember, clips, sensitive=from_folder)
     except ReplayMissError:
         rerun = (
             "the tones' answers are recorded, so a rerun costs nothing"
-            if options.clips is None
+            if not from_folder
             else "nothing of a folder's clips is recorded, so a rerun is paid for again"
         )
         print(
@@ -246,8 +258,13 @@ def main(
             file=out,
         )
         return 1
-    except (EmberError, ValueError, OSError) as error:
-        print(f"Not measured: {error}", file=out)
+    except (EmberError, ValueError) as error:
+        print(f"Not measured: {error}{numbering}", file=out)
         return 1
-    print(report(rate), file=out)
+    except OSError as error:
+        # The error's own text names the path it failed on.
+        failed = error.strerror or type(error).__name__ if from_folder else error
+        print(f"Not measured: {failed}", file=out)
+        return 1
+    print(report(rate) + numbering, file=out)
     return 0

@@ -19,8 +19,9 @@ A client given a `SpendScope` writes the scope's name on every ledger row it mak
 and refuses a live call that could take the scope's own live spend past the scope's
 budget. That is a second limit under the spending stop, never in place of it.
 
-A live client's stop is the environment's (`SpendingStop.from_env`), whichever way
-the client was built, and there is none until `EMBER_SPENT_BEFORE_USD` is set.
+A live client's stop is the process environment's (`SpendingStop.from_env` of
+`os.environ`), whichever way the client was built and whatever mapping it was built
+from, and there is none until `EMBER_SPENT_BEFORE_USD` is set.
 
 A client runs in one of three modes. Replay-only (`REPLAY=1`, the default) never touches
 the network and fails on a request with no recording. Live (`REPLAY=0`) calls the API on
@@ -64,6 +65,7 @@ from beacon.ember.pricing import (
     price_nanousd,
     read_stop_settings,
     to_usd,
+    usd_text,
 )
 from beacon.ember.replay import ReplayCache, redact, request_hash
 
@@ -114,12 +116,12 @@ _INPUT_ITEM_TYPES = frozenset({"message", "reasoning", "function_call", "functio
 # The `type` and `code` of an API error are short machine-readable words.
 _ERROR_WORD = re.compile(r"[\w.-]{1,64}")
 
-# The request fields that say how a call was made and hold nothing of what was sent.
-_SETTINGS_FIELDS = frozenset(
-    {"model", "max_output_tokens", "reasoning", "store", "include", "parallel_tool_calls"}
-)
-# An id, a status, or a model name, as the API writes them.
-_ID_WORD = re.compile(r"[\w.:-]{1,128}")
+# The request fields that hold what was sent. Of a sensitive call the ledger keeps
+# the size of each and nothing else of it.
+_CONTENT_FIELDS = ("input", "instructions", "tools", "text", "prompt_cache_key")
+# The statuses a response can end with. Any other is written down as unknown, so
+# that a word the API sent is never copied into the ledger or an error.
+_STATUSES = frozenset({"completed", "incomplete", "failed", "cancelled", "queued", "in_progress"})
 
 _LOST_SETTLEMENT = (
     "The Ember ledger file was deleted or replaced while a paid request was out, so the "
@@ -153,8 +155,10 @@ class SpendScope:
     """A piece of work with a budget of its own, such as one tap's investigation or
     the scale run."""
 
-    # Written on every ledger row the client makes. The scope's spend is the live
-    # spend of the rows that carry it.
+    # Written on every ledger row the client makes, and in errors. The scope's spend
+    # is the live spend of the rows that carry it. The label is stored as it is given,
+    # for sensitive calls too, so it names the work and never what the work is about:
+    # an id such as `tap:1842`, not an address or a person.
     label: str
     budget_nanousd: int
 
@@ -195,17 +199,18 @@ def default_data_dir(env: Mapping[str, str]) -> Path:
     return path
 
 
-def _live_stop(env: Mapping[str, str], stop_nanousd: int | None) -> SpendingStop:
-    """The stop a live client keeps: the environment's, for every one of them, so a
-    stop an operator sets holds whichever way the client was built. `stop_nanousd`
-    lowers it for one client and cannot raise it."""
-    configured = SpendingStop.from_env(env)
+def _live_stop(stop_nanousd: int | None) -> SpendingStop:
+    """The stop a live client keeps: the process environment's, for every one of them.
+    It is read from `os.environ` and from nothing a caller passes, so the stop and the
+    earlier spend an operator sets hold whichever way the client was built.
+    `stop_nanousd` lowers the stop for one client and cannot raise it."""
+    configured = SpendingStop.from_env(os.environ)
     if stop_nanousd is None:
         return configured
     if isinstance(stop_nanousd, int) and stop_nanousd > configured.ledger_nanousd:
         raise ValueError(
             f"stop_nanousd can lower the spending stop and cannot raise it above the "
-            f"${to_usd(configured.ledger_nanousd):.2f} the environment sets."
+            f"{usd_text(configured.ledger_nanousd)} the environment sets."
         )
     # Anything that is not an amount is refused when the stop is made.
     return replace(configured, ledger_nanousd=stop_nanousd)
@@ -261,7 +266,6 @@ class EmberClient:
         storage: Storage,
         *,
         api_key: str | None = None,
-        env: Mapping[str, str] | None = None,
         http_client: httpx2.Client | None = None,
         responder: Responder | None = None,
         stop_nanousd: int | None = None,
@@ -278,14 +282,10 @@ class EmberClient:
         ):
             if value is not None and api_key is None:
                 raise ValueError(f"{name} is only used by a live client, which needs api_key.")
-        # Every client that can spend keeps the stop the environment sets, however it
-        # was built. It is read before anything is written, so a client that is
-        # refused leaves no files.
-        self._stop = (
-            None
-            if api_key is None
-            else _live_stop(os.environ if env is None else env, stop_nanousd)
-        )
+        # Every client that can spend keeps the stop the process's environment sets,
+        # however it was built. It is read before anything is written, so a client
+        # that is refused leaves no files.
+        self._stop = None if api_key is None else _live_stop(stop_nanousd)
         if self._stop is not None and not storage.ledger_db.is_absolute():
             # As `default_data_dir` refuses a relative BEACON_DATA_DIR: the stop is
             # counted in one ledger file, and a relative path is a different file
@@ -331,13 +331,18 @@ class EmberClient:
         `EMBER_SPENT_BEFORE_USD`. A live client stops where `EMBER_STOP_USD` says, and
         is the only kind that uses `pacer`.
 
+        `env` is where `REPLAY`, `MODEL_API_KEY`, and `BEACON_DATA_DIR` are read, by
+        default the process's environment. The two spending settings are always read
+        from the process's environment: a mapping passed here cannot supply or change
+        what an operator set.
+
         Raises EmberConfigError when a setting cannot be read, in either mode, and when
         live mode lacks one it needs."""
         env = os.environ if env is None else env
         storage = storage or Storage.under(default_data_dir(env))
         # Read in replay mode too, so a mistyped stop is found before the day a key
         # is set.
-        read_stop_settings(env)
+        read_stop_settings(os.environ)
         replay = env.get("REPLAY", "1")
         if replay == "1":
             return cls.replay_only(storage, scope=scope)
@@ -349,7 +354,7 @@ class EmberClient:
                 "REPLAY=0 asks for live Ember calls, but MODEL_API_KEY is not set. "
                 "Set the key, or use REPLAY=1 to replay recorded responses."
             )
-        return cls.live(storage, api_key=api_key, env=env, pacer=pacer, scope=scope)
+        return cls.live(storage, api_key=api_key, pacer=pacer, scope=scope)
 
     @classmethod
     def replay_only(cls, storage: Storage, *, scope: SpendScope | None = None) -> "EmberClient":
@@ -361,28 +366,26 @@ class EmberClient:
         storage: Storage,
         *,
         api_key: str,
-        env: Mapping[str, str] | None = None,
         http_client: httpx2.Client | None = None,
         stop_nanousd: int | None = None,
         pacer: Pacer | None = None,
         scope: SpendScope | None = None,
     ) -> "EmberClient":
-        """A client that can spend. Its stop is read from `env`, by default the
-        process's environment, as `from_env` reads it: `EMBER_STOP_USD` on top of
-        `EMBER_SPENT_BEFORE_USD`, which must be set. `stop_nanousd` lowers the stop for
+        """A client that can spend. Its stop is the process environment's, as it is
+        for `from_env`: `EMBER_STOP_USD` on top of `EMBER_SPENT_BEFORE_USD`, which must
+        be set. Nothing passed here replaces either. `stop_nanousd` lowers the stop for
         this client and cannot raise it.
 
         `http_client` replaces the HTTP transport, which is how tests stand in for the
         API. `pacer` spaces the requests and has a call tried again after a 429.
         `scope` holds the client's calls to a budget of their own as well.
 
-        Raises EmberConfigError when the environment's stop cannot be read or
-        `EMBER_SPENT_BEFORE_USD` is not set, and ValueError for a `stop_nanousd` above
-        the environment's stop."""
+        Raises EmberConfigError when the environment's stop cannot be read,
+        `EMBER_SPENT_BEFORE_USD` is not set, or the ledger's path is relative, and
+        ValueError for a `stop_nanousd` above the environment's stop."""
         return cls(
             storage,
             api_key=api_key,
-            env=env,
             http_client=http_client,
             stop_nanousd=stop_nanousd,
             pacer=pacer,
@@ -445,8 +448,10 @@ class EmberClient:
         parallel_tool_calls: bool | None = None,
         prompt_cache_key: str | None = None,
     ) -> EmberResponse:
-        """Send one request to Muse Ember. `task` labels the call in the ledger, and
-        the arguments from `input` on are the Responses API fields of the same names.
+        """Send one request to Muse Ember. `task` labels the call in the ledger, the
+        trace, and errors, for sensitive calls too, so it names the kind of work, such
+        as `extract_transmission`, and never anything a request holds. The arguments
+        from `input` on are the Responses API fields of the same names.
         There is no `tool_choice`, because Meta supports only its default, `auto`.
         Media must be inline (`data:` URLs or base64) or an uploaded `file_id`, never a
         remote URL.
@@ -456,7 +461,9 @@ class EmberClient:
         traffic. Every call says which. Of a sensitive call the ledger keeps the
         accounting and the request's hash and none of the request's or the answer's content, and
         the answer is neither recorded for replay nor replayed: made again, the call
-        is paid for again, and replay-only mode refuses it.
+        is paid for again, and replay-only mode refuses it. An error from a sensitive
+        call says what kind of failure it was, with the HTTP status when there is
+        one, and carries neither the API's message nor the error under it.
 
         Raises BudgetExceededError or InputTooLargeError when a live call is refused,
         ReplayMissError when replay-only mode has no recording, and EmberCallError when
@@ -513,7 +520,15 @@ class EmberClient:
                     f"{task!r}) is never recorded, so there is nothing to replay. Make it "
                     "with REPLAY=0 and MODEL_API_KEY, or use a fake client."
                 )
-            return self._call_until_answered(self._sdk, self._stop, body, call, sensitive)
+            try:
+                return self._call_until_answered(self._sdk, self._stop, body, call, sensitive)
+            except Exception as error:
+                failure = error
+            # Raised again outside the handler, with nothing under it. The errors a
+            # failure is chained to are the SDK's, which hold the API's own message
+            # and the request, and a traceback that is printed or logged shows them.
+            failure.__cause__ = failure.__context__ = None
+            raise failure
 
         recording = self._cache.get(call.request_hash)
         if recording is not None:
@@ -575,7 +590,16 @@ class EmberClient:
         try:
             usage = Usage.from_response(response)
         except ValueError as error:
-            raise EmberError(f"The {source} response for {call.request_hash}: {error}") from error
+            if not sensitive:
+                raise EmberError(
+                    f"The {source} response for {call.request_hash}: {error}"
+                ) from error
+            # The error under this one would repeat what the usage object held.
+            usage = None
+        if usage is None:
+            raise EmberError(
+                f"The {source} response for {call.request_hash} has no usable token counts."
+            )
         safe, _recordable = _stored(response, sensitive)
         row = self._ledger.record(
             call, source=source, usage=usage, latency_ms=latency_ms, response=safe
@@ -623,7 +647,7 @@ class EmberClient:
         # limit. Those waits are not part of the call's latency.
         self._pace()
         started = time.perf_counter()
-        input_tokens = _count_input_tokens(sdk, body)
+        input_tokens = _count_input_tokens(sdk, body, sensitive)
         if input_tokens > MAX_INPUT_TOKENS:
             raise InputTooLargeError(
                 f"Refused: the request has {input_tokens:,} input tokens, over the "
@@ -676,12 +700,12 @@ class EmberClient:
                 status="error" if never_sent else "unknown",
                 cost_nanousd=0 if never_sent else reserved,
                 latency_ms=_elapsed_ms(started),
-                error=_summary(error),
+                error=_summary(error, sensitive),
             )
             if not settled and not never_sent:
                 raise LedgerReplacedError(_LOST_SETTLEMENT) from error
             raise EmberCallError(
-                _describe(error),
+                _describe(error, sensitive),
                 status_code=getattr(error, "status_code", None),
                 retry_after=_retry_after(error),
             ) from error
@@ -701,13 +725,15 @@ class EmberClient:
                 response=safe,
                 error=message,
             )
+            if sensitive:
+                raise EmberCallError(f"{message}.") from error
             raise EmberCallError(f"{message}: {redact(str(error))[:300]}") from error
 
         status = response.get("status")
         answered = status in ("completed", "incomplete")
         message = None
         if not answered:
-            shown = status if isinstance(status, str) and status.isidentifier() else "unknown"
+            shown = status if isinstance(status, str) and status in _STATUSES else "unknown"
             message = f"The response ended with status {shown}."
         self._settle_sent(
             row,
@@ -750,6 +776,9 @@ def _build_body(
             f"max_output_tokens must be an integer from {MIN_OUTPUT_TOKENS} to "
             f"{MAX_OUTPUT_TOKENS:,}, not {max_output_tokens!r}."
         )
+    parallel = optional.get("parallel_tool_calls")
+    if parallel is not None and not isinstance(parallel, bool):
+        raise EmberRequestError("parallel_tool_calls must be True or False when it is given.")
     for tool in optional.get("tools") or ():
         if not isinstance(tool, Mapping) or tool.get("type") != "function":
             # Hosted tools bill outside the token prices (web search is $2.50 per 1,000
@@ -813,40 +842,64 @@ def _withheld(value: Any) -> str:
 
 def _withheld_request(body: Mapping[str, Any]) -> dict[str, Any]:
     """What the ledger keeps of a sensitive request: how the call was made, and the
-    size of each field that holds what was sent."""
-    return {
+    size of each field that holds what was sent. Every value here is one the client
+    wrote itself or checked against a fixed set, never a string a caller chose."""
+    kept: dict[str, Any] = {
         "withheld": "sensitive",
-        **{
-            name: value if name in _SETTINGS_FIELDS else _withheld(value)
-            for name, value in body.items()
-        },
+        "model": MODEL,
+        "max_output_tokens": int(body["max_output_tokens"]),
+        "reasoning": {"effort": _effort(body["reasoning"]["effort"])},
+        "store": False,
+        "include": list(_INCLUDE),
     }
+    if "parallel_tool_calls" in body:
+        kept["parallel_tool_calls"] = body["parallel_tool_calls"] is True
+    for name in _CONTENT_FIELDS:
+        if name in body:
+            kept[name] = _withheld(body[name])
+    return kept
+
+
+def _effort(effort: Any) -> str:
+    """The effort, as one of the words the client knows."""
+    return next(known for known in get_args(Effort) if known == effort)
 
 
 def _withheld_response(response: Mapping[str, Any]) -> dict[str, Any]:
-    """What the ledger keeps of a sensitive answer: its id, status, and model when they
-    are the short words the API writes, the token counts, and the size of the output."""
-    kept: dict[str, Any] = {
-        name: response[name]
-        for name in ("id", "object", "status", "model")
-        if isinstance(response.get(name), str) and _ID_WORD.fullmatch(response[name])
+    """What the ledger keeps of a sensitive answer: its status when that is one the
+    client knows, the token counts the client reads, and the size of the output. The
+    API's other strings, such as the response's id, are not needed and not kept."""
+    kept: dict[str, Any] = {"withheld": "sensitive"}
+    status = response.get("status")
+    if isinstance(status, str) and status in _STATUSES:
+        kept["status"] = status
+    usage = response.get("usage")
+    if isinstance(usage, Mapping):
+        kept["usage"] = _known_counts(usage)
+    kept["output"] = _withheld(response.get("output"))
+    return kept
+
+
+def _known_counts(usage: Mapping[str, Any]) -> dict[str, Any]:
+    """The token counts of a usage object that the client reads, and nothing else the
+    object holds."""
+    counts: dict[str, Any] = {
+        name: usage[name]
+        for name in ("input_tokens", "output_tokens", "total_tokens")
+        if _is_count(usage.get(name))
     }
-    if isinstance(response.get("usage"), Mapping):
-        kept["usage"] = _counts(response["usage"])
-    return {"withheld": "sensitive", **kept, "output": _withheld(response.get("output"))}
-
-
-def _counts(usage: Mapping[str, Any]) -> dict[str, Any]:
-    """A usage object's numbers and nothing else it might hold."""
-    counts: dict[str, Any] = {}
-    for name, value in usage.items():
-        if not isinstance(name, str) or not _ID_WORD.fullmatch(name):
-            continue
-        if isinstance(value, Mapping):
-            counts[name] = _counts(value)
-        elif isinstance(value, int) and not isinstance(value, bool):
-            counts[name] = value
+    for details, name in (
+        ("input_tokens_details", "cached_tokens"),
+        ("output_tokens_details", "reasoning_tokens"),
+    ):
+        inner = usage.get(details)
+        if isinstance(inner, Mapping) and _is_count(inner.get(name)):
+            counts[details] = {name: inner[name]}
     return counts
+
+
+def _is_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _for_disk(response: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -899,7 +952,7 @@ def _reject_remote_media(value: Any, key: str | None) -> None:
             _reject_remote_media(item, key)
 
 
-def _count_input_tokens(sdk: openai.OpenAI, body: Mapping[str, Any]) -> int:
+def _count_input_tokens(sdk: openai.OpenAI, body: Mapping[str, Any], sensitive: bool) -> int:
     """Ask the API how many input tokens the request carries. Counting generates nothing
     and is not billed."""
     try:
@@ -908,13 +961,15 @@ def _count_input_tokens(sdk: openai.OpenAI, body: Mapping[str, Any]) -> int:
         ).input_tokens
     except openai.OpenAIError as error:
         raise EmberCallError(
-            f"Could not count the request's input tokens, so it was not sent: {_describe(error)}",
+            "Could not count the request's input tokens, so it was not sent: "
+            + _describe(error, sensitive),
             status_code=getattr(error, "status_code", None),
             retry_after=_retry_after(error),
         ) from error
-    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+    if not _is_count(count):
+        shown = "no usable count" if sensitive else repr(count)
         raise EmberCallError(
-            f"The token count endpoint returned {count!r}; the request was not sent."
+            f"The token count endpoint returned {shown}; the request was not sent."
         )
     return count
 
@@ -949,24 +1004,31 @@ def _was_never_sent(error: Exception) -> bool:
     return isinstance(error, openai.APIConnectionError) and isinstance(error.__cause__, _NEVER_SENT)
 
 
-def _summary(error: Exception) -> str:
+def _summary(error: Exception, sensitive: bool) -> str:
     """What the ledger keeps about a failure: its kind, and none of the text the API
-    or a library wrote, which could repeat part of a request."""
+    or a library wrote, which could repeat part of a request. Of a sensitive call's
+    failure that is the HTTP status as a number and no word the API sent."""
     if isinstance(error, openai.APIStatusError):
+        status = error.status_code
+        if sensitive:
+            return f"HTTP {status}" if isinstance(status, int) else "HTTP error"
         words = [
             word
             for word in (getattr(error, "type", None), getattr(error, "code", None))
             if isinstance(word, str) and _ERROR_WORD.fullmatch(word)
         ]
-        return " ".join([f"HTTP {error.status_code}", *words])
+        return " ".join([f"HTTP {status}", *words])
     cause = error.__cause__
     return type(error).__name__ + (f" ({type(cause).__name__})" if cause is not None else "")
 
 
-def _describe(error: Exception) -> str:
-    """The message for the exception the caller sees, which is not written to disk."""
+def _describe(error: Exception, sensitive: bool) -> str:
+    """The message for the exception the caller sees, which is not written to disk.
+    For a sensitive call it is the summary alone: the caller may print or log it."""
+    if sensitive:
+        return _summary(error, sensitive)
     detail = error.message if isinstance(error, openai.APIStatusError) else str(error)
-    return f"{_summary(error)}: {redact(str(detail))[:300]}"
+    return f"{_summary(error, sensitive)}: {redact(str(detail))[:300]}"
 
 
 def _as_json(value: Any, what: str) -> dict[str, Any]:

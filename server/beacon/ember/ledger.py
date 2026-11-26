@@ -17,6 +17,16 @@ as one tap's investigation or the scale run. `reserve` then also refuses a call 
 could take the scope's live spend past the scope's budget, in the same transaction. A
 scope's spend is the sum of its own rows, so no other client's calls move it, and it
 holds over every process that uses the scope for as long as the ledger file lasts.
+
+A ledger knows the file it was opened on by two things: the generation written in the
+file when it was begun, and which file is at the path (its device and inode). A file
+that is deleted and begun again has a new generation. A file that is put back from a
+copy by renaming keeps its generation and is a different file. Either stops paid calls
+(`reserve`) and leaves a reservation made before it unsettled (`settle`). What neither
+shows is a file rolled back in place, as a filesystem snapshot or a copy written over
+the same file does: the ledger then holds less than was spent and nothing here can
+tell. Whoever restores a ledger has to stop every process that spends first, and
+compare the ledger with Meta's Usage page before starting them again.
 """
 
 import json
@@ -157,6 +167,7 @@ class Ledger:
         # other: see `reserve`.
         with closing(self._connect()) as db:
             self._opened = _generation(db)
+            self._identity = _identity(db_path)
 
     def spent_nanousd(self) -> int:
         """Live spend so far, counting calls with an unknown outcome at their maximum."""
@@ -228,8 +239,13 @@ class Ledger:
         with closing(self._connect()) as db:
             self._require_opened_file(db)
 
+    def _is_opened_file(self, db: sqlite3.Connection) -> bool:
+        # The generation tells a file that was begun again. A file put back from an
+        # older copy by renaming has the same generation and is another file.
+        return _generation(db) == self._opened and _identity(self._db_path) == self._identity
+
     def _require_opened_file(self, db: sqlite3.Connection) -> None:
-        if _generation(db) != self._opened:
+        if not self._is_opened_file(db):
             raise LedgerReplacedError(
                 "Refused: the Ember ledger file was deleted or replaced while this client "
                 "was running, so what has been spent is not known from it. No paid call is "
@@ -250,8 +266,11 @@ class Ledger:
         """Replace a live call's reservation with its outcome, and return whether it
         was written. `response` must already be redacted. A reservation made in a
         ledger file that has since been replaced went with that file: nothing is
-        written, and the answer is False."""
+        written, and the answer is False. That holds when the file now at the path
+        has a row of the same id, as an older copy that was put back can."""
         with self._transaction() as db:
+            if not self._is_opened_file(db):
+                return False
             cursor = db.execute(
                 """
                 UPDATE ember_calls SET
@@ -382,6 +401,15 @@ class Ledger:
 def _generation(db: sqlite3.Connection) -> str:
     """The generation of the file this connection is open on."""
     return db.execute(_GENERATION).fetchone()[0]
+
+
+def _identity(path: Path) -> tuple[int, int] | None:
+    """Which file is at the path now: its device and inode. None when there is none."""
+    try:
+        status = path.stat()
+    except OSError:
+        return None
+    return (status.st_dev, status.st_ino)
 
 
 def _values(

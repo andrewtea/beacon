@@ -8,9 +8,12 @@ import base64
 import datetime
 import email.utils
 import json
+import os
+import shutil
 import sqlite3
 import textwrap
 import time
+import traceback
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -58,8 +61,8 @@ INPUT_TOKENS = 1200
 MAX_OUTPUT_TOKENS = 1024
 RESERVED_NANOUSD = 1200 * 100 + 1024 * 500
 
-# The settings of a live client whose account had spent nothing before the ledger began.
-LIVE_ENV = {"EMBER_SPENT_BEFORE_USD": "0"}
+# What a sensitive call is asked, kept out of the lines a traceback quotes.
+SAID = "Jane Doe, left heel"
 
 
 def completed(
@@ -114,12 +117,17 @@ class MetaApi:
     def http_client(self) -> httpx2.Client:
         return httpx2.Client(transport=httpx2.MockTransport(self))
 
-    def client(
-        self, storage: Storage, *, env: dict[str, str] = LIVE_ENV, **options: Any
-    ) -> EmberClient:
+    def client(self, storage: Storage, **options: Any) -> EmberClient:
         return EmberClient.live(
-            storage, api_key="test-key", env=env, http_client=self.http_client(), **options
+            storage, api_key="test-key", http_client=self.http_client(), **options
         )
+
+
+@pytest.fixture(autouse=True)
+def account_that_had_spent_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The process's setting that a client needs before it can spend. A test about a
+    different earlier spend, or none, sets or removes it."""
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
 
 
 @pytest.fixture
@@ -660,56 +668,157 @@ def test_every_way_of_building_a_live_client_keeps_the_stop_the_environment_sets
         EmberClient(storage, stop_nanousd=0)
 
 
-def test_a_client_can_lower_the_environments_stop_and_cannot_raise_it(storage: Storage) -> None:
+def test_a_client_can_lower_the_environments_stop_and_cannot_raise_it(
+    storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
     api = MetaApi()
-    env = LIVE_ENV | {"EMBER_STOP_USD": "0.50"}
+    monkeypatch.setenv("EMBER_STOP_USD", "0.50")
 
-    lowered = api.client(storage, env=env, stop_nanousd=1000)
+    lowered = api.client(storage, stop_nanousd=1000)
     assert lowered.stop == SpendingStop(ledger_nanousd=1000, spent_before_nanousd=0)
-    assert api.client(storage, env=env, stop_nanousd=500_000_000).stop.ledger_nanousd == (
-        500_000_000
-    )
+    assert api.client(storage, stop_nanousd=500_000_000).stop.ledger_nanousd == 500_000_000
 
     with pytest.raises(ValueError, match=r"cannot raise it above the \$0\.50"):
-        api.client(storage, env=env, stop_nanousd=500_000_001)
+        api.client(storage, stop_nanousd=500_000_001)
     for not_an_amount in (-1, True, 1.5, "3"):
         with pytest.raises(ValueError, match="nano-dollars"):
-            api.client(storage, env=env, stop_nanousd=not_an_amount)
+            api.client(storage, stop_nanousd=not_an_amount)
     # A stop the environment sets wrongly is not one a client can talk its way past.
+    monkeypatch.setenv("EMBER_STOP_USD", "three")
     with pytest.raises(EmberConfigError, match="EMBER_STOP_USD"):
-        api.client(storage, env=LIVE_ENV | {"EMBER_STOP_USD": "three"}, stop_nanousd=0)
+        api.client(storage, stop_nanousd=0)
     assert api.requests == []
 
 
 def test_a_client_that_can_spend_needs_what_the_account_had_spent_before(
-    storage: Storage,
+    storage: Storage, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     api = MetaApi()
+    live = {"REPLAY": "0", "MODEL_API_KEY": "test-key"}
 
-    # The process's environment, which the tests leave without it, and one given.
-    with pytest.raises(EmberConfigError, match="EMBER_SPENT_BEFORE_USD is not set"):
-        EmberClient.live(storage, api_key="test-key", http_client=api.http_client())
-    with pytest.raises(EmberConfigError, match="EMBER_SPENT_BEFORE_USD is not set"):
-        EmberClient(storage, api_key="test-key", http_client=api.http_client())
-    with pytest.raises(EmberConfigError, match="EMBER_SPENT_BEFORE_USD is not set"):
-        api.client(storage, env={"EMBER_STOP_USD": "1", "EMBER_SPENT_BEFORE_USD": ""})
-    with pytest.raises(EmberConfigError, match="Usage page"):
-        EmberClient.from_env({"REPLAY": "0", "MODEL_API_KEY": "test-key"}, storage=storage)
-    # A client that is refused writes nothing.
-    assert not storage.ledger_db.parent.exists()
+    for unset in (None, "", " "):
+        if unset is None:
+            monkeypatch.delenv("EMBER_SPENT_BEFORE_USD")
+        else:
+            monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", unset)
+        with pytest.raises(EmberConfigError, match="EMBER_SPENT_BEFORE_USD is not set"):
+            EmberClient.live(storage, api_key="test-key", http_client=api.http_client())
+        with pytest.raises(EmberConfigError, match="EMBER_SPENT_BEFORE_USD is not set"):
+            EmberClient(storage, api_key="test-key", http_client=api.http_client())
+        with pytest.raises(EmberConfigError, match="Usage page"):
+            EmberClient.from_env(live, storage=storage)
+        # A client that is refused writes nothing.
+        assert not storage.ledger_db.parent.exists()
+        # Replaying needs no answer: nothing is spent.
+        with pytest.raises(ReplayMissError):
+            ask(EmberClient.from_env({}, storage=Storage.under(tmp_path_factory.mktemp("r"))))
 
     # An account that had spent $8.00 has $1.00 left under the ceiling.
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "8")
     with pytest.raises(EmberConfigError, match=r"\$3\.00 on top of \$8\.00"):
-        api.client(storage, env={"EMBER_SPENT_BEFORE_USD": "8"})
-    assert api.client(
-        storage, env={"EMBER_SPENT_BEFORE_USD": "8", "EMBER_STOP_USD": "1"}
-    ).stop == SpendingStop(ledger_nanousd=1_000_000_000, spent_before_nanousd=8_000_000_000)
+        api.client(storage)
+    monkeypatch.setenv("EMBER_STOP_USD", "1")
+    assert api.client(storage).stop == SpendingStop(
+        ledger_nanousd=1_000_000_000, spent_before_nanousd=8_000_000_000
+    )
     # Zero is an answer when it is given.
-    assert ask(api.client(storage, env={"EMBER_SPENT_BEFORE_USD": "0"})).source == "live"
-
-    # Replaying needs no answer: nothing is spent.
-    assert ask(EmberClient.from_env({}, storage=storage)).source == "replay"
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+    assert ask(api.client(storage)).source == "live"
     assert ask(EmberClient.replay_only(storage)).source == "replay"
+
+
+def test_the_spending_settings_are_the_processs_and_no_mapping_replaces_them(
+    storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The operator has stopped all spending, on an account that had spent $8.00.
+    monkeypatch.setenv("EMBER_STOP_USD", "0")
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "8")
+    api = MetaApi()
+    monkeypatch.setattr(
+        EmberClient,
+        "live",
+        classmethod(
+            lambda cls, storage, **options: cls(storage, http_client=api.http_client(), **options)
+        ),
+    )
+    # Code builds a client from a mapping of its own that says otherwise.
+    generous = {
+        "REPLAY": "0",
+        "MODEL_API_KEY": "test-key",
+        "EMBER_STOP_USD": "3",
+        "EMBER_SPENT_BEFORE_USD": "0",
+    }
+
+    ember = EmberClient.from_env(generous, storage=storage)
+
+    assert ember.stop == SpendingStop(ledger_nanousd=0, spent_before_nanousd=8_000_000_000)
+    with pytest.raises(BudgetExceededError, match=r"reaches the \$0\.00 stop"):
+        ask(ember)
+    assert api.requests == []
+    # Nor does a mapping answer for an earlier spend the process was never given,
+    monkeypatch.delenv("EMBER_SPENT_BEFORE_USD")
+    with pytest.raises(EmberConfigError, match="EMBER_SPENT_BEFORE_USD is not set"):
+        EmberClient.from_env(generous, storage=storage)
+    # or hide a stop the process sets wrongly, in replay mode either.
+    monkeypatch.setenv("EMBER_STOP_USD", "three")
+    with pytest.raises(EmberConfigError, match="EMBER_STOP_USD"):
+        EmberClient.from_env({"EMBER_STOP_USD": "1"}, storage=storage)
+    # No way of building a client takes the settings as an argument.
+    monkeypatch.undo()
+    for build in (EmberClient.live, EmberClient):
+        with pytest.raises(TypeError, match="env"):
+            build(storage, api_key="test-key", env=generous)
+
+
+def test_a_ledger_put_back_from_an_older_copy_stops_every_paid_call(
+    storage: Storage, tmp_path: Path
+) -> None:
+    api = MetaApi()
+    ember = api.client(storage)
+    ask(ember)
+    generation = ember.ledger_generation()
+    backup = tmp_path / "backup.sqlite3"
+    shutil.copyfile(storage.ledger_db, backup)
+    ask(ember, input="A second request.")
+    spent, made = ember.spent_usd(), len(api.requests)
+
+    # The copy is put back by renaming it over the ledger. It is the same ledger by
+    # its generation, and it holds half of what was spent.
+    os.replace(backup, storage.ledger_db)
+    assert ember.ledger_generation() == generation
+    assert ember.spent_usd() == pytest.approx(spent / 2)
+
+    with pytest.raises(LedgerReplacedError, match="deleted or replaced"):
+        ask(ember, input="A third request.")
+    assert len(api.requests) == made
+    # What spends nothing still works.
+    assert ask(ember).source == "replay"
+
+
+def test_a_reservation_is_not_settled_into_an_older_copys_row_of_the_same_id(
+    storage: Storage, tmp_path: Path
+) -> None:
+    ledger = Ledger(storage.ledger_db)
+    call = Call(request_hash="h", task="scale", effort="low", max_output_tokens=16, request={})
+    ledger.reserve(call, reserved_nanousd=10, budget_nanousd=100)
+    backup = tmp_path / "backup.sqlite3"
+    shutil.copyfile(storage.ledger_db, backup)
+    lost = ledger.reserve(call, reserved_nanousd=20, budget_nanousd=100)
+
+    # The copy from before the second reservation is put back, and another process
+    # reserves in it: the same generation, and the same row id as the one that is gone.
+    os.replace(backup, storage.ledger_db)
+    restored = Ledger(storage.ledger_db)
+    theirs = restored.reserve(call, reserved_nanousd=30, budget_nanousd=100)
+    assert theirs == lost
+
+    assert ledger.settle(lost, status="ok", cost_nanousd=1, latency_ms=5) is False
+    # The other call's reservation is as it was.
+    assert restored.spent_nanousd() == 10 + 30
+    with pytest.raises(LedgerReplacedError):
+        ledger.reserve(call, reserved_nanousd=1, budget_nanousd=100)
+    assert restored.settle(theirs, status="ok", cost_nanousd=3, latency_ms=5) is True
+    assert restored.spent_nanousd() == 10 + 3
 
 
 def test_a_ledger_deleted_while_a_reserved_call_waits_its_turn_stops_the_paid_request(
@@ -770,10 +879,25 @@ def test_a_sensitive_call_leaves_nothing_of_what_was_said_on_disk(storage: Stora
     prompt = "Extract the incident. The caller is Jane Doe."
     heard = '{"address": "1458 Hayes Street", "patient": "67M chest pain"}'
     tool = {"type": "function", "name": "lookup_hayes", "parameters": {"type": "object"}}
-    response = completed(heard, metadata={"note": "Hayes"}, usage=USAGE | {"note": "Hayes"})
+    # Everything the API writes besides the answer can hold a word of it too.
+    response = completed(
+        heard,
+        id="resp_Hayes",
+        model="Hayes-1.0",
+        metadata={"note": "Hayes"},
+        usage=USAGE | {"Hayes": 1, "input_tokens_details": {"cached_tokens": 1792, "Hayes": 2}},
+    )
     api = MetaApi(create=lambda _request: httpx2.Response(200, json=response))
     ember = api.client(storage)
-    words = {"sensitive": True, "input": said, "instructions": prompt, "tools": [tool]}
+    words = {
+        "sensitive": True,
+        "input": said,
+        "instructions": prompt,
+        "tools": [tool],
+        "text": {"format": {"type": "json_schema", "name": "hayes", "schema": {}}},
+        "parallel_tool_calls": False,
+        "prompt_cache_key": "hayes-street",
+    }
 
     answer = ask(ember, **words)
 
@@ -781,9 +905,9 @@ def test_a_sensitive_call_leaves_nothing_of_what_was_said_on_disk(storage: Stora
     assert (answer.source, answer.output_text, answer.raw) == ("live", heard, response)
     # Nothing that was said, in the request or the answer, is in the ledger, the trace,
     # or a recording.
-    stored = persisted(storage)
     # (Words, not numbers: a number can turn up in a hash or a timestamp by chance.)
-    for text in ("Hayes", "Street", "chest", "male", "Jane", "Extract", "Medic", "lookup"):
+    stored = persisted(storage).lower()
+    for text in ("hayes", "street", "chest", "male", "jane", "caller", "medic", "lookup"):
         assert text not in stored
     assert not list(storage.replay_dir.glob("*.json"))
     # The accounting is whole.
@@ -795,25 +919,33 @@ def test_a_sensitive_call_leaves_nothing_of_what_was_said_on_disk(storage: Stora
         answer.request_hash,
     )
     assert (row["input_tokens"], row["cached_tokens"], row["output_tokens"]) == (1847, 1792, 98)
-    assert (row["cost_nanousd"], row["response_id"]) == (USAGE_COST_NANOUSD, "resp_abc123")
-    kept = json.loads(row["request"])
-    assert (kept["withheld"], kept["model"], kept["max_output_tokens"], kept["reasoning"]) == (
-        "sensitive",
+    assert (row["cost_nanousd"], row["model"], row["response_id"]) == (
+        USAGE_COST_NANOUSD,
         "muse-ember-1.0",
-        1024,
-        {"effort": "low"},
+        None,
     )
+    # Of the request, the settings the client wrote and the size of everything else.
+    sent = json.loads(api.requests[-1].content)
+    kept = json.loads(row["request"])
+    assert set(kept) == set(sent) | {"withheld"}
+    assert {name: kept[name] for name in kept if not str(kept[name]).startswith("<")} == {
+        "withheld": "sensitive",
+        "model": "muse-ember-1.0",
+        "max_output_tokens": 1024,
+        "reasoning": {"effort": "low"},
+        "store": False,
+        "include": ["reasoning.encrypted_content"],
+        "parallel_tool_calls": False,
+    }
     assert kept["input"] == f"<withheld: {len(json.dumps(said))} chars>"
+    # Of the answer, a status the client knows, the counts it reads, and a size.
+    output_size = len(json.dumps(response["output"], sort_keys=True, separators=(",", ":")))
     assert json.loads(row["response"]) == {
         "withheld": "sensitive",
-        "id": "resp_abc123",
-        "object": "response",
         "status": "completed",
-        "model": "muse-ember-1.0",
         "usage": USAGE,
-        "output": json.loads(row["response"])["output"],
+        "output": f"<withheld: {output_size} chars>",
     }
-    assert json.loads(row["response"])["output"].startswith("<withheld: ")
 
     # Nothing was recorded, so the same call is paid for again, and replay-only mode
     # has nothing to give.
@@ -827,26 +959,104 @@ def test_a_sensitive_call_leaves_nothing_of_what_was_said_on_disk(storage: Stora
     assert (ordinary.source, ask(ember, **words).source) == ("live", "live")
 
 
-@pytest.mark.parametrize(
-    "create",
-    [
-        lambda _request: httpx2.Response(200, json=completed("Jane Doe", status="failed")),
-        lambda _request: httpx2.Response(200, json={"status": "completed", "note": "Jane Doe"}),
-        lambda _request: httpx2.Response(
-            400, json={"error": {"message": "Bad input: 'Jane Doe'", "type": "invalid_request"}}
-        ),
-    ],
-    ids=["failed", "no-usage", "rejected"],
-)
-def test_a_sensitive_call_that_fails_leaves_nothing_of_what_was_said_either(
-    storage: Storage, create: Callable[[httpx2.Request], httpx2.Response]
-) -> None:
-    with pytest.raises(EmberCallError):
-        ask(MetaApi(create=create).client(storage), sensitive=True, input="Jane Doe, left heel")
+def _says_the_name(http_status: int, /, **body: Any) -> httpx2.Response:
+    """An answer that repeats who the request was about wherever it can."""
+    error = {"message": "Bad input: 'Jane Doe'", "type": "JaneDoe", "code": "Jane.Doe"}
+    return httpx2.Response(http_status, json={"error": error} if http_status >= 400 else body)
 
-    assert len(ledger_rows(storage)) == 1
-    assert "Jane" not in persisted(storage)
-    assert "heel" not in persisted(storage)
+
+@pytest.mark.parametrize(
+    ("count", "create", "status_code", "booked"),
+    [
+        (None, _says_the_name(200, **completed("Jane Doe", status="failed")), None, "error"),
+        (None, _says_the_name(200, **completed("x", status="JaneDoe")), None, "error"),
+        (None, _says_the_name(200, status="completed", note="Jane Doe"), None, "unknown"),
+        (
+            None,
+            _says_the_name(200, status="completed", usage={"input_tokens": "Jane Doe"}),
+            None,
+            "unknown",
+        ),
+        (None, _says_the_name(400), 400, "unknown"),
+        (None, httpx2.Response(200, content=b"Jane Doe is not JSON"), None, "unknown"),
+        (_says_the_name(400), None, 400, None),
+        (httpx2.Response(200, json={"input_tokens": "Jane Doe"}), None, None, None),
+    ],
+    ids=[
+        "failed",
+        "status-not-known",
+        "no-usage",
+        "usage-of-words",
+        "rejected",
+        "not-json",
+        "count-rejected",
+        "count-of-words",
+    ],
+)
+def test_a_sensitive_call_that_fails_says_nothing_of_what_was_said_anywhere(
+    storage: Storage,
+    count: httpx2.Response | None,
+    create: httpx2.Response | None,
+    status_code: int | None,
+    booked: str | None,
+) -> None:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == "/v1/responses/input_tokens":
+            return count or httpx2.Response(200, json={"input_tokens": 1200})
+        return create
+
+    ember = EmberClient.live(
+        storage,
+        api_key="test-key",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
+    )
+
+    with pytest.raises(EmberCallError) as raised:
+        ask(ember, sensitive=True, input=SAID)
+
+    # Not on disk,
+    assert [row["status"] for row in ledger_rows(storage)] == ([booked] if booked else [])
+    stored = persisted(storage).lower()
+    assert "jane" not in stored
+    assert "heel" not in stored
+    if status_code is not None and booked:
+        assert ledger_rows(storage)[0]["error"] == f"HTTP {status_code}"
+    # and not in the error, which a caller may print or log, or under it.
+    error = raised.value
+    assert error.status_code == status_code
+    assert (error.__cause__, error.__context__) == (None, None)
+    shown = "".join(traceback.format_exception(error)).lower()
+    assert "jane" not in shown
+    assert "heel" not in shown
+
+
+def test_a_sensitive_call_is_waited_out_after_a_rate_limit_like_any_other(
+    storage: Storage,
+) -> None:
+    refusals = [_rate_limited("3")]
+    api = MetaApi(
+        create=lambda _request: (
+            refusals.pop(0) if refusals else httpx2.Response(200, json=completed())
+        )
+    )
+    clock = Clock()
+    pacer = Pacer(600, clock=clock, sleep=clock.sleep, jitter=lambda: 0.0)
+    ember = api.client(storage, pacer=pacer)
+
+    assert ask(ember, sensitive=True, input=SAID).source == "live"
+
+    # The wait the API asked for is kept, though none of its words are.
+    assert clock.sleeps == pytest.approx([0.1, 3.0, 0.1])
+    assert [(row["status"], row["error"]) for row in ledger_rows(storage)] == [
+        ("unknown", "HTTP 429"),
+        ("ok", None),
+    ]
+
+    # A wait too long to sit through stops the call, with nothing under the error.
+    refusals.append(_rate_limited("3600"))
+    with pytest.raises(RateLimitHoldError, match="3600 s") as raised:
+        ask(ember, sensitive=True, input=SAID)
+    assert (raised.value.__cause__, raised.value.__context__) == (None, None)
 
 
 def test_a_fake_client_keeps_nothing_of_a_sensitive_call_either(storage: Storage) -> None:
@@ -858,6 +1068,12 @@ def test_a_fake_client_keeps_nothing_of_a_sensitive_call_either(storage: Storage
     assert "Hayes" not in persisted(storage)
     (row,) = ledger_rows(storage)
     assert (row["source"], row["input_tokens"], row["output_tokens"]) == ("fake", 900, 40)
+
+    # A stand-in's answer that cannot be priced is refused without repeating it.
+    unpriced = fake_response(text="ok") | {"usage": {"input_tokens": "Hayes"}}
+    with pytest.raises(EmberError, match="has no usable token counts") as raised:
+        ask(EmberClient.fake(storage, Script([unpriced])), sensitive=True, input="Medic 52")
+    assert "Hayes" not in "".join(traceback.format_exception(raised.value))
 
 
 def test_parallel_calls_cannot_pass_the_stop_together(storage: Storage) -> None:
@@ -1212,7 +1428,6 @@ def test_a_rate_limited_token_count_is_retried_and_costs_nothing(storage: Storag
     ember = EmberClient.live(
         storage,
         api_key="test-key",
-        env=LIVE_ENV,
         http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
         pacer=pacer,
     )
@@ -1243,7 +1458,6 @@ def test_a_rate_limit_that_starts_while_the_tokens_are_counted_holds_the_paid_re
     ember = EmberClient.live(
         storage,
         api_key="test-key",
-        env=LIVE_ENV,
         http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
         pacer=pacer,
     )
@@ -1273,7 +1487,6 @@ def test_a_wait_too_long_to_sit_through_stops_the_call_and_books_nothing(
     ember = EmberClient.live(
         storage,
         api_key="test-key",
-        env=LIVE_ENV,
         http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
         pacer=pacer,
     )
@@ -1321,7 +1534,6 @@ def test_the_call_that_is_told_to_wait_too_long_is_stopped_and_not_failed(
     counted = EmberClient.live(
         storage,
         api_key="test-key",
-        env=LIVE_ENV,
         http_client=httpx2.Client(transport=httpx2.MockTransport(refuse_the_count)),
         pacer=Pacer(3000, clock=clock, sleep=clock.sleep),
     )
@@ -1407,6 +1619,9 @@ def test_an_answer_cut_short_by_the_output_limit_is_returned_as_incomplete(
         ({"max_output_tokens": 524_289}, "from 16 to 524,288"),
         ({"sensitive": None}, "sensitive must be True or False"),
         ({"sensitive": 1}, "sensitive must be True or False"),
+        # A setting the ledger keeps of a sensitive call, so not a string of any kind.
+        ({"parallel_tool_calls": "ExampleName"}, "parallel_tool_calls must be True or False"),
+        ({"parallel_tool_calls": 1}, "parallel_tool_calls must be True or False"),
         ({"effort": "none"}, "effort must be one of"),
         ({"task": ""}, "task"),
         ({"tools": [{"type": "web_search"}]}, "Only function tools"),
@@ -1547,12 +1762,13 @@ def test_the_environment_selects_replay_by_default_and_live_only_with_a_key(
     with pytest.raises(EmberConfigError, match="REPLAY must be 1 or 0"):
         EmberClient.from_env({"REPLAY": "false", "MODEL_API_KEY": "test-key"}, storage=storage)
 
-    live = {"REPLAY": "0", "MODEL_API_KEY": "test-key", "EMBER_SPENT_BEFORE_USD": "0"}
+    live = {"REPLAY": "0", "MODEL_API_KEY": "test-key"}
     assert EmberClient.from_env(live, storage=storage).stop == SpendingStop(
         ledger_nanousd=3_000_000_000, spent_before_nanousd=0
     )
-    configured = live | {"EMBER_STOP_USD": "0.50", "EMBER_SPENT_BEFORE_USD": "1.25"}
-    assert EmberClient.from_env(configured, storage=storage).stop == SpendingStop(
+    monkeypatch.setenv("EMBER_STOP_USD", "0.50")
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "1.25")
+    assert EmberClient.from_env(live, storage=storage).stop == SpendingStop(
         ledger_nanousd=500_000_000, spent_before_nanousd=1_250_000_000
     )
 
@@ -1565,16 +1781,18 @@ def test_the_environment_selects_replay_by_default_and_live_only_with_a_key(
     )
     scope = SpendScope("tap:1", 1000)
     pacer = Pacer()
-    EmberClient.from_env(configured, storage=storage, scope=scope, pacer=pacer)
-    assert built == [
-        (storage, {"api_key": "test-key", "env": configured, "pacer": pacer, "scope": scope})
-    ]
+    EmberClient.from_env(live, storage=storage, scope=scope, pacer=pacer)
+    assert built == [(storage, {"api_key": "test-key", "pacer": pacer, "scope": scope})]
 
 
-def test_a_stop_that_cannot_be_read_is_refused_in_replay_mode_too(storage: Storage) -> None:
-    for env in ({"EMBER_STOP_USD": "three"}, {"REPLAY": "1", "EMBER_SPENT_BEFORE_USD": "-1"}):
-        with pytest.raises(EmberConfigError, match="EMBER_"):
-            EmberClient.from_env(env, storage=storage)
+def test_a_stop_that_cannot_be_read_is_refused_in_replay_mode_too(
+    storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name, value in (("EMBER_STOP_USD", "three"), ("EMBER_SPENT_BEFORE_USD", "-1")):
+        with monkeypatch.context() as patch:
+            patch.setenv(name, value)
+            with pytest.raises(EmberConfigError, match=name):
+                EmberClient.from_env({"REPLAY": "1"}, storage=storage)
 
 
 def test_a_replay_from_the_environment_is_booked_under_the_scope_it_is_given(
