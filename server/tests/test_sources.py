@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from beacon.evidence import EvidenceStore
 from beacon.ingest import Clock, IngestConfigError, build
 from beacon.main import create_app
 
@@ -102,7 +103,9 @@ def test_a_server_told_not_to_ingest_runs_no_pollers_and_says_so(
 
     assert response.status_code == 503
     assert response.json() == {"detail": "The pollers are not running in this server."}
-    assert not (tmp_path / "evidence").exists()
+    # The server still takes taps, so it has a store, and no source put a row in it.
+    store = EvidenceStore(tmp_path / "evidence" / "mock.sqlite3", "mock")
+    assert store.count_by_source() == {}
 
 
 @pytest.mark.parametrize(

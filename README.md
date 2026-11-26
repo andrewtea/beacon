@@ -4,7 +4,7 @@ Beacon is a "What's that?" button for your city. You hear a siren or see a helic
 
 Beacon is being built for the Meta Muse Ember Hackathon (Nov 23 to Dec 2, 2026). The rules, the $10 budget, and the submission checklist are in [HACKATHON.md](HACKATHON.md).
 
-**Status:** scaffold, Ember client, evidence store, and four pollers. The web app is an installable shell that shows whether the server is reachable. The server stores evidence rows and runs pollers for National Weather Service alerts, OpenSky aircraft positions, 511 road closures, and OpenMHz dispatch radio, each call of which Ember hears and turns into a row. **By default the pollers are fed an invented scenario, not real sources:** a made-up three-alarm fire in Hayes Valley, told in each source's own format, and every row from it is stored as `mock`. Its radio calls are generated tones, and what was "said" in them is filled in by a stand-in for Ember, so its radio rows are a stand-in's twice over. An early version of the NWS poller was run once against the real API; nothing else has been. The 511 poller has run only against mocked HTTP, because there is no token. The OpenSky poller has too, and **may not be pointed at the real API yet:** OpenSky's terms require a written license for a running service, which nobody has asked for. **OpenMHz has never been asked anything:** using its audio needs its permission, which Beacon does not have, and the shapes of its API are read from its server's source and unverified. **No real Ember call has been made:** there is no API key, so the client has run only against a mock of the Meta Model API in tests, and its request shapes come from Meta's documentation, not from an answer of Ember's. Nobody knows yet how well Ember hears a radio call. The audio token rate the budget rests on is [still a guess](#measure-the-audio-token-rate). No incident exists.
+**Status:** scaffold, Ember client, evidence store, four pollers, and the route that takes a tap. The web app is an installable shell that shows whether the server is reachable; it has no button yet, and **a tap is stored and not yet answered**. The server stores evidence rows and runs pollers for National Weather Service alerts, OpenSky aircraft positions, 511 road closures, and OpenMHz dispatch radio, each call of which Ember hears and turns into a row. **By default the pollers are fed an invented scenario, not real sources:** a made-up three-alarm fire in Hayes Valley, told in each source's own format, and every row from it is stored as `mock`. Its radio calls are generated tones, and what was "said" in them is filled in by a stand-in for Ember, so its radio rows are a stand-in's twice over. An early version of the NWS poller was run once against the real API; nothing else has been. The 511 poller has run only against mocked HTTP, because there is no token. The OpenSky poller has too, and **may not be pointed at the real API yet:** OpenSky's terms require a written license for a running service, which nobody has asked for. **OpenMHz has never been asked anything:** using its audio needs its permission, which Beacon does not have, and the shapes of its API are read from its server's source and unverified. **No real Ember call has been made:** there is no API key, so the client has run only against a mock of the Meta Model API in tests, and its request shapes come from Meta's documentation, not from an answer of Ember's. Nobody knows yet how well Ember hears a radio call. The audio token rate the budget rests on is [still a guess](#measure-the-audio-token-rate). No incident exists.
 
 ## Layout
 
@@ -25,6 +25,7 @@ Inside `server/beacon/`, each package has one concern so pull requests stay apar
 | `ingest/` | One poller per source, the loop that runs them, and how they are built from the environment. |
 | `radio/` | What is kept of a dispatch radio call, the Ember call that hears one (`extract_transmission`), and the conversion of its audio. |
 | `scenario/` | The mock scenario: an invented San Francisco fire, served to the pollers in each source's format. |
+| `taps/` | Taking a tap: what is kept of its place, its photo, and its clip, and for how long. |
 
 ## Run locally
 
@@ -97,12 +98,12 @@ Each source has a poller in [`server/beacon/ingest/`](server/beacon/ingest) that
 
 | Column | What it holds |
 | --- | --- |
-| `kind` | `radio`, `aircraft`, `alert`, `traffic`, `notice`, or `tap`. `notice` and `tap` are not written yet. |
-| `source`, `ref` | The feed (`nws`, `opensky`, `511`, `openmhz`) and the source's own name for the item. Together they name one row, so an item a source sends twice is stored once. |
+| `kind` | `radio`, `aircraft`, `alert`, `traffic`, `notice`, or `tap`. `notice` is not written yet. |
+| `source`, `ref` | The feed (`nws`, `opensky`, `511`, `openmhz`, and `app` for a tap) and the source's own name for the item. Together they name one row, so an item a source sends twice is stored once. |
 | `occurred_at`, `until` | When it happened according to the source, and when it stops applying, for an alert. |
 | `point`, `place` | A latitude and longitude, and the place in words. Either can be missing: a city-wide alert has no point. |
 | `confidence` | `official` for an authority speaking for itself, else `high`, `medium`, or `low`. |
-| `origin` | `mock` for the invented scenario, `live` for a real source. |
+| `origin` | `mock` for the invented scenario, `live` for a real source or a person's tap. |
 | `model` | Which kind of Ember client wrote the row's data, when a model did: `live`, `replay`, or `fake`. |
 | `data` | What the source said, as JSON in a shape of the row's kind. Each poller's module documents its own. |
 | `url` | Where a person can read the original, when it is public. |
@@ -136,6 +137,29 @@ Every call is paid for, once. The poller hears only the talkgroups it is given, 
 When the spending stop or the budget refuses a call, or Ember fails on one, the poller asks nothing for ten minutes, counted from the failure and kept in the store, so a restart does not shorten it; the same after three answers in a row that were no form. Calls that grew older than fifteen minutes meanwhile are passed over. If the Ember ledger is replaced while it runs, the poller stops until Beacon is started again. Each poll reads again from five minutes before the newest call it has finished with, because OpenMHz lists a call only when its upload arrives; calls it has already taken are told apart by their ids. The listing is read in pages, and only an empty answer to "what is after this moment" ends it. Where the poller cannot tell that a page showed every call of its last moment, it reports the poll as partial. **For real radio that is every poll whose listing ends in a call**, because nobody knows yet how many calls one of OpenMHz's answers holds: a page with one call may be a full page, with another call of the same millisecond behind it. Once a real answer has shown the number, and that it does not change, set `PAGE_SIZE` in `beacon/ingest/openmhz.py`, and a page with fewer calls is taken to be whole. The mock scenario's listing is Beacon's own, so its poller is told the number and its polls are not partial. The server's log says "partial" when it begins, not at every poll.
 
 Shutting the server down admits nothing new: a download, a conversion, or a token count is called off unpaid, and a call the Ember client had already admitted is waited for, for up to about two minutes, so that its answer is stored. If that wait runs out, the server logs it and exits: the request can still be sent and paid for, it is settled in the Ember ledger, its row is lost, and the call is not asked about again.
+
+### Taps
+
+`POST /api/taps` takes what the app sends when somebody presses "What's that?" ([`server/beacon/taps/`](server/beacon/taps)), and answers `201` with the tap's id. Nothing answers the tap yet: the incident engine and the investigator are the next phase.
+
+```json
+{
+  "location": { "lat": 37.7763, "lon": -122.4244, "accuracy_m": 12 },
+  "photo": "<a JPEG file, in base64>",
+  "clip": "<a WAV file, in base64>"
+}
+```
+
+`accuracy_m`, `photo`, and `clip` are optional, and any other field is refused. A tap is the one thing in the evidence store that is about a person, so this is what is kept of it:
+
+- **Where, to about a block.** The position is rounded to three decimal places of a degree (a box about 110 m by 90 m) before it is stored. The position the phone sent is not stored, logged, or repeated in an error.
+- **When, by the server's clock**, and nothing the phone says about the time.
+- **Who: nothing.** No address, browser, cookie, or account is read, and two taps cannot be told to be from one person. The tap route is left out of uvicorn's access log, whose lines name the address a request came from. A proxy in front of Beacon keeps its own log, which is its operator's to turn off.
+- **The photo and the clip, cleaned, for an hour.** A photo must be a JPEG of at most 4 MB and is written out again with only what a decoder needs: Exif, the GPS position, the thumbnail, comments, and anything after the end of the image are dropped, without the picture being decoded. That includes the note of which way up the picture is, so the app must send a picture it has already turned upright (drawing it to a canvas does that). A clip must be a WAV file of plain samples, at most 15 seconds and 3 MB, and is written out again as its samples alone; a browser's own recorder writes other formats, so the app has to record samples and write the WAV itself. The files are kept under `data/taps/<mock or live>/`, readable by Beacon's user only, deleted an hour after the tap by a sweep that runs every minute, and never handed out past the hour. All of them together take at most 500 MB.
+
+The row is of kind `tap`, from the source `app`, with the confidence `low`: it says only that somebody noticed something. Its origin is `live` in either store, because a person's tap is nobody's stand-in; the receipt's `mode` says which store it went to, and in `mock` whatever Beacon later answers the tap with is drawn from the invented scenario and has to be labeled so. `row.data` holds `accuracy_m`, the size of the photo and of the clip, and `media_kept_until`. Nothing in ingest looks at a photo or listens to a clip: that is the investigator's, with Ember, and only as evidence for the tap it came with.
+
+A tap from outside San Francisco is refused with `422` and nothing of it is kept. So is anything that is not a tap, in a fixed sentence that repeats nothing that was sent. The server takes at most 120 taps a minute from everybody together (`429` with `Retry-After`), because nothing tells one sender from another, receives at most 8 at once (`503`), and reads at most 10 MB of a request (`413`). A tap is taken whole or not at all: when its row cannot be stored its media is deleted, and the other way round.
 
 ### Mock and live
 
