@@ -25,6 +25,7 @@ from beacon.ember.client import (
 )
 from beacon.ember.errors import (
     BudgetExceededError,
+    CallLimitError,
     EmberCallError,
     EmberClosedError,
     EmberConfigError,
@@ -42,6 +43,7 @@ from beacon.ember.pricing import SpendingStop, Usage
 
 __all__ = [
     "BudgetExceededError",
+    "CallLimitError",
     "Effort",
     "EmberCallError",
     "EmberClient",

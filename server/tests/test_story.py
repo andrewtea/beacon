@@ -1274,8 +1274,8 @@ def test_the_pollers_are_closed_to_paid_work_when_the_story_desk_could_not_be(
         def close_paid(self) -> None:
             closed.append("pollers")
 
-    main_module._close_paid(Desk(), Pollers())  # type: ignore[arg-type]
-    main_module._close_paid(None, None)
+    main_module._close_paid(Desk(), None, Pollers())  # type: ignore[arg-type]
+    main_module._close_paid(None, None, None)
 
     assert closed == ["pollers"]
     assert "Paid work could not be closed (RuntimeError)." in caplog.text

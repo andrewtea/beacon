@@ -141,6 +141,13 @@ class Engine:
             self._made = made
             return made
 
+    def at(self, moment: datetime) -> Snapshot:
+        """The incidents as they stood at `moment`, from every row there is now
+        about that moment or before it: what a source said later of an earlier time
+        is in it, and what happened later is not. It is read anew each time, and
+        does not replace the reading `snapshot` hands out."""
+        return self._read(moment, self._store.last_id(), was_partial=True)
+
     def _read(self, now: datetime, last: int, *, was_partial: bool) -> Snapshot:
         most = MAX_ROWS
         # One more than is used, which says whether there were more.

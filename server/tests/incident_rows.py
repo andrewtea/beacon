@@ -186,7 +186,17 @@ class Rows:
             | texts,
         )
 
-    def tap(self, minute: float, point: Point = HAYES) -> Evidence:
+    def tap(
+        self,
+        minute: float,
+        point: Point = HAYES,
+        *,
+        ref: str | None = None,
+        photo: bool = False,
+        clip: bool = False,
+    ) -> Evidence:
+        """`ref` is the tap's id, for a test that reads the tap back by it."""
+        named = {} if ref is None else {"ref": ref}
         return self._add(
             kind="tap",
             source="app",
@@ -194,7 +204,13 @@ class Rows:
             confidence="low",
             origin="live",
             point=point,
-            data={"accuracy_m": 10, "photo": None, "clip": None, "media_kept_until": None},
+            data={
+                "accuracy_m": 10,
+                "photo": {"bytes": 100, "width": 4, "height": 4} if photo else None,
+                "clip": {"bytes": 100, "seconds": 1.0} if clip else None,
+                "media_kept_until": at(minute + 60).isoformat() if photo or clip else None,
+            },
+            **named,
         )
 
     def aircraft(

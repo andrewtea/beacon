@@ -61,6 +61,8 @@ _CATEGORIES = {
     12: "ultralight",
     14: "unmanned",
 }
+# The names a row's `category` can hold, for a reader that hands it on as a tag.
+AIRCRAFT_CATEGORIES: tuple[str, ...] = tuple(_CATEGORIES.values())
 _POSITION_SOURCES = {0: "adsb", 1: "asterix", 2: "mlat", 3: "flarm"}
 
 

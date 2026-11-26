@@ -22,13 +22,21 @@ def offset(point: Point, north_m: float, east_m: float) -> Point:
     )
 
 
-def circle(rows: Rows, middle: Point, radius_m: float, *, minutes: float, icao24: str) -> None:
+def circle(
+    rows: Rows,
+    middle: Point,
+    radius_m: float,
+    *,
+    minutes: float,
+    icao24: str,
+    category: str | None = "rotorcraft",
+) -> None:
     steps = int(minutes * 2)
     for step in range(steps + 1):
         # A turn every 108 seconds, seen every 30: a few points of each turn.
         angle = math.tau * step * 30 / 108
         point = offset(middle, radius_m * math.cos(angle), radius_m * math.sin(angle))
-        rows.aircraft(step / 2, point, icao24=icao24)
+        rows.aircraft(step / 2, point, icao24=icao24, category=category)
 
 
 def test_an_aircraft_that_goes_round_is_circling_and_one_that_passes_is_not(rows: Rows) -> None:

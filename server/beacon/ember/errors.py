@@ -19,6 +19,12 @@ class BudgetExceededError(EmberError):
     paid request of the call was sent."""
 
 
+class CallLimitError(BudgetExceededError):
+    """The call was refused because it could cost more than the caller allowed this
+    one call (`limit_nanousd`). No paid request of it was sent, and it says nothing
+    about the spending stop or a scope's budget, which may have room."""
+
+
 class LedgerReplacedError(BudgetExceededError):
     """A paid call was refused because the ledger file is not the one this client
     opened: what has been spent is not known from it, so the stop cannot be kept."""

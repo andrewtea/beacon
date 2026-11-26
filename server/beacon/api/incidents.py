@@ -5,6 +5,10 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict
 
 from beacon.incident import Engine, Incident
+from beacon.incident.build import CREDIT_511
+from beacon.investigate import Runs
+from beacon.investigate import card as words
+from beacon.radio.vocabulary import MEDICAL_EVENT
 from beacon.story import StoryDesk
 
 router = APIRouter()
@@ -118,6 +122,54 @@ class TrackOut(_Read):
     low: bool
 
 
+class CitedOut(BaseModel):
+    """A signal a decision on crisis mode rested on, as the incident had it when
+    the decision was made."""
+
+    kind: str
+    confidence: Literal["official", "high", "medium", "low"]
+    # The evidence rows the signal rested on then. Empty for taps, which are
+    # counted and not listed.
+    evidence_ids: list[int]
+    # How the incident has a signal of that kind now: `same` when it rests on those
+    # rows still, `changed` when it rests on others, `gone` when it has none.
+    now: Literal["same", "changed", "gone"]
+    # 511's credit for a `closure`, which its data agreement requires beside what
+    # is shown from it. It is here, and not only on the signal the incident has
+    # now, because that signal can be gone while this is still shown.
+    credit: CreditOut | None
+
+
+class CrisisOut(BaseModel):
+    """Crisis mode for an incident. Beacon's investigator turns it on when it looks
+    into a tap and decides that the incident's signals add up to more than an
+    everyday call; code holds the decision to signals the engine found. The first
+    such decision is the one kept: a later run that decides otherwise turns nothing
+    off. It is the investigator's decision and no authority's, and `text` says so.
+    It tells nobody what to do."""
+
+    # Whether it is on now: it was turned on, and the incident is still going on.
+    active: bool
+    decided_at: datetime
+    text: str
+    # Who decided: `model` for Muse Ember, `stand_in` for the stand-in that works
+    # by rule. `decided_by_text` says it in a sentence: show it with `text`.
+    decided_by: Literal["model", "stand_in"]
+    decided_by_text: str
+    # The signals the decision rested on, as they were then.
+    cited: list[CitedOut]
+    # The signals of those kinds the incident has now, each with its sources, and
+    # a sentence that says that is what they are. They are not the decision's
+    # grounds: those are `cited`.
+    signals: list[SignalOut]
+    signals_text: str
+    # Which kind of Ember client decided: `live`, or `fake` for a stand-in.
+    model: str | None
+    # True when a stand-in decided, or the incident is built from a stand-in's rows.
+    stand_in: bool
+    stand_in_text: str | None
+
+
 class IncidentSummary(_Read):
     id: str
     category: str
@@ -146,6 +198,8 @@ class IncidentSummary(_Read):
     # True when any row the incident is built from is a stand-in's: the invented
     # scenario, or a fake Ember. It is then to be labeled as one.
     stand_in: bool
+    # Null until the investigator has decided on crisis mode for it.
+    crisis: CrisisOut | None = None
 
 
 class ClaimOut(_Read):
@@ -215,6 +269,66 @@ class IncidentAnswer(BaseModel):
     incident: IncidentDetail
 
 
+def crisis_of(request: Request, incident: Incident) -> CrisisOut | None:
+    """The decision that turned crisis mode on for an incident, with what it
+    rested on then and what the incident has of it now. Reading it asks Ember
+    nothing, and needs no desk: a decision that was made is read whether or not
+    taps are still being investigated."""
+    runs: Runs | None = getattr(request.app.state, "runs", None)
+    if runs is None or incident.category == MEDICAL_EVENT:
+        return None
+    decision = runs.crisis(incident.id)
+    if decision is None:
+        return None
+    kinds = {cited.kind for cited in decision.cited}
+    now = {
+        signal.kind: {source.evidence_id for source in signal.sources} - {None}
+        for signal in incident.signals
+    }
+    having = [signal for signal in incident.signals if signal.kind in kinds]
+    by_model = decision.model == "live"
+    return CrisisOut(
+        active=incident.open,
+        decided_at=decision.decided_at,
+        text=words.CRISIS,
+        decided_by="model" if by_model else "stand_in",
+        decided_by_text=words.investigator_text(decision.model or "fake") or "",
+        cited=[
+            CitedOut(
+                kind=cited.kind,
+                confidence=cited.confidence,  # type: ignore[arg-type]
+                evidence_ids=list(cited.evidence_ids),
+                now="gone"
+                if cited.kind not in now
+                else "same"
+                if set(cited.evidence_ids) <= now[cited.kind]
+                else "changed",
+                credit=cited_credit(cited.kind),
+            )
+            for cited in decision.cited
+        ],
+        signals=[SignalOut.model_validate(signal) for signal in having],
+        signals_text=words.CRISIS_NOW if having else words.CRISIS_NONE_NOW,
+        model=decision.model,
+        stand_in=decision.stand_in or incident.stand_in or not by_model,
+        stand_in_text=words.stand_in_text(
+            decision.model or "fake", evidence=decision.stand_in or incident.stand_in
+        ),
+    )
+
+
+def cited_credit(kind: str) -> CreditOut | None:
+    """The credit that goes with a signal a decision cited: a closure is 511's."""
+    return CreditOut.model_validate(CREDIT_511) if kind == "closure" else None
+
+
+def summary_of(request: Request, incident: Incident) -> IncidentSummary:
+    """An incident as the list has it, with its crisis mode."""
+    summary = IncidentSummary.model_validate(incident)
+    summary.crisis = crisis_of(request, incident)
+    return summary
+
+
 def _engine(request: Request) -> Engine:
     engine: Engine | None = getattr(request.app.state, "incidents", None)
     if engine is None:
@@ -238,7 +352,7 @@ def incidents(request: Request, everything: bool = Query(False, alias="all")) ->
         mode=engine.mode,
         as_of=snapshot.as_of,
         partial=snapshot.partial,
-        incidents=[IncidentSummary.model_validate(incident) for incident in listed],
+        incidents=[summary_of(request, incident) for incident in listed],
     )
 
 
@@ -251,6 +365,7 @@ def incident(request: Request, incident_id: str) -> IncidentAnswer:
     if found is None:
         raise HTTPException(404, "There is no such incident.")
     detail = IncidentDetail.model_validate(found)
+    detail.crisis = crisis_of(request, found)
     desk: StoryDesk | None = getattr(request.app.state, "stories", None)
     # Reading a story asks Ember nothing: only the desk's own pass writes one.
     told = None if desk is None else desk.latest(found)
