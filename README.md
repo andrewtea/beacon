@@ -52,13 +52,13 @@ scripts/check web      # format, lint, tests, type check, build
 scripts/check server   # format, lint, tests
 ```
 
-Tests never call the Meta Model API or a live data source. They run with `REPLAY=1` and with `MODEL_API_KEY` removed from their environment, and CI runs the same script and holds no key. As a backstop, `server/tests/conftest.py` patches Python's `socket.connect` and `socket.connect_ex` in the test process to raise `NetworkBlockedError` for any address that is not this machine. It is a backstop and not a sandbox: a test that catches that error still passes, and the patch does not reach DNS lookups, subprocesses, or native code that opens sockets without Python's `socket` module.
+Tests never call the Meta Model API or a live data source. Two entry points enforce the environment for that: `scripts/check`, which CI also runs, sets `REPLAY=1` and removes `MODEL_API_KEY` before it checks either side, and server pytest does the same however it is started, because `server/tests/conftest.py` does it. CI holds no key. A web test run directly with `pnpm test` keeps whatever environment the shell has; nothing in `web/` reads the key. As a backstop for the server tests, `server/tests/conftest.py` patches Python's `socket.connect` and `socket.connect_ex` in the test process to raise `NetworkBlockedError` for any address that is not this machine. It is a backstop and not a sandbox: a test that catches that error still passes, and the patch does not reach DNS lookups, subprocesses, or native code that opens sockets without Python's `socket` module.
 
 ## Configuration
 
-Settings come from the environment. Nothing loads a `.env` file: export a variable in your shell or put it in front of the command.
+Settings come from the environment. The server does not load the repository-root `.env` file: export a variable in your shell or put it in front of the command. (Vite loads `web/.env` for the web app, as it does by default, and exposes only names that start with `VITE_` to the browser. Beacon has no such file and no such setting.)
 
-The scaffold reads none of them yet. [`.env.example`](.env.example) lists the three names that are reserved, and the Ember client, which is the second part of Phase 1, is what gives them effect: `MODEL_API_KEY` (the Meta Model API key), `REPLAY` (`1` to answer from recorded Ember responses and call nothing), and `BEACON_DATA_DIR` (where runtime data goes instead of the repository's `data/`). Today only the checks set any of them: `scripts/check`, CI, and the test suite set `REPLAY=1` and remove `MODEL_API_KEY`, and the tests point `BEACON_DATA_DIR` at a temporary directory.
+The scaffold reads none of them yet. [`.env.example`](.env.example) lists the three names that are reserved, and the Ember client, which is the second part of Phase 1, is what gives them effect: `MODEL_API_KEY` (the Meta Model API key), `REPLAY` (`1` to answer from recorded Ember responses and call nothing), and `BEACON_DATA_DIR` (where runtime data goes instead of the repository's `data/`). Three places set any of them today. `scripts/check`, and so CI, sets `REPLAY=1` and removes `MODEL_API_KEY`. Server pytest does the same and also points `BEACON_DATA_DIR` at a temporary directory for each test. The orb's API service in [`.amp/services.yaml`](.amp/services.yaml) sets `REPLAY=1`.
 
 ## Rules Beacon is built under
 
