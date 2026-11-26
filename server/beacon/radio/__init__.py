@@ -11,7 +11,15 @@ a street has to be on, `extract` for the Ember call, and `audio` for how a call'
 audio gets to Ember without touching a disk.
 """
 
-from beacon.radio.audio import AudioError, ConversionStopped, Ffmpeg, Transcoder, plain_wav
+from beacon.radio.audio import (
+    AudioError,
+    ConversionStopped,
+    Ffmpeg,
+    Transcoder,
+    core_dump_problem,
+    forbid_core_dumps,
+    plain_wav,
+)
 from beacon.radio.extract import ExtractionError, Transmission, extract_transmission, read_form
 from beacon.radio.vocabulary import MEDICAL_EVENT, NOTHING_KNOWN, Known
 
@@ -25,7 +33,9 @@ __all__ = [
     "Known",
     "Transcoder",
     "Transmission",
+    "core_dump_problem",
     "extract_transmission",
+    "forbid_core_dumps",
     "plain_wav",
     "read_form",
 ]

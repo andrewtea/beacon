@@ -14,7 +14,9 @@ class EmberRequestError(EmberError, ValueError):
 
 
 class BudgetExceededError(EmberError):
-    """The call was refused because it could take the ledger past the spending stop."""
+    """The call was refused because it could take the ledger past the spending stop.
+    Raised as this class itself, and not as LedgerReplacedError, it means that no
+    paid request of the call was sent."""
 
 
 class LedgerReplacedError(BudgetExceededError):
@@ -29,7 +31,9 @@ class EmberClosedError(EmberError):
 
 class RateLimitHoldError(EmberError):
     """The API asked for a wait longer than a paced client waits. Nothing is sent
-    through that client's pacer until the wait has passed."""
+    through that client's pacer until the wait has passed. The call it is raised to
+    can be the one that was sent and told to wait, so it does not say that nothing
+    was sent."""
 
 
 class InputTooLargeError(EmberError):

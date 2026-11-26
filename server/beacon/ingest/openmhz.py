@@ -40,29 +40,39 @@ row for the call. What follows from what the audio is:
   for the life of the process: an operator has to compare Meta's Usage page with the
   ledger first.
 - **A call that is listed late is still heard.** OpenMHz lists a call when its
-  upload arrives, which is after the call was made, so each poll asks again for the
-  last `OVERLAP` before the newest call it has finished with. The calls it has
-  already taken are told apart by their ids and cost nothing. A call listed later
-  than that is missed.
-- **Shutting down sends nothing new.** `close` closes the poller's Ember client and
-  its converter. After it, no paid request is sent that was not already out, even
-  for a call whose tokens were being counted. A call that was being fetched or
-  converted is dropped unclaimed, and waits for the next run. A call whose paid
-  request is out is waited for (`drain`), until its row is stored.
+  upload arrives, which is after the call was made, so each poll reads again from
+  `OVERLAP` before the newest call it has finished with. The calls it has already
+  taken are told apart by their ids and cost nothing. A call listed later than
+  that is missed.
+- **Shutting down admits nothing new.** `close` closes the poller's Ember client
+  and its converter. A call that was being fetched, converted, or counted is
+  dropped unpaid, and waits for the next run. A call that Ember's client had
+  already admitted goes on: its paid request is sent, which can be a moment after
+  `close` returns, and `drain` waits until its row is stored. Only a `drain` that
+  answers True says that nothing more is sent.
 
-The listing is read in pages, each asking for the calls after the newest of the page
-before, until a page brings nothing newer. That is right whether the API answers
-with the calls nearest after the moment asked about or with all of them. If it
-answers with only the newest ones, calls in between are missed in a busy minute:
-one of the things to check with the first real answer.
+The listing is read in pages (`_scan`), on the one assumption that an answer holds
+the calls nearest after the moment asked about, however many of them it holds. How
+far a page reaches is read from the times of everything it lists, whether or not
+Beacon can use the item. Because a page can end in the middle of a moment that
+several calls share, the next page asks for that moment again, and the calls that
+follow it prove that all of that moment's calls were shown. When a page holds only
+calls of one moment and looks full, nothing can prove that, and the poll is reported
+as partial. A poll reads at most `SCAN_PAGES` pages from where the overlap begins,
+and when that does not reach the end, `SCAN_PAGES` more from where it had got to
+before, so that a long overlap never keeps it from going forward. If OpenMHz
+answers with only the newest calls instead, calls in between are missed in a busy
+minute: one of the things to check with the first real answer.
 """
 
 import contextlib
+import hashlib
+import json
 import logging
 import re
 import threading
 from collections.abc import Callable, Collection, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn
 from urllib.parse import urlsplit
@@ -104,8 +114,8 @@ OVERLAP = timedelta(minutes=5)
 # A call older than this is not heard: nobody is tapping about it any more.
 MAX_AGE = timedelta(minutes=15)
 MAX_CALLS_PER_POLL = 20
-# The most pages of the listing one poll reads.
-MAX_PAGES = 10
+# The most pages of the listing one scan reads. A poll makes one scan, or two.
+SCAN_PAGES = 6
 # A call shorter than this is a click of the microphone.
 MIN_CALL_SECONDS = 1.0
 MAX_CALL_SECONDS = float(MAX_AUDIO_SECONDS)
@@ -217,6 +227,9 @@ class OpenMhzRadio:
             # hear a stand-in's tones. A client that only replays can hear neither:
             # a radio call is a sensitive one, and is never recorded.
             raise ValueError("Real radio is heard by a live Ember, and a stand-in's by a fake one.")
+        if ember.retries:
+            # Each try is a paid request, and a call is claimed for one.
+            raise ValueError("The radio poller's Ember client makes each call once: no pacer.")
         self._http = http
         self._ember = ember
         self._system = system
@@ -241,8 +254,9 @@ class OpenMhzRadio:
         return self._http.origin
 
     def close(self) -> None:
-        """Start no more paid work. When this returns no paid request is sent that
-        was not already out, and a conversion that was running is called off."""
+        """Admit no more paid work, and call off a conversion that is running. A
+        call the Ember client had already admitted still sends its paid request
+        (`EmberClient.close`); `drain` waits for it."""
         self._ember.close()
         if self._transcoder is not None:
             self._transcoder.close()
@@ -270,13 +284,16 @@ class OpenMhzRadio:
         store.refuse_stand_in(self.origin)
         if self._ledger_lost:
             raise_bare(PollerHeldError(_LEDGER_LOST, MAX_WAIT_SECONDS))
-        progress = _progress(store.state(self.name), now)
+        saved = store.state(self.name)
+        progress = _progress(saved, now)
         if progress.held_until is not None:
             left = (progress.held_until - self._wall_clock()).total_seconds()
             if left > 0:
                 raise_bare(PollerHeldError(_HELD, left))
             progress.held_until = None
-        calls, unreadable, whole = self._listing(progress.after_ms, now)
+        listing = self._listing(progress.after_ms, now, first=not saved)
+        calls = [call for call in listing.calls.values() if call.time_ms <= _ms(now)]
+        unreadable = listing.unreadable
         taken = store.taken(SOURCE, [call.ref for call in calls])
         # Oldest first, whichever way the answer was ordered. A call that is too
         # short or too long by its listing is passed over here, and takes no place
@@ -311,50 +328,93 @@ class OpenMhzRadio:
                 # The row and what the poller remembers are saved together.
                 state = (self.name, progress.as_state())
                 added += len(store.add([self._row(call, heard)], state=state, now=now))
-        if len(waiting) <= MAX_CALLS_PER_POLL and calls:
-            # Everything listed is finished with, the calls passed over included.
-            progress.after_ms = max(progress.after_ms, max(call.time_ms for call in calls))
+        more_waiting = len(waiting) > MAX_CALLS_PER_POLL
+        if not more_waiting:
+            # Everything that was read is finished with, the calls passed over
+            # included, as far as the listing was read forward and no later than now.
+            progress.after_ms = max(progress.after_ms, min(listing.reached_ms, _ms(now)))
         store.add([], state=(self.name, progress.as_state()), now=now)
         return PollReport(
-            added=added,
-            unreadable=unreadable,
-            partial=len(waiting) > MAX_CALLS_PER_POLL or not whole,
+            added=added, unreadable=unreadable, partial=more_waiting or not listing.complete
         )
 
-    def _listing(self, after_ms: int, now: datetime) -> tuple[list[Call], int, bool]:
-        """The calls OpenMHz lists from `OVERLAP` before `after_ms` up to now, how
-        many of its items could not be read, and whether the listing was read to
-        its end. A call the answer dates after now is left for the poll after that
-        moment, and one older than `MAX_AGE` is not asked for."""
-        since_ms = max(after_ms - _ms_of(OVERLAP), _ms(now - MAX_AGE)) - 1
-        calls: dict[str, Call] = {}
-        unreadable = 0
-        whole = False
-        for _ in range(MAX_PAGES):
-            body = fetch(
-                self._http,
-                "GET",
-                f"{API}/{self._system}/calls/newer",
-                source=SOURCE,
-                max_bytes=_MAX_LIST_BYTES,
-                params={
-                    "time": str(since_ms),
-                    "filter-type": "talkgroup",
-                    "filter-code": ",".join(str(number) for number in sorted(self._talkgroups)),
-                },
+    def _listing(self, after_ms: int, now: datetime, *, first: bool) -> "_Listing":
+        """What OpenMHz lists from `OVERLAP` before `after_ms` on. The very first
+        poll, which has nothing behind it to read again, begins at `after_ms`, and
+        nothing older than `MAX_AGE` is asked for."""
+        begin_ms = after_ms if first else max(after_ms - _ms_of(OVERLAP), _ms(now - MAX_AGE))
+        listing = _Listing(reached_ms=after_ms)
+        whole, reached_ms = self._scan(listing, begin_ms - 1)
+        if not whole:
+            # The scan ran out of pages. When it stopped short of where the poller
+            # had got to before, the rest of the overlap is not read this time, and
+            # the poll goes on from where it had got to: it always moves forward.
+            listing.complete = reached_ms >= after_ms
+            # From that moment itself, whose calls a page may have cut short.
+            whole, reached_ms = self._scan(listing, max(reached_ms, after_ms) - 1)
+        listing.complete = listing.complete and whole and not listing.cut
+        listing.reached_ms = max(after_ms, reached_ms)
+        return listing
+
+    def _scan(self, listing: "_Listing", since_ms: int) -> tuple[bool, int]:
+        """Read up to `SCAN_PAGES` pages of the calls after `since_ms` into
+        `listing`. Returns whether the listing was read to its end, and the moment
+        it was read up to. The module's docstring says how the pages are told to
+        be complete."""
+        # The listing is read up to `reached_ms`, as far as its pages show.
+        reached_ms = since_ms
+        # Whether the next page asks for the moment `reached_ms` itself again.
+        again = False
+        # How many calls the page before held, when it held only calls of the one
+        # moment `reached_ms` and may have been full of them.
+        of_one_moment: int | None = None
+        for _ in range(SCAN_PAGES):
+            asked_ms = reached_ms - 1 if again else reached_ms
+            items = self._page(asked_ms)
+            listing.take(items, asked_ms)
+            newest_ms = max(
+                (item.time_ms for item in items if item.time_ms is not None), default=None
             )
-            page, bad = parse_calls(read_json(body, SOURCE), self._talkgroups, self._media_hosts)
-            unreadable += bad
-            newest = max((call.time_ms for call in page), default=since_ms)
-            for call in page:
-                if call.time_ms > since_ms:
-                    calls.setdefault(call.ref, call)
-            if newest <= since_ms:
-                # Nothing after where this page began: the listing is read.
-                whole = True
-                break
-            since_ms = newest
-        return [call for call in calls.values() if call.time_ms <= _ms(now)], unreadable, whole
+            if again:
+                if newest_ms is not None and newest_ms > reached_ms:
+                    # Later calls follow, so every call of that moment was shown.
+                    reached_ms = newest_ms
+                    continue
+                if len(items) < listing.largest:
+                    # A page shorter than another was is not full: nothing follows.
+                    return True, reached_ms
+                # It may be full of the one moment. What is after that moment?
+                of_one_moment, again = len(items), False
+                continue
+            if not items:
+                # A page that looked full of one moment of several calls, and
+                # nothing after it: more of that moment's calls may be hidden.
+                listing.cut = listing.cut or (of_one_moment is not None and of_one_moment >= 2)
+                return True, reached_ms
+            if newest_ms is None or newest_ms <= asked_ms:
+                # Items, and none that says it is later: no telling how far it reaches.
+                return False, reached_ms
+            # Calls follow a page that showed only one moment, so that page was
+            # full, and more of that moment's calls may be hidden behind it.
+            listing.cut = listing.cut or of_one_moment is not None
+            of_one_moment, again, reached_ms = None, True, newest_ms
+        return False, reached_ms
+
+    def _page(self, since_ms: int) -> "list[Listed]":
+        """One answer: what OpenMHz lists after a moment, on the talkgroups heard."""
+        body = fetch(
+            self._http,
+            "GET",
+            f"{API}/{self._system}/calls/newer",
+            source=SOURCE,
+            max_bytes=_MAX_LIST_BYTES,
+            params={
+                "time": str(since_ms),
+                "filter-type": "talkgroup",
+                "filter-code": ",".join(str(number) for number in sorted(self._talkgroups)),
+            },
+        )
+        return parse_items(read_json(body, SOURCE), self._talkgroups, self._media_hosts)
 
     def _audio(self, call: Call) -> bytes | None:
         """A call's audio as a WAV file Beacon made, or None for a call that is
@@ -490,31 +550,114 @@ class OpenMhzRadio:
         )
 
 
-def parse_calls(
+@dataclass(frozen=True)
+class Listed:
+    """One item of an OpenMHz answer, whatever could be made of it."""
+
+    # Names the item within a poll: its id, or a digest of it when it has none.
+    key: str
+    # When it says it was made, if it says so readably. How far a page reaches is
+    # read from this, for an item Beacon cannot use as for one it can.
+    time_ms: int | None
+    # The call, when the item is one on a talkgroup that is heard and can be read.
+    call: Call | None
+    # Whether it counts as unreadable. An item on another talkgroup does not.
+    unreadable: bool
+
+
+@dataclass
+class _Listing:
+    """What one poll read of the listing."""
+
+    # The moment the listing was read up to, going forward.
+    reached_ms: int
+    calls: dict[str, Call] = field(default_factory=dict)
+    unreadable: int = 0
+    _unreadable_keys: set[str] = field(default_factory=set)
+    # The most items one answer held, which tells a page that is not full.
+    largest: int = 0
+    # Whether calls may be hidden behind a page that was full of one moment.
+    cut: bool = False
+    # Whether everything from the start of the overlap to the listing's end was
+    # read, with nothing possibly hidden.
+    complete: bool = True
+
+    def take(self, items: "list[Listed]", asked_ms: int) -> None:
+        """Add a page's calls. A page that asks for a moment again lists items
+        again, and each call and each unreadable item is taken once."""
+        self.largest = max(self.largest, len(items))
+        for item in items:
+            if item.call is not None:
+                if item.call.time_ms > asked_ms:
+                    self.calls.setdefault(item.call.ref, item.call)
+            elif item.unreadable and item.key not in self._unreadable_keys:
+                self._unreadable_keys.add(item.key)
+                self.unreadable += 1
+
+
+def parse_items(
     payload: Any, talkgroups: Collection[int], media_hosts: Collection[str] = ()
-) -> tuple[list[Call], int]:
-    """The calls of a `/calls/newer` answer on the talkgroups that are heard, and
-    how many of its calls could not be read. A call on another talkgroup is left out
-    and not counted. A call whose audio is somewhere other than on OpenMHz's own
-    hosts or `media_hosts`, over HTTPS, is counted as unreadable: its audio is not
-    fetched from wherever an answer points.
+) -> list[Listed]:
+    """Every item of a `/calls/newer` answer. An item on a talkgroup that is heard
+    is a call when it can be read, and unreadable when it cannot. A call whose
+    audio is somewhere other than on OpenMHz's own hosts or `media_hosts`, over
+    HTTPS, is unreadable: its audio is not fetched from wherever an answer points.
+    An item on another talkgroup is neither.
 
     Raises SourceError when the answer is not a calls object."""
     listed = payload.get("calls") if isinstance(payload, dict) else None
     if not isinstance(listed, list):
         raise_bare(SourceError(SOURCE, "sent a reply Beacon cannot read"))
-    calls: list[Call] = []
-    unreadable = 0
+    items: list[Listed] = []
     for item in listed:
-        talkgroup = item.get("talkgroupNum") if isinstance(item, dict) else None
-        if _is_talkgroup(talkgroup) and talkgroup not in talkgroups:
-            continue
-        call = _call(item, talkgroup, media_hosts) if _is_talkgroup(talkgroup) else None
-        if call is None:
-            unreadable += 1
-        else:
-            calls.append(call)
-    return calls, unreadable
+        fields = item if isinstance(item, dict) else {}
+        talkgroup = fields.get("talkgroupNum")
+        heard = not _is_talkgroup(talkgroup) or talkgroup in talkgroups
+        call = None
+        if heard and _is_talkgroup(talkgroup):
+            call = _call(fields, talkgroup, media_hosts)
+        ref = fields.get("_id")
+        items.append(
+            Listed(
+                key=ref if isinstance(ref, str) and _CALL_ID.fullmatch(ref) else _digest(item),
+                time_ms=_time_ms(fields.get("time")),
+                call=call,
+                unreadable=heard and call is None,
+            )
+        )
+    return items
+
+
+def parse_calls(
+    payload: Any, talkgroups: Collection[int], media_hosts: Collection[str] = ()
+) -> tuple[list[Call], int]:
+    """The calls of a `/calls/newer` answer on the talkgroups that are heard, and
+    how many of its items could not be read. See `parse_items`.
+
+    Raises SourceError when the answer is not a calls object."""
+    items = parse_items(payload, talkgroups, media_hosts)
+    calls = [item.call for item in items if item.call is not None]
+    return calls, sum(item.unreadable for item in items)
+
+
+def _time_ms(time: Any) -> int | None:
+    """When an item says it was made, or None when it does not say so readably."""
+    if not isinstance(time, str) or len(time) > 40:
+        return None
+    try:
+        moment = datetime.fromisoformat(time)
+    except ValueError:
+        return None
+    return None if moment.utcoffset() is None else _ms(moment)
+
+
+def _digest(item: Any) -> str:
+    """A name for an item that has no usable id, the same each time it is listed."""
+    try:
+        text = json.dumps(item, sort_keys=True)
+    except (TypeError, ValueError):
+        text = repr(item)
+    return "#" + hashlib.sha256(text.encode()).hexdigest()[:32]
 
 
 def _call(item: dict[str, Any], talkgroup: int, media_hosts: Collection[str]) -> Call | None:
@@ -558,12 +701,12 @@ def _is_audio_address(url: str, media_hosts: Collection[str]) -> bool:
 
 
 def _progress(saved: dict[str, Any], now: datetime) -> _Progress:
-    """What the poller saved last. With nothing saved it begins now, which has the
-    first poll ask for the last `OVERLAP`, and it never goes back further than
-    `MAX_AGE`."""
+    """What the poller saved last. With nothing saved it begins `OVERLAP` ago, so
+    the first poll hears the calls of the last few minutes and not the archive, and
+    it never goes back further than `MAX_AGE`."""
     after_ms, held, run = saved.get("after_ms"), saved.get("held_until"), saved.get("unusable_run")
     if isinstance(after_ms, bool) or not isinstance(after_ms, int):
-        after_ms = _ms(now)
+        after_ms = _ms(now - OVERLAP)
     held_until = None
     if isinstance(held, str):
         with contextlib.suppress(ValueError):

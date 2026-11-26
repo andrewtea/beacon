@@ -603,9 +603,11 @@ def test_each_source_is_asked_with_the_settings_the_environment_holds(
 
 @pytest.fixture(autouse=True)
 def an_ffmpeg_that_can_be_confined(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Building a poller for real radio tries ffmpeg out, confined. These tests are
-    about the settings, on any machine; `test_radio_audio` is about ffmpeg."""
+    """Building a poller for real radio tries ffmpeg out, confined, and reads where
+    the host sends core dumps. These tests are about the settings, on any machine;
+    `test_radio_audio` is about ffmpeg and the host."""
     monkeypatch.setattr(Ffmpeg, "problem", lambda self: None)
+    monkeypatch.setattr("beacon.ingest.setup.core_dump_problem", lambda: None)
 
 
 RADIO = {
@@ -682,6 +684,39 @@ def test_radio_is_not_polled_for_real_where_its_audio_cannot_be_converted(
 
     # Refused before a client that can spend was built.
     assert not (Path(env["BEACON_DATA_DIR"]) / "ember").exists()
+
+
+def test_radio_is_not_polled_for_real_on_a_host_that_pipes_core_dumps_to_a_collector(
+    env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+    monkeypatch.setattr(
+        "beacon.ingest.setup.core_dump_problem",
+        lambda: "This host pipes core dumps to a collector.",
+    )
+    before = resource.getrlimit(resource.RLIMIT_CORE)
+
+    with pytest.raises(
+        IngestConfigError,
+        match=r"^BEACON_LIVE_SOURCES names openmhz\. This host pipes core dumps",
+    ):
+        build(env | RADIO)
+
+    # Refused before a client that can spend was built, and nothing was changed.
+    assert not (Path(env["BEACON_DATA_DIR"]) / "ember").exists()
+    assert resource.getrlimit(resource.RLIMIT_CORE) == before
+
+
+def test_the_decoder_of_real_radio_is_kept_from_beacons_data_directory(
+    env: dict[str, str], time: Time, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+
+    ingest = build(env | RADIO, Clock(time))
+
+    (radio,) = ingest.paid
+    assert radio._transcoder._hidden == (Path(env["BEACON_DATA_DIR"]),)
+    ingest.close()
 
 
 def test_naming_radio_builds_its_poller_with_a_live_ember_under_its_budget_and_asks_nothing(

@@ -62,8 +62,9 @@ class PaidWork(Protocol):
     starts a paid request nor loses the answer to one that is out."""
 
     def close(self) -> None:
-        """Start no more paid work, and call off work that has cost nothing yet.
-        When it returns, no paid request is sent that was not already out."""
+        """Admit no more paid work, and call off work that has cost nothing yet.
+        Work that was admitted before goes on, and can send its paid request after
+        this returns: only `drain` says when none is left."""
         ...
 
     def drain(self, timeout: float) -> bool:

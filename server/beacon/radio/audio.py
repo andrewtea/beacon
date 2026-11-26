@@ -14,18 +14,27 @@ comes from the internet, so the decoder is given as little as can be:
   exists only in memory (`memfd_create`, a Linux feature), and what ffmpeg makes of
   it comes back through a pipe.
 - **ffmpeg runs confined**, by bubblewrap (`bwrap`): in namespaces of its own, with
-  no network, an empty environment, and a file system that is the system's programs
-  and libraries, read-only, and nothing else. Beacon's data, its keys, and the
-  user's files are not there to be read. Inside, limits keep it from writing a file
-  of any size or a core dump, and bound its memory, its processor time, and its
-  open files; outside, a clock and a size limit bound how long it runs and how much
-  it answers.
+  no network, an empty environment, and a file system that is the directories a
+  system keeps its programs and their libraries in (`_SYSTEM_DIRS`), read-only, and
+  nothing else. `/usr/local`, `/usr/share`, `/opt`, `/etc`, `/home`, and `/var` are
+  not there, so neither are Beacon's data, its keys, or the user's files; a path
+  that is named as `hidden`, as Beacon's data directory is, is covered over even
+  if it lies inside one of those directories. What is left to see is the system's
+  own programs and libraries, which are taken to hold no secret. Inside, limits
+  keep ffmpeg from writing a file of any size, and bound its memory, its processor
+  time, and its open files; outside, a clock and a size limit bound how long it
+  runs and how much it answers.
 
-What that does not cover, and an operator has to: memory can be written to disk by
-the system itself, as swap, or as a core dump of Beacon's own process, which holds
-the call while it is worked on. Run live radio with swap off or encrypted.
-`beacon.ingest.setup` turns Beacon's own core dumps off when it builds a poller for
-real radio.
+What that does not cover is memory that the system itself writes to a disk, and an
+operator has to see to both kinds:
+
+- **Swap.** Run live radio with swap off or encrypted. Nothing here checks it.
+- **Core dumps.** Beacon's own process and ffmpeg both run with a core size limit
+  of nothing, which stops a core that is written to a file. Linux ignores that
+  limit when cores are piped to a collector (`kernel.core_pattern` beginning with
+  `|`, as systemd-coredump and apport set it), and a collector runs on the host,
+  outside any confinement. `core_dump_problem` reads the setting, and
+  `beacon.ingest.setup` refuses to hear real radio on a host that pipes cores.
 
 On a system without `memfd_create` or without a working `bwrap`, nothing is
 converted. The mock scenario's calls are WAV and need no ffmpeg anywhere.
@@ -33,11 +42,14 @@ converted. The mock scenario's calls are WAV and need no ffmpeg anywhere.
 
 import io
 import os
+import resource
 import shutil
 import struct
 import subprocess
 import threading
 import wave
+from collections.abc import Iterable
+from pathlib import Path
 from typing import Literal, Protocol
 
 from beacon.errors import raise_bare
@@ -70,8 +82,23 @@ _LIMITS = (
     f"ulimit -c 0 && ulimit -f 0 && ulimit -t {_TIMEOUT_SECONDS} && "
     f'ulimit -v {_MEMORY_KB} && ulimit -n {_OPEN_FILES} && exec "$@"'
 )
-# Where a system keeps its programs and libraries. ffmpeg sees these, read-only.
-_SYSTEM_DIRS = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32")
+# Where a system keeps its programs and their libraries, and nobody keeps anything
+# of their own. ffmpeg sees these, read-only, and no other directory: not the rest
+# of /usr, where /usr/local and /usr/share are.
+_SYSTEM_DIRS = (
+    "/usr/bin",
+    "/usr/lib",
+    "/usr/lib32",
+    "/usr/lib64",
+    "/usr/libx32",
+    "/bin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+)
+# The kernel's setting for where a core dump goes.
+CORE_PATTERN = Path("/proc/sys/kernel/core_pattern")
 # What the dynamic loader reads to find a library.
 _LOADER_FILES = ("/etc/ld.so.cache", "/etc/alternatives")
 
@@ -166,19 +193,58 @@ def pcm_to_wav(pcm: bytes) -> bytes:
     return out.getvalue()
 
 
-def confinement(bwrap: str) -> list[str]:
+def core_dump_problem(pattern: Path = CORE_PATTERN) -> str | None:
+    """Why a crash could leave radio audio on a disk on this host, in a sentence,
+    or None. A core size limit of nothing, which `forbid_core_dumps` and the
+    confinement set, stops a core that is written to a file. Linux ignores the
+    limit when cores are piped to a collector, so a host that pipes them is a
+    problem, and so is one whose setting cannot be read."""
+    try:
+        setting = pattern.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return (
+            f"Where this host sends core dumps ({pattern}) cannot be read, so nothing "
+            "says that a crash would leave no radio audio on a disk."
+        )
+    if setting.lstrip().startswith("|"):
+        return (
+            "This host pipes core dumps to a collector (kernel.core_pattern begins with "
+            "|), which ignores the limit Beacon sets and could keep radio audio from a "
+            "crash. Set kernel.core_pattern to a file name, such as core."
+        )
+    return None
+
+
+def forbid_core_dumps() -> None:
+    """Set this process's core size limit to nothing. See `core_dump_problem` for
+    the hosts on which that is not enough."""
+    resource.setrlimit(resource.RLIMIT_CORE, (0, resource.getrlimit(resource.RLIMIT_CORE)[1]))
+
+
+def confinement(bwrap: str, hidden: Iterable[Path] = ()) -> list[str]:
     """The start of a command that runs the rest of it confined: no network, no
-    environment, the system's programs and libraries read-only and no other file,
-    and the limits of `_LIMITS`. The module's docstring says why."""
+    environment, the system's program and library directories read-only and no
+    other file, the paths in `hidden` covered over where they lie inside those
+    directories, and the limits of `_LIMITS`. The module's docstring says why."""
     command = [bwrap, "--unshare-all", "--die-with-parent", "--new-session", "--clearenv"]
+    shown = []
     for directory in _SYSTEM_DIRS:
         if os.path.islink(directory):
             # /bin is usr/bin on most systems, and is made the same link inside.
             command += ["--symlink", os.readlink(directory), directory]
         elif os.path.isdir(directory):
             command += ["--ro-bind", directory, directory]
+            shown.append(directory)
     for file in _LOADER_FILES:
         command += ["--ro-bind-try", file, file]
+    for path in hidden:
+        private = os.path.realpath(path)
+        if not any(_is_inside(private, directory) for directory in shown):
+            continue
+        if os.path.isdir(private):
+            command += ["--tmpfs", private]
+        elif os.path.exists(private):
+            command += ["--ro-bind", "/dev/null", private]
     # /proc is the confined process's own, and is how it opens the call it is handed.
     command += ["--proc", "/proc", "--dev", "/dev", "--chdir", "/", "--"]
     return [*command, "/bin/sh", "-c", _LIMITS, "sh"]
@@ -188,10 +254,15 @@ class Ffmpeg:
     """Converts with the `ffmpeg` program, confined by `bwrap`. Both have to be
     installed, and the system has to be Linux; `problem` says when they are not."""
 
-    def __init__(self, executable: str = "ffmpeg", *, bwrap: str = "bwrap") -> None:
+    def __init__(
+        self, executable: str = "ffmpeg", *, bwrap: str = "bwrap", hidden: Iterable[Path] = ()
+    ) -> None:
+        """`hidden` are paths ffmpeg is not to see even if they lie inside a
+        directory it is shown: Beacon's data directory, for one."""
         # Found once, and run by their full paths: the confined shell has no PATH.
         self._ffmpeg = _program(executable)
         self._bwrap = _program(bwrap)
+        self._hidden = tuple(Path(path) for path in hidden)
         # Guards `_closed` and `_running`, the conversion that is under way.
         self._lock = threading.Lock()
         self._closed = False
@@ -204,17 +275,19 @@ class Ffmpeg:
             return "Radio audio is converted in memory, which needs Linux."
         if self._ffmpeg is None:
             return "Radio audio is converted by ffmpeg, which is not installed."
-        if not _is_system_file(self._ffmpeg):
+        if not _is_system_file(self._ffmpeg) or any(
+            _is_inside(self._ffmpeg, os.path.realpath(path)) for path in self._hidden
+        ):
             return (
                 "Radio audio is converted by an ffmpeg that is confined to the system's "
-                "own directories, and the one installed is outside them. Install the "
-                "system's package."
+                "own program directories, and the one installed is outside them. Install "
+                "the system's package."
             )
         if self._bwrap is None:
             return "ffmpeg is run confined by bubblewrap (bwrap), which is not installed."
         try:
             trial = subprocess.run(
-                [*confinement(self._bwrap), self._ffmpeg, "-version"],
+                [*confinement(self._bwrap, self._hidden), self._ffmpeg, "-version"],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -252,7 +325,7 @@ class Ffmpeg:
             os.lseek(clip, 0, os.SEEK_SET)
             pcm = self._run(
                 [
-                    *confinement(self._bwrap),
+                    *confinement(self._bwrap, self._hidden),
                     self._ffmpeg,
                     "-nostdin",
                     "-hide_banner",
@@ -349,7 +422,12 @@ def _program(name: str) -> str | None:
 def _is_system_file(path: str) -> bool:
     """Whether a file is in one of the directories the confinement lets be seen."""
     return any(
-        path.startswith(os.path.realpath(directory) + "/")
+        _is_inside(path, os.path.realpath(directory))
         for directory in _SYSTEM_DIRS
         if os.path.isdir(directory)
     )
+
+
+def _is_inside(path: str, directory: str) -> bool:
+    """Whether a path is a directory or something in it. Both are real paths."""
+    return path == directory or path.startswith(directory.rstrip("/") + "/")

@@ -22,6 +22,7 @@ from beacon.ember import (
     EmberClosedError,
     EmberError,
     LedgerReplacedError,
+    Pacer,
     Storage,
     fake_response,
 )
@@ -32,8 +33,8 @@ from beacon.ingest.http import SourceHttp
 from beacon.ingest.openmhz import (
     HELD_INTERVAL_SECONDS,
     MAX_CALLS_PER_POLL,
-    MAX_PAGES,
     OVERLAP,
+    SCAN_PAGES,
     UNUSABLE_RUN_LIMIT,
     OpenMhzRadio,
     parse_calls,
@@ -94,6 +95,8 @@ class Radio:
         self.page_size = 1000
         # What Ember's client refuses a call with before anything is sent, by its audio.
         self.refused: dict[bytes, Exception] = {}
+        # When a call was made, for a call whose own `time` field does not say.
+        self.times: dict[str, datetime] = {}
 
     def call(
         self,
@@ -140,10 +143,9 @@ class Radio:
                 (
                     call
                     for call in self.calls
-                    if datetime.fromisoformat(call["time"]).timestamp() * 1000 > after
-                    and call["talkgroupNum"] in wanted
+                    if ms(self.made(call)) > after and call["talkgroupNum"] in wanted
                 ),
-                key=lambda call: call["time"],
+                key=self.made,
             )[: self.page_size]
             # Newest first, as its site lists them.
             return httpx2.Response(200, json={"calls": listed[::-1], "direction": "newer"})
@@ -151,6 +153,11 @@ class Radio:
         if isinstance(clip, int):
             return httpx2.Response(clip, text=f"No audio for Jane Doe at {url}")
         return httpx2.Response(200, content=clip)
+
+    def made(self, call: dict[str, Any]) -> datetime:
+        """When a call was made, which is how the stand-in orders its listing,
+        whatever the call's own `time` field was changed to say."""
+        return self.times.get(call["_id"]) or datetime.fromisoformat(call["time"])
 
     def ember(self, body: dict[str, Any]) -> dict[str, Any]:
         (message,) = body["input"]
@@ -350,10 +357,15 @@ def test_what_a_call_named_reaches_no_row_no_file_and_no_log(
         stored = json.dumps(db.execute("SELECT * FROM evidence").fetchall())
         stored += json.dumps(db.execute("SELECT * FROM poller_state").fetchall())
         stored += json.dumps(db.execute("SELECT * FROM claims").fetchall())
-    for word in (*PRIVATE, "BP", "180", "ANN", "One Two"):
+    # Whole forms, as they were said and as their shape would be stored: a number as
+    # short as 180 turns up by chance in a file's hashes.
+    for word in (*PRIVATE, "BP180", "BP 180", "ANN72", "Ann 72", "One Two"):
         assert word not in on_disk
         assert word not in stored
         assert word not in caplog.text
+    # What is kept of the calls holds no trace of the reading or the age.
+    for number in ("180", "72"):
+        assert number not in json.dumps([row.data for row in store.search()])
     assert "1458" not in stored
     # The audio is not kept, as it came or as it was sent to Ember.
     assert tone(1)[44:108].decode("latin-1") not in on_disk
@@ -399,16 +411,16 @@ def test_a_call_is_heard_once_however_often_it_is_listed(
     assert refs(store) == ["call0001", "call0002", "call0003"]
     assert radio.asked == [tone(1), tone(2), tone(3)]
     assert radio.downloads == ["call0001", "call0002", "call0003"]
-    # Each poll asks again for the five minutes before where it had got to, which
-    # is where it began until a call is newer than that, and then for whatever is
-    # after the newest call it was shown.
+    # Each poll reads again from five minutes before the newest call it finished
+    # with, and then asks for the moment of the newest call it was shown once more:
+    # a page shorter than the one before shows that nothing follows.
     assert [int(request.url.params["time"]) for request in radio.listings] == [
         ms(NOON - OVERLAP) - 1,
-        ms(seconds(-10)),
-        ms(NOON - OVERLAP) - 1,
-        ms(seconds(20)),
+        ms(seconds(-10)) - 1,
+        ms(seconds(-10) - OVERLAP) - 1,
+        ms(seconds(20)) - 1,
         ms(seconds(20) - OVERLAP) - 1,
-        ms(seconds(20)),
+        ms(seconds(20)) - 1,
     ]
 
 
@@ -443,7 +455,7 @@ def test_calls_already_taken_take_no_place_among_the_calls_a_poll_may_hear(
     assert len(radio.asked) == MAX_CALLS_PER_POLL + 1
 
 
-def test_a_listing_is_read_in_pages_until_one_brings_nothing_newer(
+def test_a_listing_is_read_in_pages_until_one_shows_that_nothing_follows(
     store: EvidenceStore, radio: Radio, poller: OpenMhzRadio
 ) -> None:
     radio.page_size = 2
@@ -453,29 +465,109 @@ def test_a_listing_is_read_in_pages_until_one_brings_nothing_newer(
     report = poller.poll(store, NOON)
 
     assert (report.added, report.partial) == (5, False)
-    # Three pages of calls, and one that was empty.
+    # Each page asks for the moment of the newest call of the page before again,
+    # and the last, with one call where two would fit, ends the listing.
     assert [int(request.url.params["time"]) for request in radio.listings] == [
         ms(NOON - OVERLAP) - 1,
-        ms(seconds(-58)),
-        ms(seconds(-56)),
-        ms(seconds(-55)),
+        ms(seconds(-58)) - 1,
+        ms(seconds(-57)) - 1,
+        ms(seconds(-56)) - 1,
+        ms(seconds(-55)) - 1,
     ]
 
 
-def test_a_listing_longer_than_a_poll_reads_is_reported_as_partial(
+def test_a_listing_longer_than_a_poll_reads_is_partial_and_every_poll_moves_forward(
+    store: EvidenceStore, radio: Radio, poller: OpenMhzRadio
+) -> None:
+    radio.page_size = 2
+    for number in range(1, 25):
+        radio.call(number, seconds(-60 + number))
+
+    polls = [poller.poll(store, seconds(30 * count)) for count in range(4)]
+
+    # A poll reads at most twelve pages, half of them from where it had got to
+    # before, so reading the overlap again never keeps it from the calls after it.
+    assert [(poll.added, poll.partial) for poll in polls] == [
+        (13, True),
+        (6, True),
+        (5, True),
+        (0, True),
+    ]
+    assert max(len(radio.listings[start : start + 12]) for start in range(0, 48, 12)) <= 12
+    assert len(radio.listings) <= 4 * 2 * SCAN_PAGES
+    assert refs(store) == [f"call{number:04d}" for number in range(1, 25)]
+    assert len(radio.asked) == 24
+
+
+def test_calls_that_share_a_moment_are_all_heard_though_a_page_ends_among_them(
+    store: EvidenceStore, radio: Radio, poller: OpenMhzRadio
+) -> None:
+    radio.page_size = 4
+    radio.call(1, seconds(-50))
+    radio.call(2, seconds(-40))
+    radio.call(3, seconds(-30))
+    radio.call(4, seconds(-30), talkgroup=TACTICAL)
+    radio.call(5, seconds(-30), talkgroup=EMS)
+    radio.call(6, seconds(-20))
+
+    report = poller.poll(store, NOON)
+
+    # The first page ends inside the moment three calls share. Asking for that
+    # moment again shows all three and the call after them, which proves that no
+    # more of them are hidden.
+    assert (report.added, report.partial) == (6, False)
+    assert len(radio.asked) == 6
+
+
+def test_a_page_full_of_one_moment_is_reported_as_partial(
+    store: EvidenceStore, radio: Radio, poller: OpenMhzRadio
+) -> None:
+    radio.page_size = 2
+    for number, talkgroup in enumerate((FIRE, TACTICAL, EMS, FIRE), start=1):
+        radio.call(number, seconds(-30), talkgroup=talkgroup)
+
+    report = poller.poll(store, NOON)
+
+    # Two of the four are all the listing will show, and nothing says so but a
+    # page as full as a page gets, of calls of one moment. That is not "all read".
+    assert (report.added, report.partial) == (2, True)
+
+    # A later call does not prove it either: it only shows that the page was full.
+    radio.call(9, seconds(10))
+    report = poller.poll(store, seconds(30))
+    assert (report.added, report.partial) == (1, True)
+
+
+def test_a_page_of_calls_beacon_cannot_use_does_not_hide_the_calls_after_it(
+    store: EvidenceStore, radio: Radio, poller: OpenMhzRadio
+) -> None:
+    radio.page_size = 2
+    elsewhere = "https://calls.example.org/sfp25/call.m4a"
+    radio.call(1, seconds(-50), url=elsewhere)
+    radio.call(2, seconds(-40), url=elsewhere)
+    radio.call(3, seconds(-30))
+    radio.call(4, seconds(-20))
+
+    report = poller.poll(store, NOON)
+
+    # How far a page reaches is read from the times of what it lists, usable or
+    # not, and each unusable item is counted once however often it is listed.
+    assert (report.added, report.unreadable, report.partial) == (2, 2, False)
+    assert refs(store) == ["call0003", "call0004"]
+
+
+def test_a_page_that_does_not_say_how_far_it_reaches_is_reported_as_partial(
     store: EvidenceStore, radio: Radio, poller: OpenMhzRadio
 ) -> None:
     radio.page_size = 1
-    for number in range(1, MAX_PAGES + 3):
-        radio.call(number, seconds(-60 + number))
+    radio.call(1, seconds(-30), time="half past seven")
+    radio.call(2, seconds(-20))
+    # The stand-in lists by the time it was given, so the item with no time is first.
+    radio.times = {"call0001": seconds(-30)}
 
-    first = poller.poll(store, NOON)
+    report = poller.poll(store, NOON)
 
-    assert (first.added, first.partial) == (MAX_PAGES, True)
-    # The rest at the next poll: the calls already taken do not hold it back.
-    radio.page_size = 100
-    second = poller.poll(store, seconds(30))
-    assert (second.added, second.partial) == (2, False)
+    assert (report.added, report.unreadable, report.partial) == (0, 1, True)
 
 
 def test_a_call_too_short_or_too_long_to_be_worth_hearing_is_not_paid_for(
@@ -658,7 +750,7 @@ def test_calls_that_grew_old_while_the_poller_was_held_are_not_bought_as_a_backl
     report = poller.poll(store, seconds(180 * 60))
 
     # Only the last fifteen minutes are asked for.
-    asked_from = int(radio.listings[2].url.params["time"])
+    asked_from = int(radio.listings[3].url.params["time"])
     assert asked_from == ms(seconds(165 * 60)) - 1
     assert report.added == 16
     assert refs(store)[1] == "call0166"
@@ -1114,6 +1206,10 @@ def test_real_radio_is_not_handed_to_a_stand_in_for_ember(
     # A client that only replays hears nothing at all: a radio call is never recorded.
     with pytest.raises(ValueError, match="a stand-in's by a fake one"):
         OpenMhzRadio(stand_in, EmberClient.replay_only(storage), talkgroups=(FIRE,), known=KNOWN)
+    # A client that tries a call again after a 429 would send a claimed call twice.
+    paced = EmberClient.live(storage, api_key="test-key", pacer=Pacer(3000))
+    with pytest.raises(ValueError, match="makes each call once: no pacer"):
+        OpenMhzRadio(SourceHttp(), paced, talkgroups=(FIRE,), known=KNOWN)
 
 
 def test_the_pollers_origin_is_its_clients_and_cannot_be_set(poller: OpenMhzRadio) -> None:

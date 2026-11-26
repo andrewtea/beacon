@@ -36,7 +36,6 @@ the pollers that failed in it poll again.
 
 import logging
 import re
-import resource
 import threading
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
@@ -53,7 +52,7 @@ from beacon.ingest.openmhz import OpenMhzRadio
 from beacon.ingest.opensky import SIGNED_IN_INTERVAL_SECONDS, OpenSkyAircraft
 from beacon.ingest.runner import Clock, PaidWork, Poller, PollerStatus, Runner
 from beacon.ingest.traffic511 import Traffic511
-from beacon.radio import Ffmpeg, Known
+from beacon.radio import Ffmpeg, Known, core_dump_problem, forbid_core_dumps
 from beacon.radio.vocabulary import read_names
 from beacon.scenario import DURATION, Scenario, scenario_transport, stand_in_ember
 from beacon.scenario import radio as scenario_radio
@@ -219,10 +218,12 @@ class Ingest:
         the store is closed, and the thread is given `timeout` seconds to end. A
         poll is stored whole or not at all, so nothing is left half done.
 
-        Whatever it answers, once this returns no source is asked, no paid request
-        is begun, and no row is stored. When it answers False with a paid request
-        still out, that request is settled in the Ember ledger when it ends, its
-        row is lost, and its call is never asked about again."""
+        Only True is a stop that is complete. Whatever it answers, once this
+        returns no source is asked, no new paid work is admitted, and no row is
+        stored. When it answers False, work that was admitted before the stop is
+        still out: its paid request can still be sent, and paid for, after this
+        returns. It is settled in the Ember ledger when it ends, its row is lost,
+        and its call stays claimed and is never asked about again."""
         self._stop.set()
         for work in self.paid:
             work.close()
@@ -361,7 +362,8 @@ def _radio_poller(env: Mapping[str, str], http: SourceHttp) -> OpenMhzRadio:
     """The poller for real radio, heard by a live Ember under a budget of its own.
 
     Raises IngestConfigError when permission, the talkgroups, the budget, a live
-    Ember, or a confined ffmpeg is missing, or a list of names cannot be read."""
+    Ember, or a confined ffmpeg is missing, when the host pipes core dumps to a
+    collector, or when a list of names cannot be read."""
     names = f"{LIVE_SOURCES_VARIABLE} names openmhz"
     if env.get(OPENMHZ_PERMITTED_VARIABLE) != "1":
         raise IngestConfigError(
@@ -394,8 +396,10 @@ def _radio_poller(env: Mapping[str, str], http: SourceHttp) -> OpenMhzRadio:
             "hearing radio may cost over every run. It has no default, because every "
             "call is paid for."
         )
-    transcoder = Ffmpeg()
-    problem = transcoder.problem()
+    # ffmpeg is shown the system's programs and nothing of Beacon's, wherever
+    # Beacon's data happens to be kept.
+    transcoder = Ffmpeg(hidden=[default_data_dir(env)])
+    problem = transcoder.problem() or core_dump_problem()
     if problem is not None:
         raise IngestConfigError(f"{names}. {problem}")
     known = _known(env)
@@ -405,8 +409,9 @@ def _radio_poller(env: Mapping[str, str], http: SourceHttp) -> OpenMhzRadio:
             f"{names}, and a radio call is heard by a live Ember and cannot be replayed: "
             "set REPLAY=0, MODEL_API_KEY, and EMBER_SPENT_BEFORE_USD."
         )
-    # This process will hold real radio audio in memory. It leaves no core dump.
-    resource.setrlimit(resource.RLIMIT_CORE, (0, resource.getrlimit(resource.RLIMIT_CORE)[1]))
+    # This process will hold real radio audio in memory. It writes no core file,
+    # and the host was just seen not to pipe cores to a collector.
+    forbid_core_dumps()
     return OpenMhzRadio(
         http,
         ember,

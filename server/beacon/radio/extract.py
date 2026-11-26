@@ -105,8 +105,9 @@ _QUESTION = "Fill in the form for this radio call."
 
 
 class ExtractionError(Exception):
-    """Ember answered, and the answer is not a form. The text is fixed and says
-    nothing of the call or the answer. The call was made, and may have been paid for."""
+    """Ember answered, and the answer is not a form with all its fields. The text
+    is fixed and says nothing of the call or the answer. The call was made, and may
+    have been paid for."""
 
 
 @dataclass(frozen=True)
@@ -273,11 +274,16 @@ def read_form(
 
 
 def _form(text: str) -> dict[str, Any] | None:
+    """Ember's answer as a form with every field the form has, or None. An object
+    that lacks a field is no form: `{}` says nothing about a call, and is not to be
+    kept as a call that nothing was heard in."""
     try:
         form = json.loads(text)
     except ValueError:
         return None
-    return form if isinstance(form, dict) else None
+    if not isinstance(form, dict) or not set(SCHEMA["required"]) <= form.keys():
+        return None
+    return form
 
 
 def _one_of(value: Any, allowed: tuple[str, ...], otherwise: str) -> str:

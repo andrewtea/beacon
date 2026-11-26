@@ -16,11 +16,14 @@ from pathlib import Path
 import pytest
 
 from beacon.radio import AudioError, ConversionStopped, Ffmpeg, plain_wav
+from beacon.radio import audio as audio_module
 from beacon.radio.audio import (
     MAX_SECONDS,
     SAMPLE_RATE,
     confinement,
     container,
+    core_dump_problem,
+    forbid_core_dumps,
     pcm_to_wav,
     wav_seconds,
 )
@@ -236,6 +239,106 @@ def test_ffmpeg_is_confined_to_the_systems_programs_with_no_network_and_no_room_
     assert [line for line in seen.splitlines() if line.startswith("interface=")] == ["interface=lo"]
     assert "core=0 file=0 time=30 memory=1048576 open=64" in seen
     assert "wrote=0" not in seen
+
+
+@needs_ffmpeg
+def test_ffmpeg_is_shown_the_program_directories_and_not_the_rest_of_usr() -> None:
+    bwrap = shutil.which("bwrap")
+    assert bwrap is not None
+
+    seen = subprocess.run(
+        [*confinement(bwrap), "/bin/sh", "-c", "ls -d /usr/* /etc/* /opt /var /home /root"],
+        capture_output=True,
+        text=True,
+        env={},
+        cwd="/",
+        check=False,
+    ).stdout.split()
+
+    # Where programs and their libraries are, and what the loader reads. Not
+    # /usr/local or /usr/share, where a deployment can keep things of its own.
+    assert set(seen) <= {
+        "/usr/bin",
+        "/usr/lib",
+        "/usr/lib32",
+        "/usr/lib64",
+        "/usr/libx32",
+        "/etc/ld.so.cache",
+        "/etc/alternatives",
+    }
+    assert "/usr/bin" in seen
+
+
+@needs_ffmpeg
+def test_a_path_that_is_hidden_is_covered_over_inside_a_directory_ffmpeg_is_shown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A deployment that keeps Beacon's data under a directory the decoder sees.
+    data = tmp_path / "lib" / "beacon-data"
+    data.mkdir(parents=True)
+    (data / "ledger.sqlite3").write_text("private")
+    (tmp_path / "lib" / "libshared.so").write_text("a library")
+    monkeypatch.setattr(
+        "beacon.radio.audio._SYSTEM_DIRS", (*audio_module._SYSTEM_DIRS, str(tmp_path / "lib"))
+    )
+    bwrap = shutil.which("bwrap")
+    assert bwrap is not None
+
+    def look(hidden: list[Path]) -> str:
+        return subprocess.run(
+            [*confinement(bwrap, hidden), "/bin/sh", "-c", f"ls {tmp_path}/lib {data}"],
+            capture_output=True,
+            text=True,
+            env={},
+            cwd="/",
+            check=False,
+        ).stdout
+
+    assert "ledger.sqlite3" in look([])
+    covered = look([data])
+    assert "ledger.sqlite3" not in covered
+    assert "libshared.so" in covered
+    # A path outside what is shown needs no covering, and adds nothing to the command.
+    assert confinement(bwrap, [Path("/home/somebody/data")]) == confinement(bwrap)
+
+
+@pytest.mark.parametrize(
+    ("setting", "problem"),
+    [
+        ("core\n", None),
+        ("/var/crash/core.%p\n", None),
+        # Piped to a collector, which Linux hands the core whatever the limit is.
+        ("|/usr/lib/systemd/systemd-coredump %P %u %g %s %t %c %h\n", "pipes core dumps"),
+        ("|/usr/share/apport/apport -p%p -s%s -c%c\n", "pipes core dumps"),
+        (" |/bin/false\n", "pipes core dumps"),
+    ],
+)
+def test_a_host_that_pipes_core_dumps_to_a_collector_is_a_problem(
+    tmp_path: Path, setting: str, problem: str | None
+) -> None:
+    pattern = tmp_path / "core_pattern"
+    pattern.write_text(setting)
+
+    found = core_dump_problem(pattern)
+
+    assert (found is None) if problem is None else (problem in (found or ""))
+
+
+def test_a_host_whose_core_dump_setting_cannot_be_read_is_a_problem(tmp_path: Path) -> None:
+    found = core_dump_problem(tmp_path / "no-such-setting")
+
+    assert found is not None
+    assert "cannot be read" in found
+
+
+def test_this_process_can_be_kept_from_writing_a_core_file() -> None:
+    resource = pytest.importorskip("resource")
+    before = resource.getrlimit(resource.RLIMIT_CORE)
+    try:
+        forbid_core_dumps()
+        assert resource.getrlimit(resource.RLIMIT_CORE)[0] == 0
+    finally:
+        resource.setrlimit(resource.RLIMIT_CORE, before)
 
 
 @needs_ffmpeg

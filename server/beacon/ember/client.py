@@ -324,7 +324,7 @@ class EmberClient:
                 # caller makes.
                 max_retries=0,
                 timeout=REQUEST_TIMEOUT_SECONDS,
-                http_client=http_client,
+                http_client=_without_redirects(http_client),
             )
         )
         self._responder = responder
@@ -433,20 +433,31 @@ class EmberClient:
             return "live"
         return "replay" if self._responder is None else "fake"
 
+    @property
+    def retries(self) -> bool:
+        """Whether the client makes a call again after the API answers 429, which a
+        client with a pacer does. Each attempt is a paid request of its own."""
+        return self._pacer is not None
+
     def close(self) -> None:
-        """Answer no more calls, for a process that is shutting down. When this
-        returns, no paid request is sent that was not already out: a call that had
-        not sent its paid request, one that is still counting its tokens included,
-        raises EmberClosedError and costs nothing. A paid request that is out is not
-        called off, because it may be paid for whatever is done here; `drain` waits
-        for it."""
+        """Admit no more paid requests, for a process that is shutting down. A call
+        is admitted at the last check before its paid request, after its tokens are
+        counted. When this returns, a call that had not been admitted raises
+        EmberClosedError and costs nothing.
+
+        A call that had been admitted goes on: its paid request is sent, which can
+        be a moment after this returns, and it may be paid for. It is not called
+        off, because nobody could then say whether it was paid for. Only `drain`
+        says when no such request is left."""
         with self._sending:
             self._closed = True
 
     def drain(self, timeout: float) -> bool:
-        """Wait up to `timeout` seconds for the calls whose paid request is out to
-        end, and say whether they have. A call has ended when it is settled in the
-        ledger and is returning to its caller."""
+        """Wait up to `timeout` seconds for the calls that were admitted to end,
+        and say whether they have. A call has ended when it is settled in the
+        ledger and is returning to its caller. After `close`, True means that this
+        client sends nothing more; False means that an admitted call is still out,
+        and its paid request can still be sent and paid for."""
         with self._sending:
             return self._sending.wait_for(lambda: self._out == 0, timeout)
 
@@ -660,9 +671,16 @@ class EmberClient:
         sensitive: bool,
     ) -> EmberResponse:
         attempt = 0
+        # The answer to the last attempt that was sent, when there has been one.
+        sent: EmberCallError | None = None
         while True:
             try:
                 return self._call_live(sdk, stop, body, call, sensitive)
+            except (BudgetExceededError, EmberClosedError) as refusal:
+                # Raised before a paid request is sent, which says that nothing was
+                # sent only for a first attempt. A replaced ledger is told as it is.
+                if sent is None or isinstance(refusal, LedgerReplacedError):
+                    raise
             except EmberCallError as error:
                 # Only a rate limit is waited out. Any other failure may have been
                 # billed and may fail the same way again. A wait too long to sit
@@ -673,7 +691,13 @@ class EmberClient:
                     or not self._pacer.back_off(attempt, error.retry_after)
                 ):
                     raise
+                sent = error
                 attempt += 1
+                continue
+            # A later attempt was refused before it was sent. The call as a whole
+            # was sent, and answered 429: that is what its caller is told, so that
+            # a refusal always means nothing of the call was sent.
+            raise sent
 
     def _pace(self) -> None:
         if self._pacer is not None:
@@ -959,6 +983,17 @@ def _check_input_item(item: Any, place: int) -> None:
             f"input[{place}] is not an allowed kind of item. Input items are messages or "
             f"one of {sorted(_INPUT_ITEM_TYPES)}."
         )
+
+
+def _without_redirects(http_client: httpx2.Client | None) -> httpx2.Client:
+    """The HTTP client the SDK is given, which follows no redirect. The SDK's own
+    default follows them, and a 307 or a 308 has the request sent again, body and
+    all, to wherever the answer points: a request's audio or document would go to
+    an address nobody chose. An answer that redirects is an error like any other."""
+    if http_client is None:
+        return openai.DefaultHttpx2Client(follow_redirects=False)
+    http_client.follow_redirects = False
+    return http_client
 
 
 def _ask(responder: Responder, body: dict[str, Any], sensitive: bool) -> dict[str, Any]:

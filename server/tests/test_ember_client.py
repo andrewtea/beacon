@@ -2083,3 +2083,103 @@ def test_a_paid_request_that_is_out_when_the_client_is_closed_is_answered_and_wa
     with pytest.raises(EmberClosedError):
         ask(ember, input="Another request.")
     assert api.paths() == ["/v1/responses/input_tokens", "/v1/responses"]
+
+
+def test_a_refusal_of_a_second_attempt_does_not_say_that_nothing_was_sent(
+    storage: Storage,
+) -> None:
+    api = MetaApi(create=lambda _request: _rate_limited())
+    clock = Clock()
+    # The scope has room for one attempt at the most it can cost, and not for two.
+    scope = SpendScope("ingest:openmhz", RESERVED_NANOUSD + 1)
+    ember = api.client(storage, scope=scope, pacer=Pacer(3000, clock=clock, sleep=clock.sleep))
+
+    with pytest.raises(EmberCallError) as raised:
+        ask(ember)
+
+    # The first attempt was sent and answered 429, and booked as it may have cost.
+    # The second was refused by the budget before it was sent. What the caller is
+    # told is the first: a refusal alone would say that the call cost nothing.
+    assert not isinstance(raised.value, BudgetExceededError)
+    assert raised.value.status_code == 429
+    assert api.paths().count("/v1/responses") == 1
+    assert Ledger(storage.ledger_db).spent_nanousd() == RESERVED_NANOUSD
+    # A call that has sent nothing yet is told of the budget as before.
+    with pytest.raises(BudgetExceededError):
+        ask(ember, input="Another question.")
+
+
+def test_a_client_closed_between_attempts_reports_the_attempt_that_was_sent(
+    storage: Storage,
+) -> None:
+    built: list[EmberClient] = []
+
+    def refuse_and_close(_request: httpx2.Request) -> httpx2.Response:
+        built[0].close()
+        return _rate_limited()
+
+    api = MetaApi(create=refuse_and_close)
+    clock = Clock()
+    built.append(api.client(storage, pacer=Pacer(3000, clock=clock, sleep=clock.sleep)))
+
+    with pytest.raises(EmberCallError) as raised:
+        ask(built[0])
+
+    assert not isinstance(raised.value, EmberClosedError)
+    assert raised.value.status_code == 429
+    assert api.paths().count("/v1/responses") == 1
+
+
+def test_a_client_says_whether_it_makes_a_call_again(storage: Storage) -> None:
+    api = MetaApi()
+    assert api.client(storage).retries is False
+    assert api.client(storage, pacer=Pacer(3000)).retries is True
+    assert EmberClient.fake(storage, Script([])).retries is False
+
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+@pytest.mark.parametrize("redirected", ["/v1/responses/input_tokens", "/v1/responses"])
+def test_a_redirect_from_the_api_is_not_followed_with_the_request(
+    storage: Storage, status: int, redirected: str
+) -> None:
+    requests: list[httpx2.Request] = []
+    api = MetaApi()
+
+    def redirecting(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        if request.url.path == redirected and request.url.host != "elsewhere.example":
+            return httpx2.Response(
+                status, headers={"location": f"https://elsewhere.example{request.url.path}"}
+            )
+        # Wherever a followed redirect would take the request, it would be answered.
+        return api(request)
+
+    # A client as a caller could hand it over, set to follow redirects.
+    http_client = httpx2.Client(transport=httpx2.MockTransport(redirecting), follow_redirects=True)
+    ember = EmberClient.live(storage, api_key="test-key", http_client=http_client)
+    audio = encoded(b"RIFF generated tone")
+
+    with pytest.raises(EmberError):
+        ask(
+            ember,
+            sensitive=True,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_audio", "input_audio": {"data": audio, "format": "wav"}}
+                    ],
+                }
+            ],
+        )
+
+    # Nothing was sent anywhere but to Meta, and the redirected request once.
+    assert {request.url.host for request in requests} == {"api.meta.ai"}
+    assert [request.url.path for request in requests].count(redirected) == 1
+
+
+def test_the_client_built_without_an_http_client_follows_no_redirect(storage: Storage) -> None:
+    ember = EmberClient.live(storage, api_key="test-key")
+
+    assert ember._sdk is not None
+    assert ember._sdk._client.follow_redirects is False

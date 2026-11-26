@@ -319,7 +319,18 @@ def _while_handling(error: Exception, call: Callable[[], object]) -> None:
 
 @pytest.mark.parametrize(
     "answer",
-    ["Medic 52 to 1458 Hayes Street for Jane Doe", '["Jane Doe"]', '"Jane Doe"', "", "{"],
+    [
+        "Medic 52 to 1458 Hayes Street for Jane Doe",
+        '["Jane Doe"]',
+        '"Jane Doe"',
+        "",
+        "{",
+        # An object that is not the form: it says nothing about the call, and is
+        # not kept as a call in which nothing was heard.
+        "{}",
+        '{"clarity": "clear", "category": "fire"}',
+        '{"transcript": "Jane Doe"}',
+    ],
 )
 def test_an_answer_that_is_not_a_form_is_an_error_that_repeats_none_of_it(
     storage: Storage, answer: str
