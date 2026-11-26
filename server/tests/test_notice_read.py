@@ -82,7 +82,7 @@ def test_ember_is_handed_the_document_itself_and_a_form_at_low_effort(storage: S
     }
     assert request["instructions"] == INSTRUCTIONS
     assert request["reasoning"] == {"effort": "low"}
-    assert request["max_output_tokens"] == 1500
+    assert request["max_output_tokens"] == 2500
     assert request["text"]["format"] == {
         "type": "json_schema",
         "name": "notice",
@@ -100,6 +100,7 @@ def test_ember_is_handed_the_document_itself_and_a_form_at_low_effort(storage: S
         streets=("Hayes St", "Gough St", "Octavia St"),
         instruction="Leave now, on foot, toward Franklin St.",
         summary="Everyone on the block is ordered to leave.",
+        incomplete=(),
         read_by="fake",
     )
     assert notice.is_order
@@ -150,27 +151,30 @@ def test_of_what_is_not_a_notice_to_the_public_no_text_is_kept(
         storage,
         form(
             notice_type=notice_type,
-            issuer="San Francisco Fire Department",
+            issuer="Jane Doe, 67",
             title="Three-alarm fire on Hayes St is out; Jane Doe hospitalized",
             areas=["432 Hayes St, the home of Jane Doe"],
-            streets=["432 Hayes St", "Hayes at Gough", "Jane Doe", "Gough St"],
+            streets=["432 Hayes St", "Four Three Two Hayes St", "Jane Doe", "Gough St"],
             instruction="Send flowers to Jane Doe.",
             summary="Jane Doe, 67, of 432 Hayes St, was taken to a hospital with burns.",
         ),
     )
 
+    # What it is, what it is about, and when: nothing a model writes freely. An
+    # issuer and a street are such fields too, and take a name or a house number
+    # as readily as a summary does.
     assert notice.as_data() == {
         "notice_type": notice_type,
         "hazard": "fire",
-        "issuer": "San Francisco Fire Department",
+        "issuer": None,
         "title": None,
         "issued_at": "2026-11-27T12:19:00-08:00",
         "effective_until": None,
         "areas": [],
-        # Names of streets in one shape, without numbers, and nothing else.
-        "streets": ["Hayes St", "Gough St"],
+        "streets": [],
         "instruction": None,
         "summary": None,
+        "incomplete": [],
     }
     assert not notice.is_order
     kept = json.dumps(notice.as_data()) + repr(notice)
@@ -178,28 +182,72 @@ def test_of_what_is_not_a_notice_to_the_public_no_text_is_kept(
         assert word not in kept
 
 
-def test_an_orders_own_words_are_kept_on_one_line_and_cut_to_a_length(storage: Storage) -> None:
+def test_an_orders_own_words_are_kept_on_one_line(storage: Storage) -> None:
     notice, _script = read(
         storage,
         form(
             notice_type="shelter_in_place",
             title="Shelter\nin place:\x00 smoke\t\tfrom a fire",
-            areas=["  Hayes Valley  ", "Hayes Valley", "", 7, "x" * 500, *["A", "B"] * 20],
-            instruction="Stay inside. " * 200,
+            areas=["  Hayes Valley  ", "Hayes Valley", "", 7, "400 through 450 Hayes St"],
+            streets=["432 Hayes St", "Hayes St", "Jane Doe", "Gough St"],
             summary=None,
         ),
     )
 
     assert notice.title == "Shelter in place: smoke from a fire"
-    assert notice.areas[:2] == ("Hayes Valley", "x" * 240)
-    assert len(notice.areas) == 4
-    assert notice.instruction is not None
-    assert len(notice.instruction) <= 800
-    assert notice.instruction.startswith("Stay inside. Stay inside.")
-    assert notice.summary is None
     # An order's addresses stay in its own words: that is what an order is.
-    order, _script = read(storage, form(areas=["400 through 450 Hayes St"]))
-    assert order.areas == ("400 through 450 Hayes St",)
+    assert notice.areas == ("Hayes Valley", "400 through 450 Hayes St")
+    # Street names in one shape, without numbers, each once.
+    assert notice.streets == ("Hayes St", "Gough St")
+    assert (notice.summary, notice.incomplete) == (None, ())
+
+
+def test_a_text_longer_than_beacon_keeps_is_left_out_whole_and_said_to_be_missing(
+    storage: Storage,
+) -> None:
+    # An all-clear whose exception comes at the end. Cut to a length, it would
+    # tell everybody they may return.
+    returning = "Residents of Hayes St between Gough St and Octavia St may return. "
+    exception = "Except 400 through 450 Hayes St, which stay closed."
+    long_instruction = returning * 30 + exception
+
+    notice, _script = read(
+        storage, form(notice_type="all_clear", instruction=long_instruction, summary="x" * 601)
+    )
+
+    assert len(long_instruction) > 1500
+    assert (notice.instruction, notice.summary) == (None, None)
+    assert notice.incomplete == ("instruction", "summary")
+    assert notice.as_data()["incomplete"] == ["instruction", "summary"]
+    # The rest of the reading is there, and the type still says what it is.
+    assert (notice.notice_type, notice.areas) == (
+        "all_clear",
+        ("Both sides of Hayes St between Gough St and Octavia St",),
+    )
+
+    # At the length Beacon keeps, it is kept to its last word.
+    fits = (returning * 30)[: 1500 - len(exception)] + exception
+    kept, _script = read(storage, form(notice_type="all_clear", instruction=fits))
+    assert (len(fits), kept.instruction, kept.incomplete) == (1500, fits, ())
+
+
+def test_areas_that_are_more_than_beacon_keeps_are_left_out_and_not_some_of_them(
+    storage: Storage,
+) -> None:
+    thirteen = [f"Zone {number}" for number in range(13)]
+
+    many, _script = read(storage, form(areas=thirteen))
+    long, _script = read(storage, form(areas=["Hayes Valley", "x" * 301]))
+    twelve, _script = read(storage, form(areas=thirteen[:12], issuer="x" * 201, title="y" * 201))
+    streets, _script = read(storage, form(streets=[f"{number}th Ave" for number in range(4, 40)]))
+
+    # A list with one area missing reads as if that area were not under the order.
+    assert (many.areas, many.incomplete) == ((), ("areas",))
+    assert (long.areas, long.incomplete) == ((), ("areas",))
+    assert len(twelve.areas) == 12
+    assert (twelve.issuer, twelve.title, twelve.incomplete) == (None, None, ("issuer", "title"))
+    # The streets are an index and no instruction: the first are kept, and it is said.
+    assert (len(streets.streets), streets.incomplete) == (30, ("streets",))
 
 
 def test_a_field_that_does_not_fit_is_left_empty_or_taken_for_the_least() -> None:
@@ -232,6 +280,7 @@ def test_a_field_that_does_not_fit_is_left_empty_or_taken_for_the_least() -> Non
         streets=(),
         instruction=None,
         summary=None,
+        incomplete=(),
         read_by="live",
     )
 

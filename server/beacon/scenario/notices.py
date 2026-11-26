@@ -10,9 +10,9 @@ the rows it stores say so (`model == "fake"`).
 The notices tell the fire of `beacon.scenario.fire` from the authorities' side: an
 evacuation order for the block, the all-clear that lifts it, and a press release. The
 stand-in's form for the press release is untidy in the way a model's can be, with a
-name, an age, and a house number in its summary, so that what Beacon drops of a press
-release is seen to be dropped. The feed also lists an item with no document and one
-whose document is on a host nobody named.
+name, an age, and a house number in its title, its summary, and its streets, so that
+what Beacon drops of a press release is seen to be dropped. The feed also lists an
+item with no document and one whose document is on a host nobody named.
 
 The host is under `.example`, which no one can register.
 """
@@ -182,6 +182,7 @@ def feed(start: datetime, at: datetime) -> dict[str, Any]:
             "id": f"https://{FEED_HOST}/news/street-cleaning",
             "url": f"https://{FEED_HOST}/news/street-cleaning",
             "title": f"Street cleaning schedule. {INVENTED}",
+            "content_text": f"{INVENTED} Street cleaning is on its usual days this week.",
             "date_published": _stamp(start - timedelta(minutes=30)),
         },
         # A document somewhere nobody named, which Beacon does not fetch.
@@ -189,6 +190,7 @@ def feed(start: datetime, at: datetime) -> dict[str, Any]:
             "id": f"https://{FEED_HOST}/news/elsewhere",
             "url": f"https://{FEED_HOST}/news/elsewhere",
             "title": f"A document kept elsewhere. {INVENTED}",
+            "content_text": f"{INVENTED} The document is attached.",
             "date_published": _stamp(start - timedelta(minutes=20)),
             "attachments": [
                 {"url": "https://files.elsewhere.example/a.pdf", "mime_type": "application/pdf"}
@@ -204,6 +206,8 @@ def feed(start: datetime, at: datetime) -> dict[str, Any]:
                 "id": f"https://{FEED_HOST}/notices/{notice.slug}",
                 "url": f"https://{FEED_HOST}/notices/{notice.slug}",
                 "title": notice.title,
+                # A feed's item has a text of its own. Beacon reads the document.
+                "content_text": f"{INVENTED} {notice.title}. The notice is attached as a PDF.",
                 "date_published": _stamp(published),
                 "attachments": [{"url": document_url(notice), "mime_type": "application/pdf"}],
             }

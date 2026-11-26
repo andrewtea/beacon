@@ -1223,9 +1223,12 @@ def test_the_notices_of_the_mock_scenario_tell_the_fire_through_a_stand_in_for_e
         (story(74), f"{host}/documents/all-clear-hayes-st.pdf"),
         (story(88), f"{host}/documents/press-release-hayes-st-fire.pdf"),
     ]
-    assert {(row.source, row.origin, row.model, row.confidence) for row in (order, lifted)} == {
-        ("notices", "mock", "fake", "official")
-    }
+    # Each is a stand-in's reading of an invented document: not the authority
+    # speaking, so not `official`.
+    assert {
+        (row.source, row.origin, row.model, row.confidence) for row in (order, lifted, release)
+    } == {("notices", "mock", "fake", "high")}
+    assert (order.data["incomplete"], lifted.data["incomplete"]) == ([], [])
     assert (order.data["notice_type"], lifted.data["notice_type"]) == (
         "evacuation_order",
         "all_clear",
@@ -1237,20 +1240,20 @@ def test_the_notices_of_the_mock_scenario_tell_the_fire_through_a_stand_in_for_e
     # An order's own words name addresses, and are kept as its words.
     assert lifted.data["areas"][1] == "400 through 450 Hayes St stay closed"
     # The stand-in filled the press release's form in with a person and a house
-    # number. The row has what it is, who issued it, when, and a street.
+    # number. The row has what it is, what it is about, and when.
     assert release.data == {
         "notice_type": "press_release",
         "hazard": "fire",
-        "issuer": "San Francisco Fire Department",
+        "issuer": None,
         "title": None,
         "issued_at": story(88).isoformat(),
         "effective_until": None,
         "areas": [],
-        "streets": ["Hayes St"],
+        "streets": [],
         "instruction": None,
         "summary": None,
+        "incomplete": [],
         "page": f"{host}/notices/press-release-hayes-st-fire",
-        "published": story(88).isoformat(),
     }
     # The document on a host nobody named was not fetched, and was said once.
     assert caplog.text.count("notices sent 1 items Beacon could not read.") == 1
@@ -1296,6 +1299,8 @@ def test_the_mock_scenario_serves_its_notices_as_a_feed_and_documents(time: Time
             )
 
     # A one-page PDF that says what it is: made up.
+    # Each item is one a JSON Feed reader takes: an id, and a text of its own.
+    assert all(item["id"] and item["content_text"] for item in feed["items"])
     assert document.startswith(b"%PDF-1.4\n")
     assert document.rstrip().endswith(b"%%EOF")
     assert b"(EVACUATION ORDER) Tj" in document
@@ -1373,3 +1378,34 @@ def test_naming_notices_builds_their_poller_with_a_live_ember_under_a_budget_of_
     assert notices._hosts == {"notices.example.org", "files.example.org"}
     assert radio._ember is not notices._ember
     ingest.close()
+
+
+def test_notices_are_not_read_for_real_where_a_crash_could_hand_a_document_to_a_collector(
+    env: dict[str, str], time: Time, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+    marked: list[bool] = []
+
+    def mark() -> bool:
+        marked.append(True)
+        return False
+
+    # Whichever command builds the pollers: the server, or `python -m beacon.ingest`.
+    monkeypatch.setattr("beacon.ingest.setup.forbid_core_dumps", mark)
+    monkeypatch.setattr("beacon.ingest.setup.core_dump_problem", lambda: "It hands cores on.")
+
+    with pytest.raises(IngestConfigError, match="names notices, and this process could not mark"):
+        build(env | NOTICES)
+
+    # Refused before a client that can spend was built, or a store was opened.
+    assert not (Path(env["BEACON_DATA_DIR"]) / "ember").exists()
+    assert not (Path(env["BEACON_DATA_DIR"]) / "evidence").exists()
+
+    # Where a core would be a file, its size limit of nothing is enough. And a
+    # process that is marked reads notices on a host with a collector too.
+    monkeypatch.setattr("beacon.ingest.setup.core_dump_problem", lambda: None)
+    build(env | NOTICES, Clock(time)).close()
+    monkeypatch.setattr("beacon.ingest.setup.forbid_core_dumps", lambda: True)
+    monkeypatch.setattr("beacon.ingest.setup.core_dump_problem", lambda: "It hands cores on.")
+    build(env | NOTICES, Clock(time)).close()
+    assert marked == [True, True]

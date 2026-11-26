@@ -17,6 +17,11 @@ What follows from what a notice is:
 - **A document is fetched only from a host that was named**, over HTTPS: the feed's
   own host and the ones in `document_hosts`. A feed that lists a document anywhere
   else is not followed there.
+- **A document's address is a plain one**: no query. The address names the document
+  in the evidence store and is stored and shown as its source, so it has to be the
+  same at every poll and hold nothing but where the document is. A link that is
+  signed for a while is neither, and an item that gives only such a link is not
+  read. What follows a `#` is never sent to a site, and is dropped.
 - **Nothing in Beacon's process parses a PDF.** The poller looks at how the file
   begins and how long it is, and hands it to Ember. The document is held in memory
   and is not stored; the row links it (`url`).
@@ -26,27 +31,35 @@ What follows from what a notice is:
   that is claimed is never read again: not after a crash, not after an answer that
   was no form. So **a document that is changed where it lies is not read again**;
   an authority that revises a notice lists it again, or under a new address.
-- **Only what is recent is paid for.** A notice the feed dates more than `MAX_AGE`
-  ago is passed over, at most `MAX_READS_PER_POLL` documents are read in a poll,
-  the newest first, and all of it under the budget `setup` gives the poller's
-  Ember client. A notice the feed gives no date is taken to be new, because not
-  reading an order is the worse mistake; a feed that dates nothing has its whole
-  listing read, four documents a poll, until the budget is spent.
+- **A notice has to say when it was published.** A row's time is the feed's
+  `date_published`, and never the moment Beacon happened to see the item: an old
+  all-clear seen today is not a new one. An item with no date, or one that cannot
+  be read as a moment, is not read. One dated later than now waits until then.
+- **Only what is recent is paid for.** A notice dated more than `MAX_AGE` ago is
+  passed over, at most `MAX_READS_PER_POLL` documents are read in a poll, the
+  newest first, and all of it under the budget `setup` gives the poller's Ember
+  client.
 - **A document that cannot be had is left for the next poll**, whatever the reason:
   it is not there yet, its host is down, it is not a PDF. The poll is reported as
-  partial, and the other notices are read all the same. Only a document longer
-  than a notice is (`beacon.notice.MAX_PDF_BYTES`) is finished with unread, because
-  it is not fetched every two minutes for a day.
+  partial, and the other notices are read all the same. At the next poll the
+  documents that have not been tried come first, so that ones that keep failing
+  do not use up every poll's fetches while another notice grows old. Only a
+  document longer than a notice is (`beacon.notice.MAX_PDF_BYTES`) is finished
+  with unread, because it is not fetched every two minutes for a day.
+- **A host that asks for a wait gets it.** When a document's host answers 429, or
+  with a `Retry-After`, the poll ends there with that error, and the runner leaves
+  the feed and its documents alone for as long as was asked.
 - **What could not be read is counted once.** A feed lists the same items at every
   poll, so an item that cannot be read, or a document that cannot be had, is
-  counted as `unreadable` the first time this process sees it and not again.
+  counted as `unreadable` once and not at every poll, for as long as it is among
+  the last `_COUNTED_ONCE` things this process counted.
 - **Trouble with Ember holds the poller**, as it holds radio.
 
 What a row says is Ember's reading of the document, and `beacon.notice.read` says
-what is kept of it and why. The row's confidence is `official` because of where the
-document came from: a feed and a host an operator named as an authority's. That it
-was read by a model is said by `model`, and whoever shows the row links the
-document, which outranks the reading.
+what is kept of it and why. The document is the authority speaking and the reading
+is a model's, so the row's confidence is `high` and not `official`. `model` says
+which Ember read it, and `url` is the document: whoever shows the row says it is a
+reading, links the document, and sends people there for what to do.
 """
 
 import contextlib
@@ -82,6 +95,8 @@ MAX_ITEMS = 200
 _MAX_FEED_BYTES = 2_000_000
 _MAX_ADDRESS = 500
 _MAX_ID = 1000
+# How many of the things it could not read a poller remembers having counted.
+_COUNTED_ONCE = 10 * MAX_ITEMS
 
 
 @dataclass(frozen=True)
@@ -90,12 +105,12 @@ class ListedNotice:
 
     # Names this document of this item, for the evidence store.
     ref: str
-    # Where the document is.
+    # Where the document is: a plain HTTPS address.
     document: str
-    # The page the feed gives for the item, when it is an HTTPS address.
+    # The page the feed gives for the item, when it is a plain HTTPS address.
     page: str | None
-    # When the feed says the item was published, when it says so readably.
-    published: datetime | None
+    # When the feed says the item was published.
+    published: datetime
 
 
 class NoticeFeed:
@@ -121,6 +136,8 @@ class NoticeFeed:
         host = _host_of(feed_url)
         if host is None:
             raise ValueError("The notices feed is named by an https address, with no port.")
+        if not all(isinstance(named, str) and named for named in document_hosts):
+            raise ValueError("A host a document may be on is named by its name.")
         if ember.mode != ("live" if http.origin == "live" else "fake"):
             # A real notice is not handed to a stand-in for Ember, whose answer
             # would be an invention about a real order, and a real Ember is not
@@ -138,8 +155,13 @@ class NoticeFeed:
         self._hosts = frozenset({host, *(named.lower() for named in document_hosts)})
         # What every poller that pays Ember keeps to: `beacon.ingest.paid`.
         self._paid = PaidDesk(ember, poller="notice", items="notices", wall_clock=wall_clock)
-        # The items and documents already counted as unreadable by this process.
-        self._counted: set[str] = set()
+        # The items and documents this process has counted as unreadable, the
+        # last `_COUNTED_ONCE` of them, oldest first.
+        self._counted: dict[str, None] = {}
+        # How many polls this process has made, and for a document that could not
+        # be had, the poll in which that was last so.
+        self._polls = 0
+        self._missed_in: dict[str, int] = {}
 
     @property
     def origin(self) -> Origin:
@@ -173,19 +195,26 @@ class NoticeFeed:
         )
         listed, unread, cut = parse_feed(read_json(body, SOURCE), self._hosts)
         unreadable = self._new(unread)
-        recent = [
-            notice
-            for notice in listed
-            if notice.published is None or now - notice.published <= MAX_AGE
-        ]
+        # Published by now, and not long ago. One dated later than now waits.
+        recent = [notice for notice in listed if timedelta(0) <= now - notice.published <= MAX_AGE]
         taken = store.taken(SOURCE, [notice.ref for notice in recent])
-        # The newest first: the all-clear before the order it lifts, and a notice
-        # of today before one that has waited since yesterday. One with no date
-        # is taken to be new.
+        self._polls += 1
+        self._missed_in = {
+            ref: poll
+            for ref, poll in self._missed_in.items()
+            if ref not in taken and any(notice.ref == ref for notice in recent)
+        }
+        # The documents that have not been tried before the ones that could not be
+        # had, and those the longest left alone first. Within that the newest
+        # first: the all-clear before the order it lifts, and a notice of today
+        # before one that has waited since yesterday.
         waiting = sorted(
             (notice for notice in recent if notice.ref not in taken),
-            key=lambda notice: (notice.published or now, notice.ref),
-            reverse=True,
+            key=lambda notice: (
+                self._missed_in.get(notice.ref, 0),
+                -notice.published.timestamp(),
+                notice.ref,
+            ),
         )
         added = fetched = read = 0
         left = False
@@ -199,12 +228,16 @@ class NoticeFeed:
             # now is not claimed, and waits for the next poll.
             try:
                 pdf = self._document(notice)
-            except SourceError:
-                if self._http.closed:
-                    # Beacon is stopping, which is nothing about the document.
+            except SourceError as error:
+                self._missed_in[notice.ref] = self._polls
+                if self._http.closed or error.retry_after is not None or error.status == 429:
+                    # Beacon is stopping, which is nothing about the document, or
+                    # the host asked to be left alone, and is: the runner waits
+                    # as long as it asked before the next poll.
                     raise
                 missed.append(notice.ref)
                 continue
+            self._missed_in.pop(notice.ref, None)
             if not store.claim(SOURCE, notice.ref, now=now):
                 # Another process took it between the listing and now.
                 continue
@@ -217,11 +250,11 @@ class NoticeFeed:
             with self._paid.working():
                 reading = self._read(store, notice, pdf, hold, now)
                 if reading is None:
-                    unreadable += 1
+                    unreadable += self._new([notice.ref])
                     continue
                 # The row and what the poller remembers are saved together.
                 state = (self.name, hold.hold_state())
-                added += len(store.add([self._row(notice, reading, now)], state=state, now=now))
+                added += len(store.add([self._row(notice, reading)], state=state, now=now))
         store.add([], state=(self.name, hold.hold_state()), now=now)
         return PollReport(
             added=added,
@@ -230,13 +263,13 @@ class NoticeFeed:
         )
 
     def _new(self, keys: list[str]) -> int:
-        """How many of these have not been counted as unreadable before, by this
-        process. They have been now."""
-        if len(self._counted) > 10 * MAX_ITEMS:
-            # Long enough ago that saying it again is news.
-            self._counted.clear()
-        new = set(keys) - self._counted
-        self._counted |= new
+        """How many of these are not among what this process last counted as
+        unreadable. They are now."""
+        new = [key for key in dict.fromkeys(keys) if key not in self._counted]
+        self._counted.update(dict.fromkeys(new))
+        while len(self._counted) > _COUNTED_ONCE:
+            # The oldest: long enough ago that saying it again is news.
+            del self._counted[next(iter(self._counted))]
         return len(new)
 
     def _document(self, notice: ListedNotice) -> bytes | None:
@@ -318,30 +351,28 @@ class NoticeFeed:
         # of `poll` may be handling.
         raise_bare(failure)
 
-    def _row(self, listed: ListedNotice, reading: Notice, now: datetime) -> NewEvidence:
-        # When the feed says it was published, which nobody had to read out of the
-        # document, and when Beacon first saw it for a feed that does not say. A
-        # date that is still to come is a mistake of the feed's.
-        occurred_at = min(listed.published or now, now)
+    def _row(self, listed: ListedNotice, reading: Notice) -> NewEvidence:
         until = reading.effective_until
         return NewEvidence(
             kind="notice",
             source=SOURCE,
             ref=listed.ref,
+            # The authority's own document, which the reading is of.
             url=listed.document,
-            occurred_at=occurred_at,
-            until=until if until is not None and until > occurred_at else None,
+            # When the feed says it was published, which nobody had to read out
+            # of the document.
+            occurred_at=listed.published,
+            until=until if until is not None and until > listed.published else None,
             # A notice has no place in words that is known to be no finer than a
             # block, and nothing here knows where on the map its streets are.
-            # Where it applies is in `data`, in the authority's words.
-            confidence="official" if reading.notice_type != "other" else "low",
+            # Where it applies is in `data`, as Ember read it.
+            #
+            # A model's reading of an official document is not the authority
+            # speaking for itself, which is what `official` says.
+            confidence="high" if reading.notice_type != "other" else "low",
             origin=self.origin,
             model=reading.read_by,
-            data=reading.as_data()
-            | {
-                "page": listed.page,
-                "published": None if listed.published is None else listed.published.isoformat(),
-            },
+            data=reading.as_data() | {"page": listed.page},
         )
 
 
@@ -351,9 +382,10 @@ def parse_feed(payload: Any, hosts: Collection[str]) -> tuple[list[ListedNotice]
     whether it has more items than that.
 
     An item is a notice when it has a PDF among its attachments. It is unreadable
-    when it has no id, or when none of its PDFs is at an HTTPS address on one of
-    `hosts`: a document is not fetched from wherever a feed points. Any other item
-    is neither, and a feed is full of them.
+    when it has no id, when it does not say when it was published, or when none of
+    its PDFs is at a plain HTTPS address on one of `hosts`: a document is not
+    fetched from wherever a feed points, and is named by an address that stays
+    the same. Any other item is neither, and a feed is full of them.
 
     Raises SourceError when the answer is not a feed."""
     items = payload.get("items") if isinstance(payload, dict) else None
@@ -372,21 +404,22 @@ def parse_feed(payload: Any, hosts: Collection[str]) -> tuple[list[ListedNotice]
         if not documents:
             continue
         item_id = _item_id(fields.get("id"))
-        allowed = [url for url in documents if _host_of(url) in hosts]
-        if item_id is None or not allowed:
+        published = _moment(fields.get("date_published"))
+        allowed = [
+            address
+            for url in documents
+            if (address := _plain(url)) is not None and _host_of(address) in hosts
+        ]
+        if item_id is None or published is None or not allowed:
             unreadable.append(_digest(item))
             continue
         document = allowed[0]
         # Of the two as a pair, so that no id and address run together into another's.
         ref = hashlib.sha256(json.dumps([item_id, document]).encode()).hexdigest()[:32]
-        page = fields.get("url")
         notices.setdefault(
             ref,
             ListedNotice(
-                ref=ref,
-                document=document,
-                page=page if _host_of(page) is not None else None,
-                published=_moment(fields.get("date_published")),
+                ref=ref, document=document, page=_plain(fields.get("url")), published=published
             ),
         )
     return list(notices.values()), unreadable, len(items) > MAX_ITEMS
@@ -418,6 +451,19 @@ def _item_id(value: Any) -> str | None:
     if isinstance(value, int) and not isinstance(value, bool):
         return str(value)
     return value if isinstance(value, str) and 0 < len(value) <= _MAX_ID else None
+
+
+def _plain(url: Any) -> str | None:
+    """An address Beacon may ask, store, and show, without what follows a `#`, or
+    None for one it may not: one that is not HTTPS on the usual port, that has
+    somebody's name or password in it, or that has a query, which is where a link
+    carries a signature that runs out or a token that is somebody's."""
+    if _host_of(url) is None:
+        return None
+    parts = urlsplit(url)
+    if parts.query or "?" in url.partition("#")[0]:
+        return None
+    return url.partition("#")[0]
 
 
 def _host_of(url: Any) -> str | None:

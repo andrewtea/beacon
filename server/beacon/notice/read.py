@@ -4,22 +4,29 @@ A notice is a document an authority published: an evacuation order, a shelter-in
 order, a road closure, an all-clear, a press release. Ember is given the PDF and a
 form to fill in. Nothing in Beacon's own process parses the PDF.
 
-Unlike a radio call, a notice is meant to be relayed in the authority's own words, so
-the form has text fields: the notice's title, the areas it applies to, its instruction
-to the public, and a short summary. They are kept as Ember gave them, cut to a length,
-with control characters removed, and nothing else about them can be checked. What
-follows from that is deliberate:
+Unlike a radio call, a notice is about what an authority told the public, so the form
+has text fields: the notice's title, the areas it applies to, its instruction to the
+public, and a short summary. They are kept as Ember gave them, with control
+characters removed, and nothing else about them can be checked. What follows from
+that is deliberate:
 
-- **What is kept of a notice is only as right as Ember's reading of it.** A row made
-  from one says which Ember read it and links the document, and whoever shows it
-  links the document too.
+- **What is kept is Ember's reading of a notice, and not the notice.** The document
+  is the authority speaking; the reading is a model's, and can be wrong or leave
+  something out. A row made from one says which Ember read it and links the
+  document, and whoever shows it says it is a reading and sends people to the
+  document for what to do.
+- **A text is kept whole or not at all.** An instruction with its end cut off can
+  say the opposite of the instruction: "residents may return" without "except to
+  these addresses". So a text that is longer than Beacon keeps, or a list of areas
+  with more entries than it keeps, is left out, and the notice says which of its
+  fields are not all there (`incomplete`).
 - **Text is kept only of a notice that tells the public something** (`TEXT_TYPES`): an
   order, a warning, a closure, an advisory, an all-clear. Such a document is written
   to be repeated, and names places, not people. A press release is where a victim is
   named and a home is described, so of a press release, and of anything Ember does
-  not take for a notice, Beacon keeps what it is, who issued it, its times, and the
-  streets it names, and none of its text. The streets are names in the one shape
-  `beacon.radio.vocabulary.clean_street` gives them, without numbers.
+  not take for a notice, Beacon keeps what it is, what hazard it is about, and its
+  times, and nothing a model could write a name or an address into: no text, no
+  issuer, and no streets.
 - **An order names places finer than a block**, because that is what an order is: a
   list of the addresses that must leave. Beacon's rule against house numbers is for
   radio traffic about people's emergencies, not for an authority's published order.
@@ -47,9 +54,10 @@ from beacon.evidence import ModelSource
 from beacon.radio.vocabulary import clean_street
 
 TASK = "read_notice"
-# The form with every text field full is about four hundred tokens. The rest is room
-# for the reasoning low effort does, which counts against the same limit.
-MAX_OUTPUT_TOKENS = 1500
+# The form with every text field as full as Beacon keeps it is about fifteen hundred
+# tokens. The rest is room for the reasoning low effort does, which counts against
+# the same limit.
+MAX_OUTPUT_TOKENS = 2500
 # A notice is a page or a few. A longer document is not one, and is not sent.
 MAX_PDF_BYTES = 5_000_000
 
@@ -85,10 +93,11 @@ TEXT_TYPES = ORDERS | {"road_closure", "advisory"}
 
 MAX_AREAS = 12
 MAX_STREETS = 30
-_MAX_NAME = 160
-_MAX_AREA = 240
-_MAX_INSTRUCTION = 800
-_MAX_SUMMARY = 500
+# The longest each text may be. A longer one is left out whole, not cut.
+_MAX_NAME = 200
+_MAX_AREA = 300
+_MAX_INSTRUCTION = 1500
+_MAX_SUMMARY = 600
 
 INSTRUCTIONS = """\
 You read official public-safety notices for a public incident feed in San Francisco. \
@@ -107,8 +116,8 @@ that orders nothing, and `other` for anything that is not a notice from an autho
 document gives the date and the time. Else null.
 - `areas`: each area the notice applies to, in the document's own words.
 - `streets`: the streets it names, each as a name with its type (Hayes St).
-- `instruction`: what the notice tells the public to do, in the document's own words. \
-Null when it tells them nothing.
+- `instruction`: everything the notice tells the public to do, in the document's own \
+words, with every exception and condition it gives. Null when it tells them nothing.
 - `summary`: one or two plain sentences on what the notice says.
 - Never give the name, the age, or the condition of a private person, even when the \
 document does. An agency, an official's title, and a public information line are not private.
@@ -165,13 +174,17 @@ class Notice:
     # When the notice says it was issued, and until when it applies.
     issued_at: datetime | None
     effective_until: datetime | None
-    # In the notice's own words, as Ember gave them. Empty for a notice whose type
-    # is not one of `TEXT_TYPES`, and so is `title`.
+    # The notice's words, as Ember gave them. All of these, and `issuer` and
+    # `title`, are empty for a notice whose type is not one of `TEXT_TYPES`.
     areas: tuple[str, ...]
     # Street names, without numbers.
     streets: tuple[str, ...]
     instruction: str | None
     summary: str | None
+    # The fields of which this does not hold all that Ember gave, because it was
+    # more than Beacon keeps: a text or the areas, left out whole, or the streets,
+    # of which the first are kept. Whoever shows the notice says it is not all here.
+    incomplete: tuple[str, ...]
     # Which kind of Ember client read it: `live`, or `fake` for a stand-in.
     read_by: ModelSource
 
@@ -195,6 +208,7 @@ class Notice:
             "streets": list(self.streets),
             "instruction": self.instruction,
             "summary": self.summary,
+            "incomplete": list(self.incomplete),
         }
 
 
@@ -246,36 +260,77 @@ def read_notice(ember: EmberClient, pdf: bytes) -> Notice:
 
 
 def read_form(form: dict[str, Any], *, read_by: ModelSource) -> Notice:
-    """A `Notice` from a filled-in form. A field of the wrong kind is left empty, a
-    text is cut to its length, and a street that is not shaped like one is dropped.
-    Of a notice whose type is not one of `TEXT_TYPES`, no text is kept at all."""
+    """A `Notice` from a filled-in form. A field of the wrong kind is left empty, and
+    a street that is not shaped like one is dropped. A text that is longer than
+    Beacon keeps is left out whole, and so are the areas when there are more of them
+    than it keeps or one of them is too long: the notice names those fields in
+    `incomplete`. Of a notice whose type is not one of `TEXT_TYPES`, nothing a model
+    could have written freely is kept at all."""
     notice_type = _one_of(form.get("notice_type"), NOTICE_TYPES, "other")
-    worded = notice_type in TEXT_TYPES
-    areas = form.get("areas")
-    streets = form.get("streets")
+    hazard = _one_of(form.get("hazard"), HAZARDS, "other")
+    issued_at = _moment(form.get("issued_at"))
+    effective_until = _moment(form.get("effective_until"))
+    if notice_type not in TEXT_TYPES:
+        return Notice(
+            notice_type=notice_type,  # type: ignore[arg-type]
+            hazard=hazard,  # type: ignore[arg-type]
+            issuer=None,
+            title=None,
+            issued_at=issued_at,
+            effective_until=effective_until,
+            areas=(),
+            streets=(),
+            instruction=None,
+            summary=None,
+            incomplete=(),
+            read_by=read_by,
+        )
+    incomplete: list[str] = []
+
+    def whole(name: str, limit: int) -> str | None:
+        text = _text(form.get(name))
+        if text is not None and len(text) > limit:
+            incomplete.append(name)
+            return None
+        return text
+
+    issuer, title = whole("issuer", _MAX_NAME), whole("title", _MAX_NAME)
+    given = form.get("areas")
+    areas = tuple(
+        dict.fromkeys(
+            area
+            for value in (given if isinstance(given, list) else [])
+            if (area := _text(value)) is not None
+        )
+    )
+    if len(areas) > MAX_AREAS or any(len(area) > _MAX_AREA for area in areas):
+        incomplete.append("areas")
+        areas = ()
+    given = form.get("streets")
+    streets = tuple(
+        dict.fromkeys(
+            street
+            for value in (given if isinstance(given, list) else [])
+            if (street := clean_street(value)) is not None
+        )
+    )
+    if len(streets) > MAX_STREETS:
+        # An index of names and no instruction, so the first of them are of use.
+        incomplete.append("streets")
+        streets = streets[:MAX_STREETS]
+    instruction, summary = whole("instruction", _MAX_INSTRUCTION), whole("summary", _MAX_SUMMARY)
     return Notice(
         notice_type=notice_type,  # type: ignore[arg-type]
-        hazard=_one_of(form.get("hazard"), HAZARDS, "other"),  # type: ignore[arg-type]
-        issuer=_text(form.get("issuer"), _MAX_NAME),
-        title=_text(form.get("title"), _MAX_NAME) if worded else None,
-        issued_at=_moment(form.get("issued_at")),
-        effective_until=_moment(form.get("effective_until")),
-        areas=tuple(
-            dict.fromkeys(
-                area
-                for value in (areas if worded and isinstance(areas, list) else [])
-                if (area := _text(value, _MAX_AREA)) is not None
-            )
-        )[:MAX_AREAS],
-        streets=tuple(
-            dict.fromkeys(
-                street
-                for value in (streets if isinstance(streets, list) else [])
-                if (street := clean_street(value)) is not None
-            )
-        )[:MAX_STREETS],
-        instruction=_text(form.get("instruction"), _MAX_INSTRUCTION) if worded else None,
-        summary=_text(form.get("summary"), _MAX_SUMMARY) if worded else None,
+        hazard=hazard,  # type: ignore[arg-type]
+        issuer=issuer,
+        title=title,
+        issued_at=issued_at,
+        effective_until=effective_until,
+        areas=areas,
+        streets=streets,
+        instruction=instruction,
+        summary=summary,
+        incomplete=tuple(incomplete),
         read_by=read_by,
     )
 
@@ -296,12 +351,12 @@ def _one_of(value: Any, allowed: tuple[str, ...], otherwise: str) -> str:
     return value if isinstance(value, str) and value in allowed else otherwise
 
 
-def _text(value: Any, limit: int) -> str | None:
-    """A text on one line, without control characters, cut to `limit`."""
+def _text(value: Any) -> str | None:
+    """A text on one line, without control characters, or None for what is no text
+    or is empty."""
     if not isinstance(value, str):
         return None
-    text = " ".join("".join(char if char.isprintable() else " " for char in value).split())
-    return text[:limit].rstrip() or None
+    return " ".join("".join(char if char.isprintable() else " " for char in value).split()) or None
 
 
 def _moment(value: Any) -> datetime | None:

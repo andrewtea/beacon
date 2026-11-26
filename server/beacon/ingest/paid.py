@@ -19,6 +19,8 @@ the rules about money are written once:
 - **A replaced ledger stops the poller for the life of the process.** What was
   spent is then not known from the ledger, and an operator has to compare Meta's
   Usage page with it first.
+- **A poller that can spend has a budget of its own.** A live client without a
+  `SpendScope` is refused.
 - **Shutting down admits nothing new and loses no answer.** `close` closes the
   poller's Ember client. Work under a claim is counted (`working`), and `drain`
   waits until its row is stored.
@@ -106,7 +108,14 @@ class PaidDesk:
         scenario is played on a clock of its own.
 
         `ember` is closed with the desk (`close`), so it is a client of the
-        poller's own."""
+        poller's own. One that can spend has a budget of its own as well (a
+        `SpendScope`), under the spending stop: what a poller may pay for over
+        every run is a number an operator set, and never the whole stop."""
+        if ember.mode == "live" and ember.scope is None:
+            raise ValueError(
+                f"The {poller} poller pays under a budget of its own: its Ember client "
+                "needs a spending scope."
+            )
         self._ember = ember
         self._wall_clock = (lambda: datetime.now(UTC)) if wall_clock is None else wall_clock
         self._held = (

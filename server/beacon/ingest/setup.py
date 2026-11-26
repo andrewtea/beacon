@@ -26,7 +26,8 @@ A source needs no code change to go live, only its name in that list and what it
               an authority's notices as PDF attachments; BEACON_NOTICES_BUDGET_USD,
               the most reading them may cost; and a live Ember (REPLAY=0,
               MODEL_API_KEY, EMBER_SPENT_BEFORE_USD). BEACON_NOTICES_HOSTS names
-              hosts a document may be on besides the feed's own.
+              hosts a document may be on besides the feed's own. Refused where the
+              process cannot be kept from handing a core dump to a collector.
 
 Radio and notices are the sources that cost money: every call is heard by Ember, and
 every document read by it. In mock mode the calls are tones and the documents are
@@ -485,7 +486,8 @@ def _notice_poller(env: Mapping[str, str], http: SourceHttp) -> NoticeFeed:
     """The poller for a real feed of notices, read by a live Ember under a budget
     of its own.
 
-    Raises IngestConfigError when the feed, the budget, or a live Ember is missing."""
+    Raises IngestConfigError when the feed, the budget, or a live Ember is missing,
+    and when a crash of this process could hand a document to a core collector."""
     names = f"{LIVE_SOURCES_VARIABLE} names notices"
     feed_url = env.get(NOTICES_FEED_VARIABLE, "").strip()
     hosts = _hosts(env, NOTICES_HOSTS_VARIABLE)
@@ -495,6 +497,20 @@ def _notice_poller(env: Mapping[str, str], http: SourceHttp) -> NoticeFeed:
             f"{names}, which needs {NOTICES_BUDGET_VARIABLE}: the most, in dollars, that "
             "reading notices may cost over every run. It has no default, because every "
             "document is paid for."
+        )
+    # This process will hold each document, and what Ember makes of it, in memory,
+    # and a document at an address somebody listed can be anything. So it is made
+    # a process of which no core is written, as the server is before it takes a
+    # tap, whichever command runs the pollers. No program is started for a notice,
+    # so the mark is enough where it can be set. Before a client that can spend
+    # is built.
+    if not forbid_core_dumps() and core_dump_problem() is not None:
+        raise IngestConfigError(
+            f"{names}, and this process could not mark itself as one of which no core "
+            "dump is made, on a host that hands core dumps to a collector "
+            "(kernel.core_pattern begins with | or @, or cannot be read): a crash would "
+            "hand over the document being read. Set kernel.core_pattern to a file name, "
+            "such as core."
         )
     ember = EmberClient.from_env(env, scope=scope)
     if ember.mode != "live":

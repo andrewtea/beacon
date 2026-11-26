@@ -19,6 +19,7 @@ from beacon.ember import (
     EmberError,
     LedgerReplacedError,
     Pacer,
+    SpendScope,
     Storage,
     fake_response,
 )
@@ -223,8 +224,9 @@ def test_a_notice_is_fetched_read_by_ember_and_stored_as_one_row(
     assert (report.added, report.unreadable, report.partial) == (1, 0, False)
     (row,) = store.search()
     assert (row.kind, row.source, row.origin, row.model) == ("notice", "notices", "mock", "fake")
-    # An authority speaking for itself, read by a model: both are said.
-    assert (row.confidence, row.stand_in) == ("official", True)
+    # A model's reading of the authority's document, which is not the authority
+    # speaking: not `official`, and the document is linked.
+    assert (row.confidence, row.stand_in) == ("high", True)
     # When the feed says it was published, and where a person can read it.
     assert (row.occurred_at, row.url) == (minutes(-20), url)
     assert row.until == datetime(2026, 11, 28, 4, 0, tzinfo=UTC)
@@ -241,8 +243,8 @@ def test_a_notice_is_fetched_read_by_ember_and_stored_as_one_row(
         "streets": ["Hayes St", "Gough St"],
         "instruction": "Leave now, on foot, toward Franklin St.",
         "summary": "Everyone on the block is ordered to leave.",
+        "incomplete": [],
         "page": f"https://{HOST}/notices/1",
-        "published": minutes(-20).isoformat(),
     }
     # A name of its own for this document of this item, which is no address.
     assert len(row.ref) == 32
@@ -295,17 +297,19 @@ def test_a_document_is_fetched_only_from_a_host_that_was_named_over_https(
     assert documents(store) == ["1", "6"]
 
 
+PUBLISHED = "2026-11-27T19:40:00Z"
+
+
 def test_an_attachment_is_a_pdf_by_its_type_or_by_how_its_address_ends() -> None:
     def listed(attachment: Any, **item: Any) -> tuple[int, int]:
-        feed = {"items": [{"id": "a", "attachments": [attachment]} | item]}
-        notices, unreadable, _cut = parse_feed(feed, {HOST})
+        fields = {"id": "a", "date_published": PUBLISHED, "attachments": [attachment]}
+        notices, unreadable, _cut = parse_feed({"items": [fields | item]}, {HOST})
         return len(notices), len(unreadable)
 
     address = f"https://{HOST}/a"
     assert listed({"url": address, "mime_type": "application/pdf"}) == (1, 0)
     assert listed({"url": address, "mime_type": "Application/PDF; qs=1"}) == (1, 0)
     assert listed({"url": address + ".PDF"}) == (1, 0)
-    assert listed({"url": address + ".pdf?version=2"}) == (1, 0)
     # Said to be something else, it is not taken for a PDF by its name.
     assert listed({"url": address + ".pdf", "mime_type": "text/html"}) == (0, 0)
     assert listed({"url": address}) == (0, 0)
@@ -325,13 +329,40 @@ def test_a_notice_is_named_by_its_item_and_its_document() -> None:
         return [notice.ref for notice in parse_feed({"items": list(items)}, {HOST})[0]]
 
     def item(item_id: str, name: str) -> dict[str, Any]:
-        return {"id": item_id, "attachments": [{"url": f"https://{HOST}/{name}.pdf"}]}
+        return {
+            "id": item_id,
+            "date_published": PUBLISHED,
+            "attachments": [{"url": f"https://{HOST}/{name}.pdf"}],
+        }
 
     (first,) = refs(item("a", "one"))
     # Listed twice, it is one notice. Another item, or another document of the
     # same item, is another: a revision under a new address is read.
     assert refs(item("a", "one"), item("a", "one")) == [first]
     assert len({first, *refs(item("b", "one")), *refs(item("a", "two"))}) == 3
+    # What follows a # is never sent to a site, and names no other document.
+    assert refs(item("a", "one.pdf#page=2")) == refs(item("a", "one.pdf#page=3"))
+
+
+def test_a_document_is_at_a_plain_address_that_is_the_same_at_every_poll(
+    store: EvidenceStore, site: Site, poller: NoticeFeed
+) -> None:
+    signed = f"https://{HOST}/documents/notice-1.pdf?X-Signature=3c9d&X-Expires=600"
+    site.notice(1, minutes(-30), attachments=[{"url": signed, "mime_type": "application/pdf"}])
+    site.notice(2, minutes(-20), attachments=[{"url": f"https://{HOST}/download.pdf?"}])
+    plain = site.notice(3, minutes(-10), url=f"https://{HOST}/notices/3?utm_source=feed#top")
+    site.items[-1]["attachments"][0]["url"] = plain + "#page=2"
+
+    report = poller.poll(store, NOON)
+
+    # A link that is signed for a while would be another notice at the next poll,
+    # and what signs it would be stored as the notice's source. It is not read.
+    assert (report.added, report.unreadable) == (1, 2)
+    assert site.downloads == ["3"]
+    (row,) = store.search()
+    # Stored and asked for without the fragment, and no page whose address has a query.
+    assert (row.url, row.data["page"]) == (plain, None)
+    assert "Signature" not in everything_on_disk(store.path.parent)
 
 
 def test_what_is_not_a_feed_is_a_source_that_cannot_be_read(
@@ -355,7 +386,11 @@ def test_what_is_not_a_feed_is_a_source_that_cannot_be_read(
 
 def test_only_the_top_of_a_long_feed_is_looked_at_and_the_poll_says_so() -> None:
     def item(number: int) -> dict[str, Any]:
-        return {"id": str(number), "attachments": [{"url": f"https://{HOST}/{number}.pdf"}]}
+        return {
+            "id": str(number),
+            "date_published": PUBLISHED,
+            "attachments": [{"url": f"https://{HOST}/{number}.pdf"}],
+        }
 
     notices, _unreadable, cut = parse_feed({"items": [item(n) for n in range(MAX_ITEMS)]}, {HOST})
     assert (len(notices), cut) == (MAX_ITEMS, False)
@@ -415,29 +450,30 @@ def test_a_document_longer_than_a_notice_is_finished_with_unread(
     assert (site.asked, site.downloads) == ([pdf(2)], ["2", "1"])
 
 
-def test_only_what_is_recent_is_read_and_a_notice_with_no_date_is_taken_to_be_new(
+def test_only_what_is_recent_is_read_and_a_notice_says_when_it_was_published(
     store: EvidenceStore, site: Site, poller: NoticeFeed
 ) -> None:
     site.notice(1, NOON - MAX_AGE - timedelta(minutes=1))
     site.notice(2, NOON - MAX_AGE)
+    # No date, a date with no zone, which is no moment, and what is no date.
     site.notice(3, None)
-    # A date still to come, and one with no zone, which is no moment.
-    site.notice(4, minutes(30))
-    site.notice(5, None, date_published="2026-11-27T12:00:00")
-    site.notice(6, None, date_published=20261127)
+    site.notice(4, None, date_published="2026-11-27T12:00:00")
+    site.notice(5, None, date_published=20261127)
+    # A date still to come.
+    site.notice(6, minutes(30))
 
-    # More than one poll reads, so two of them.
-    first, second = poller.poll(store, NOON), poller.poll(store, NOON)
+    report = poller.poll(store, NOON)
 
-    assert (first.added + second.added, first.unreadable + second.unreadable) == (5, 0)
-    by_document = {(row.url or "")[-5:-4]: row for row in store.search()}
-    assert sorted(by_document) == ["2", "3", "4", "5", "6"]
-    assert by_document["2"].occurred_at == NOON - MAX_AGE
-    # Seen now, which is all that is known of when.
-    for number in "3456":
-        assert by_document[number].occurred_at == NOON
-    assert by_document["3"].data["published"] is None
-    assert by_document["4"].data["published"] == minutes(30).isoformat()
+    # When Beacon saw an item says nothing of when a notice was issued: an old
+    # all-clear seen today is not a new one. Without a date it is not read.
+    assert (report.added, report.unreadable, report.partial) == (1, 3, False)
+    assert (site.downloads, documents(store)) == (["2"], ["2"])
+    assert store.search()[0].occurred_at == NOON - MAX_AGE
+
+    # The one dated later waits until then, and is then a notice of that moment.
+    assert poller.poll(store, minutes(29)).added == 0
+    assert poller.poll(store, minutes(30)).added == 1
+    assert [row.occurred_at for row in store.search()] == [NOON - MAX_AGE, minutes(30)]
 
 
 def test_a_poll_reads_the_newest_few_and_leaves_the_rest_for_the_next(
@@ -490,10 +526,10 @@ def test_of_a_press_release_the_row_keeps_no_text_and_nothing_of_it_is_on_disk(
         minutes(-20),
         form(
             notice_type="press_release",
-            issuer="San Francisco Fire Department",
+            issuer="Jane Doe, 67",
             title="Three-alarm fire on Hayes St is out; Jane Doe hospitalized",
             areas=["432 Hayes St, the home of Jane Doe"],
-            streets=["432 Hayes St", "Gough St"],
+            streets=["432 Hayes St", "Four Three Two Hayes St"],
             instruction=None,
             summary="Jane Doe, 67, of 432 Hayes St, was taken to a hospital with burns.",
         ),
@@ -504,18 +540,26 @@ def test_of_a_press_release_the_row_keeps_no_text_and_nothing_of_it_is_on_disk(
     poller.poll(store, NOON)
 
     release, other = store.search()
-    assert (release.confidence, release.data["notice_type"]) == ("official", "press_release")
-    assert release.data["streets"] == ["Hayes St", "Gough St"]
-    assert [release.data[name] for name in ("title", "areas", "instruction", "summary")] == [
-        None,
-        [],
-        None,
-        None,
-    ]
-    # What Ember did not take for an authority's notice is not called official.
+    assert (release.confidence, release.data["notice_type"]) == ("high", "press_release")
+    # What it is, what it is about, when, and where to read it.
+    assert release.data == {
+        "notice_type": "press_release",
+        "hazard": "fire",
+        "issuer": None,
+        "title": None,
+        "issued_at": "2026-11-27T19:40:00+00:00",
+        "effective_until": None,
+        "areas": [],
+        "streets": [],
+        "instruction": None,
+        "summary": None,
+        "incomplete": [],
+        "page": f"https://{HOST}/notices/1",
+    }
+    # What Ember did not take for an authority's notice is trusted least.
     assert (other.confidence, other.data["notice_type"]) == ("low", "other")
     on_disk = everything_on_disk(tmp_path)
-    for word in ("Jane", "Doe", "burns", "432 Hayes", "PRESS RELEASE"):
+    for word in ("Jane", "Doe", "burns", "432 Hayes", "Four Three Two", "PRESS RELEASE"):
         assert word not in on_disk
 
 
@@ -786,3 +830,121 @@ def test_the_pollers_origin_is_its_clients_and_a_stand_ins_feed_is_kept_out_of_t
     with pytest.raises(EvidenceStoreError, match="holds nothing a stand-in produced"):
         poller.poll(live, NOON)
     assert (site.requests, site.asked, live.search()) == ([], [], [])
+
+
+def test_documents_that_keep_failing_do_not_keep_another_notice_waiting_until_it_is_old(
+    store: EvidenceStore, site: Site, poller: NoticeFeed
+) -> None:
+    # An order, and after it more notices than a poll fetches, none of which can be had.
+    site.notice(1, minutes(-60))
+    for number in range(2, MAX_FETCHES_PER_POLL + 2):
+        site.notice(number, minutes(-60 + number), document=404)
+
+    first = poller.poll(store, NOON)
+
+    # The newest first, and the poll's fetches are used up before the order's turn.
+    assert site.downloads == [str(number) for number in range(9, 1, -1)]
+    assert (first.added, first.partial) == (0, True)
+
+    second = poller.poll(store, minutes(2))
+
+    # What has not been tried comes before what could not be had.
+    assert site.downloads[8] == "1"
+    assert (second.added, documents(store), site.asked) == (1, ["1"], [pdf(1)])
+    # The ones that failed are still asked for, the longest left alone first.
+    assert site.downloads[9:] == [str(number) for number in range(9, 2, -1)]
+    third = poller.poll(store, minutes(4))
+    assert site.downloads[16:18] == ["2", "9"]
+    assert (third.added, third.partial) == (0, True)
+
+
+@pytest.mark.parametrize(
+    ("answer", "waits"),
+    [
+        (httpx2.Response(429, headers={"Retry-After": "900"}), 900.0),
+        (httpx2.Response(503, headers={"Retry-After": "300"}), 300.0),
+        # Asked to slow down, with no word on for how long.
+        (httpx2.Response(429), None),
+    ],
+)
+def test_a_documents_host_that_asks_for_a_wait_ends_the_poll_and_is_left_alone(
+    store: EvidenceStore,
+    site: Site,
+    storage: Storage,
+    wall: list[datetime],
+    answer: httpx2.Response,
+    waits: float | None,
+) -> None:
+    site.notice(1, minutes(-30))
+    busy = site.notice(2, minutes(-20))
+    site.notice(3, minutes(-10))
+    real_http = site.http
+
+    def http(request: httpx2.Request) -> httpx2.Response:
+        if str(request.url) == busy:
+            site.requests.append(request)
+            return answer
+        return real_http(request)
+
+    poller = NoticeFeed(
+        SourceHttp(httpx2.MockTransport(http)),
+        EmberClient.fake(storage, site.ember),
+        feed_url=FEED,
+    )
+    runner = Runner([poller], store, Clock(lambda: wall[0]))
+
+    failure = runner.step()["notices"]
+
+    # The notice before it is read. The next document is not asked for.
+    assert isinstance(failure, SourceError)
+    assert (failure.status, failure.retry_after) == (answer.status_code, waits)
+    assert (site.downloads, documents(store)) == (["3", "2"], ["3"])
+    # The runner leaves the feed and its documents alone for as long as was asked.
+    wall[0] = NOON + timedelta(seconds=(waits or poller.interval_seconds) - 1)
+    assert runner.step() == {}
+    assert len(site.requests) == 3
+
+
+def test_what_could_not_be_read_is_counted_once_whatever_went_wrong_with_it_later(
+    store: EvidenceStore, site: Site, poller: NoticeFeed
+) -> None:
+    late = site.notice(1, minutes(-20), document=404)
+    site.read[pdf(1)] = "A sentence, and no form."
+
+    assert poller.poll(store, NOON).unreadable == 1
+    assert poller.poll(store, minutes(2)).unreadable == 0
+    # It is there now, and Ember's answer about it is no form: the same notice,
+    # which was counted when its document could not be had.
+    site.documents[late] = pdf(1)
+    report = poller.poll(store, minutes(4))
+
+    assert (report.added, report.unreadable, site.asked) == (0, 0, [pdf(1)])
+
+
+def test_what_was_counted_is_remembered_for_the_last_two_thousand_and_no_more(
+    site: Site, poller: NoticeFeed
+) -> None:
+    assert poller._new(["a", "b", "a"]) == 2
+    assert poller._new(["b", "c"]) == 1
+    assert poller._new([f"item {number}" for number in range(10 * MAX_ITEMS)]) == 10 * MAX_ITEMS
+
+    # The oldest have been forgotten, and are news again. The newest have not.
+    assert poller._new(["a", "b", "c"]) == 3
+    assert poller._new([f"item {10 * MAX_ITEMS - 1}", "c"]) == 0
+
+
+def test_a_poller_that_can_spend_has_a_budget_of_its_own(
+    storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+    unscoped = EmberClient.live(storage, api_key="test-key")
+    scoped = EmberClient.live(
+        storage, api_key="test-key", scope=SpendScope("ingest:notices", 500_000_000)
+    )
+
+    # Without one, all that holds its spending is the stop on everything.
+    with pytest.raises(ValueError, match="pays under a budget of its own"):
+        NoticeFeed(SourceHttp(), unscoped, feed_url=FEED)
+
+    with SourceHttp() as http:
+        assert NoticeFeed(http, scoped, feed_url=FEED).origin == "live"
