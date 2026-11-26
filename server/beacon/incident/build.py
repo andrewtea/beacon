@@ -39,8 +39,11 @@ shown. With no point it is matched to nothing by distance.
 The wording here is where the product's rules about words are kept:
 
 - A medical call is written as "Medical response", its units, and its block.
-- What crews say on the radio about an evacuation, a shelter, or an all-clear is
-  written as radio traffic and said not to be an official order.
+- What is said on the radio about an evacuation, a shelter, or an all-clear is
+  written as radio traffic and said not to be an official order. No line says who
+  said it: a radio row keeps what was said and the units that were named, and not
+  the speaker, and a dispatcher relaying an all-clear leaves the same row as a crew
+  giving one.
 - An official alert's instruction is the authority's own words, shown as such
   (`Official.instruction`). Beacon writes no instruction itself. A text that is as
   long as its poller keeps may have been cut, so it is left out whole and named in
@@ -56,8 +59,8 @@ The wording here is where the product's rules about words are kept:
 - That a source stopped listing something is written as what Beacon saw, not as an
   all-clear.
 - Where the radio and an official source disagree, the official source holds, and
-  the incident says so and why (`Incident.conflicts`): crews saying all clear does
-  not end an alert or lift an order, and a notice's hazard outranks the radio's.
+  the incident says so and why (`Incident.conflicts`): an all-clear on the radio
+  does not end an alert or lift an order, and a notice's hazard outranks the radio's.
 - Everything from 511 carries the credit its data agreement requires.
 """
 
@@ -140,6 +143,7 @@ STATUS_WORDS = {
     "unknown": "radio traffic",
 }
 NOT_AN_ORDER = "That is radio traffic, not an official order."
+# What a call's line says of each detail. None names a speaker.
 DETAIL_WORDS = {
     "smoke_showing": "Smoke showing.",
     "fire_showing": "Fire showing.",
@@ -147,15 +151,15 @@ DETAIL_WORDS = {
     "additional_alarm": "Additional alarm called.",
     "exposure_threatened": "Neighbouring buildings threatened.",
     "rescue_in_progress": "Rescue in progress.",
-    "evacuation": f"Crews mention an evacuation. {NOT_AN_ORDER}",
-    "shelter_in_place": f"Crews mention sheltering in place. {NOT_AN_ORDER}",
+    "evacuation": f"An evacuation mentioned. {NOT_AN_ORDER}",
+    "shelter_in_place": f"Sheltering in place mentioned. {NOT_AN_ORDER}",
     "police_requested": "Police requested.",
     "utilities_requested": "Utilities requested.",
-    "road_closed": "Crews report a road closed.",
-    "aircraft_overhead": "Crews mention an aircraft overhead.",
+    "road_closed": "A road reported closed.",
+    "aircraft_overhead": "An aircraft mentioned overhead.",
     "knocked_down": "Fire reported knocked down.",
     "overhaul": "Overhaul under way.",
-    "all_clear": f"Crews say all clear. {NOT_AN_ORDER}",
+    "all_clear": f"All clear said. {NOT_AN_ORDER}",
 }
 _NOTICE_WORDS = {
     "evacuation_order": "an evacuation order",
@@ -749,7 +753,7 @@ def _signals(
         signals.append(
             _signal(
                 "evacuation_on_radio",
-                f"Crews mention an evacuation. {NOT_AN_ORDER}",
+                f"An evacuation was mentioned on the radio. {NOT_AN_ORDER}",
                 of(evacuating),
             )
         )
@@ -843,8 +847,9 @@ def _conflicts(
     outranks what a call said it is.
 
     The two are set against each other only when the order of their times makes
-    them disagree: crews who said all clear before an alert was issued said nothing
-    about the alert, and a notice outranks only what the radio said before it."""
+    them disagree: an all-clear said before an alert was issued said nothing about
+    the alert, and a notice outranks only what the radio said before it. The texts
+    do not say who gave the all-clear, which a row does not keep."""
     found: list[Conflict] = []
     clear = [row for row in group.rows if "all_clear" in (row.data.get("details") or [])]
     for item in official:
@@ -853,10 +858,10 @@ def _conflicts(
             continue
         if item.kind == "alert" and item.state == "in_force":
             text = (
-                "Crews said all clear on the radio after this official alert was "
-                "issued. The alert, whose area holds this place, is in force. An "
+                "An all-clear was reported on the radio after this official alert "
+                "was issued. The alert, whose area holds this place, is in force. An "
                 "official source outranks radio traffic: the alert is what holds, and "
-                "what crews say on the radio does not end it."
+                "radio traffic does not end it."
             )
         elif (
             item.kind == "notice"
@@ -864,10 +869,11 @@ def _conflicts(
             and item.type in ORDERS - {"all_clear"}
         ):
             text = (
-                f"Crews said all clear on the radio after {_NOTICE_WORDS[item.type]} "
-                "that names a street of this incident was published by an authority. "
-                "An official source outranks radio traffic: what crews say on the "
-                "radio lifts no official notice. Whether the notice still holds is "
+                "An all-clear was reported on the radio after "
+                f"{_NOTICE_WORDS[item.type]} that names a street of this incident was "
+                "published by an authority. An official source outranks radio "
+                "traffic: radio traffic lifts no official notice. Whether the notice "
+                "still holds is "
                 f"for its authority to say. {_READING}"
             )
         else:

@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from beacon.ember import fake_response
-from beacon.incident.build import STATUS_WORDS
+from beacon.incident.build import DETAIL_WORDS, STATUS_WORDS
 
 
 def stand_in_writer(body: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -35,8 +35,9 @@ def stand_in_writer(body: Mapping[str, Any]) -> Mapping[str, Any]:
     raised = [line for line in radio if f"Alarm level {alarm}." in str(line.get("text"))]
     if isinstance(alarm, int) and alarm >= 2 and raised:
         points.append({"kind": "alarm", "cites": [raised[0]["n"]]})
-    # As the timeline's line says it (`beacon.incident.build.DETAIL_WORDS`).
-    evacuating = [line for line in radio if "mention an evacuation" in str(line.get("text"))]
+    # As a call's line says it.
+    said = DETAIL_WORDS["evacuation"]
+    evacuating = [line for line in radio if said in str(line.get("text"))]
     if evacuating:
         points.append({"kind": "evacuation", "cites": [evacuating[0]["n"]]})
     for kind in ("closure", "aircraft", "taps"):

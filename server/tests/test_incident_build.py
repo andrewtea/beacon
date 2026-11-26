@@ -643,7 +643,7 @@ def test_a_warning_is_named_as_a_warning_and_never_as_an_order(rows: Rows) -> No
     assert signal.sources[0].evidence_id == warning.id
 
 
-def test_crews_saying_all_clear_does_not_end_an_alert_or_lift_an_order(rows: Rows) -> None:
+def test_an_all_clear_on_the_radio_does_not_end_an_alert_or_lift_an_order(rows: Rows) -> None:
     fire(rows)
     alert = rows.alert(2, "shelter")
     order = rows.notice(3, "evacuation_order")
@@ -655,28 +655,60 @@ def test_crews_saying_all_clear_does_not_end_an_alert_or_lift_an_order(rows: Row
     by_alert, by_order = incident.conflicts
     assert (by_alert.kind, by_order.kind) == ("all_clear_on_radio", "all_clear_on_radio")
     assert by_alert.text == (
-        "Crews said all clear on the radio after this official alert was issued. The "
+        "An all-clear was reported on the radio after this official alert was issued. The "
         "alert, whose area holds this place, is in force. An official source outranks "
-        "radio traffic: the alert is what holds, and what crews say on the radio does "
-        "not end it."
+        "radio traffic: the alert is what holds, and radio traffic does not end it."
     )
     assert [source.evidence_id for source in by_alert.official] == [alert.id]
     assert [source.evidence_id for source in by_alert.radio] == [said.id]
     assert by_order.text == (
-        "Crews said all clear on the radio after an evacuation order that names a "
+        "An all-clear was reported on the radio after an evacuation order that names a "
         "street of this incident was published by an authority. An official source "
-        "outranks radio traffic: what crews say on the radio lifts no official notice. "
+        "outranks radio traffic: radio traffic lifts no official notice. "
         "Whether the notice still holds is for its authority to say. This is Beacon's "
         "reading of the document. Read the document for what it says."
     )
     assert [source.url for source in by_order.official] == [order.url]
     # Each is trusted as little as the weakest row it rests on: a call heard clear.
     assert (by_alert.confidence, by_order.confidence) == ("medium", "medium")
+    # Neither says who gave the all-clear: the row names units, and not a speaker.
+    for conflict in (by_alert, by_order):
+        assert "rews" not in conflict.text
 
     # Once the alert is cancelled, the radio is at odds with the order only.
     rows.alert(20, "gone", message_type="Cancel", replaces=("shelter",), point=None)
     (incident,) = incidents(rows, 25)
     assert [conflict.official[0].evidence_id for conflict in incident.conflicts] == [order.id]
+
+
+def test_what_was_said_on_the_radio_is_told_without_saying_who_said_it(rows: Rows) -> None:
+    fire(rows)
+    # A dispatcher relaying these leaves the same row as a crew saying them.
+    said = rows.radio(
+        2,
+        "fire",
+        "working",
+        units=("E36",),
+        details=("evacuation", "shelter_in_place", "road_closed", "aircraft_overhead", "all_clear"),
+    )
+
+    (incident,) = incidents(rows, 5)
+
+    (line,) = [
+        entry
+        for entry in incident.timeline
+        if said.id in [source.evidence_id for source in entry.sources]
+    ]
+    not_an_order = "That is radio traffic, not an official order."
+    assert line.text == (
+        f"Fire: crews at work. An evacuation mentioned. {not_an_order} Sheltering in "
+        f"place mentioned. {not_an_order} A road reported closed. An aircraft mentioned "
+        f"overhead. All clear said. {not_an_order} Units: E36."
+    )
+    (signal,) = [signal for signal in incident.signals if signal.kind == "evacuation_on_radio"]
+    assert signal.text == f"An evacuation was mentioned on the radio. {not_an_order}"
+    for text in (line.text, signal.text):
+        assert "Crews" not in text
 
 
 def test_an_all_clear_said_before_the_alert_or_the_order_is_not_at_odds_with_it(

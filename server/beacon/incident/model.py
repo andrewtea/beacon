@@ -32,7 +32,7 @@ SignalKind = Literal[
     "taps",
 ]
 ConflictKind = Literal[
-    # Crews said all clear on the radio after an official alert for the place was
+    # An all-clear was reported on the radio after an official alert for the place was
     # issued that is in force, or after an order or a warning was published.
     "all_clear_on_radio",
     # A notice that names a street of the incident, published after the radio's
