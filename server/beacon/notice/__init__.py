@@ -11,8 +11,10 @@ authority's own words.
 
 from beacon.notice.read import (
     HAZARDS,
+    MAX_PDF_BYTES,
     NOTICE_TYPES,
     ORDERS,
+    TEXT_TYPES,
     Notice,
     NoticeError,
     is_pdf,
@@ -22,8 +24,10 @@ from beacon.notice.read import (
 
 __all__ = [
     "HAZARDS",
+    "MAX_PDF_BYTES",
     "NOTICE_TYPES",
     "ORDERS",
+    "TEXT_TYPES",
     "Notice",
     "NoticeError",
     "is_pdf",

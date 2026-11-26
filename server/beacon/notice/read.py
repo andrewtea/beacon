@@ -2,24 +2,37 @@
 
 A notice is a document an authority published: an evacuation order, a shelter-in-place
 order, a road closure, an all-clear, a press release. Ember is given the PDF and a
-form to fill in. Unlike a radio call, a notice is meant to be relayed in the
-authority's own words, so the form has text fields: the areas it applies to, its
-instruction to the public, and a short summary. They are kept as Ember gave them, cut
-to a length, with control characters removed, and nothing else about them is checked.
+form to fill in. Nothing in Beacon's own process parses the PDF.
 
-Two things follow, and both are deliberate:
+Unlike a radio call, a notice is meant to be relayed in the authority's own words, so
+the form has text fields: the notice's title, the areas it applies to, its instruction
+to the public, and a short summary. They are kept as Ember gave them, cut to a length,
+with control characters removed, and nothing else about them can be checked. What
+follows from that is deliberate:
 
 - **What is kept of a notice is only as right as Ember's reading of it.** A row made
   from one says which Ember read it and links the document, and whoever shows it
   links the document too.
-- **A notice names places finer than a block**, because that is what an order is: a
+- **Text is kept only of a notice that tells the public something** (`TEXT_TYPES`): an
+  order, a warning, a closure, an advisory, an all-clear. Such a document is written
+  to be repeated, and names places, not people. A press release is where a victim is
+  named and a home is described, so of a press release, and of anything Ember does
+  not take for a notice, Beacon keeps what it is, who issued it, its times, and the
+  streets it names, and none of its text. The streets are names in the one shape
+  `beacon.radio.vocabulary.clean_street` gives them, without numbers.
+- **An order names places finer than a block**, because that is what an order is: a
   list of the addresses that must leave. Beacon's rule against house numbers is for
   radio traffic about people's emergencies, not for an authority's published order.
+  They stay in `areas` and `instruction`, and never become a row's `place`.
 
-The Ember call is made with `sensitive=True` all the same. A document at an address
-somebody listed can turn out to be anything, a press release that names a victim
-included, and the Ember ledger and trace are exported and published. So they keep the
-call's accounting and none of its text, and the call is paid for each time it is made.
+Ember is told not to give a private person's name, age, or condition whatever the
+document says. That is an instruction to a model, not a guarantee: the redaction pass
+that follows ingest still reads a notice's text before it is shown.
+
+The Ember call is made with `sensitive=True`. A document at an address somebody
+listed can turn out to be anything, and the Ember ledger and trace are exported and
+published. So they keep the call's accounting and none of its text, and the call is
+paid for each time it is made.
 """
 
 import base64
@@ -67,6 +80,8 @@ HAZARDS: tuple[str, ...] = get_args(Hazard)
 
 # The types that tell people to do something, or that they may stop.
 ORDERS = frozenset({"evacuation_order", "evacuation_warning", "shelter_in_place", "all_clear"})
+# The types whose text is kept: the ones written to be repeated to the public.
+TEXT_TYPES = ORDERS | {"road_closure", "advisory"}
 
 MAX_AREAS = 12
 MAX_STREETS = 30
@@ -150,8 +165,10 @@ class Notice:
     # When the notice says it was issued, and until when it applies.
     issued_at: datetime | None
     effective_until: datetime | None
-    # In the notice's own words, as Ember gave them.
+    # In the notice's own words, as Ember gave them. Empty for a notice whose type
+    # is not one of `TEXT_TYPES`, and so is `title`.
     areas: tuple[str, ...]
+    # Street names, without numbers.
     streets: tuple[str, ...]
     instruction: str | None
     summary: str | None
@@ -230,20 +247,23 @@ def read_notice(ember: EmberClient, pdf: bytes) -> Notice:
 
 def read_form(form: dict[str, Any], *, read_by: ModelSource) -> Notice:
     """A `Notice` from a filled-in form. A field of the wrong kind is left empty, a
-    text is cut to its length, and a street that is not shaped like one is dropped."""
+    text is cut to its length, and a street that is not shaped like one is dropped.
+    Of a notice whose type is not one of `TEXT_TYPES`, no text is kept at all."""
+    notice_type = _one_of(form.get("notice_type"), NOTICE_TYPES, "other")
+    worded = notice_type in TEXT_TYPES
     areas = form.get("areas")
     streets = form.get("streets")
     return Notice(
-        notice_type=_one_of(form.get("notice_type"), NOTICE_TYPES, "other"),  # type: ignore[arg-type]
+        notice_type=notice_type,  # type: ignore[arg-type]
         hazard=_one_of(form.get("hazard"), HAZARDS, "other"),  # type: ignore[arg-type]
         issuer=_text(form.get("issuer"), _MAX_NAME),
-        title=_text(form.get("title"), _MAX_NAME),
+        title=_text(form.get("title"), _MAX_NAME) if worded else None,
         issued_at=_moment(form.get("issued_at")),
         effective_until=_moment(form.get("effective_until")),
         areas=tuple(
             dict.fromkeys(
                 area
-                for value in (areas if isinstance(areas, list) else [])
+                for value in (areas if worded and isinstance(areas, list) else [])
                 if (area := _text(value, _MAX_AREA)) is not None
             )
         )[:MAX_AREAS],
@@ -254,18 +274,22 @@ def read_form(form: dict[str, Any], *, read_by: ModelSource) -> Notice:
                 if (street := clean_street(value)) is not None
             )
         )[:MAX_STREETS],
-        instruction=_text(form.get("instruction"), _MAX_INSTRUCTION),
-        summary=_text(form.get("summary"), _MAX_SUMMARY),
+        instruction=_text(form.get("instruction"), _MAX_INSTRUCTION) if worded else None,
+        summary=_text(form.get("summary"), _MAX_SUMMARY) if worded else None,
         read_by=read_by,
     )
 
 
 def _form(text: str) -> dict[str, Any] | None:
+    """The form in Ember's answer, or None when the answer is not the whole form:
+    every key of the schema, whatever its value."""
     try:
         form = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
-    return form if isinstance(form, dict) else None
+    if not isinstance(form, dict) or not set(SCHEMA["required"]) <= form.keys():
+        return None
+    return form
 
 
 def _one_of(value: Any, allowed: tuple[str, ...], otherwise: str) -> str:
