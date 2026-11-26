@@ -7,7 +7,7 @@ Beacon is a "What's that?" button for San Francisco, built for the Meta Muse Emb
 - `web/`: React + Vite + TypeScript PWA. Package manager is pnpm. Tests are Vitest with Testing Library, lint is oxlint, format is Prettier.
 - `server/`: Python 3.12 + FastAPI, managed with uv. Tests are pytest, lint and format are ruff (config in the root `ruff.toml`). The package is `beacon`; every route is under `/api`.
 - `scripts/`: repository scripts. Python scripts import `beacon` and run with `uv run --project server python scripts/<name>.py`. Keep their logic in `server/beacon/` so it is tested; the script is a thin entry point.
-- `data/`: local runtime data (SQLite files, recordings, downloads), ignored by Git. `BEACON_DATA_DIR` moves it.
+- `data/`: local runtime data (SQLite files, recordings, downloads), ignored by Git. Nothing writes there yet. `BEACON_DATA_DIR` is the name reserved for moving it; the code that stores data must read it.
 
 Each `server/beacon/` package has one concern, so parallel pull requests stay apart. Today: `api/` (HTTP routes, one module per resource, each exposing a `router` that `beacon.main` mounts under `/api`). When you add a package, add it to this list and to the README's layout table.
 
@@ -24,8 +24,8 @@ Run one server test with `cd server && uv run pytest tests/test_health.py -k nam
 
 ## Rules
 
-- **Only `server/beacon/ember/` may call the Meta Model API.** Every model call goes through its client, which records tokens and cost and refuses a call past the spending stop. No other module imports an SDK for a model or sends a request to `api.meta.ai`. Going over $10 disqualifies the entry.
-- **Tests and CI never call the Meta Model API or a live data source.** Tests replay recorded or hand-written responses. `server/tests/conftest.py` removes `MODEL_API_KEY`, sets `REPLAY=1`, and fails any test that opens a TCP connection to another machine. Do not weaken it; give the code under test a fake transport instead.
+- **Only `server/beacon/ember/` may call the Meta Model API.** That package does not exist yet: it is the second part of Phase 1, and until it lands nothing calls a model. It must hold the one client every model call goes through, which records tokens and cost for each call, replays recorded responses when `REPLAY=1`, and refuses a call past the spending stop. No other module imports an SDK for a model or sends a request to `api.meta.ai`. Going over $10 disqualifies the entry.
+- **Tests and CI never call the Meta Model API or a live data source.** Tests replay recorded or hand-written responses. `server/tests/conftest.py` removes `MODEL_API_KEY`, sets `REPLAY=1`, and patches Python's `socket.connect` and `socket.connect_ex` to raise `NetworkBlockedError` for an address that is not this machine. The patch is a backstop: a test that catches the error still passes, and native code that opens its own sockets is not covered, so the rule is yours to keep. Do not weaken the guard; give the code under test a fake transport instead.
 - **Never commit secrets, raw radio audio, or downloaded source data.** The repository is public. Keys come from the environment (`MODEL_API_KEY`). Runtime data stays under the Git-ignored `data/`. Beacon publishes summaries, never raw radio audio.
 - **Say what is mocked.** Until real keys and permissions exist, features run on mock data. Anything a stand-in produced is labeled as such in the API reply and in the app, and the README's status says so. Never present a stand-in's output as Ember's.
 - **Product lines that keep Beacon inside the hackathon rules** (see HACKATHON.md, "Constraints for Beacon"):

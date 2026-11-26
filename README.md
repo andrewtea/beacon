@@ -35,6 +35,13 @@ pnpm dev
 
 In an Amp orb, `amp orb services ensure` starts both and prints the portal URL.
 
+Both of those serve the web app with Vite's dev server, which leaves out the web app manifest and the service worker, so the app cannot be installed from it. To try the installable build, keep the server running and serve the production build, then open it on `localhost` or over HTTPS:
+
+```sh
+cd web
+pnpm build && pnpm preview
+```
+
 Run a Python script from `scripts/` with the server's environment: `uv run --project server python scripts/<name>.py`.
 
 ## Check
@@ -45,15 +52,17 @@ scripts/check web      # format, lint, tests, type check, build
 scripts/check server   # format, lint, tests
 ```
 
-Tests never call the Meta Model API or a live data source. They run with `REPLAY=1` and with `MODEL_API_KEY` removed from their environment, and CI runs the same script and holds no key. As a backstop, a server test that opens a TCP connection to another machine fails. That guard covers sockets in the test process only, not DNS lookups or subprocesses.
+Tests never call the Meta Model API or a live data source. They run with `REPLAY=1` and with `MODEL_API_KEY` removed from their environment, and CI runs the same script and holds no key. As a backstop, `server/tests/conftest.py` patches Python's `socket.connect` and `socket.connect_ex` in the test process to raise `NetworkBlockedError` for any address that is not this machine. It is a backstop and not a sandbox: a test that catches that error still passes, and the patch does not reach DNS lookups, subprocesses, or native code that opens sockets without Python's `socket` module.
 
 ## Configuration
 
-The server reads its settings from the environment; [`.env.example`](.env.example) lists them. `MODEL_API_KEY` is the Meta Model API key, and `REPLAY=1` (the default for development) replays recorded Ember responses at no cost. `BEACON_DATA_DIR` is where runtime data goes; it defaults to the repository's `data/`.
+Settings come from the environment. Nothing loads a `.env` file: export a variable in your shell or put it in front of the command.
+
+The scaffold reads none of them yet. [`.env.example`](.env.example) lists the three names that are reserved, and the Ember client, which is the second part of Phase 1, is what gives them effect: `MODEL_API_KEY` (the Meta Model API key), `REPLAY` (`1` to answer from recorded Ember responses and call nothing), and `BEACON_DATA_DIR` (where runtime data goes instead of the repository's `data/`). Today only the checks set any of them: `scripts/check`, CI, and the test suite set `REPLAY=1` and remove `MODEL_API_KEY`, and the tests point `BEACON_DATA_DIR` at a temporary directory.
 
 ## Rules Beacon is built under
 
-- Every model call goes through Muse Ember on the Meta Model API, from one client that tracks tokens and spend and stops before the budget is passed.
+- Every model call goes through Muse Ember on the Meta Model API, from one client that tracks tokens and spend and stops before the budget is passed. That client is not built yet, and until it is, nothing in the repository calls a model.
 - The answer to a tap is the product. The map is secondary.
 - A photo only adds evidence to an incident. Beacon is not an image analyzer.
 - EMS traffic is described as "medical response" with crews and a block-level location, never the patient.

@@ -1,14 +1,16 @@
-"""Shared test setup: tests run in replay mode, without an API key, and cannot open
-TCP connections to other machines.
+"""Shared test setup: tests run in replay mode, without an API key, and with a guard
+on Python's socket connections to other machines.
 
 Ember calls cost real money from a $10 budget, and going over it disqualifies the
 entry. What keeps a test run from spending it is the missing key: this module removes
 MODEL_API_KEY when pytest imports it, which is before any test module or fixture
 runs, and CI holds no key at all.
 
-The connection guard is a backstop, not a sandbox. It covers `connect` on sockets
-in this process. It does not cover DNS lookups, datagrams sent without `connect`,
-or subprocesses.
+The connection guard is a backstop, not a sandbox. It replaces `socket.socket.connect`
+and `connect_ex` in this process with versions that raise `NetworkBlockedError` for
+an address that is not this machine. A test that catches that error still passes. The
+guard does not cover DNS lookups, datagrams sent without `connect`, subprocesses, or
+native code that opens sockets without Python's `socket` module.
 """
 
 import ipaddress
