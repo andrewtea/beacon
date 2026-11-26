@@ -14,6 +14,7 @@ audio gets to Ember without touching a disk.
 from beacon.radio.audio import (
     AudioError,
     ConversionStopped,
+    ConversionUnavailable,
     Ffmpeg,
     Transcoder,
     core_dump_problem,
@@ -28,6 +29,7 @@ __all__ = [
     "NOTHING_KNOWN",
     "AudioError",
     "ConversionStopped",
+    "ConversionUnavailable",
     "ExtractionError",
     "Ffmpeg",
     "Known",

@@ -20,11 +20,12 @@ class Tap(BaseModel):
 def test_a_request_that_fails_validation_is_not_echoed_back() -> None:
     app = create_app()
 
-    @app.post("/api/taps")
+    # A route of the test's own, read by FastAPI as the real tap route is not.
+    @app.post("/api/places")
     def tap(tap: Tap) -> Tap:
         return tap
 
-    response = TestClient(app).post("/api/taps", json={"latitude": "37.7749 Mission St"})
+    response = TestClient(app).post("/api/places", json={"latitude": "37.7749 Mission St"})
 
     assert response.status_code == 422
     assert response.json() == {"detail": "The request cannot be used (body: float_parsing)."}

@@ -34,21 +34,31 @@ operator has to see to both kinds:
   limit when cores are handed to a collector: piped to a program
   (`kernel.core_pattern` beginning with `|`, as systemd-coredump and apport set
   it) or sent to a socket (beginning with `@`). A collector runs on the host,
-  outside any confinement. `core_dump_problem` reads the setting, and
-  `beacon.ingest.setup` refuses to hear real radio on a host that has one. The
-  setting is read once, when Beacon starts: it has to stay as it was for as long
-  as real radio is heard, and nothing here watches it.
+  outside any confinement. Beacon's own process is also marked as one the kernel
+  does not dump at all (`forbid_core_dumps`), which holds whatever the host does
+  with cores. That mark does not survive starting another program, so ffmpeg does
+  not have it: `core_dump_problem` reads the host's setting, and
+  `beacon.ingest.setup` refuses to hear real radio, and `beacon.taps` to take a
+  photo, on a host that has a collector. The setting is read once, when Beacon
+  starts: it has to stay as it was for as long as Beacon runs, and nothing here
+  watches it.
 
 On a system without `memfd_create` or without a working `bwrap`, nothing is
 converted. The mock scenario's calls are WAV and need no ffmpeg anywhere.
+
+A tap's photo comes from the internet as well, and is somebody's own picture, so it
+is decoded and drawn again by the same confined ffmpeg (`Ffmpeg.to_jpeg`), under the
+same limits. `beacon.taps.media` says what for.
 """
 
+import ctypes
 import io
 import os
 import resource
 import shutil
 import struct
 import subprocess
+import sys
 import threading
 import wave
 from collections.abc import Iterable
@@ -75,6 +85,9 @@ MAX_SECONDS = 120
 _READ_SECONDS = MAX_SECONDS + 1
 # How long ffmpeg may take over one call, by the clock and of processor time.
 _TIMEOUT_SECONDS = 30
+# How long it may take over one photo, by the clock.
+PHOTO_SECONDS = 10.0
+_UNAVAILABLE = "The converter could not be run on this host just now."
 # The address space ffmpeg may have, in kilobytes, and the files it may have open.
 _MEMORY_KB = 1_048_576
 _OPEN_FILES = 64
@@ -117,6 +130,12 @@ class AudioError(Exception):
     says nothing of the clip."""
 
 
+class ConversionUnavailable(Exception):
+    """The converter could not be run on this host just now: no memory for the
+    file, no process, no thread. It says nothing about the file, which may be a
+    good one, and is worth handing over again later. The text is fixed."""
+
+
 class ConversionStopped(Exception):
     """A conversion was called off because the converter was closed. It says
     nothing about the clip, which can be converted another time."""
@@ -125,7 +144,8 @@ class ConversionStopped(Exception):
 class Transcoder(Protocol):
     def to_wav(self, audio: bytes, kind: Convertible) -> bytes:
         """An M4A or MP3 clip as a WAV file, of at most a second more than
-        `MAX_SECONDS`. Raises AudioError when it cannot be converted, and
+        `MAX_SECONDS`. Raises AudioError when it cannot be converted,
+        ConversionUnavailable when the transcoder could not be run just now, and
         ConversionStopped when the transcoder was closed."""
         ...
 
@@ -219,10 +239,32 @@ def core_dump_problem(pattern: Path = CORE_PATTERN) -> str | None:
     return None
 
 
-def forbid_core_dumps() -> None:
-    """Set this process's core size limit to nothing. See `core_dump_problem` for
-    the hosts on which that is not enough."""
+# `prctl` operations, from <linux/prctl.h>.
+_PR_GET_DUMPABLE, _PR_SET_DUMPABLE = 3, 4
+
+
+def forbid_core_dumps() -> bool:
+    """Keep a crash of this process from leaving its memory anywhere, and say
+    whether that is now so.
+
+    Its core size limit is set to nothing, which stops a core that is written to a
+    file. On Linux, where a collector ignores that limit, the process is also marked
+    as not dumpable (`PR_SET_DUMPABLE`), and the kernel then makes no core of it
+    for a file, a pipe, or a socket. The mark also keeps another process of the
+    same user from reading this one's memory or attaching a debugger to it. It does
+    not pass to a program this process starts: see `core_dump_problem` for those.
+
+    False when the mark could not be set on Linux. Elsewhere the limit is all there
+    is, and all that is needed where nothing is known to ignore it."""
     resource.setrlimit(resource.RLIMIT_CORE, (0, resource.getrlimit(resource.RLIMIT_CORE)[1]))
+    if sys.platform != "linux":
+        return True
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0)
+        return libc.prctl(_PR_GET_DUMPABLE, 0, 0, 0, 0) == 0
+    except (OSError, AttributeError):
+        return False
 
 
 def confinement(bwrap: str, hidden: Iterable[Path] = ()) -> list[str]:
@@ -267,10 +309,11 @@ class Ffmpeg:
         self._ffmpeg = _program(executable)
         self._bwrap = _program(bwrap)
         self._hidden = tuple(Path(path) for path in hidden)
-        # Guards `_closed` and `_running`, the conversion that is under way.
+        # Guards `_closed` and `_running`, the conversions that are under way:
+        # one for the radio poller, and one for each tap that is being taken.
         self._lock = threading.Lock()
         self._closed = False
-        self._running: subprocess.Popen[bytes] | None = None
+        self._running: set[subprocess.Popen[bytes]] = set()
 
     def problem(self) -> str | None:
         """Why nothing can be converted here, in a sentence, or None when ffmpeg
@@ -312,22 +355,115 @@ class Ffmpeg:
     def close(self) -> None:
         with self._lock:
             self._closed = True
-            if self._running is not None:
+            for process in self._running:
                 # bwrap takes everything it confined down with it.
-                self._running.kill()
+                process.kill()
 
     def to_wav(self, audio: bytes, kind: Convertible) -> bytes:
         demuxer = _DEMUXERS.get(kind)
         usable = self._ffmpeg is not None and self._bwrap is not None
+        # A converter that is not installed converts nothing, today or tomorrow,
+        # which `problem` says before one is put to use.
         if demuxer is None or not usable or not hasattr(os, "memfd_create"):
             raise_bare(AudioError("A radio call could not be converted by ffmpeg."))
-        clip = os.memfd_create("beacon-radio-call")
+        pcm = self._convert(
+            audio,
+            "beacon-radio-call",
+            # An MP4 file can say its audio is in another file. It is not followed.
+            ["-f", demuxer, *(["-enable_drefs", "0"] if demuxer == "mov" else [])],
+            ["-vn", "-t", str(_READ_SECONDS), "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le"],
+            limit=_READ_SECONDS * SAMPLE_RATE * _SAMPLE_BYTES,
+            seconds=_TIMEOUT_SECONDS,
+        )
+        # Whole samples, and no more of them than were asked for.
+        pcm = pcm[: _READ_SECONDS * SAMPLE_RATE * _SAMPLE_BYTES]
+        pcm = pcm[: len(pcm) - len(pcm) % _SAMPLE_BYTES]
+        if not pcm:
+            raise_bare(AudioError("A radio call could not be converted by ffmpeg."))
+        return pcm_to_wav(pcm)
+
+    def to_jpeg(self, photo: bytes, *, max_side: int, max_bytes: int) -> bytes | None:
+        """A JPEG file decoded and drawn again as a new one: the first picture in
+        the file, no wider or taller than `max_side`, with nothing in it that the
+        encoder did not write. None when it cannot be decoded, takes longer than
+        `PHOTO_SECONDS`, or comes out larger than `max_bytes`.
+
+        The new file has no colour profile, and the picture's colours are not
+        converted for the lack of one.
+
+        Raises ConversionUnavailable when ffmpeg could not be run at all, which
+        says nothing about the photo, and ConversionStopped when the converter is
+        closed, before or meanwhile."""
+        fit = f"min(iw,{int(max_side)})", f"min(ih,{int(max_side)})"
+        drawn = self._convert(
+            photo,
+            "beacon-tap-photo",
+            # Read as a JPEG and decoded as one, whatever else the bytes could pass for.
+            # And strictly: a file whose picture is damaged or cut short is no
+            # picture, where ffmpeg would otherwise draw what it could of it.
+            ["-err_detect", "explode", "-xerror", "-f", "jpeg_pipe", "-c:v", "mjpeg"],
+            [
+                "-an",
+                "-frames:v",
+                "1",
+                "-vf",
+                f"scale=w='{fit[0]}':h='{fit[1]}':force_original_aspect_ratio=decrease",
+                "-pix_fmt",
+                "yuvj420p",
+                # Nothing is carried over from the file that was read, and the
+                # encoder does not sign what it writes.
+                "-map_metadata",
+                "-1",
+                "-fflags",
+                "+bitexact",
+                "-flags:v",
+                "+bitexact",
+                "-q:v",
+                "4",
+                "-f",
+                "mjpeg",
+            ],
+            limit=max_bytes,
+            seconds=PHOTO_SECONDS,
+        )
+        return drawn or None
+
+    def _convert(
+        self,
+        data: bytes,
+        name: str,
+        read_as: list[str],
+        write_as: list[str],
+        *,
+        limit: int,
+        seconds: float,
+    ) -> bytes:
+        """What the confined ffmpeg makes of `data`, read as `read_as` says and
+        written to its output as `write_as` says, or nothing when ffmpeg made
+        nothing of it.
+
+        Raises ConversionUnavailable when ffmpeg could not be run at all, and
+        ConversionStopped when the converter is closed, before or meanwhile."""
+        if self._ffmpeg is None or self._bwrap is None or not hasattr(os, "memfd_create"):
+            raise_bare(ConversionUnavailable(_UNAVAILABLE))
+        clip = -1
+        held = False
         try:
-            view = memoryview(audio)
+            clip = os.memfd_create(name)
+            view = memoryview(data)
             while view:
                 view = view[os.write(clip, view) :]
             os.lseek(clip, 0, os.SEEK_SET)
-            pcm = self._run(
+            held = True
+        except OSError:
+            # No memory for the file, or no more files. Nothing about the file.
+            held = False
+        if not held:
+            if clip >= 0:
+                os.close(clip)
+            raise_bare(ConversionUnavailable(_UNAVAILABLE))
+        try:
+            return self._run(
                 [
                     *confinement(self._bwrap, self._hidden),
                     self._ffmpeg,
@@ -337,83 +473,88 @@ class Ffmpeg:
                     "quiet",
                     "-threads",
                     "1",
-                    # The clip is read as the one kind of file it is, from this
+                    # The file is read as the one kind of file it is, from this
                     # file and nothing else: a file ffmpeg is left to recognize can
                     # be a playlist, and a playlist can name other files and addresses.
                     "-protocol_whitelist",
                     "file",
-                    "-f",
-                    demuxer,
-                    # An MP4 file can say its audio is in another file. It is not followed.
-                    *(["-enable_drefs", "0"] if demuxer == "mov" else []),
+                    *read_as,
                     "-i",
                     f"/proc/self/fd/{clip}",
-                    "-vn",
-                    "-t",
-                    str(_READ_SECONDS),
-                    "-ac",
-                    "1",
-                    "-ar",
-                    str(SAMPLE_RATE),
-                    "-f",
-                    "s16le",
+                    *write_as,
                     "pipe:1",
                 ],
                 clip,
+                limit=limit,
+                seconds=seconds,
             )
         finally:
             os.close(clip)
-        # Whole samples, and no more of them than were asked for.
-        pcm = pcm[: _READ_SECONDS * SAMPLE_RATE * _SAMPLE_BYTES]
-        pcm = pcm[: len(pcm) - len(pcm) % _SAMPLE_BYTES]
-        if not pcm:
-            raise_bare(AudioError("A radio call could not be converted by ffmpeg."))
-        return pcm_to_wav(pcm)
 
-    def _run(self, command: list[str], clip: int) -> bytes:
+    def _run(self, command: list[str], clip: int, *, limit: int, seconds: float) -> bytes:
         """What the command wrote to its output, or nothing when it failed, ran
-        over its time, or wrote more than a clip can be.
+        for longer than `seconds`, or wrote more than `limit` bytes.
 
-        Raises ConversionStopped when the converter is closed, before or meanwhile."""
-        limit = _READ_SECONDS * SAMPLE_RATE * _SAMPLE_BYTES
+        Raises ConversionUnavailable when the command could not be started or
+        watched, and ConversionStopped when the converter is closed, before or
+        meanwhile. Either way no process of it is left behind."""
+        process: subprocess.Popen[bytes] | None = None
         with self._lock:
-            if self._closed:
-                raise_bare(ConversionStopped("The converter is closed."))
-            try:
-                process = subprocess.Popen(
-                    command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    # What ffmpeg says about a clip is not kept.
-                    stderr=subprocess.DEVNULL,
-                    pass_fds=(clip,),
-                    # Nothing of Beacon's environment: a setting such as FFREPORT
-                    # would have ffmpeg write a report about the clip to a file.
-                    env={},
-                    cwd="/",
-                )
-            except OSError:
-                process = None
-            self._running = process
-        if process is None or process.stdout is None:
-            return b""
+            closed = self._closed
+            if not closed:
+                try:
+                    process = subprocess.Popen(
+                        command,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        # What ffmpeg says about a file is not kept.
+                        stderr=subprocess.DEVNULL,
+                        pass_fds=(clip,),
+                        # Nothing of Beacon's environment: a setting such as FFREPORT
+                        # would have ffmpeg write a report about the file to a file.
+                        env={},
+                        cwd="/",
+                    )
+                except OSError:
+                    process = None
+                else:
+                    self._running.add(process)
+        if closed:
+            raise_bare(ConversionStopped("The converter is closed."))
+        if process is None:
+            raise_bare(ConversionUnavailable(_UNAVAILABLE))
         out = bytearray()
-        clock = threading.Timer(_TIMEOUT_SECONDS, process.kill)
-        clock.start()
+        clock: threading.Timer | None = None
+        watched = True
         try:
-            while len(out) <= limit and (piece := process.stdout.read(65_536)):
-                out += piece
+            clock = threading.Timer(seconds, process.kill)
+            # A host that is out of threads raises here, with the process running.
+            clock.start()
+            if process.stdout is not None:
+                while len(out) <= limit and (piece := process.stdout.read(65_536)):
+                    out += piece
             if len(out) > limit:
                 process.kill()
-            process.stdout.close()
             process.wait()
+        except (OSError, RuntimeError):
+            watched = False
         finally:
-            clock.cancel()
+            if clock is not None:
+                clock.cancel()
+            if process.returncode is None:
+                # It was not seen to its end above, whatever went wrong there. It
+                # is ended here, and waited for, before anything else is done.
+                process.kill()
+                process.wait()
+            if process.stdout is not None:
+                process.stdout.close()
             with self._lock:
-                self._running = None
+                self._running.discard(process)
                 closed = self._closed
         if closed:
             raise_bare(ConversionStopped("The converter is closed."))
+        if not watched:
+            raise_bare(ConversionUnavailable(_UNAVAILABLE))
         return bytes(out) if process.returncode == 0 and len(out) <= limit else b""
 
 

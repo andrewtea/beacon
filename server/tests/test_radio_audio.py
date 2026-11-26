@@ -1,6 +1,8 @@
 """Radio audio on its way to Ember: what kind of file it is, how long it really
 plays, and how ffmpeg is confined while it decodes one."""
 
+import ctypes
+import errno
 import io
 import math
 import os
@@ -12,10 +14,17 @@ import time
 import wave
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from beacon.radio import AudioError, ConversionStopped, Ffmpeg, plain_wav
+from beacon.radio import (
+    AudioError,
+    ConversionStopped,
+    ConversionUnavailable,
+    Ffmpeg,
+    plain_wav,
+)
 from beacon.radio import audio as audio_module
 from beacon.radio.audio import (
     MAX_SECONDS,
@@ -335,12 +344,53 @@ def test_a_host_whose_core_dump_setting_cannot_be_read_is_a_problem(tmp_path: Pa
     assert "cannot be read" in found
 
 
-def test_this_process_can_be_kept_from_writing_a_core_file() -> None:
+# `prctl` operations: whether the kernel makes a core of this process.
+_GET_DUMPABLE, _SET_DUMPABLE = 3, 4
+
+
+def test_this_process_can_be_kept_from_leaving_a_core_in_a_file_or_with_a_collector() -> None:
     resource = pytest.importorskip("resource")
     before = resource.getrlimit(resource.RLIMIT_CORE)
+    libc = ctypes.CDLL(None) if sys.platform == "linux" else None
     try:
-        forbid_core_dumps()
+        if libc is not None:
+            libc.prctl(_SET_DUMPABLE, 1, 0, 0, 0)
+
+        assert forbid_core_dumps() is True
+
+        # No core file, and on Linux no core at all, which a collector would get
+        # whatever the limit says.
         assert resource.getrlimit(resource.RLIMIT_CORE)[0] == 0
+        if libc is not None:
+            assert libc.prctl(_GET_DUMPABLE, 0, 0, 0, 0) == 0
+    finally:
+        resource.setrlimit(resource.RLIMIT_CORE, before)
+        if libc is not None:
+            libc.prctl(_SET_DUMPABLE, 1, 0, 0, 0)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="The mark is Linux's.")
+def test_a_process_that_cannot_be_marked_is_said_not_to_be_kept_from_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = pytest.importorskip("resource")
+    before = resource.getrlimit(resource.RLIMIT_CORE)
+
+    class Refusing:
+        """A C library whose `prctl` changes nothing, as under a filter that forbids it."""
+
+        def prctl(self, operation: int, *arguments: int) -> int:
+            return 1 if operation == _GET_DUMPABLE else -1
+
+    try:
+        monkeypatch.setattr(ctypes, "CDLL", lambda *args, **kwargs: Refusing())
+        assert forbid_core_dumps() is False
+
+        def missing(*args: object, **kwargs: object) -> object:
+            raise OSError("no C library")
+
+        monkeypatch.setattr(ctypes, "CDLL", missing)
+        assert forbid_core_dumps() is False
     finally:
         resource.setrlimit(resource.RLIMIT_CORE, before)
 
@@ -365,7 +415,7 @@ def test_closing_the_converter_calls_off_a_conversion_and_refuses_the_next(
     thread = threading.Thread(target=convert)
     thread.start()
     deadline = time.monotonic() + 10
-    while converter._running is None and time.monotonic() < deadline:
+    while not converter._running and time.monotonic() < deadline:
         time.sleep(0.01)
     began = time.monotonic()
 
@@ -409,11 +459,62 @@ def test_what_is_not_the_clip_it_is_said_to_be_is_refused_with_a_fixed_sentence(
     assert (failure.value.__cause__, failure.value.__context__) == (None, None)
 
 
+_UNAVAILABLE = r"^The converter could not be run on this host just now\.$"
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("failing", ["memory", "process", "watch"])
+def test_a_host_that_could_not_run_the_converter_says_so_and_nothing_about_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing: str
+) -> None:
+    m4a = as_m4a(tone(1.0), tmp_path)
+    started: list[subprocess.Popen[bytes]] = []
+    real_popen = subprocess.Popen
+
+    def out_of(*args: object, **kwargs: object) -> object:
+        raise OSError(errno.EAGAIN, "Resource temporarily unavailable")
+
+    def popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        started.append(real_popen(*args, **kwargs))
+        return started[-1]
+
+    def no_thread(self: threading.Thread) -> None:
+        raise RuntimeError("can't start new thread")
+
+    if failing == "memory":
+        monkeypatch.setattr(os, "memfd_create", out_of)
+    elif failing == "process":
+        monkeypatch.setattr(subprocess, "Popen", out_of)
+    else:
+        # The process runs, and would for a minute, and nothing can watch the time.
+        monkeypatch.setattr("beacon.radio.audio._LIMITS", "sleep 60")
+        monkeypatch.setattr(subprocess, "Popen", popen)
+        monkeypatch.setattr(threading.Timer, "start", no_thread)
+    converter = Ffmpeg()
+    began = time.monotonic()
+
+    # A good clip, which is not called a bad one: it can be handed over again.
+    with pytest.raises(ConversionUnavailable, match=_UNAVAILABLE) as failure:
+        _while_handling(ValueError("Jane Doe"), lambda: converter.to_wav(m4a, "m4a"))
+
+    assert (failure.value.__cause__, failure.value.__context__) == (None, None)
+    with pytest.raises(ConversionUnavailable, match=_UNAVAILABLE):
+        converter.to_jpeg(b"\xff\xd8\xff\xd9", max_side=2048, max_bytes=1_000_000)
+    # No process is left behind: each one that began was ended and waited for.
+    assert time.monotonic() - began < 10
+    assert len(started) == (2 if failing == "watch" else 0)
+    assert all(process.returncode is not None for process in started)
+    assert converter._running == set()
+
+
 def test_a_missing_ffmpeg_is_the_same_fixed_sentence_and_a_problem_that_is_named() -> None:
     missing = Ffmpeg("/nonexistent/ffmpeg")
 
     with pytest.raises(AudioError, match=r"^A radio call could not be converted by ffmpeg\.$"):
         missing.to_wav(b"\x00\x00\x00\x1cftypM4A ", "m4a")
+    # A photo is another caller's, which is told that the converter cannot be run.
+    with pytest.raises(ConversionUnavailable, match=_UNAVAILABLE):
+        missing.to_jpeg(b"\xff\xd8\xff\xd9", max_side=2048, max_bytes=1_000_000)
     if hasattr(os, "memfd_create"):
         assert missing.problem() == "Radio audio is converted by ffmpeg, which is not installed."
 

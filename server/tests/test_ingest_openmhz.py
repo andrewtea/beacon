@@ -40,7 +40,13 @@ from beacon.ingest.openmhz import (
     parse_calls,
 )
 from beacon.ingest.runner import PollerHeldError
-from beacon.radio import NOTHING_KNOWN, AudioError, ConversionStopped, Known
+from beacon.radio import (
+    NOTHING_KNOWN,
+    AudioError,
+    ConversionStopped,
+    ConversionUnavailable,
+    Known,
+)
 from beacon.radio.audio import pcm_to_wav
 
 NOON = datetime(2026, 11, 27, 20, 0, tzinfo=UTC)
@@ -1086,6 +1092,8 @@ class Converter:
     def __init__(self) -> None:
         self.converted: list[tuple[bytes, str]] = []
         self.closed = False
+        # Whether the host has no memory, process or thread for a conversion.
+        self.unavailable = False
 
     def to_wav(self, audio: bytes, kind: str) -> bytes:
         self.converted.append((audio, kind))
@@ -1093,6 +1101,8 @@ class Converter:
             raise ConversionStopped("The converter is closed.")
         if b"broken" in audio:
             raise AudioError("A radio call could not be converted by ffmpeg.")
+        if self.unavailable:
+            raise ConversionUnavailable("The converter could not be run on this host just now.")
         return tone(audio[-1])
 
     def close(self) -> None:
@@ -1124,6 +1134,30 @@ def test_a_call_that_is_not_wav_is_converted_before_ember_hears_it(
     assert converter.converted == [(m4a(1), "m4a"), (m4a(2, b"broken"), "m4a"), (mp3(3), "mp3")]
     # Ember was handed the WAV, and only for the calls that converted.
     assert radio.asked == [tone(1), tone(3)]
+
+
+def test_a_call_the_host_could_not_convert_just_now_is_not_passed_over(
+    store: EvidenceStore, radio: Radio, storage: Storage
+) -> None:
+    converter = Converter()
+    poller = build(radio, storage, transcoder=converter)
+    radio.call(1, seconds(-30), audio=m4a(1))
+    radio.heard[tone(1)] = form()
+    converter.unavailable = True
+
+    # The poll ends as it does when a source fails, which is tried again later.
+    with pytest.raises(
+        SourceError, match=r"^openmhz calls could not be converted on this host just now\.$"
+    ) as failure:
+        poller.poll(store, NOON)
+
+    assert (failure.value.__cause__, failure.value.__context__) == (None, None)
+    # Nothing was asked of Ember, and the call was neither taken nor counted out.
+    assert (radio.asked, store.taken("openmhz", ["call0001"])) == ([], set())
+    converter.unavailable = False
+    report = poller.poll(store, seconds(30))
+    assert (report.added, report.unreadable) == (1, 0)
+    assert refs(store) == ["call0001"]
 
 
 def test_a_conversion_called_off_by_closing_leaves_the_call_for_the_next_run(
