@@ -19,18 +19,28 @@ is kept:
   it was, and until when it is kept; it does not hold it.
 
 A tap from outside the area Beacon covers is refused, and nothing of it is kept.
+
+A tap comes from anybody, so the work it is given is bounded in the order it is done:
+what is read of a request is bounded before it is parsed (`MAX_TAPS_AT_ONCE`, and
+`_parse`, which refuses a body with more structure than a tap has before any of it
+is made into objects); the place is checked before anything else is looked at; the
+tap takes its place in the minute (`MAX_TAPS_PER_MINUTE`) before its photo or clip
+is decoded, so a sender who is being refused costs no decoding; and only then is the
+media cleaned. A tap whose photo turns out not to be one has used its place.
 """
 
 import base64
 import binascii
 import contextlib
+import json
+import logging
 import math
 import secrets
 import sqlite3
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -38,6 +48,7 @@ from typing import Any
 from beacon.errors import raise_bare
 from beacon.evidence import EvidenceStore, EvidenceStoreError, Mode, NewEvidence, Point
 from beacon.ingest.area import SAN_FRANCISCO, Bounds
+from beacon.radio.audio import ConversionStopped
 from beacon.taps.media import (
     MAX_CLIP_BYTES,
     MAX_PHOTO_BYTES,
@@ -46,11 +57,15 @@ from beacon.taps.media import (
     MediaFullError,
     MediaKind,
     Photo,
+    PhotoConverter,
+    Swept,
     TapMedia,
     clean_clip,
     clean_photo,
     is_tap_id,
 )
+
+logger = logging.getLogger(__name__)
 
 # The feed a tap comes from: the web app.
 SOURCE = "app"
@@ -67,6 +82,19 @@ MAX_TAPS_AT_ONCE = 8
 _MAX_ACCURACY_M = 100_000.0
 _FIELDS = frozenset({"location", "photo", "clip"})
 _LOCATION_FIELDS = frozenset({"lat", "lon", "accuracy_m"})
+# The most of each mark of JSON's structure a tap's body may hold. A tap has two
+# objects, four commas, and six colons, and base64 has none of these characters, so
+# a body with more is not a tap, and is refused before it is parsed: ten megabytes
+# of brackets would otherwise become millions of objects.
+_MOST_MARKS = ((b"{", 4), (b"[", 2), (b",", 12), (b":", 12))
+
+_SHAPE = (
+    "A tap is a JSON object with a location, which has lat and lon in degrees, "
+    "and optionally accuracy_m, a photo, and a clip."
+)
+_NOT_JSON = "A tap is a JSON object."
+_MEDIA = "A tap's photo and clip are files in base64, of a size Beacon takes."
+_NOT_TAKING = "This server is not taking taps."
 
 
 class TapError(Exception):
@@ -103,11 +131,16 @@ class Taps:
         store: EvidenceStore,
         media: TapMedia,
         *,
+        photos: PhotoConverter | None = None,
         clock: Callable[[], datetime] | None = None,
         bounds: Bounds = SAN_FRANCISCO,
     ) -> None:
+        """`photos` draws a tap's photo again (`beacon.taps.media.clean_photo`).
+        Without one, a tap that sends a photo is refused, and one that sends none
+        is taken. It is closed with the taps (`close`)."""
         self._store = store
         self._media = media
+        self._photos = photos
         self._clock = (lambda: datetime.now(UTC)) if clock is None else clock
         self._bounds = bounds
         # When the taps of the last minute were taken, by a clock that only goes forward.
@@ -120,11 +153,11 @@ class Taps:
     def store(self) -> EvidenceStore:
         return self._store
 
-    @contextlib.contextmanager
-    def receiving(self) -> Iterator[None]:
-        """Hold one of the `MAX_TAPS_AT_ONCE` places for as long as a tap is being
-        read from the network and taken. The route enters this before it reads a
-        tap's body.
+    def admit(self) -> Callable[[], None]:
+        """Take one of the `MAX_TAPS_AT_ONCE` places, for as long as a tap is being
+        read from the network and taken, and return what gives the place back. The
+        route takes a place before it reads a tap's body, and whoever finishes with
+        the tap gives it back, once: calling it again does nothing.
 
         Raises TapError when every place is held."""
         with self._counting:
@@ -133,11 +166,22 @@ class Taps:
                 self._receiving += 1
         if full:
             raise_bare(TapError(503, "Beacon is busy with other taps. Try again in a moment.", 1))
-        try:
-            yield
-        finally:
+        held = [True]
+
+        def give_back() -> None:
             with self._counting:
-                self._receiving -= 1
+                if held[0]:
+                    held[0] = False
+                    self._receiving -= 1
+
+        return give_back
+
+    def take_body(self, body: bytes) -> Tap:
+        """Take one tap from the body of the request that sent it. It reads all of
+        a body, so a server calls it off its event loop.
+
+        Raises TapError as `take` does, and when the body is not a tap's JSON."""
+        return self.take(_parse(body))
 
     def take(self, payload: Any) -> Tap:
         """Take one tap, as the JSON a phone sent:
@@ -149,12 +193,29 @@ class Taps:
         media kept, or neither is.
 
         Raises TapError when the tap cannot be used or cannot be taken just now."""
-        point, accuracy_m, photo, clip = _read(payload)
+        point, accuracy_m, photo_sent, clip_sent = _read(payload)
         if not self._bounds.holds(point):
             raise_bare(
                 TapError(422, "Beacon covers San Francisco, and this tap is from somewhere else.")
             )
+        photos = self._photos
+        if photo_sent is not None and photos is None:
+            raise_bare(TapError(503, "This server cannot take a photo. Send the tap without one."))
+        # Its place in the minute, before anything of it is decoded.
         self._count()
+        stopped = False
+        photo: Photo | None = None
+        clip: Clip | None = None
+        try:
+            if photo_sent is not None and photos is not None:
+                photo = _media(photo_sent, lambda file: clean_photo(file, photos))
+            if clip_sent is not None:
+                clip = _media(clip_sent, clean_clip)
+        except ConversionStopped:
+            stopped = True
+        if stopped:
+            # The server is shutting down.
+            raise_bare(TapError(503, _NOT_TAKING))
         now = self._clock()
         tap_id = secrets.token_urlsafe(12)
         kept_until = None
@@ -165,7 +226,15 @@ class Taps:
             self._store.add([_row(tap_id, now, point, accuracy_m, photo, clip, kept_until)])
         except BaseException as error:
             # A tap is taken whole or not at all: no photo without its row.
-            self._media.drop(tap_id)
+            try:
+                self._media.drop(tap_id)
+            except OSError:
+                # The tap is still refused as it would have been. The file has no
+                # row, so nobody is handed it, and the sweep deletes it.
+                logger.error(
+                    "A file of a tap that was not taken could not be deleted. It is "
+                    "handed to nobody, and the sweep will try again."
+                )
             refusal = _refusal(error)
             if refusal is None:
                 raise
@@ -182,18 +251,29 @@ class Taps:
 
     def media(self, tap_id: str, kind: MediaKind) -> bytes | None:
         """A tap's photo (a JPEG file) or clip (a WAV file), as it was cleaned, or
-        None when the tap sent none, its hour is over, or there is no such tap."""
-        if not is_tap_id(tap_id):
+        None when the tap sent none, its hour is over, or there is no such tap. A
+        file is handed out only for a tap whose row is stored and says it sent one."""
+        if not is_tap_id(tap_id) or kind not in ("photo", "clip"):
+            return None
+        row = self._store.find(SOURCE, tap_id)
+        if row is None or row.kind != "tap" or row.data.get(kind) is None:
             return None
         return self._media.read(tap_id, kind, self._clock())
 
-    def sweep(self) -> int:
-        """Delete the media whose hour is over, and return how many files that was."""
-        return self._media.sweep(self._clock())
+    def sweep(self) -> Swept:
+        """Delete the media whose hour is over, of this store's taps and the other
+        store's, and the files of this store's that have had no row for too long.
+
+        Raises OSError when the media cannot be listed."""
+        return self._media.sweep(self._clock(), lambda ids: self._store.taken(SOURCE, ids))
 
     def close(self) -> None:
-        """Take no more taps: the store is closed."""
+        """Take no more taps: the store is closed, and a photo that is being drawn
+        again is given up."""
         self._store.close()
+        close = getattr(self._photos, "close", None)
+        if callable(close):
+            close()
 
     def _count(self) -> None:
         """Count this tap against the limit for a minute, or refuse it."""
@@ -213,6 +293,18 @@ class Taps:
             self._recent.append(now)
 
 
+def _parse(body: bytes) -> Any:
+    """The JSON of a tap's body. Raises TapError for a body with more structure
+    than a tap has, which is not parsed, and for one that is not JSON in UTF-8."""
+    if any(body.count(mark) > most for mark, most in _MOST_MARKS):
+        raise_bare(TapError(422, _SHAPE))
+    # A decoder's error quotes what it could not read. This one says nothing, and is
+    # raised with that one handled and gone.
+    with contextlib.suppress(ValueError, RecursionError):
+        return json.loads(body.decode("utf-8"))
+    raise_bare(TapError(422, _NOT_JSON))
+
+
 def _refusal(error: BaseException) -> TapError | None:
     """What a tap is refused with after a failure to keep it, or None for a failure
     that is not one of keeping it."""
@@ -223,7 +315,7 @@ def _refusal(error: BaseException) -> TapError | None:
             retry_after=600,
         )
     # The store is closed, or another writer held its file for too long, or the disk
-    # would not take the file.
+    # would not take the file or say how much it holds.
     if isinstance(error, EvidenceStoreError | sqlite3.Error | OSError):
         return TapError(503, "Beacon could not keep this tap. Try again in a moment.", 5)
     return None
@@ -261,8 +353,10 @@ def _row(
     )
 
 
-def _read(payload: Any) -> tuple[Point, int | None, Photo | None, Clip | None]:
-    """A tap's place and its cleaned media. Raises TapError for what is not a tap."""
+def _read(payload: Any) -> tuple[Point, int | None, str | None, str | None]:
+    """A tap's place, and its photo and clip as they were sent, which are looked at
+    no further here than that each is a text of a length a file can have. Raises
+    TapError for what is not a tap."""
     location = payload.get("location") if isinstance(payload, Mapping) else None
     shaped = (
         isinstance(location, Mapping)
@@ -271,18 +365,15 @@ def _read(payload: Any) -> tuple[Point, int | None, Photo | None, Clip | None]:
     )
     point = _point(location) if shaped else None
     if point is None:
-        raise_bare(
-            TapError(
-                422,
-                "A tap is a JSON object with a location, which has lat and lon in degrees, "
-                "and optionally accuracy_m, a photo, and a clip.",
-            )
-        )
+        raise_bare(TapError(422, _SHAPE))
     accuracy = location.get("accuracy_m")
     if accuracy is not None and not (_is_number(accuracy) and 0 <= accuracy <= _MAX_ACCURACY_M):
         raise_bare(TapError(422, "A tap's accuracy_m is a number of metres, when it is given."))
-    photo = _media(payload.get("photo"), MAX_PHOTO_BYTES, clean_photo)
-    clip = _media(payload.get("clip"), MAX_CLIP_BYTES, clean_clip)
+    photo, clip = payload.get("photo"), payload.get("clip")
+    for sent, most in ((photo, MAX_PHOTO_BYTES), (clip, MAX_CLIP_BYTES)):
+        # Four characters of base64 for three bytes, so a longer text is a larger file.
+        if sent is not None and not (isinstance(sent, str) and len(sent) <= most * 4 // 3 + 4):
+            raise_bare(TapError(422, _MEDIA))
     return point, None if accuracy is None else math.ceil(accuracy), photo, clip
 
 
@@ -297,22 +388,15 @@ def _point(location: Mapping[str, Any]) -> Point | None:
     return None
 
 
-def _media[Cleaned](sent: Any, most: int, clean: Callable[[bytes], Cleaned]) -> Cleaned | None:
-    """A tap's photo or clip, decoded and cleaned, or None when none was sent.
-    Raises TapError when what was sent is not base64 or not media Beacon takes."""
-    if sent is None:
-        return None
+def _media[Cleaned](sent: str, clean: Callable[[bytes], Cleaned]) -> Cleaned:
+    """A tap's photo or clip, decoded and cleaned. Raises TapError when what was
+    sent is not base64 or not media Beacon takes, and what `clean` raises besides
+    MediaError."""
     content = None
-    # Four characters of base64 for three bytes, so a longer text is a larger file.
-    if isinstance(sent, str) and len(sent) <= most * 4 // 3 + 4:
-        try:
-            content = base64.b64decode(sent, validate=True)
-        except (binascii.Error, ValueError):
-            content = None
+    with contextlib.suppress(binascii.Error, ValueError):
+        content = base64.b64decode(sent, validate=True)
     if content is None:
-        raise_bare(
-            TapError(422, "A tap's photo and clip are files in base64, of a size Beacon takes.")
-        )
+        raise_bare(TapError(422, _MEDIA))
     try:
         return clean(content)
     except MediaError as error:
@@ -322,4 +406,10 @@ def _media[Cleaned](sent: Any, most: int, clean: Callable[[bytes], Cleaned]) -> 
 
 
 def _is_number(value: Any) -> bool:
-    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+    """Whether this is a number a place or a distance can be. An integer of any
+    size is valid JSON, and one too large to be a float is not one of these."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return -1_000_000_000 <= value <= 1_000_000_000
+    return isinstance(value, float) and math.isfinite(value)
