@@ -38,21 +38,42 @@ export async function recordClip(
       'Beacon could not use the microphone. Allow it for this site to send a clip.',
     )
   }
-  // From here the microphone is held, so everything that can fail is inside the
-  // block that lets go of it, the making of the audio context included. Only
-  // what was made is undone.
+  // From here the microphone is held. It is let go of the moment the tap is
+  // called off, whatever is being waited for then, and again when this function
+  // ends, however it ends: everything that can fail is inside the block whose
+  // `finally` does it, the making of the audio context included.
+  const letGo = () => {
+    for (const track of stream.getTracks()) track.stop()
+  }
   let context: AudioContext | null = null
   let module: string | null = null
   let late: ReturnType<typeof setTimeout> | undefined
-  let abort: (() => void) | undefined
+  let calledOff: (() => void) | undefined
+  const aborted = new Promise<never>((_resolve, reject) => {
+    calledOff = () => {
+      letGo()
+      reject(new DOMException('Aborted', 'AbortError'))
+    }
+  })
+  // A tap that is called off while nothing is waiting on `aborted` is not an
+  // error nobody handled.
+  aborted.catch(() => undefined)
   try {
     // The tap can have been called off while the browser asked for permission.
-    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+    if (signal?.aborted) calledOff?.()
+    else if (calledOff !== undefined)
+      signal?.addEventListener('abort', calledOff, { once: true })
+    // Each step that waits is raced against the tap being called off, so that
+    // nothing more is set up once it is. `aborted` is named first: of two
+    // promises that are both settled, the race goes to the first.
+    const unlessCalledOff = <T>(step: Promise<T>): Promise<T> =>
+      Promise.race([aborted, step])
+    await unlessCalledOff(Promise.resolve())
     context = new AudioContext()
     module = URL.createObjectURL(
       new Blob([WORKLET], { type: 'text/javascript' }),
     )
-    await context.audioWorklet.addModule(module)
+    await unlessCalledOff(context.audioWorklet.addModule(module))
     const node = new AudioWorkletNode(context, 'beacon-tap', {
       numberOfInputs: 1,
       numberOfOutputs: 0,
@@ -63,10 +84,7 @@ export async function recordClip(
     const samples = new Float32Array(wanted)
     let have = 0
     const source = context.createMediaStreamSource(stream)
-    await new Promise<void>((resolve, reject) => {
-      abort = () => reject(new DOMException('Aborted', 'AbortError'))
-      if (signal?.aborted) return abort()
-      signal?.addEventListener('abort', abort, { once: true })
+    const recorded = new Promise<void>((resolve, reject) => {
       // A microphone that sends nothing does not hold the tap up for good.
       late = setTimeout(
         () => reject(new ClipError('The microphone sent no sound.')),
@@ -78,17 +96,18 @@ export async function recordClip(
         have += block.length
         if (have >= wanted) resolve()
       }
-      source.connect(node)
-      void context?.resume()
     })
+    source.connect(node)
+    void context.resume()
+    await unlessCalledOff(recorded)
     return encodeWav(samples, rate)
   } catch (error) {
     if (error instanceof ClipError || error instanceof DOMException) throw error
     throw new ClipError('Beacon could not record a clip.')
   } finally {
-    for (const track of stream.getTracks()) track.stop()
+    letGo()
     clearTimeout(late)
-    if (abort !== undefined) signal?.removeEventListener('abort', abort)
+    if (calledOff !== undefined) signal?.removeEventListener('abort', calledOff)
     if (module !== null) URL.revokeObjectURL(module)
     // Closing a context that is already closed is refused, and is no failure.
     if (context !== null) void context.close().catch(() => undefined)

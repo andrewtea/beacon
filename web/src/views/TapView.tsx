@@ -73,23 +73,26 @@ function Match({ answer }: { answer: TapAnswer }) {
   )
 }
 
+/** Incidents listed because of where they are: found near the tap by the
+ * investigator's tool, or begun near it since. The server's sentence says which,
+ * and when a place one is near by is 511's, 511's credit goes beside it. */
 function Others({
   heading,
-  text,
   answer,
   which,
 }: {
   heading: string
-  text: string | null
   answer: TapAnswer
   which: 'nearby' | 'since'
 }) {
   const incidents = answer[which]
+  const text = answer[`${which}_text`]
   if (incidents.length === 0) return null
   return (
     <section className="panel others" aria-labelledby={`${which}-heading`}>
       <h2 id={`${which}-heading`}>{heading}</h2>
       {text !== null && <p className="meta">{text}</p>}
+      <CreditLine credit={answer[`${which}_credit`]} />
       <div className="card-list">
         {incidents.map((incident) => (
           <IncidentCard
@@ -202,12 +205,7 @@ export function TapView({ id }: { id: string }) {
             <Investigation answer={answer} />
           </>
         )}
-        <Others
-          heading="Also nearby"
-          text={answer.nearby_text}
-          answer={answer}
-          which="nearby"
-        />
+        <Others heading="Also nearby" answer={answer} which="nearby" />
       </div>
     )
   }
@@ -226,16 +224,10 @@ export function TapView({ id }: { id: string }) {
       )}
       <Others
         heading="Began near here since your tap"
-        text={answer.since_text}
         answer={answer}
         which="since"
       />
-      <Others
-        heading="Also nearby"
-        text={answer.nearby_text}
-        answer={answer}
-        which="nearby"
-      />
+      <Others heading="Also nearby" answer={answer} which="nearby" />
       <Investigation answer={answer} />
       <a className="action" href={href.home}>
         <Icon name="back" size={16} />

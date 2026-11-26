@@ -883,6 +883,8 @@ def test_a_tap_on_the_mock_scenario_is_answered_with_the_fire_and_every_part_say
         None,
     )
     assert answer["nearby_text"] == words.NEARBY
+    # Its place is from the list of blocks: nothing listed here is 511's.
+    assert (answer["nearby_credit"], answer["since_credit"]) == (None, None)
     assert (answer["watching"], answer["since"], answer["since_text"]) == (False, [], None)
     assert (answer["ember_calls"], answer["cost_usd"]) == (3, 0.0)
     # The list of incidents carries the decision too, and names no tap.
@@ -997,6 +999,7 @@ def test_a_tap_with_nothing_near_is_unconfirmed_and_beacon_lists_what_begins_the
     assert since["title"] == "Fire at the 100 block of Oak St"
     assert answer["since_text"] == words.SINCE
     assert "Nobody has investigated" in answer["since_text"]
+    assert (since["point_from"], answer["since_credit"]) == ("blocks", None)
     # The fire on Hayes St began before the tap and is far from it: it is not listed.
     assert since["id"] != hayes
 
@@ -1191,6 +1194,54 @@ def test_the_distance_and_the_credit_of_a_match_are_the_runs_and_stay_when_the_i
     moved = client.get(f"/api/taps/{TAP}").json()
     assert moved["incident"]["point"] != answer["incident"]["point"]
     assert moved["match"]["grounds"][0] == near
+
+
+def test_what_is_listed_as_near_a_tap_by_a_place_of_511s_carries_511s_credit(
+    world: World,
+) -> None:
+    # With no list of blocks an incident is where 511 says a closure on its street is.
+    engine = Engine(world.rows.store, NO_BLOCKS, names=NAMES, clock=lambda: world.now[0])
+    world = replace(world, engine=engine)
+    credit = {"text": CREDIT_511.text, "url": CREDIT_511.url}
+    # An alarm a street over from the fire, placed by a closure of its own.
+    world.rows.radio(4, "alarm", "on_scene", units=("E21",), street="Fell St", block=300)
+    world.rows.traffic(4.5, "511.org/2", road="Fell St", point=offset(HAYES, 0, 150))
+    world.rows.tap(6, offset(HAYES, 100, 0), ref=TAP)
+    world.rows.tap(6, FAR, ref=OTHER)
+    desk = world.desk()
+    client = world.app(desk)
+
+    desk.investigate(TAP)
+    desk.investigate(OTHER)
+    answer = client.get(f"/api/taps/{TAP}").json()
+
+    assert answer["incident"]["title"].startswith("Fire")
+    assert [(i["title"], i["point_from"]) for i in answer["nearby"]] == [
+        ("Alarm at the 300 block of Fell St", "closure")
+    ]
+    # That the alarm is listed as near rests on a place of 511's.
+    assert (answer["nearby_text"], answer["nearby_credit"]) == (words.NEARBY, credit)
+    assert answer["since_credit"] is None
+
+    # Read later by a Beacon that has the block on its list: the alarm's place is
+    # the list's now, and it was still found near the tap by the place 511 gave.
+    alarm = offset(HAYES, 0, 150)
+    listed = Blocks.of([("Fell St", 300, alarm.lat, alarm.lon)])
+    later = replace(
+        world, engine=Engine(world.rows.store, listed, names=NAMES, clock=lambda: world.now[0])
+    )
+    moved = later.app(None, desk.runs).get(f"/api/taps/{TAP}").json()
+    assert [i["point_from"] for i in moved["nearby"]] == ["blocks"]
+    assert moved["nearby_credit"] == credit
+
+    # Something begins near the far tap, where 511 lists a closure on its street.
+    world.rows.radio(8.5, "fire", "dispatched", units=("E5",), street="Oak St", block=100)
+    world.rows.traffic(8.6, "511.org/3", road="Oak St", point=FAR)
+    world.now[0] = at(9)
+    far = client.get(f"/api/taps/{OTHER}").json()
+    assert (far["status"], [i["point_from"] for i in far["since"]]) == ("unconfirmed", ["closure"])
+    assert (far["since_text"], far["since_credit"]) == (words.SINCE, credit)
+    assert far["nearby_credit"] is None
 
 
 def test_who_investigated_and_what_the_evidence_is_are_said_apart(world: World) -> None:

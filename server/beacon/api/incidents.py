@@ -2,10 +2,10 @@ from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from beacon.incident import Engine, Incident
-from beacon.incident.build import CREDIT_511, STATUS_WORDS, weakest
+from beacon.incident.build import CREDIT_511, STATUS_WORDS, label_of, weakest
 from beacon.investigate import Runs
 from beacon.investigate import card as words
 from beacon.radio.vocabulary import MEDICAL_EVENT
@@ -48,6 +48,15 @@ class SourceOut(_Read):
     # Which kind of Ember client wrote the row, when a model did: live, replay, fake.
     model: str | None
     credit: CreditOut | None
+
+    @model_validator(mode="after")
+    def _no_ember_in_a_stand_ins_label(self) -> "SourceOut":
+        """A row a stand-in for Ember wrote is not labeled "as Ember heard it",
+        wherever the label is from: a story that was kept holds the labels its
+        sources had when it was written."""
+        if self.model == "fake":
+            self.label = label_of(self.source, self.model)
+        return self
 
 
 class EntryOut(_Read):

@@ -118,6 +118,31 @@ test('offers no invented places and no invented label on a live server', async (
   expect(screen.queryByText(/invented/i)).not.toBeInTheDocument()
 })
 
+test('stops taking taps when the server stops answering, and takes them again when it is back', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true })
+  let health: () => Response = () => Response.json(MOCK_HEALTH)
+  serve({ 'GET /api/health': () => health() })
+  render(<App />)
+  const button = screen.getByRole('button', { name: ASK })
+  await waitFor(() => expect(button).toBeEnabled())
+
+  // The next asking fails. What the server said before is not carried over:
+  // the one that comes back can be on other sources.
+  health = () => Response.json({ detail: 'Down.' }, { status: 503 })
+  await vi.advanceTimersByTimeAsync(30_100)
+  await waitFor(() => expect(button).toBeDisabled())
+  expect(screen.queryByText(INVENTED)).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('button', { name: /Near the invented fire/ }),
+  ).not.toBeInTheDocument()
+
+  // It is back, as a server on real sources.
+  health = () => Response.json({ ...MOCK_HEALTH, mode: 'live' })
+  await vi.advanceTimersByTimeAsync(5_100)
+  await waitFor(() => expect(button).toBeEnabled())
+  expect(screen.queryByText(/invented/i)).not.toBeInTheDocument()
+})
+
 test('sends a tap, keeps its id on the device, and shows the incident it was matched to', async () => {
   const asked = serve({
     ...fireRoutes,
@@ -585,6 +610,56 @@ test('takes no tap and no second picture while a chosen photo is still being dra
   await screen.findByRole('heading', { level: 1, name: /Fire at/ })
   const sent = asked.find((request) => request.key === 'POST /api/taps')
   expect(sent?.body).toMatchObject({ photo: '/9j/' })
+})
+
+test('incidents listed because of where they are carry 511’s credit when the place is 511’s', async () => {
+  const credit = { text: 'data provided by 511.org', url: 'https://511.org' }
+  const since = { ...fireAnswer.incident!, crisis: null }
+  serve({
+    'GET /api/health': MOCK_HEALTH,
+    [`GET /api/taps/${FIRE_TAP}`]: {
+      ...fireAnswer,
+      nearby_credit: credit,
+    },
+    [`GET /api/taps/${QUIET_TAP}`]: {
+      ...quietAnswer,
+      watching: true,
+      since: [since],
+      since_text: 'The server’s sentence about what began since.',
+      since_credit: credit,
+    },
+    [`GET /api/incidents/${FIRE_ID}`]: fireIncident,
+  })
+  window.location.hash = `#/tap/${FIRE_TAP}`
+  const { unmount } = render(<App />)
+
+  const nearby = await screen.findByRole('region', { name: 'Also nearby' })
+  expect(nearby).toHaveTextContent(fireAnswer.nearby_text!)
+  expect(
+    within(nearby).getByRole('link', { name: credit.text }),
+  ).toHaveAttribute('href', credit.url)
+
+  unmount()
+  window.location.hash = `#/tap/${QUIET_TAP}`
+  render(<App />)
+  const began = await screen.findByRole('region', {
+    name: 'Began near here since your tap',
+  })
+  expect(
+    within(began).getByRole('link', { name: credit.text }),
+  ).toHaveAttribute('href', credit.url)
+})
+
+test('a section of nearby incidents with no place of 511’s shows no credit', async () => {
+  serve(fireRoutes)
+  window.location.hash = `#/tap/${FIRE_TAP}`
+  render(<App />)
+
+  const nearby = await screen.findByRole('region', { name: 'Also nearby' })
+  expect(fireAnswer.nearby_credit).toBeNull()
+  expect(
+    within(nearby).queryByRole('link', { name: /511/ }),
+  ).not.toBeInTheDocument()
 })
 
 test('a source is linked only at a web address, and its credit is shown either way', () => {

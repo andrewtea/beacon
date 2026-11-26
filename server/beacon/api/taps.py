@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
@@ -131,6 +131,10 @@ class TapAnswer(BaseModel):
     # now. It did not take the tap to be about them, and `nearby_text` says so.
     nearby: list[IncidentSummary]
     nearby_text: str | None
+    # 511's credit, when the place the investigator's tool measured from for one
+    # of `nearby` was a 511 closure's, as it was then: that an incident is listed
+    # as near rests on that place. Show it beside `nearby_text`.
+    nearby_credit: CreditOut | None = None
     # Whether Beacon still lists what begins near the tap: for half an hour after
     # an unconfirmed tap. `since` are the incidents whose first radio call came
     # after the tap, within a kilometre. Nobody investigated whether one is what
@@ -138,6 +142,9 @@ class TapAnswer(BaseModel):
     watching: bool
     since: list[IncidentSummary]
     since_text: str | None
+    # 511's credit, when the place one of `since` is near the tap by is a 511
+    # closure's. Show it beside `since_text`.
+    since_credit: CreditOut | None = None
     # What the investigation cost, and how many calls to Ember it made.
     # `cost_incomplete` is true when a call ended in an error after it may have
     # been sent, or nothing was kept of the run: the totals may then be incomplete,
@@ -451,9 +458,13 @@ def tap_answer(request: Request, tap_id: str) -> TapAnswer:
         match=None if run is None or outcome is None else _match(run, outcome),
         nearby=[summary_of(request, incident) for incident in nearby],
         nearby_text=words.NEARBY if nearby else None,
+        nearby_credit=_nearby_credit(run, nearby),
         watching=watching,
         since=[summary_of(request, incident) for incident in since],
         since_text=words.SINCE if since else None,
+        since_credit=_credit()
+        if any(incident.point_from == "closure" for incident in since)
+        else None,
         cost_usd=0.0 if run is None else run.cost_usd,
         ember_calls=0 if run is None else len(run.calls),
         cost_incomplete=lost or unaccounted,
@@ -524,6 +535,20 @@ def _nearby(run: Run, snapshot: Snapshot) -> list[Any]:
     ]
     found = [snapshot.get(incident_id) for incident_id in dict.fromkeys(ids) if incident_id]
     return [incident for incident in found if incident is not None]
+
+
+def _nearby_credit(run: Run | None, nearby: Sequence[Any]) -> CreditOut | None:
+    """511's credit for the incidents listed as near a tap, when the place one of
+    them was found near by was a 511 closure's. It is read from what the run's
+    tool kept then, not from the incident now, whose place can have changed
+    since: the listing rests on where the tool measured from."""
+    if run is None:
+        return None
+    for incident in nearby:
+        then = words.found_then(run, incident.id)
+        if then is not None and then.get("point_from") == "closure":
+            return _credit()
+    return None
 
 
 def _since(row: Evidence, snapshot: Snapshot) -> list[Any]:

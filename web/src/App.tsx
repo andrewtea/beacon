@@ -38,8 +38,11 @@ function View({ route, mode }: { route: Route; mode: 'live' | 'mock' | null }) {
 export default function App() {
   const route = useRoute()
   const health = usePolled('health', fetchHealth, () => HEALTH_MS)
-  const mode = health.data?.mode ?? null
   const unreachable = health.error !== null
+  // The mode is what the server said at the latest asking. When that asking
+  // failed, the mode is not known: the last answer is not carried over, because
+  // the server that comes back can be another one, on other sources.
+  const mode = unreachable ? null : (health.data?.mode ?? null)
   // A tap the server no longer answers for is deleted from this device.
   useEffect(() => sweepTaps(), [])
 

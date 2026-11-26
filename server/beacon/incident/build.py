@@ -121,6 +121,23 @@ _LABELS = {
     "opensky": "OpenSky Network aircraft positions",
     "app": "Taps in the Beacon app",
 }
+# What the two feeds a model writes the rows of are called when a stand-in wrote
+# the row: no Ember heard that call or read that document, so the label does not
+# say one did. That a stand-in did is said beside it, from the row's `stand_in`.
+_STAND_IN_LABELS = {
+    "openmhz": "Fire and EMS dispatch radio",
+    "notices": "Official notice",
+}
+
+
+def label_of(source: str, model: str | None) -> str:
+    """What a feed is called beside a claim. A row a fake Ember wrote is not
+    labeled as Ember's."""
+    if model == "fake" and source in _STAND_IN_LABELS:
+        return _STAND_IN_LABELS[source]
+    return _LABELS.get(source, source)
+
+
 _CATEGORY_WORDS = {
     "fire": "Fire",
     "hazmat": "Hazardous materials call",
@@ -391,7 +408,7 @@ def source_of(row: Evidence) -> Source:
     return Source(
         kind=row.kind,
         source=row.source,
-        label=_LABELS.get(row.source, row.source),
+        label=label_of(row.source, row.model),
         confidence=row.confidence,
         at=row.occurred_at,
         evidence_id=row.id,

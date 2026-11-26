@@ -56,9 +56,14 @@ export type TapAnswer = {
   match: Match | null
   nearby: IncidentSummary[]
   nearby_text: string | null
+  // 511's credit, when one of `nearby` was found near the tap by a place of
+  // 511's. Shown beside `nearby_text`.
+  nearby_credit: Credit | null
   watching: boolean
   since: IncidentSummary[]
   since_text: string | null
+  // The same for `since`, shown beside `since_text`.
+  since_credit: Credit | null
   cost_usd: number
   ember_calls: number
   cost_incomplete: boolean

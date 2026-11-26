@@ -4,7 +4,7 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 
-from beacon.api.incidents import radio_of, status_text_of
+from beacon.api.incidents import SourceOut, radio_of, status_text_of
 from beacon.incident import open_engine
 from beacon.main import create_app
 from tests.incident_rows import Rows, at, mock_store
@@ -38,6 +38,20 @@ def test_an_incidents_status_is_said_as_what_the_radio_said_and_a_medical_one_ha
     assert fire["radio"] == one["radio"]
     assert {source["kind"] for source in fire["radio"]["sources"]} == {"radio"}
     assert {source["stand_in"] for source in fire["radio"]["sources"]} == {True}
+    # A stand-in "heard" the scenario's calls and "read" its notices. No label
+    # says Ember did.
+    labels = {
+        (source["source"], source["model"], source["label"])
+        for line in one["timeline"]
+        for source in line["sources"]
+        if source["model"] is not None
+    }
+    assert labels <= {
+        ("openmhz", "fake", "Fire and EMS dispatch radio"),
+        ("notices", "fake", "Official notice"),
+    }
+    assert ("openmhz", "fake", "Fire and EMS dispatch radio") in labels
+    assert "Ember" not in str(one["official"]) + str(one["story"]) + str(fire["radio"])
     calls = [line for line in one["timeline"] if line["kind"] == "radio"]
     assert [source["evidence_id"] for source in fire["radio"]["sources"]] == [
         line["sources"][0]["evidence_id"] for line in calls
@@ -74,3 +88,25 @@ def test_what_a_card_rests_on_is_as_weak_as_its_weakest_call(tmp_path: Path) -> 
     assert radio is not None
     assert radio.confidence == "low"
     assert [source.evidence_id for source in radio.sources] == [first.id, second.id]
+
+
+def test_a_source_a_stand_in_wrote_is_not_labeled_as_embers_whatever_label_was_kept() -> None:
+    # A story that was kept holds the labels its sources had when it was written.
+    kept = {
+        "kind": "radio",
+        "source": "openmhz",
+        "label": "Fire and EMS dispatch radio, as Ember heard it",
+        "confidence": "medium",
+        "at": at(0),
+        "evidence_id": 1,
+        "url": None,
+        "stand_in": True,
+        "credit": None,
+    }
+
+    by_a_stand_in = SourceOut.model_validate({**kept, "model": "fake"})
+    by_ember = SourceOut.model_validate({**kept, "model": "live", "stand_in": False})
+
+    assert by_a_stand_in.label == "Fire and EMS dispatch radio"
+    # What Ember did hear is still said to be as Ember heard it.
+    assert by_ember.label == "Fire and EMS dispatch radio, as Ember heard it"

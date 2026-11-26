@@ -12,12 +12,16 @@ import {
   keepTap,
   keptTaps,
   pruneTaps,
+  subscribeTaps,
   sweepTaps,
 } from './tapStore.ts'
 import { encodeWav, toBase64 } from './wav.ts'
 
 beforeEach(() => window.localStorage.clear())
-afterEach(() => vi.useRealTimers())
+afterEach(() => {
+  vi.useRealTimers()
+  vi.restoreAllMocks()
+})
 
 const stored = (): string[] =>
   (
@@ -165,10 +169,10 @@ test('a tap the server no longer answers for is deleted from storage, not only h
   )
   expect(stored()).toEqual(['fresh', 'stale'])
 
-  expect(pruneTaps(now)).toBe(true)
+  expect(pruneTaps(now)).toBe('deleted')
 
   expect(stored()).toEqual(['fresh'])
-  expect(pruneTaps(now)).toBe(false)
+  expect(pruneTaps(now)).toBe('nothing')
 })
 
 test('an open app deletes each tap from storage at the moment it runs out', () => {
@@ -208,6 +212,87 @@ test('an open app deletes each tap from storage at the moment it runs out', () =
   stop()
   vi.advanceTimersByTime(KEPT_MS)
   expect(stored()).toEqual(['new'])
+})
+
+test('storage that refuses a write is not asked again every millisecond', () => {
+  vi.useFakeTimers()
+  const now = Date.parse('2026-11-26T12:00:00Z')
+  vi.setSystemTime(now)
+  window.localStorage.setItem(
+    'beacon.taps.v1',
+    JSON.stringify([
+      {
+        id: 'stale',
+        at: new Date(now - KEPT_MS - 1).toISOString(),
+        photo: false,
+        clip: false,
+      },
+    ]),
+  )
+  const refused = vi
+    .spyOn(Storage.prototype, 'setItem')
+    .mockImplementation(() => {
+      throw new DOMException('Full.', 'QuotaExceededError')
+    })
+  expect(pruneTaps(now)).toBe('failed')
+  refused.mockClear()
+
+  const stop = sweepTaps()
+  vi.advanceTimersByTime(1_000)
+
+  // One try when the app started, and none on a timer after it failed.
+  expect(refused).toHaveBeenCalledTimes(1)
+  // The tap that ran out is not shown, though it could not be deleted.
+  expect(keptTaps()).toEqual([])
+  // Looking at the page again is one more try, which storage now takes.
+  refused.mockRestore()
+  document.dispatchEvent(new Event('visibilitychange'))
+  expect(stored()).toEqual([])
+  stop()
+})
+
+test('a tap kept or forgotten in another tab is known here, and is swept here when it runs out', () => {
+  vi.useFakeTimers()
+  const now = Date.parse('2026-11-26T12:00:00Z')
+  vi.setSystemTime(now)
+  const stop = sweepTaps()
+  const told = vi.fn()
+  const unsubscribe = subscribeTaps(told)
+  const written = vi.spyOn(Storage.prototype, 'setItem')
+
+  // Another tab keeps a tap that has a minute left. The browser changes the
+  // storage both tabs share, and tells this one.
+  const other = [
+    {
+      id: 'theirs',
+      at: new Date(now - KEPT_MS + 60_000).toISOString(),
+      photo: false,
+      clip: false,
+    },
+  ]
+  written.mockRestore()
+  window.localStorage.setItem('beacon.taps.v1', JSON.stringify(other))
+  const writes = vi.spyOn(Storage.prototype, 'setItem')
+  window.dispatchEvent(new StorageEvent('storage', { key: 'beacon.taps.v1' }))
+
+  expect(told).toHaveBeenCalledTimes(1)
+  expect(keptTaps().map((tap) => tap.id)).toEqual(['theirs'])
+  // Being told writes nothing back.
+  expect(writes).not.toHaveBeenCalled()
+  // A change to another key is none of this.
+  window.dispatchEvent(new StorageEvent('storage', { key: 'something.else' }))
+  expect(told).toHaveBeenCalledTimes(1)
+
+  // This tab had nothing to wait for before. It deletes the tap when it runs out.
+  vi.advanceTimersByTime(61_000)
+  expect(stored()).toEqual([])
+
+  // Storage that is cleared elsewhere is told with no key.
+  told.mockClear()
+  window.dispatchEvent(new StorageEvent('storage', { key: null }))
+  expect(told).toHaveBeenCalledTimes(1)
+  unsubscribe()
+  stop()
 })
 
 test('a path of a tap’s own routes is written to a log without the tap’s id', () => {
@@ -250,7 +335,7 @@ test('the microphone is let go of when the recording cannot even begin', async (
 
   await expect(recordClip(1)).rejects.toThrow('Beacon could not record a clip.')
 
-  expect(stop).toHaveBeenCalledTimes(1)
+  expect(stop).toHaveBeenCalled()
 })
 
 test('a tap called off while the microphone was being asked for records nothing and lets go of it', async () => {
@@ -270,6 +355,33 @@ test('a tap called off while the microphone was being asked for records nothing 
   controller.abort()
 
   await expect(recording).rejects.toMatchObject({ name: 'AbortError' })
-  expect(stop).toHaveBeenCalledTimes(1)
+  expect(stop).toHaveBeenCalled()
   expect(made).not.toHaveBeenCalled()
+})
+
+test('a tap called off while the recorder is being set up lets go of the microphone at once', async () => {
+  const { stop } = microphone()
+  // The recorder's module is still loading, and goes on loading.
+  const loading = vi.fn(() => new Promise<void>(() => undefined))
+  const closed = vi.fn(async () => undefined)
+  vi.stubGlobal(
+    'AudioContext',
+    class {
+      audioWorklet = { addModule: loading }
+      close = closed
+    },
+  )
+  URL.createObjectURL ??= () => 'blob:beacon'
+  URL.revokeObjectURL ??= () => undefined
+  const controller = new AbortController()
+
+  const recording = recordClip(1, controller.signal)
+  await vi.waitFor(() => expect(loading).toHaveBeenCalled())
+  expect(stop).not.toHaveBeenCalled()
+  controller.abort()
+
+  // Let go of as the tap is called off, not when the module has loaded.
+  expect(stop).toHaveBeenCalled()
+  await expect(recording).rejects.toMatchObject({ name: 'AbortError' })
+  expect(closed).toHaveBeenCalled()
 })
