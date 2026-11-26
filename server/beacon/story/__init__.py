@@ -1,26 +1,27 @@
-"""Stories: what Ember writes about an incident, kept beside the incident engine.
+"""Stories: the few points Ember picks to tell an incident by, kept beside the engine.
 
     from beacon.story import open_stories
 
     desk = open_stories(os.environ, engine)  # in the server: request.app.state.stories
-    desk.refresh_all(engine.snapshot())  # write the stories that are due
+    desk.refresh_all(engine.snapshot())  # have the stories that are due made
     found = desk.latest(incident)  # (story, current) or None
 
-See `merge` for the Ember call and what is kept of its answer, `store` for where
-stories are kept, `desk` for when one is paid for, and `stand_in` for the stand-in
-that writes them with no key.
+See `merge` for the Ember call and how code checks and words what it chose, `store`
+for where stories are kept, `desk` for when one is paid for, and `stand_in` for the
+stand-in that chooses with no key.
 """
 
 from beacon.story.desk import INTERVAL, MAX_PER_PASS, MIN_LINES, SCOPE, StoryDesk
 from beacon.story.merge import (
     LINE_KINDS,
-    NOT_AN_ORDER,
+    POINT_KINDS,
     Claim,
     Draft,
     StoryError,
     basis_of,
     lines_of,
     merge_incident,
+    point_claim,
 )
 from beacon.story.setup import BUDGET_VARIABLE, StoryConfigError, open_stories
 from beacon.story.stand_in import stand_in_writer
@@ -32,7 +33,7 @@ __all__ = [
     "LINE_KINDS",
     "MAX_PER_PASS",
     "MIN_LINES",
-    "NOT_AN_ORDER",
+    "POINT_KINDS",
     "SCOPE",
     "Claim",
     "Draft",
@@ -46,5 +47,6 @@ __all__ = [
     "lines_of",
     "merge_incident",
     "open_stories",
+    "point_claim",
     "stand_in_writer",
 ]

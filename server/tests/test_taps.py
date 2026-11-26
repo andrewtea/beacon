@@ -859,6 +859,9 @@ class FakeIngest:
         if not self._starts:
             raise RuntimeError("The pollers' thread could not be started.")
 
+    def close_paid(self) -> None:
+        pass
+
     def stop(self) -> bool:
         self.stopped += 1
         return True

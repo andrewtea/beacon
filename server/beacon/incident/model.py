@@ -32,11 +32,11 @@ SignalKind = Literal[
     "taps",
 ]
 ConflictKind = Literal[
-    # Crews said all clear on the radio while an official alert for the place is
-    # in force, or while an order or a warning an authority published stands.
+    # Crews said all clear on the radio after an official alert for the place was
+    # issued that is in force, or after an order or a warning was published.
     "all_clear_on_radio",
-    # A notice that names a street of the incident is about another hazard than
-    # the radio's calls.
+    # A notice that names a street of the incident, published after the radio's
+    # calls said what it is, is about another hazard.
     "hazard",
 ]
 OfficialState = Literal[
@@ -145,6 +145,9 @@ class Conflict:
 
     kind: ConflictKind
     text: str
+    # How far to trust that the two disagree, which is as far as the weakest row
+    # it rests on: a call that was only partly made out makes it `low`.
+    confidence: Confidence
     # The official rows, which are the ones that hold, and the radio rows.
     official: tuple[Source, ...]
     radio: tuple[Source, ...]

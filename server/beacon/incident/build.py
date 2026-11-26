@@ -129,7 +129,7 @@ _CATEGORY_WORDS = {
     "other": "Fire department call",
     "medical": "Medical response",
 }
-_STATUS_WORDS = {
+STATUS_WORDS = {
     "dispatched": "units dispatched",
     "en_route": "units on the way",
     "on_scene": "units on scene",
@@ -140,7 +140,7 @@ _STATUS_WORDS = {
     "unknown": "radio traffic",
 }
 _NOT_AN_ORDER = "That is radio traffic, not an official order."
-_DETAIL_WORDS = {
+DETAIL_WORDS = {
     "smoke_showing": "Smoke showing.",
     "fire_showing": "Fire showing.",
     "working_fire": "Working fire declared.",
@@ -434,14 +434,14 @@ def _radio_entry(row: Evidence) -> Entry:
         parts = [f"{_CATEGORY_WORDS['medical']}."]
         details: dict[str, Any] = {"event": MEDICAL_EVENT, "units": units, "place": row.place}
     else:
-        status = data.get("status") if data.get("status") in _STATUS_WORDS else "unknown"
-        tags = [tag for tag in data.get("details") or [] if tag in _DETAIL_WORDS]
+        status = data.get("status") if data.get("status") in STATUS_WORDS else "unknown"
+        tags = [tag for tag in data.get("details") or [] if tag in DETAIL_WORDS]
         category = _CATEGORY_WORDS.get(data.get("category"), _CATEGORY_WORDS["other"])
-        parts = [f"{category}: {_STATUS_WORDS[status]}."]
+        parts = [f"{category}: {STATUS_WORDS[status]}."]
         alarm = data.get("alarm")
         if isinstance(alarm, int) and not isinstance(alarm, bool):
             parts.append(f"Alarm level {alarm}.")
-        parts += [_DETAIL_WORDS[tag] for tag in tags]
+        parts += [DETAIL_WORDS[tag] for tag in tags]
         details = {
             "event": data.get("category"),
             "status": status,
@@ -838,42 +838,41 @@ def _conflicts(
     """Where the incident's radio calls and an official source do not agree. The
     official source is the one that holds, and each text says so: nothing said on
     the radio ends an alert or lifts an order, and what a notice says a thing is
-    outranks what a call said it is."""
+    outranks what a call said it is.
+
+    The two are set against each other only when the order of their times makes
+    them disagree: crews who said all clear before an alert was issued said nothing
+    about the alert, and a notice outranks only what the radio said before it."""
     found: list[Conflict] = []
     clear = [row for row in group.rows if "all_clear" in (row.data.get("details") or [])]
-    if clear:
-        said = "Crews said all clear on the radio."
-        alerts = [item for item in official if item.kind == "alert" and item.state == "in_force"]
-        if alerts:
-            found.append(
-                Conflict(
-                    kind="all_clear_on_radio",
-                    text=f"{said} An official alert whose area holds this place is in "
-                    "force. An official source outranks radio traffic: the alert is "
-                    "what holds, and what crews say on the radio does not end it.",
-                    official=tuple(item.source for item in alerts),
-                    radio=tuple(source_of(row) for row in clear),
-                )
+    for item in official:
+        after = [row for row in clear if row.occurred_at > item.issued_at]
+        if not after:
+            continue
+        if item.kind == "alert" and item.state == "in_force":
+            text = (
+                "Crews said all clear on the radio after this official alert was "
+                "issued. The alert, whose area holds this place, is in force. An "
+                "official source outranks radio traffic: the alert is what holds, and "
+                "what crews say on the radio does not end it."
             )
-        orders = [
-            item
-            for item in official
-            if item.kind == "notice"
+        elif (
+            item.kind == "notice"
             and item.state == "published"
             and item.type in ORDERS - {"all_clear"}
-        ]
-        if orders:
-            found.append(
-                Conflict(
-                    kind="all_clear_on_radio",
-                    text=f"{said} {_published(orders)} An official source outranks radio "
-                    "traffic: what crews say on the radio lifts no official notice. "
-                    "Whether the notice still holds is for its authority to say. "
-                    f"{_READING}",
-                    official=tuple(item.source for item in orders),
-                    radio=tuple(source_of(row) for row in clear),
-                )
+        ):
+            text = (
+                f"Crews said all clear on the radio after {_NOTICE_WORDS[item.type]} "
+                "that names a street of this incident was published by an authority. "
+                "An official source outranks radio traffic: what crews say on the "
+                "radio lifts no official notice. Whether the notice still holds is "
+                f"for its authority to say. {_READING}"
             )
+        else:
+            continue
+        found.append(
+            _conflict("all_clear_on_radio", text, [item.source], [source_of(row) for row in after])
+        )
     expected = _HAZARDS.get(group.category)
     if expected is not None:
         # The calls that gave the incident its category.
@@ -886,21 +885,33 @@ def _conflicts(
                 or hazard in expected
             ):
                 continue
-            found.append(
-                Conflict(
-                    kind="hazard",
-                    # A notice is matched by a street's name, so it can be about
-                    # another place on the street: the text does not say it is not.
-                    text=f"Radio traffic calls this {_CATEGORY_AS[group.category]}. A notice "
-                    "an authority published, which names a street of this incident, is "
-                    f"about {_HAZARD_WORDS[hazard]}, as Beacon reads it. Where the two are "
-                    "about the same thing, the official notice outranks radio traffic. "
-                    f"{_READING}",
-                    official=(source_of(notice),),
-                    radio=tuple(source_of(row) for row in calls[:1]),
-                )
+            earlier = [row for row in calls if row.occurred_at < notice.occurred_at]
+            if not earlier:
+                continue
+            # A notice is matched by a street's name, so it can be about another
+            # place on the street: the text does not say it is not.
+            text = (
+                f"Radio traffic called this {_CATEGORY_AS[group.category]}. A notice an "
+                "authority published later, which names a street of this incident, is "
+                f"about {_HAZARD_WORDS[hazard]}, as Beacon reads it. Where the two are "
+                "about the same thing, the official notice outranks radio traffic. "
+                f"{_READING}"
             )
+            found.append(_conflict("hazard", text, [source_of(notice)], [source_of(earlier[0])]))
     return found
+
+
+def _conflict(
+    kind: str, text: str, official: Sequence[Source], radio: Sequence[Source]
+) -> Conflict:
+    """A conflict, trusted as little as the weakest row it rests on."""
+    return Conflict(
+        kind=kind,  # type: ignore[arg-type]
+        text=text,
+        confidence=weakest([source.confidence for source in (*official, *radio)]),
+        official=tuple(official),
+        radio=tuple(radio),
+    )
 
 
 def _events(traffic: Sequence[Evidence]) -> dict[object, list[Evidence]]:

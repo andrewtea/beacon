@@ -1409,3 +1409,18 @@ def test_notices_are_not_read_for_real_where_a_crash_could_hand_a_document_to_a_
     monkeypatch.setattr("beacon.ingest.setup.core_dump_problem", lambda: "It hands cores on.")
     build(env | NOTICES, Clock(time)).close()
     assert marked == [True, True]
+
+
+def test_closing_paid_work_admits_none_and_leaves_the_store_open(tmp_path: Path) -> None:
+    ingest = build({"BEACON_DATA_DIR": str(tmp_path)}, Clock(lambda: NOON))
+    assert ingest.paid
+
+    ingest.close_paid()
+
+    # The pollers that pay ask Ember nothing more, and a row whose answer is out
+    # can still be stored: only `stop` closes the store.
+    assert not ingest.store.closed
+    ingest.catch_up()
+    assert ingest.store.search(kinds=["radio", "notice"]) == []
+    assert ingest.store.search(kinds=["alert"]) != []
+    assert ingest.stop() is True

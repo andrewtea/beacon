@@ -98,6 +98,8 @@ class ConflictOut(_Read):
     # holds, and `text` says so and why: show it with the incident.
     kind: str
     text: str
+    # As far as the weakest row it rests on is trusted.
+    confidence: Literal["official", "high", "medium", "low"]
     official: list[SourceOut]
     radio: list[SourceOut]
 
@@ -147,36 +149,37 @@ class IncidentSummary(_Read):
 
 
 class ClaimOut(_Read):
-    # A sentence Ember wrote, which the redaction pass let through whole.
+    # What the sentence is about: `status`, `alarm`, `units`, a detail a call gave
+    # (`evacuation`, `knocked_down`, ...), `closure`, `aircraft`, or `taps`.
+    kind: str
+    # Written by code from the rows it rests on. No word of it is a model's.
     text: str
+    # When the newest line it rests on is from: a status is the status as of then.
+    at: datetime
     # The least confidence among the lines it rests on, and those lines' sources.
-    # Code works both out; Ember does not.
     confidence: Literal["official", "high", "medium", "low"]
     sources: list[SourceOut]
-    # Words to show beside the sentence, or null: "That is radio traffic, not an
-    # official order." for one about an evacuation, sheltering, or an all-clear.
-    note: str | None
 
 
 class StoryOut(_Read):
-    """What Ember wrote about the incident from its radio, closure, aircraft, and
-    tap lines. It says nothing of alerts or notices: those are in `official`."""
+    """The few points Ember chose from the incident's radio, closure, aircraft,
+    and tap lines, each checked against its rows and worded by code. It says
+    nothing of alerts or notices: those are in `official`."""
 
     written_at: datetime
     # Whether it was written from the lines the incident has now. False while a
     # newer one is due: the timeline then has lines the story has not read.
     current: bool = False
-    # Null when Ember gave none that may be shown: use the incident's `title`.
-    headline: str | None
     claims: list[ClaimOut]
-    # How many of Ember's sentences were left out, and how many of the incident's
-    # older lines Ember was not given.
+    # How many of the points Ember gave were left out because the lines they cite
+    # do not show them, and how many of the incident's older lines Ember was not
+    # given.
     left_out: int
     lines: int
     lines_left_out: int
-    # Which kind of Ember client wrote it: `live`, or `fake` for a stand-in.
+    # Which kind of Ember client chose the points: `live`, or `fake` for a stand-in.
     model: str
-    # True when a stand-in wrote it or a line under it is a stand-in's: label it.
+    # True when a stand-in chose them or a line under it is a stand-in's: label it.
     stand_in: bool
     input_tokens: int
     cached_tokens: int

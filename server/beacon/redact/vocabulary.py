@@ -2,8 +2,8 @@
 
 The pass (`beacon.redact.screen`) lets a text through only when every word of it is
 one of these or part of a name somebody listed. So this is a list of the words a
-notice to the public and a plain account of an incident are written in: what happened,
-where, when, who responded, and what an authority said. It leaves out, on purpose:
+notice to the public is written in: what happened, where, when, who responded, and
+what the authority tells people. It leaves out, on purpose:
 
 - **Words about a person's body or fate** (injured, burns, hospital, patient, died),
   so a text that describes somebody's condition does not pass.
@@ -13,25 +13,26 @@ where, when, who responded, and what an authority said. It leaves out, on purpos
   name (`may`, `will`) is here only when notices cannot be written without it, and
   the pass refuses it where it is written with a capital in the middle of a sentence.
 
-There are four lists:
+The lists:
 
-- `WORDS`: what a text in Beacon's own voice may be made of. None of them tells a
-  reader what to do.
-- `ORDER_WORDS`: what only an authority's notice may use besides: the words an
-  instruction is made of (`leave`, `stay`, `must`, `you`), and the words that say
-  an order holds or is over (`effect`, `force`, `lifted`). A text a model wrote for
-  Beacon that holds one of them does not pass, which is how "Beacon never says stay
-  or go" is kept for what a model writes, and how a model is kept from saying that
-  an order is in force.
-- `PROPER`: words that may be written with a capital anywhere.
-- `PUBLIC_NAMES`: public bodies, which a text may name. A public place a notice
-  sends people to is on a list an operator gives (`Names`).
+- `WORDS`: the ordinary words, written without a capital except at the start of a
+  sentence. They include the words an instruction is made of (`leave`, `stay`,
+  `must`), because the only text the pass reads is an authority's notice as Ember
+  read it. Nothing a model writes in Beacon's own voice is shown at all.
+- `ACRONYMS`: public bodies and time zones as they are written, in capitals and no
+  other way: `BART` is the railway, and `Bart` is somebody.
+- `MONTHS` and `DAYS`: a month passes with a capital only beside a number
+  (`November 26`), and a day only in front of such a date (`Friday, November 27`).
+  Anywhere else `April` and `June` are somebody's name.
+- `PUBLIC_NAMES`: public bodies, which a text may name and which a notice's issuer
+  may be. A public place a notice sends people to is on a list an operator gives
+  (`Names`).
+- `OTHER_NAMES`: names a text may hold that are nobody who issues a notice.
 
 A text that uses a word that is not here is left out whole, never cut, and whoever
 shows it says so and links the original. That is the safe failure, and it is common:
 the fix for a word that plainly belongs is to add it here, with a second look at
-whether it can describe a person or tell one what to do. Never add a way past the
-lists.
+whether it can name or describe a person. Never add a way past the lists.
 """
 
 _WORDS = """
@@ -119,7 +120,7 @@ winds wire wires with within without work working would
 
 yard yet zone zones
 
-am pm utc pst pdt
+am pm
 
 zero eight nine eleven twelve twenty thirty forty fifty hundred thousand
 first second third fourth fifth
@@ -127,7 +128,7 @@ first second third fourth fifth
 invented scenario mock
 """
 
-# The words an instruction is made of. Only an authority's notice may use them.
+# The words an instruction is made of. An authority's notice is written in them.
 _ORDER_WORDS = """
 advised avoid bring call can't come do don't enter evacuate follow go keep leave
 may must need needs please remain return shall shelter should stay stop take turn
@@ -135,20 +136,35 @@ urged use wait you your yours yourself
 
 effect force lifted lifts
 """
-ORDER_WORDS: frozenset[str] = frozenset(_ORDER_WORDS.split())
 
-# Never among Beacon's own words, whatever the list above them says.
-WORDS: frozenset[str] = frozenset(_WORDS.split()) - ORDER_WORDS
+WORDS: frozenset[str] = frozenset((_WORDS + _ORDER_WORDS).split())
 
-# Written with a capital wherever they stand.
-_PROPER = """
-beacon ember nws sffd sfpd sfmta dem caltrans chp pge muni bart ems utc pst pdt
-monday tuesday wednesday thursday friday saturday sunday
-january february march april june july august september october november december
-"""
-PROPER: frozenset[str] = frozenset(_PROPER.split())
+# Written in capitals, and passed only as they are written here.
+ACRONYMS: frozenset[str] = frozenset(
+    {"NWS", "SFFD", "SFPD", "SFMTA", "DEM", "CHP", "PGE", "BART", "EMS", "UTC", "PST", "PDT"}
+)
 
-# Public bodies a text may name, as they are written.
+MONTHS: frozenset[str] = frozenset(
+    {
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    }
+)
+DAYS: frozenset[str] = frozenset(
+    {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}
+)
+
+# Public bodies a text may name, and a notice's issuer may be, as they are written.
 PUBLIC_NAMES: tuple[str, ...] = (
     "San Francisco",
     "City and County of San Francisco",
@@ -165,9 +181,9 @@ PUBLIC_NAMES: tuple[str, ...] = (
     "National Weather Service",
     "California Highway Patrol",
     "Pacific Gas and Electric",
-    "Muse Ember",
+    "Caltrans",
+    "Muni",
 )
 
-# Phrases that hold a word of `ORDER_WORDS` and are the name of a thing, not an
-# instruction: a shelter-in-place order is called that in Beacon's own voice too.
-FIXED_PHRASES: tuple[str, ...] = ("shelter in place",)
+# Names a text may hold that issue no notice.
+OTHER_NAMES: tuple[str, ...] = ("Beacon", "Muse Ember")

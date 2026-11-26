@@ -253,13 +253,19 @@ class Ingest:
             ended = not self._thread.is_alive()
         return drained and ended
 
+    def close_paid(self) -> None:
+        """Have the pollers that pay for their work begin no more paid requests,
+        and wait for nothing. It is the first thing a shutdown does, before it
+        waits for anything else; `stop` does it again, which changes nothing."""
+        for work in self.paid:
+            work.close()
+
     def close(self) -> None:
         """Close the pollers that pay for their work, which then begin no paid
         request; the HTTP client, which ends any request a poller has out; and the
         store, which then takes no more rows. Nothing is waited for: `stop` is the
         way to end pollers that run on a thread."""
-        for work in self.paid:
-            work.close()
+        self.close_paid()
         self.http.close()
         self.store.close()
 

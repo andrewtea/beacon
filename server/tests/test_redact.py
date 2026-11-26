@@ -1,8 +1,8 @@
-"""The redaction pass: which texts a person is shown, and which are left out whole."""
+"""The redaction pass: which readings a person is shown, and which are left out whole."""
 
 import pytest
 
-from beacon.redact import MAX_TEXT, NO_NAMES, ORDER_WORDS, PROPER, WORDS, Names, own, reading
+from beacon.redact import ACRONYMS, DAYS, MAX_TEXT, MONTHS, NO_NAMES, WORDS, Names, reading
 from beacon.scenario import INVENTED
 from beacon.scenario.notices import NOTICES
 
@@ -30,6 +30,9 @@ NAMES = Names.of(
         f"{INVENTED} The evacuation order for Hayes St between Gough St and Octavia St is lifted.",
         "Hayes St. is closed between Gough St. and Van Ness Ave until 6:30 pm on the 3rd.",
         "A shelter-in-place order is in effect. Call 415-555-0100 for information.",
+        # A date, and a public body by its acronym or with a possessive.
+        "Issued Friday, November 27, 2026. Hayes St is closed until April 3 at 6 pm.",
+        "BART and Muni are stopped near Hayes St. SFFD's crews are on scene.",
     ],
 )
 def test_a_notice_in_plain_words_about_listed_places_passes_as_a_reading(text: str) -> None:
@@ -45,18 +48,27 @@ def test_a_notice_in_plain_words_about_listed_places_passes_as_a_reading(text: s
         # A name that is also a word, in the middle of a sentence and in capitals.
         "The building of resident Will was closed.",
         "The order was issued by MAY.",
+        # A name that is also a month, a day, or a public body's acronym.
+        "The resident April was at the fire.",
+        "Residents were told by June to leave.",
+        "The building of resident Friday was closed.",
+        "The resident Bart was at the fire.",
+        "The resident Dem was at the fire.",
         # Who somebody is, and what happened to them.
         "A 67-year-old was taken from the building.",
         "One resident was injured.",
         # A street nobody listed, and a part of a listed name.
         "Leave toward Laguna St.",
         "The fire on Hayes is out.",
-        # An address written out of a listed name's reach, and other things no
-        # plain notice holds.
+        # A name in another script, beside a listed name or alone.
+        "The Fire Department 張三 is on scene.",
+        "Hayes St張三 is closed.",
+        # Other things no plain notice holds.
         "Write to jane@example.org for information.",
         "See https://example.org/order for the map.",
         "The unit 3B is closed.",
         "Résidents may return.",
+        "The road ٣ is closed.",
         "",
         "   ",
     ],
@@ -65,7 +77,6 @@ def test_a_text_that_names_or_describes_a_person_or_an_unlisted_place_is_left_ou
     text: str,
 ) -> None:
     assert reading(text, NAMES) is None
-    assert own(text, NAMES) is None
 
 
 def test_a_text_is_kept_whole_or_left_out_and_never_cut() -> None:
@@ -78,63 +89,72 @@ def test_a_text_is_kept_whole_or_left_out_and_never_cut() -> None:
     assert reading(["The fire is out."], NAMES) is None
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "Leave now.",
-        "You must go toward Franklin St.",
-        "Residents should stay indoors.",
-        "Stay away from Hayes St.",
-        "People may return to the area.",
-        "Avoid the area.",
-        "Please wait for the all-clear.",
-        "Do not enter the building.",
-    ],
-)
-def test_beacons_own_voice_never_tells_a_reader_what_to_do(text: str) -> None:
-    assert reading(text, NAMES) == text
-    assert own(text, NAMES) is None
-
-
-def test_beacons_own_voice_names_a_block_and_never_a_house() -> None:
-    assert own("Crews are at work at the 400 block of Hayes St.", NAMES) is not None
-    assert own("E36 and T6 are on scene at Hayes St at Gough St.", NAMES) is not None
-    assert own("An authority published a shelter-in-place order.", NAMES) is not None
-    assert own("Crews are at work at 432 Hayes St.", NAMES) is None
-    assert own("Crews are at work at 432, Hayes St.", NAMES) is not None  # no house: a count
-    assert own("For information, the number is 4155550100.", NAMES) is None
-    # An order names the addresses it is for, and its reading may.
-    assert reading("400 through 450 Hayes St stay closed.", NAMES) is not None
+def test_a_month_passes_only_beside_a_number_and_a_day_only_before_a_date() -> None:
+    assert reading("Closed until April 3.", NAMES) is not None
+    assert reading("Closed from 3 May to 5 May.", NAMES) is not None
+    assert reading("Closed until Friday, April 3.", NAMES) is not None
+    assert reading("Closed until Friday April 3.", NAMES) is not None
+    # With no number beside it, a month is somebody's name, and so is a day.
+    assert reading("Closed until April.", NAMES) is None
+    assert reading("Closed until Friday.", NAMES) is None
+    assert reading("Closed until Friday, at 6 pm.", NAMES) is None
+    assert reading("Closed until APRIL 3.", NAMES) is None
+    assert reading("The building of April's family, 3 doors down.", NAMES) is None
 
 
 def test_a_listed_name_passes_only_as_a_whole_phrase() -> None:
-    assert own("Fire on Hayes St.", NAMES) is not None
-    assert own("Fire on hayes st.", NAMES) is not None
-    assert own("Fire on Hayes Street.", NAMES) is None
-    assert own("Fire on Hayes Sts.", NAMES) is None
+    assert reading("Fire on Hayes St.", NAMES) is not None
+    assert reading("Fire on hayes st.", NAMES) is not None
+    assert reading("Fire on Hayes Street.", NAMES) is None
+    assert reading("Fire on Hayes Sts.", NAMES) is None
     # With no list, only the public bodies Beacon knows itself are names.
-    assert own("The Fire Department is on scene.", NO_NAMES) is not None
-    assert own("Fire on Hayes St.", NO_NAMES) is None
-    assert own("E36 is on scene.", NO_NAMES) is None
+    assert reading("The Fire Department is on scene.", NO_NAMES) is not None
+    assert reading("Fire on Hayes St.", NO_NAMES) is None
+    assert reading("E36 is on scene.", NO_NAMES) is None
 
 
-def test_an_issuer_is_shown_only_when_it_is_a_listed_public_body_and_nothing_else() -> None:
+@pytest.mark.parametrize(
+    "issuer",
+    [
+        "San Francisco Fire Department, Chief Jane Doe",
+        "Jane Doe",
+        # The private name is in another script, or behind punctuation: the name
+        # of the body is all there may be.
+        "Fire Department 張三",
+        "Fire Department (Jane Doe)",
+        "Fire Department!",
+        "Fire Department\u200b",
+        "Fire Department - 432",
+        # A street, a unit, and Beacon itself are names, and issue no notice.
+        "Hayes St",
+        "E36",
+        "Beacon",
+        "",
+        None,
+    ],
+)
+def test_an_issuer_with_anything_beside_a_listed_bodys_name_is_left_out_whole(
+    issuer: object,
+) -> None:
+    assert NAMES.public_body(issuer) is None
+
+
+def test_an_issuer_that_is_a_listed_public_body_and_nothing_else_is_shown() -> None:
     assert NAMES.public_body(" San Francisco  Fire Department ") == "San Francisco Fire Department"
     assert NAMES.public_body("Civic Center Plaza") == "Civic Center Plaza"
-    assert NAMES.public_body("San Francisco Fire Department, Chief Jane Doe") is None
-    assert NAMES.public_body("Jane Doe") is None
-    # A street and a unit are names, and are nobody who issues a notice.
-    assert NAMES.public_body("Hayes St") is None
-    assert NAMES.public_body("E36") is None
-    assert NAMES.public_body(None) is None
+    assert NAMES.public_body("fire department") == "fire department"
 
 
-def test_no_word_of_an_instruction_is_among_beacons_own_and_none_describes_a_person() -> None:
-    assert not WORDS & ORDER_WORDS
-    for word in ("leave", "stay", "go", "must", "should", "evacuate", "you", "your", "avoid"):
-        assert word in ORDER_WORDS
+def test_no_word_on_the_lists_describes_a_person() -> None:
+    lowered = {acronym.lower() for acronym in ACRONYMS}
     for word in DESCRIBES_A_PERSON.split():
-        assert word not in WORDS | ORDER_WORDS | PROPER, word
+        assert word not in WORDS | lowered | MONTHS | DAYS, word
+    # An acronym passes in capitals only, and a month is no ordinary word, except
+    # `may`, which a notice cannot be written without.
+    assert not lowered & WORDS
+    months_that_are_words = MONTHS & WORDS
+    assert months_that_are_words == {"may"}
+    assert not DAYS & WORDS
 
 
 def test_the_scenarios_public_notices_pass_and_its_press_release_does_not() -> None:

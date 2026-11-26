@@ -8,7 +8,7 @@
   (`basis_of`), which is claimed in the stories file before Ember is asked. The same
   lines are never paid for twice, by this process or another.
 - **No more often than `interval` for one incident**, and no more than
-  `MAX_PER_PASS` incidents in one pass, so a busy hour is written about at a pace
+  `MAX_PER_PASS` paid attempts in one pass, so a busy hour is written about at a pace
   somebody set and not at the pace of the radio.
 - **Under a budget of its own**: a live client pays under the `SpendScope` labelled
   `SCOPE`, and is refused without it.
@@ -31,7 +31,6 @@ from beacon.incident import Incident, Snapshot
 from beacon.ingest.paid import Hold, PaidDesk, read_hold
 from beacon.ingest.runner import PollerHeldError
 from beacon.radio.vocabulary import MEDICAL_EVENT
-from beacon.redact import Names
 from beacon.story.merge import Draft, StoryError, basis_of, lines_of, merge_incident
 from beacon.story.store import Stories, StoriesError, Story
 
@@ -41,7 +40,7 @@ SCOPE = "story:merge"
 MIN_LINES = 3
 # How long after one story of an incident was asked for the next one may be.
 INTERVAL = timedelta(minutes=2)
-# How many stories one pass over the incidents asks for at most.
+# How many incidents one pass asks Ember about at most, whatever it answers.
 MAX_PER_PASS = 3
 
 logger = logging.getLogger("beacon.story")
@@ -54,7 +53,6 @@ class StoryDesk:
         self,
         ember: EmberClient,
         stories: Stories,
-        names: Names,
         *,
         interval: timedelta = INTERVAL,
         wall_clock: Callable[[], datetime] | None = None,
@@ -66,7 +64,6 @@ class StoryDesk:
         )
         self._ember = ember
         self._stories = stories
-        self._names = names
         self._interval = interval
 
     @property
@@ -87,32 +84,38 @@ class StoryDesk:
         return len(lines_of(incident)[0]) >= MIN_LINES
 
     def refresh(self, incident: Incident, now: datetime) -> Story | None:
-        """Have the story of an incident written, when one is wanted and its lines
-        have not been written about. Returns the story that was written, or None
-        when none was: it is not wanted, its basis is already claimed, the
-        incident's last story is younger than the interval, or Ember's answer came
-        to nothing.
+        """Have the story of an incident made, when one is wanted and its lines
+        have not been told. Returns the story, or None when none was made: it is
+        not wanted, its basis is already claimed, the incident's last story is
+        younger than the interval, or Ember's answer came to nothing.
 
         Raises PollerHeldError while the desk is leaving Ember alone, what Ember
         raised when it refused or failed, and StoriesError when the stories file is
         closed."""
+        return self._attempt(incident, now)[0]
+
+    def _attempt(self, incident: Incident, now: datetime) -> tuple[Story | None, bool]:
+        """`refresh`, and whether the incident's basis was claimed for it, which
+        is when Ember is asked."""
         if not self.wanted(incident):
-            return None
+            return None, False
         basis = basis_of(incident)
         latest = self._stories.latest(incident.id)
         if latest is not None and latest.basis == basis:
-            return None
+            return None, False
         hold = Hold(*read_hold(self._stories.state()))
         self._paid.check(hold)
-        if not self._stories.claim(incident.id, basis, now, self._interval):
-            return None
-        # From here to the story's row, a shutdown waits (`drain`).
+        # From before the claim to the story's row, a shutdown waits (`drain`): a
+        # claim that was made is written under or given up before the file is
+        # closed, and is never left behind for lines nobody paid for.
         with self._paid.working():
+            if not self._stories.claim(incident.id, basis, now, self._interval):
+                return None, False
             draft: Draft | None = None
             answered = False
             failure: EmberError | None = None
             try:
-                draft = merge_incident(self._ember, incident, self._names)
+                draft = merge_incident(self._ember, incident)
                 answered = True
             except StoryError:
                 # Ember answered, and was paid, and the answer is no form.
@@ -141,26 +144,26 @@ class StoryDesk:
                 self._stories.save_state(hold.hold_state())
         if held is not None:
             raise_bare(held)
-        return story
+        return story, True
 
     def refresh_all(self, snapshot: Snapshot) -> int:
-        """Have stories written for the incidents of a reading that want one, the
-        ones heard from last first, at most `MAX_PER_PASS` of them, and say how
-        many were written. It ends early, without raising, when the desk is held,
-        when Ember refused or failed, and when the stories file is closed."""
-        written = 0
+        """Have stories made for the incidents of a reading that want one, the
+        ones heard from last first, and say how many were. Ember is asked about at
+        most `MAX_PER_PASS` incidents, whatever came of each answer. It ends early,
+        without raising, when the desk is held, when Ember refused or failed, and
+        when the stories file is closed."""
+        asked = written = 0
         wanted = sorted(
             (incident for incident in snapshot.incidents if self.wanted(incident)),
             key=lambda incident: incident.updated_at,
             reverse=True,
         )
         for incident in wanted:
-            if written >= MAX_PER_PASS:
+            if asked >= MAX_PER_PASS:
                 break
             failed: str | None = None
             try:
-                if self.refresh(incident, snapshot.as_of) is not None:
-                    written += 1
+                story, claimed = self._attempt(incident, snapshot.as_of)
             except (PollerHeldError, EmberClosedError, StoriesError):
                 # Held, or shutting down: neither is news.
                 break
@@ -168,8 +171,10 @@ class StoryDesk:
                 # Only the kind of error: the desk is held now, and says so itself.
                 failed = type(error).__name__
             if failed is not None:
-                logger.warning("A story could not be written (%s).", failed)
+                logger.warning("A story could not be made (%s).", failed)
                 break
+            asked += claimed
+            written += story is not None
         return written
 
     def close(self) -> None:

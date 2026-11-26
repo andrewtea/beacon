@@ -1,7 +1,8 @@
 """Where stories are kept: beside the incident engine, and not in it.
 
-An incident is derived from the evidence and never stored. What Ember writes about
-one is not derived: it was paid for, and asking again gives other words. So a story
+An incident is derived from the evidence and never stored. What Ember chooses to
+tell of one is not derived: it was paid for, and asking again can give another
+choice. So a story
 is kept here, under the incident's id and the basis it was written from
 (`beacon.story.merge.basis_of`), in a file of its own: `data/story/mock.sqlite3` or
 `data/story/live.sqlite3`, as the evidence store has one file for each.
@@ -10,11 +11,11 @@ is kept here, under the incident's id and the basis it was written from
   caller's, for good: the same lines are never paid for twice. A claim is also
   refused while the incident's last one is younger than the caller's interval, so
   an incident that changes every few seconds is not written about every few seconds.
-- **Only text that passed the redaction pass is written here.** A story holds
-  Ember's sentences after `merge_incident` let each one through, the sources code
-  gave them, and the call's token counts. The file holds nothing a person sent and
-  nothing a source said beyond what an incident's own lines show.
-- **The live file holds nothing a stand-in wrote.** `write` refuses a story whose
+- **No word a model wrote is written here.** A story holds the sentences code
+  wrote for the points Ember chose, the sources code gave them, and the call's
+  token counts. The file holds nothing a person sent and nothing a source said
+  beyond what an incident's own lines show.
+- **The live file holds nothing a stand-in chose.** `write` refuses a story whose
   model is `fake` there.
 - Rows older than `KEPT` are deleted when a new one is claimed: the engine reads
   twelve hours, and an incident older than that has no reader.
@@ -60,24 +61,22 @@ class StoriesError(Exception):
 
 @dataclass(frozen=True)
 class Story:
-    """What Ember wrote about an incident, as it is kept and shown."""
+    """The story of an incident, as it is kept and shown."""
 
     incident_id: str
     # Names the lines it was written from.
     basis: str
     written_at: datetime
-    # None when Ember gave none that may be shown: the incident's own title stands.
-    headline: str | None
     claims: tuple[Claim, ...]
-    # How many of Ember's sentences were left out, and how many of the incident's
-    # older lines Ember was not given.
+    # How many of the points Ember gave were left out, and how many of the
+    # incident's older lines Ember was not given.
     left_out: int
     lines: int
     lines_left_out: int
-    # Which kind of Ember client wrote it: `live`, or `fake` for a stand-in.
+    # Which kind of Ember client chose its points: `live`, or `fake` for a stand-in.
     model: str
-    # Whether a stand-in had a part in it: a fake Ember wrote it, or a line it was
-    # written from is a stand-in's.
+    # Whether a stand-in had a part in it: a fake Ember chose its points, or a line
+    # it was made from is a stand-in's.
     stand_in: bool
     input_tokens: int
     cached_tokens: int
@@ -173,7 +172,6 @@ class Stories:
             incident_id=incident_id,
             basis=basis,
             written_at=now.astimezone(UTC),
-            headline=draft.headline,
             claims=draft.claims,
             left_out=draft.left_out,
             lines=draft.lines,
@@ -259,12 +257,12 @@ def _stamp(moment: datetime) -> str:
 def _as_json(story: Story) -> dict[str, Any]:
     return {
         "written_at": story.written_at.isoformat(),
-        "headline": story.headline,
         "claims": [
             {
+                "kind": claim.kind,
                 "text": claim.text,
+                "at": claim.at.isoformat(),
                 "confidence": claim.confidence,
-                "note": claim.note,
                 "sources": [_source_json(source) for source in claim.sources],
             }
             for claim in story.claims
@@ -288,13 +286,13 @@ def _from_json(incident_id: str, basis: str, kept: dict[str, Any]) -> Story:
         incident_id=incident_id,
         basis=basis,
         written_at=datetime.fromisoformat(kept["written_at"]),
-        headline=kept["headline"],
         claims=tuple(
             Claim(
+                kind=claim["kind"],
                 text=claim["text"],
+                at=datetime.fromisoformat(claim["at"]),
                 confidence=claim["confidence"],
                 sources=tuple(_source_from(source) for source in claim["sources"]),
-                note=claim["note"],
             )
             for claim in kept["claims"]
         ),

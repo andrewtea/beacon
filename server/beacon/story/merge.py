@@ -1,121 +1,124 @@
-"""`merge_incident`: Ember tells what an incident's radio, closures, aircraft, and taps
-add up to, in a few sentences, each of which names the lines it rests on.
+"""`merge_incident`: Ember chooses what an incident's lines add up to, and code checks
+each choice against its rows and writes the sentence.
 
 The incident engine has already decided what belongs to the incident and written a
-line for each thing a source said (`beacon.incident`). This call adds the one thing
-plain code does not do well: saying in a few sentences what those lines come to. It
-decides nothing. What Ember is given, and what is kept of its answer:
+line for each thing a source said (`beacon.incident`). An incident that has gone on
+for an hour has dozens. This call has Ember pick the few points that tell it, in the
+order a reader should see them. It decides nothing, and **no word Ember writes is
+shown**:
 
-- **Ember is given only the lines of radio, 511 events, aircraft, and taps**, as the
-  engine wrote them. It is given no alert and no notice, and may not write about
-  one: what an authority said is shown by code, in the authority's words or as a
-  labeled reading beside its link (`Incident.official`), and never in a model's
-  retelling. A sentence that uses a word for an official act (`order`, `official`,
-  `alert`, `warning`, `notice`) is left out.
-- **Every sentence cites lines, and code gives it its sources and its confidence**:
-  the sources of the lines it cites, and the least confidence among them. A
-  sentence that cites nothing, or a line that is not there, is left out.
-- **Every sentence passes the redaction pass in Beacon's own voice**
-  (`beacon.redact.own`): ordinary words and listed names only, no word that tells a
-  reader what to do, no number in front of a street. One that does not pass is
-  left out whole.
-- **A sentence about an evacuation, sheltering, or an all-clear rests on radio
-  alone**, because Ember was given nothing else, so code puts beside it the words
-  "That is radio traffic, not an official order."
+- **Ember answers with points, not prose.** A point is a kind from a closed list
+  (`POINT_KINDS`: where the radio has got to, an alarm level, the units, a detail a
+  call gave, a 511 event, an aircraft, taps) and the numbers of the lines that show
+  it. No free text of Ember's is read, kept, or shown. A model that writes prose
+  cannot be kept from telling a reader what to do by a list of words, so it is
+  given no sentence to write.
+- **Code checks every point against the lines it cites.** A point is kept only when
+  every line it cites shows it: an `evacuation` point has to cite radio calls whose
+  own rows hold that detail, an `alarm` point calls that gave an alarm level. A
+  point that cites nothing, a line that is not there, or a line that does not show
+  it is left out and counted (`Draft.left_out`).
+- **Code writes the sentence**, from the cited rows' own fields, in the engine's
+  words: what crews said about an evacuation, sheltering, or an all-clear is written
+  with "That is radio traffic, not an official order.", as it is in the timeline.
+  A 511 event, an aircraft, and taps are told in the timeline's own line.
+- **Code gives it its sources and its confidence**: the sources of the lines it
+  cites, and the least confidence among them.
+- **Ember is given only the lines of radio, 511 events, aircraft, and taps.** It is
+  given no alert and no notice, and there is no kind of point about one: what an
+  authority said is shown by code, in the authority's words or as a labeled reading
+  beside its link (`Incident.official`).
 - **A medical response has no story.** It is its crews and its block, which the
   engine already says, and `merge_incident` refuses it.
 
-What this cannot do: nothing checks that a sentence is true to the lines it cites.
-Its sources and its confidence say what it rests on, and the lines themselves are
-shown beside it.
+So a story is a choice among true lines, and what can be wrong with it is the choice:
+a point that matters can be missing, and an old status can be picked over a new one,
+which is why each sentence carries the time of its line.
 
-The call is `sensitive=True`. Its input is made of code's own words and 511's, and
-its answer is unread text from a model until the pass above has read it, so the
-ledger and the trace keep the call's accounting and none of its text. What is kept
-of the answer is the story, once every sentence of it has passed.
+The call is `sensitive=True`: its answer is not read beyond its form, and nothing of
+the request or the answer is kept in the ledger or the trace besides the accounting.
 """
 
 import hashlib
 import json
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from beacon.ember import EmberClient
 from beacon.errors import raise_bare
 from beacon.evidence import Confidence
 from beacon.incident import Entry, Incident, Source, weakest
+from beacon.incident.build import DETAIL_WORDS, STATUS_WORDS
 from beacon.radio.vocabulary import MEDICAL_EVENT
-from beacon.redact import Names, own
 
 TASK = "merge_incident"
-MAX_OUTPUT_TOKENS = 1500
+MAX_OUTPUT_TOKENS = 1000
 
-# The kinds of line Ember is given, and so the only ones a sentence can cite.
+# The kinds of line Ember is given, and so the only ones a point can cite.
 LINE_KINDS = ("radio", "closure", "aircraft", "taps")
 # The newest lines are given, and no more than this many.
 MAX_LINES = 60
-MAX_CLAIMS = 8
-MAX_CLAIM_CHARS = 280
-MAX_HEADLINE_CHARS = 100
-MAX_CITES = 6
+MAX_POINTS = 8
+MAX_CITES = 4
+# The most units one sentence names.
+MAX_UNITS = 12
 
-NOT_AN_ORDER = "That is radio traffic, not an official order."
+# What a point can be about. `status`, `alarm`, `units`, and each detail a call can
+# give rest on radio lines; the last three on a line of their own kind.
+POINT_KINDS: tuple[str, ...] = (
+    "status",
+    "alarm",
+    "units",
+    *DETAIL_WORDS,
+    "closure",
+    "aircraft",
+    "taps",
+)
 
 INSTRUCTIONS = """\
-You write the short account of one incident for Beacon, an app that tells people in \
-San Francisco what the sirens near them are about.
+You choose what goes into the short account of one incident for Beacon, an app that \
+tells people in San Francisco what the sirens near them are about.
 
 You are given a JSON document: the incident as Beacon's own code has put it together, \
 and numbered lines, each one thing a source said (dispatch radio as it was logged, a \
-511 traffic event, an aircraft's track, taps in the app). Write a headline and at most \
-eight short sentences that say what the lines add up to: what kind of call it is, \
-where, how far it has got, who is on it, and what else was seen.
+511 traffic event, an aircraft's track, taps in the app).
 
-Rules:
-- Say only what the lines say. For each sentence, give the numbers of the lines it \
-rests on. A sentence with no line is thrown away.
-- Plain words. Name only streets, units, and agencies that appear in the lines, \
-spelled as they are there. Never name or describe a person. Give a place no finer \
-than a block.
-- Never tell the reader what to do, and never write "you".
-- Do not write about official alerts, orders, warnings, or notices, and do not use \
-those words: Beacon shows what authorities said itself, beside its source.
-- Radio traffic is what crews said, not what is confirmed. Write "crews report" or \
-"the radio says" where it matters.
+Choose at most eight points that tell what the lines add up to, in the order a reader \
+should see them: how far the call has got, how large it is, who is on it, and what \
+else was seen. For each point give its kind and the numbers of the lines that show it.
+
+- status: one radio line, the one that says how far the call has got now.
+- alarm: the radio lines that give the alarm level.
+- units: radio lines that name the units on the call.
+- a detail (smoke_showing, evacuation, knocked_down, and the others): the radio lines \
+that say it.
+- closure, aircraft, taps: one line of that kind.
+
+Beacon checks each point against the lines it cites and writes the sentence itself. \
+A point whose lines do not show it is thrown away. Write nothing else.
 """
 
 SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "headline": {"type": ["string", "null"]},
-        "claims": {
+        "points": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
-                    "text": {"type": "string"},
+                    "kind": {"type": "string", "enum": list(POINT_KINDS)},
                     "cites": {"type": "array", "items": {"type": "integer"}},
                 },
-                "required": ["text", "cites"],
+                "required": ["kind", "cites"],
                 "additionalProperties": False,
             },
         },
     },
-    "required": ["headline", "claims"],
+    "required": ["points"],
     "additionalProperties": False,
 }
-
-# A word for an official act. Ember is given no official source, so a sentence with
-# one of these says more than its lines can.
-_OFFICIAL = re.compile(
-    r"\b(?:official\w*|authorit\w+|orders?|ordered|warnings?|alerts?|notices?|advisor\w+|"
-    r"published|issued|declared|mandatory)\b",
-    re.IGNORECASE,
-)
-# What crews can say on the radio that an authority can also order.
-_ORDER_LIKE = re.compile(r"evacuat|shelter|all[\s-]+clear", re.IGNORECASE)
 
 
 class StoryError(Exception):
@@ -127,30 +130,30 @@ class StoryError(Exception):
 class Claim:
     """One sentence of a story, and what it rests on."""
 
-    # Ember's words, after the redaction pass let the whole sentence through.
+    # What it is about, from `POINT_KINDS`. Ember chose it; code checked it.
+    kind: str
+    # Written by code from the rows of the lines it cites. None of it is Ember's.
     text: str
+    # When the newest of those lines is from.
+    at: datetime
     # The least confidence among the lines it cites, worked out by code.
     confidence: Confidence
     # The sources of the lines it cites.
     sources: tuple[Source, ...]
-    # Words code puts beside it, or None: `NOT_AN_ORDER` for a sentence about an
-    # evacuation, sheltering, or an all-clear.
-    note: str | None = None
 
 
 @dataclass(frozen=True)
 class Draft:
     """What `merge_incident` made of one answer."""
 
-    headline: str | None
     claims: tuple[Claim, ...]
-    # How many sentences Ember wrote that were left out: one that did not pass the
-    # redaction pass, cited nothing that is there, or spoke of an official act.
+    # How many points Ember gave that were left out: one that cited nothing that is
+    # there, one its lines do not show, and one that says again what another said.
     left_out: int
     # How many lines Ember was given, and how many older ones it was not.
     lines: int
     lines_left_out: int
-    # Which kind of Ember client wrote it: `live`, or `fake` for a stand-in.
+    # Which kind of Ember client chose the points: `live`, or `fake` for a stand-in.
     model: str
     input_tokens: int
     cached_tokens: int
@@ -168,15 +171,15 @@ def lines_of(incident: Incident) -> tuple[list[Entry], int]:
 
 
 def basis_of(incident: Incident) -> str:
-    """Names what an incident's story would be written from: a digest of the lines
+    """Names what an incident's story would be made from: a digest of the lines
     Ember would be given. Two readings of an incident with the same basis would get
-    the same request, and a story is the story of the basis it was written from."""
+    the same request, and a story is the story of the basis it was made from."""
     lines, _ = lines_of(incident)
     return hashlib.sha256(_document(incident, lines).encode()).hexdigest()[:32]
 
 
-def merge_incident(ember: EmberClient, incident: Incident, names: Names) -> Draft:
-    """Have Ember write the story of an incident from its lines.
+def merge_incident(ember: EmberClient, incident: Incident) -> Draft:
+    """Have Ember choose the points of an incident's story from its lines.
 
     Raises ValueError for a medical response and for an incident with no line to
     tell, before anything is asked. Raises StoryError when Ember's answer is not the
@@ -185,7 +188,7 @@ def merge_incident(ember: EmberClient, incident: Incident, names: Names) -> Draf
         raise ValueError("A medical response is its crews and its block, and has no story.")
     lines, lines_left_out = lines_of(incident)
     if not lines:
-        raise ValueError("The incident has no line a story could be written from.")
+        raise ValueError("The incident has no line a story could be made from.")
     answer = ember.respond(
         task=TASK,
         effort="low",
@@ -202,20 +205,20 @@ def merge_incident(ember: EmberClient, incident: Incident, names: Names) -> Draf
             }
         },
     )
-    form = _form(answer.output_text)
-    if form is None:
+    points = _points(answer.output_text)
+    if points is None:
         raise_bare(StoryError("Ember's answer about an incident is not a filled-in form."))
-    headline, written = form
-    claims: list[Claim] = []
-    for text, cites in written[:MAX_CLAIMS]:
-        claim = _claim(text, cites, lines, names)
+    claims: dict[tuple[str, tuple[int, ...]], Claim] = {}
+    for kind, cites in points[:MAX_POINTS]:
+        cited = _cited(cites, lines)
+        claim = None if cited is None else point_claim(kind, [lines[n - 1] for n in cited])
         if claim is not None:
-            claims.append(claim)
+            # A point that says again what another said is counted as left out.
+            claims.setdefault((claim.kind, tuple(cited or ())), claim)
     usage = answer.usage
     return Draft(
-        headline=_headline(headline, names),
-        claims=tuple(claims),
-        left_out=len(written) - len(claims),
+        claims=tuple(claims.values()),
+        left_out=len(points) - len(claims),
         lines=len(lines),
         lines_left_out=lines_left_out,
         model=answer.source,
@@ -226,6 +229,70 @@ def merge_incident(ember: EmberClient, incident: Incident, names: Names) -> Draf
         cost_usd=answer.cost_usd,
         latency_ms=answer.latency_ms,
     )
+
+
+def point_claim(kind: object, cited: Sequence[Entry]) -> Claim | None:
+    """The sentence for a point of `kind` that cites these lines, or None when the
+    lines do not show it. Every line has to: a point is no truer for a line beside
+    it that says something else."""
+    if not isinstance(kind, str) or not cited:
+        return None
+    text = _sentence(kind, cited)
+    if text is None:
+        return None
+    sources: dict[tuple[str, int | None], Source] = {}
+    for entry in cited:
+        for source in entry.sources:
+            sources.setdefault((source.source, source.evidence_id), source)
+    return Claim(
+        kind=kind,
+        text=text,
+        at=max(entry.at for entry in cited),
+        confidence=weakest([entry.confidence for entry in cited]),
+        sources=tuple(sources.values()),
+    )
+
+
+def _sentence(kind: str, cited: Sequence[Entry]) -> str | None:
+    """The words for a point, from the fields the cited lines were written from."""
+    details = [entry.details for entry in cited]
+    if kind in ("closure", "aircraft", "taps"):
+        if len(cited) != 1 or cited[0].kind != kind:
+            return None
+        if kind == "closure" and details[0].get("state") in ("replaced", "not_listed"):
+            # A version of a 511 event that 511 has since changed or stopped
+            # listing: its words are not what 511 says now.
+            return "511 listed a traffic event here, in a version it has since changed."
+        # The engine's own line, as the timeline has it: for a 511 event that is
+        # 511's words, and for a change what Beacon saw and that it is no reopening.
+        return cited[0].text
+    if any(entry.kind != "radio" for entry in cited):
+        return None
+    if kind == "status":
+        status = details[0].get("status")
+        if len(cited) != 1 or status not in STATUS_WORDS or status == "unknown":
+            return None
+        return f"The radio said: {STATUS_WORDS[status]}."
+    if kind == "alarm":
+        levels = [said.get("alarm") for said in details]
+        if not all(isinstance(level, int) and not isinstance(level, bool) for level in levels):
+            return None
+        return f"The radio said: alarm level {max(levels)}."  # type: ignore[type-var]
+    if kind == "units":
+        named: dict[str, None] = {}
+        for said in details:
+            units = [unit for unit in said.get("units") or [] if isinstance(unit, str)]
+            if not units:
+                return None
+            named.update(dict.fromkeys(units))
+        shown = list(named)[:MAX_UNITS]
+        more = ", and others" if len(named) > MAX_UNITS else ""
+        return f"Units named on the radio: {', '.join(shown)}{more}."
+    if kind in DETAIL_WORDS:
+        if not all(kind in (said.get("details") or []) for said in details):
+            return None
+        return DETAIL_WORDS[kind]
+    return None
 
 
 def _document(incident: Incident, lines: Sequence[Entry]) -> str:
@@ -257,54 +324,27 @@ def _document(incident: Incident, lines: Sequence[Entry]) -> str:
     )
 
 
-def _form(text: str) -> tuple[object, list[tuple[object, object]]] | None:
-    """The headline and the sentences of an answer, each sentence as what it gave
-    for its text and its lines, or None when the answer is not the form."""
+def _points(text: str) -> list[tuple[object, object]] | None:
+    """The points of an answer, each as what it gave for its kind and its lines, or
+    None when the answer is not the form. Nothing else of the answer is read."""
     try:
         answer = json.loads(text)
     except ValueError:
         return None
-    if not isinstance(answer, dict) or not isinstance(answer.get("claims"), list):
+    if not isinstance(answer, dict) or not isinstance(answer.get("points"), list):
         return None
-    written = [
-        (claim.get("text"), claim.get("cites")) if isinstance(claim, dict) else (None, None)
-        for claim in answer["claims"]
+    return [
+        (point.get("kind"), point.get("cites")) if isinstance(point, dict) else (None, None)
+        for point in answer["points"]
     ]
-    return answer.get("headline"), written
 
 
-def _claim(text: object, cites: object, lines: Sequence[Entry], names: Names) -> Claim | None:
-    """A sentence Ember wrote, when it may be shown, with what code adds to it."""
-    if not isinstance(text, str) or len(text) > MAX_CLAIM_CHARS:
-        return None
-    shown = own(text, names)
-    if shown is None or _OFFICIAL.search(shown):
-        return None
+def _cited(cites: object, lines: Sequence[Entry]) -> list[int] | None:
+    """The numbers of the lines a point cites, in order and once each, or None when
+    it cites none, too many, or one that is not there."""
     if not isinstance(cites, list) or not 1 <= len(cites) <= MAX_CITES:
         return None
     numbers = [n for n in cites if isinstance(n, int) and not isinstance(n, bool)]
     if len(numbers) != len(cites) or not all(1 <= n <= len(lines) for n in numbers):
         return None
-    cited = [lines[n - 1] for n in sorted(set(numbers))]
-    sources: dict[tuple[str, int | None], Source] = {}
-    for entry in cited:
-        for source in entry.sources:
-            sources.setdefault((source.source, source.evidence_id), source)
-    return Claim(
-        text=shown,
-        confidence=weakest([entry.confidence for entry in cited]),
-        sources=tuple(sources.values()),
-        note=NOT_AN_ORDER if _ORDER_LIKE.search(shown) else None,
-    )
-
-
-def _headline(text: object, names: Names) -> str | None:
-    """Ember's headline when it may be shown, else None: whoever shows the story
-    then uses the incident's own title. A headline has no room for a note, so one
-    that speaks of an evacuation is left out as one that speaks of an order is."""
-    if not isinstance(text, str) or len(text) > MAX_HEADLINE_CHARS:
-        return None
-    shown = own(text, names)
-    if shown is None or _OFFICIAL.search(shown) or _ORDER_LIKE.search(shown):
-        return None
-    return shown
+    return sorted(set(numbers))

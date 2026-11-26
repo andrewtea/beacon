@@ -18,9 +18,9 @@ Each `server/beacon/` package has one concern, so parallel pull requests stay ap
 - `ingest/`: one module per source (`nws`, `opensky`, `traffic511`, `openmhz`, `notices`), the `Runner` that polls them, `paid` (what a poller that pays Ember for each item keeps to), and `setup`, which reads `BEACON_LIVE_SOURCES` once to open the right store (`open_store`) and make the pollers (`build`).
 - `notice/`: what is kept of an official notice (`Notice`), and the Ember call that reads one from its PDF (`read_notice` in `read`).
 - `radio/`: the closed vocabulary a radio call is kept in and the lists a unit or a street has to be on (`vocabulary`), the Ember call that hears one (`extract_transmission` in `extract`), and the in-memory, confined decoding of its audio (`audio`), whose `Ffmpeg` also draws a tap's photo again.
-- `redact/`: the redaction pass. `screen` lets a text a model wrote through only when every word of it is an ordinary word or a listed name (`reading` for a notice's words, `own` for Beacon's voice); `vocabulary` is the words.
+- `redact/`: the redaction pass. `screen` lets Ember's reading of a notice through only when every word of it is an ordinary word or a listed name (`reading`), and an issuer only when it is a listed public body (`Names.public_body`); `vocabulary` is the words. It passes nothing a model wrote in Beacon's own voice: there is no such text.
 - `scenario/`: the mock scenario, an invented San Francisco fire served to the pollers in each source's own format, with its radio calls and the stand-in for Ember that "hears" them (`radio`), and its notices, written as PDFs (`pdf`), with the stand-in that "reads" them (`notices`).
-- `story/`: what Ember writes about an incident. `merge` is the Ember call (`merge_incident`) and what is kept of its answer, `store` the file stories are kept in (`Stories`), `desk` when one is paid for (`StoryDesk`), `stand_in` the stand-in that writes them with no key, and `setup` opens the desk (`open_stories`).
+- `story/`: the points Ember picks to tell an incident by. `merge` is the Ember call (`merge_incident`), the check of each point against its rows, and the sentences code writes for them; `store` is the file stories are kept in (`Stories`), `desk` when one is paid for (`StoryDesk`), `stand_in` the stand-in that chooses with no key, and `setup` opens the desk (`open_stories`).
 - `taps/`: taking a tap. `desk` checks one, rounds its place, and stores its row (`Taps.take`); `media` has a photo drawn again as a new JPEG and a clip written out again as its samples, and keeps them for an hour (`Taps.media` reads them back).
 
 `beacon/errors.py` is a module beside them, with `raise_bare`: how an error about something private is raised with nothing chained under it.
@@ -195,7 +195,7 @@ engine.get(incident_id)  # one incident, or None
 - **Every line names its rows.** An `Entry`, an `Official`, and a `Signal` carry the sources they rest on (`Source`: the feed, the row's id, its link, its credit), and an entry's confidence is its row's. A new kind of line does the same, with `source_of(row)`; a line that rests on several rows is trusted as little as the weakest (`weakest`).
 - **Medical stays medical.** A medical call is grouped only with medical calls, its entry is "Medical response", units, and block, and its incident has no alarm, no official list, no signals, and no taps. Nothing downstream adds them back.
 - **A notice's words are shown only through the redaction pass, as a reading.** A notice's timeline entry says only that a document of its type was published, with its link. `Official.issuer`, `headline`, `instruction`, `summary`, and `areas` hold a notice's words only when `beacon.redact.reading` let the whole text through; what did not pass is named in `Official.withheld`, and nothing is read of a type outside `TEXT_TYPES`. Show them as Beacon's reading beside `source.url`, never as the authority's words. Do not show a notice's text by any path that does not go through the pass.
-- **Official outranks radio, and code says so.** `Incident.conflicts` lists where the radio and an official source disagree, with a text that says the official source holds and why. Finding and wording a conflict is code's (`_conflicts` in `build.py`); no model weighs one source against another.
+- **Official outranks radio, and code says so.** `Incident.conflicts` lists where the radio and an official source disagree, with a text that says the official source holds and why, and a confidence that is the weakest row's. Finding and wording a conflict is code's (`_conflicts` in `build.py`); no model weighs one source against another. Two sources disagree only in the order of their times: an all-clear on the radio is set against an alert or an order issued before it, and a notice against a call made before it. Do not pair rows without their times.
 - **`published` is not `in_force`.** Beacon has read a document; it does not know that an order still holds. Say that an authority published it. An all-clear is another published document, and no code says that it lifts an order: a notice's row keeps streets and no blocks, so an all-clear for one block of a street cannot be told from one for another. Show both with their links; there is no `lifted` state, and do not add one.
 - **`not_listed` is what Beacon saw.** Keep the words "not an official all-clear" with it.
 - **A point from 511 carries 511's credit.** `incident.point_from == "closure"` says the point is a 511 event's, and `incident.point_source` is that row's `Source` with the credit. Show the credit wherever the point is shown, a map included; a point from the list of blocks has no `point_source`.
@@ -210,23 +210,25 @@ engine.get(incident_id)  # one incident, or None
 ## Using the redaction pass and stories
 
 ```python
-from beacon.redact import own, reading
-from beacon.story import merge_incident
+from beacon.redact import reading
+from beacon.story import merge_incident, point_claim
 
 names = engine.names  # the listed streets, units, and public places, or None
 reading(notice_text, names)  # the text, or None when it does not pass
-own(model_text, names)  # as strict, and with no word that tells a reader what to do
+names.public_body(issuer)  # the issuer, or None when it is not one listed body
 
-desk = request.app.state.stories  # a StoryDesk, or absent when no stories are written
+desk = request.app.state.stories  # a StoryDesk, or absent when no stories are made
 found = desk.latest(incident)  # (Story, current) or None; asks Ember nothing
 ```
 
-- **Text a model wrote reaches a person only through `beacon.redact`.** `reading` for Ember's reading of an authority's notice, `own` for anything Ember writes in Beacon's voice. A text passes whole or is left out whole: never cut one, and never show one that failed. When a word plainly belongs, add it to `vocabulary.py` after asking whether it can describe a person or tell one what to do; never add a way past the lists.
-- **Beacon's own voice gives no instruction.** `ORDER_WORDS` (`leave`, `stay`, `go`, `must`, `you`, `effect`, `lifted`, ...) pass only in a reading. Do not move one into `WORDS`.
-- **A model is given no official text to retell.** `merge_incident` sends only radio, closure, aircraft, and tap lines (`LINE_KINDS`), and leaves out a sentence that speaks of an order, an alert, or a notice. What an authority said is shown by code from `Incident.official`. Keep it so for any new call that writes prose.
-- **Code derives a claim's sources and confidence.** A `Claim` gets them from the lines it cites (`weakest`). Do not let a model state its own confidence or source.
-- **A story is paid for once per basis.** `Stories.claim(incident_id, basis, ...)` before `merge_incident`, as `StoryDesk.refresh` does, and the rules after Ember has been asked are `PaidDesk`'s. `StoryDesk` pays under the scope `story:merge`. Reading a story (`desk.latest`, the incident route) never asks Ember.
-- **Only text that passed is written to the stories file**, and the live file refuses a stand-in's story. `merge_incident` is a `sensitive=True` call: Ember's raw answer is unread text and stays out of the ledger.
+- **No sentence a model wrote is shown in Beacon's voice. Code writes every one.** A model that has a part in what Beacon says chooses from a closed list and cites rows; code checks the choice against those rows and writes the words (`point_claim` and `_sentence` in `story/merge.py`). Do not add a free-text field (a headline, a summary, a note, a reason) to a form a model fills in for something Beacon says, and do not try to make such a text safe with a list of words: "Exit the building." is made of ordinary words. A new thing worth saying is a new kind in `POINT_KINDS` with its check and its sentence.
+- **The one text of a model's that is shown is a reading of a notice, through `beacon.redact.reading`**, labeled as Beacon's reading beside the document's link. A text passes whole or is left out whole: never cut one, and never show one that failed. When a word plainly belongs, add it to `vocabulary.py` after asking whether it can describe a person; never add a way past the lists.
+- **A point is kept only when every line it cites shows it.** The check reads the cited rows' own fields (`Entry.details`), not the line's words and not the model's. A point that fails is left out and counted (`Draft.left_out`), never mended.
+- **A model is given no official text to retell.** `merge_incident` sends only radio, closure, aircraft, and tap lines (`LINE_KINDS`), and no kind of point is about an order, an alert, or a notice. What an authority said is shown by code from `Incident.official`.
+- **Code derives a claim's sources, confidence, and time.** A `Claim` gets them from the lines it cites (`weakest`). Do not let a model state its own confidence or source.
+- **A story is paid for once per basis.** `Stories.claim(incident_id, basis, ...)` before `merge_incident`, inside `PaidDesk.working()` so that a shutdown waits from before the claim to the story's row, as `StoryDesk` does; the rules after Ember has been asked are `PaidDesk`'s. `StoryDesk` pays under the scope `story:merge`, and a pass counts paid attempts, not stories. Reading a story (`desk.latest`, the incident route) never asks Ember.
+- **A shutdown closes everything that pays before it waits for anything** (`_close_paid` in `main.py`). Something new that pays is added there.
+- **Only what code wrote is in the stories file**, and the live file refuses a stand-in's story. `merge_incident` is a `sensitive=True` call: nothing of Ember's answer but its points is read, and none of it is in the ledger.
 - **In tests**, hand `merge_incident` an `EmberClient.fake` with a `Script` of answers, as `server/tests/test_story.py` does, or use `stand_in_writer`.
 
 ## Conventions

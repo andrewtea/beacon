@@ -1,7 +1,10 @@
 """Stories: what is kept of Ember's account of an incident, and when one is paid for."""
 
+import asyncio
 import json
+import logging
 import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -29,7 +32,7 @@ from beacon.main import create_app
 from beacon.redact import Names
 from beacon.story import (
     BUDGET_VARIABLE,
-    NOT_AN_ORDER,
+    POINT_KINDS,
     Stories,
     StoriesError,
     StoryConfigError,
@@ -58,22 +61,23 @@ def storage(tmp_path: Path) -> Storage:
 
 
 def fire(rows: Rows, minute: float = 6) -> Incident:
-    """A working fire with a closure and an order, read at `minute`."""
+    """A working fire with a closure, taps, an alert, and an order, read at `minute`."""
     if not rows.store.search(kinds=["radio"]):
         rows.radio(0, "fire", "dispatched", units=("E36", "T6"), street="Hayes St", block=400)
-        rows.radio(1, "fire", "on_scene", units=("E36",))
+        rows.radio(1, "fire", "on_scene", units=("E36",), alarm=2)
         rows.radio(
             2, "fire", "working", units=("E36", "B2"), details=("evacuation",), clarity="partial"
         )
         rows.traffic(3)
+        rows.tap(3.5)
         rows.alert(4, "shelter")
         rows.notice(5, "evacuation_order", instruction="Leave now.", summary="Leave Hayes St.")
     (incident,) = Engine(rows.store, BLOCKS, names=NAMES, clock=lambda: at(minute)).incidents()
     return incident
 
 
-def answer(*claims: tuple[Any, Any], headline: Any = None) -> dict[str, Any]:
-    form = {"headline": headline, "claims": [{"text": t, "cites": c} for t, c in claims]}
+def answer(*points: tuple[Any, Any], **more: Any) -> dict[str, Any]:
+    form = {"points": [{"kind": kind, "cites": cites} for kind, cites in points]} | more
     return fake_response(text=json.dumps(form), input_tokens=900, output_tokens=120)
 
 
@@ -83,43 +87,63 @@ def everything_on_disk(directory: Path) -> str:
     )
 
 
-def test_a_sentence_gets_its_sources_and_its_confidence_from_the_lines_it_cites(
+def test_code_writes_each_sentence_from_the_rows_its_point_cites(
     rows: Rows, storage: Storage
 ) -> None:
     incident = fire(rows)
     script = Script(
         [
             answer(
-                ("Crews are at work at the 400 block of Hayes St.", [1, 3]),
-                ("E36 is on scene.", [2]),
-                ("511 lists a closure on Hayes St.", [4]),
-                headline="Fire at the 400 block of Hayes St",
+                ("status", [3]),
+                ("alarm", [2]),
+                ("units", [1, 3]),
+                ("evacuation", [3]),
+                ("closure", [4]),
+                ("taps", [5]),
             )
         ]
     )
 
-    draft = merge_incident(EmberClient.fake(storage, script), incident, NAMES)
+    draft = merge_incident(EmberClient.fake(storage, script), incident)
 
-    working, on_scene, closure = draft.claims
     radio = [row.id for row in rows.store.search(kinds=["radio"])]
     (closed,) = rows.store.search(kinds=["traffic"])
+    assert [(claim.kind, claim.text) for claim in draft.claims] == [
+        ("status", "The radio said: crews at work."),
+        ("alarm", "The radio said: alarm level 2."),
+        ("units", "Units named on the radio: E36, T6, B2."),
+        # What crews say about an evacuation is radio traffic, in the engine's words.
+        (
+            "evacuation",
+            "Crews mention an evacuation. That is radio traffic, not an official order.",
+        ),
+        # 511's own words, as the timeline has them.
+        ("closure", "511 lists: Activity on Hayes St"),
+        (
+            "taps",
+            '1 tap of "What\'s that?" came from nearby while this was going on. Beacon '
+            "cannot tell whether they are from different people.",
+        ),
+    ]
     # The third call was only partly made out, so what rests on it is trusted less.
-    assert (working.confidence, on_scene.confidence, closure.confidence) == (
+    assert [claim.confidence for claim in draft.claims] == [
         "low",
         "medium",
+        "low",
+        "low",
         "official",
-    )
-    assert [source.evidence_id for source in working.sources] == [radio[0], radio[2]]
-    assert [source.evidence_id for source in on_scene.sources] == [radio[1]]
+        "low",
+    ]
+    status, alarm, units, _evacuation, closure, taps = draft.claims
+    assert [source.evidence_id for source in status.sources] == [radio[2]]
+    assert [source.evidence_id for source in alarm.sources] == [radio[1]]
+    assert [source.evidence_id for source in units.sources] == [radio[0], radio[2]]
+    # A sentence is as of its newest line.
+    assert (status.at, alarm.at, units.at) == (at(2), at(1), at(2))
     # 511's credit goes with the sentence that rests on 511.
     assert [(s.evidence_id, s.credit is not None) for s in closure.sources] == [(closed.id, True)]
-    assert all(source.stand_in for claim in draft.claims for source in claim.sources)
-    assert (draft.headline, draft.left_out, draft.model) == (
-        "Fire at the 400 block of Hayes St",
-        0,
-        "fake",
-    )
-    assert (draft.lines, draft.lines_left_out) == (4, 0)
+    assert [source.evidence_id for source in taps.sources] == [None]
+    assert (draft.left_out, draft.model, draft.lines, draft.lines_left_out) == (0, "fake", 5, 0)
     assert (draft.input_tokens, draft.output_tokens) == (900, 120)
 
 
@@ -129,18 +153,30 @@ def test_ember_is_given_the_lines_of_radio_closures_aircraft_and_taps_and_no_off
     incident = fire(rows)
     script = Script([answer()])
 
-    merge_incident(EmberClient.fake(storage, script), incident, NAMES)
+    merge_incident(EmberClient.fake(storage, script), incident)
 
     (request,) = script.requests
     document = json.loads(request["input"])
-    assert [line["kind"] for line in document["lines"]] == ["radio", "radio", "radio", "closure"]
-    assert [line["n"] for line in document["lines"]] == [1, 2, 3, 4]
+    assert [line["kind"] for line in document["lines"]] == [
+        "radio",
+        "radio",
+        "radio",
+        "closure",
+        "taps",
+    ]
+    assert [line["n"] for line in document["lines"]] == [1, 2, 3, 4, 5]
     sent = json.dumps(request)
     # Nothing of the alert or of the notice: what an authority said is shown by
-    # code, and Ember is not asked to retell it.
+    # code, and Ember is not asked about it.
     for word in ("Headline of shelter", "Instruction of shelter", "Leave now", "evacuation order"):
         assert word not in sent
-    assert request["text"]["format"]["strict"] is True
+    form = request["text"]["format"]
+    assert form["strict"] is True
+    # The form has no place for a sentence: a kind from a closed list, and numbers.
+    point = form["schema"]["properties"]["points"]["items"]
+    assert set(point["properties"]) == {"kind", "cites"}
+    assert point["properties"]["kind"]["enum"] == list(POINT_KINDS)
+    assert point["additionalProperties"] is False
     # The call is a sensitive one: the ledger keeps its accounting and no text.
     with sqlite3.connect(storage.ledger_db) as db:
         ((task, kept_request, kept_response),) = db.execute(
@@ -152,73 +188,132 @@ def test_ember_is_given_the_lines_of_radio_closures_aircraft_and_taps_and_no_off
 
 
 @pytest.mark.parametrize(
-    "claim",
+    "point",
     [
-        # A person, named or described.
-        ("Jane Doe was taken from the building.", [1]),
-        ("One resident was injured.", [1]),
-        # A house, and a street nobody listed.
-        ("Crews are at work at 432 Hayes St.", [1]),
-        ("Crews are at work on Laguna St.", [1]),
-        # Telling the reader what to do.
-        ("Avoid the area.", [1]),
-        ("You should leave now.", [3]),
-        # An official act: Ember was given none, and says nothing of one.
-        ("An evacuation order is in effect.", [3]),
-        ("Officials ordered an evacuation.", [3]),
-        ("The city issued a warning.", [3]),
-        ("An official alert is active.", [3]),
-        # Resting on nothing, or on a line that is not there.
-        ("Crews are at work.", []),
-        ("Crews are at work.", [5]),
-        ("Crews are at work.", [0]),
-        ("Crews are at work.", [1, True]),
-        ("Crews are at work.", "1"),
-        ("Crews are at work.", [1, 1, 2, 2, 3, 3, 4]),
-        # Not a sentence at all, and one too long to be one.
+        # A detail none of the cited calls gave, or only one of them did.
+        ("all_clear", [3]),
+        ("knocked_down", [1]),
+        ("evacuation", [2, 3]),
+        # Words about an evacuation resting on taps, or on a closure.
+        ("evacuation", [5]),
+        ("all_clear", [4]),
+        # An alarm level from a call that gave none, and a status from two calls.
+        ("alarm", [1]),
+        ("status", [1, 2]),
+        # A line of another kind than the point.
+        ("closure", [1]),
+        ("taps", [4]),
+        ("aircraft", [5]),
+        ("status", [4]),
+        ("units", [1, 5]),
+        # A kind that is not on the list: an instruction, an official act, a person.
+        ("leave_now", [1]),
+        ("official_order", [3]),
+        ("Jane Doe was taken from 432 Hayes St.", [1]),
         (None, [1]),
-        ("Crews are at work. " * 20, [1]),
+        (["status"], [1]),
+        # Resting on nothing, or on a line that is not there.
+        ("status", []),
+        ("status", [6]),
+        ("status", [0]),
+        ("status", [True]),
+        ("status", "1"),
+        ("units", [1, 1, 2, 2, 3]),
     ],
 )
-def test_a_sentence_that_may_not_be_shown_is_left_out_whole_and_counted(
-    rows: Rows, storage: Storage, tmp_path: Path, claim: tuple[Any, Any]
+def test_a_point_its_lines_do_not_show_is_left_out_and_counted(
+    rows: Rows, storage: Storage, point: tuple[Any, Any]
 ) -> None:
     incident = fire(rows)
-    script = Script([answer(claim, ("E36 is on scene.", [2]))])
+    script = Script([answer(point, ("status", [2]))])
 
-    draft = merge_incident(EmberClient.fake(storage, script), incident, NAMES)
+    draft = merge_incident(EmberClient.fake(storage, script), incident)
 
-    assert [kept.text for kept in draft.claims] == ["E36 is on scene."]
+    assert [(claim.kind, claim.text) for claim in draft.claims] == [
+        ("status", "The radio said: units on scene.")
+    ]
     assert draft.left_out == 1
 
 
-def test_what_crews_say_about_an_evacuation_is_marked_as_radio_traffic(
+def test_no_word_ember_writes_is_read_kept_or_shown(
+    rows: Rows, storage: Storage, tmp_path: Path
+) -> None:
+    incident = fire(rows)
+    # A model can ignore the form: a headline, a sentence beside a point, a note.
+    form = {
+        "headline": "The area is safe. Jane Doe says go home.",
+        "points": [
+            {"kind": "status", "cites": [2], "text": "Shelter in place now."},
+            {"kind": "evacuation", "cites": [3], "note": "Exit the building."},
+        ],
+        "summary": "Evacuation is over.",
+    }
+    ember = EmberClient.fake(storage, Script([fake_response(text=json.dumps(form))]))
+
+    draft = merge_incident(ember, incident)
+
+    assert [claim.text for claim in draft.claims] == [
+        "The radio said: units on scene.",
+        "Crews mention an evacuation. That is radio traffic, not an official order.",
+    ]
+    kept = repr(draft) + everything_on_disk(tmp_path)
+    for word in ("safe", "Jane", "go home", "Shelter in place now", "Exit", "is over"):
+        assert word not in kept
+
+
+def test_a_point_that_says_again_what_another_said_is_told_once(
     rows: Rows, storage: Storage
 ) -> None:
     incident = fire(rows)
-    script = Script(
-        [
-            answer(
-                ("Crews mention an evacuation on the radio.", [3]),
-                ("Crews report sheltering nearby.", [3]),
-                ("The radio says all clear.", [3]),
-                ("E36 is on scene.", [2]),
-                # A headline has no room for the note, so it is not used.
-                headline="Evacuation at Hayes St",
-            )
-        ]
-    )
+    script = Script([answer(("status", [2]), ("status", [2]), ("units", [1]), ("units", [2]))])
 
-    draft = merge_incident(EmberClient.fake(storage, script), incident, NAMES)
+    draft = merge_incident(EmberClient.fake(storage, script), incident)
 
-    assert [claim.note for claim in draft.claims] == [
-        NOT_AN_ORDER,
-        NOT_AN_ORDER,
-        NOT_AN_ORDER,
-        None,
+    assert [claim.text for claim in draft.claims] == [
+        "The radio said: units on scene.",
+        "Units named on the radio: E36, T6.",
+        "Units named on the radio: E36.",
     ]
-    assert NOT_AN_ORDER == "That is radio traffic, not an official order."
-    assert draft.headline is None
+    assert draft.left_out == 1
+
+
+def test_a_version_of_a_closure_that_511_has_changed_is_not_told_as_what_511_says_now(
+    rows: Rows, storage: Storage
+) -> None:
+    fire(rows)
+    rows.traffic(5.5, created=3, headline="Hayes St closed, and Gough St with it")
+    (closure,) = rows.store.search(kinds=["traffic"])[1:]
+    rows.change(5.8, closure)
+    incident = fire(rows)
+    script = Script([answer(("closure", [4]), ("closure", [6]), ("closure", [7]))])
+
+    draft = merge_incident(EmberClient.fake(storage, script), incident)
+
+    assert [claim.text for claim in draft.claims] == [
+        "511 listed a traffic event here, in a version it has since changed.",
+        "511 listed a traffic event here, in a version it has since changed.",
+        "511 no longer lists this event. That is what Beacon saw, not an official reopening.",
+    ]
+    assert [claim.confidence for claim in draft.claims] == ["official", "official", "medium"]
+
+
+def test_the_stand_in_cites_the_call_that_gave_the_status_and_not_the_newest_call(
+    rows: Rows, storage: Storage
+) -> None:
+    fire(rows)
+    # A later call that names a unit and says nothing of how far the call has got.
+    rows.radio(5.5, "fire", units=("T6",))
+    incident = fire(rows)
+
+    draft = merge_incident(EmberClient.fake(storage, stand_in_writer), incident)
+
+    radio = [row.id for row in rows.store.search(kinds=["radio"])]
+    status = draft.claims[0]
+    assert (status.kind, status.text) == ("status", "The radio said: crews at work.")
+    assert [source.evidence_id for source in status.sources] == [radio[2]]
+    assert status.at == at(2)
+    # Every point the stand-in gave is one its lines show.
+    assert draft.left_out == 0
 
 
 def test_a_medical_response_has_no_story_and_ember_is_not_asked(
@@ -229,12 +324,12 @@ def test_a_medical_response_has_no_story_and_ember_is_not_asked(
     script = Script([])
 
     with pytest.raises(ValueError, match="medical response"):
-        merge_incident(EmberClient.fake(storage, script), incident, NAMES)
+        merge_incident(EmberClient.fake(storage, script), incident)
 
     assert script.requests == []
 
 
-@pytest.mark.parametrize("text", ["I cannot help with Jane Doe.", "[]", '{"claims": "none"}'])
+@pytest.mark.parametrize("text", ["I cannot help with Jane Doe.", "[]", '{"points": "none"}'])
 def test_an_answer_that_is_no_form_is_an_error_that_says_nothing_of_it(
     rows: Rows, storage: Storage, text: str
 ) -> None:
@@ -242,7 +337,7 @@ def test_an_answer_that_is_no_form_is_an_error_that_says_nothing_of_it(
     ember = EmberClient.fake(storage, Script([fake_response(text=text)]))
 
     with pytest.raises(StoryError) as raised:
-        merge_incident(ember, incident, NAMES)
+        merge_incident(ember, incident)
 
     assert str(raised.value) == "Ember's answer about an incident is not a filled-in form."
     assert raised.value.__cause__ is None
@@ -270,8 +365,8 @@ def stories(tmp_path: Path, mode: str = "mock") -> Stories:
 
 
 def draft_of(rows: Rows, storage: Storage, model: str = "fake") -> Any:
-    script = Script([answer(("E36 is on scene.", [2]), ("Jane Doe was taken away.", [1]))])
-    draft = merge_incident(EmberClient.fake(storage, script), fire(rows), NAMES)
+    script = Script([answer(("status", [2]), ("all_clear", [1]))])
+    draft = merge_incident(EmberClient.fake(storage, script), fire(rows))
     return draft if model == "fake" else draft.__class__(**{**draft.__dict__, "model": model})
 
 
@@ -315,8 +410,7 @@ def test_a_story_is_written_once_under_its_claim_and_read_back_as_it_was(
     # A story that was written is not given up, and its basis stays claimed.
     kept.release("inc-a", "one")
     assert kept.latest("inc-a") == written
-    # The sentence that did not pass is nowhere on disk.
-    assert "Jane" not in everything_on_disk(tmp_path)
+    assert [claim.text for claim in written.claims] == ["The radio said: units on scene."]
 
     # The newest story of an incident is the one that is read.
     kept.claim("inc-a", "two", at(5), timedelta(0))
@@ -409,19 +503,19 @@ def refusals(writer: Writer, monkeypatch: pytest.MonkeyPatch) -> None:
     before Ember is asked: a fake client has no spending stop and no ledger."""
     merge = desk_module.merge_incident
 
-    def merging(ember: EmberClient, incident: Incident, names: Names) -> Any:
+    def merging(ember: EmberClient, incident: Incident) -> Any:
         if writer.next:
             failure = writer.next.pop(0)
             if failure is not None:
                 raise failure
-        return merge(ember, incident, names)
+        return merge(ember, incident)
 
     monkeypatch.setattr(desk_module, "merge_incident", merging)
 
 
 def desk_of(tmp_path: Path, storage: Storage, writer: Any, wall: list[datetime]) -> StoryDesk:
     return StoryDesk(
-        EmberClient.fake(storage, writer), stories(tmp_path), NAMES, wall_clock=lambda: wall[0]
+        EmberClient.fake(storage, writer), stories(tmp_path), wall_clock=lambda: wall[0]
     )
 
 
@@ -438,7 +532,13 @@ def test_a_story_is_paid_for_once_for_the_same_lines_and_again_when_they_change(
     assert writer.asked == 1
     assert (story.model, story.stand_in, story.basis) == ("fake", True, basis_of(incident))
     assert desk.latest(incident) == (story, True)
-    assert [claim.note for claim in story.claims if "evacuation" in claim.text] == [NOT_AN_ORDER]
+    assert [claim.kind for claim in story.claims] == [
+        "status",
+        "alarm",
+        "evacuation",
+        "closure",
+        "taps",
+    ]
     # The same lines, later and from another desk on the same file: nothing is asked.
     assert desk.refresh(fire(rows, minute=20), at(20)) is None
     other = desk_of(tmp_path, storage, writer, wall)
@@ -595,12 +695,78 @@ def test_a_pass_writes_the_newest_few_and_ends_quietly_when_ember_fails(
 
     writer.next = [EmberCallError("The API failed with Jane Doe's name.")]
     assert desk.refresh_all(engine.snapshot()) == 0
-    assert "A story could not be written (EmberCallError)." in caplog.text
+    assert "A story could not be made (EmberCallError)." in caplog.text
     assert "Jane" not in caplog.text
     # Held now: the next pass asks nothing and says nothing.
     caplog.clear()
     assert desk.refresh_all(engine.snapshot()) == 0
     assert (writer.asked, caplog.text) == (desk_module.MAX_PER_PASS, "")
+
+
+def test_a_pass_asks_ember_about_its_few_incidents_whatever_came_of_the_answers(
+    rows: Rows, storage: Storage, tmp_path: Path, wall: list[datetime]
+) -> None:
+    asked: list[int] = []
+
+    def every_other_is_no_form(body: dict[str, Any]) -> Any:
+        asked.append(1)
+        if len(asked) % 2:
+            return fake_response(text="Not a form.")
+        return stand_in_writer(body)
+
+    desk = desk_of(tmp_path, storage, every_other_is_no_form, wall)
+    for place, street in enumerate(("Hayes St", "Gough St", "Fell St", "Irving St", "Geary Blvd")):
+        for minute in (0, 1, 2):
+            rows.radio(
+                place + minute / 10,
+                "alarm",
+                "working",
+                units=(f"E{place + 1}",),
+                street=street,
+                block=100,
+            )
+    engine = Engine(rows.store, BLOCKS, clock=lambda: at(6))
+
+    # Three answers were paid for and one of them made a story. The two that came
+    # to nothing count toward the pass's few all the same.
+    assert desk.refresh_all(engine.snapshot()) == 1
+    assert len(asked) == desk_module.MAX_PER_PASS
+
+
+def test_a_shutdown_waits_from_before_the_claim_until_the_story_is_stored(
+    rows: Rows,
+    storage: Storage,
+    tmp_path: Path,
+    writer: Writer,
+    wall: list[datetime],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    desk = desk_of(tmp_path, storage, writer, wall)
+    incident = fire(rows)
+    claiming, go = threading.Event(), threading.Event()
+    claim = desk.stories.claim
+
+    def slow_claim(*given: Any) -> bool:
+        claiming.set()
+        assert go.wait(5)
+        return claim(*given)
+
+    monkeypatch.setattr(desk.stories, "claim", slow_claim)
+    made: list[Any] = []
+    thread = threading.Thread(target=lambda: made.append(desk.refresh(incident, at(6))))
+    thread.start()
+    try:
+        assert claiming.wait(5)
+        # The claim is about to be made. A shutdown that closed the file now would
+        # leave it behind, for lines nobody paid for: `drain` says work is out.
+        assert desk.drain(0.05) is False
+    finally:
+        go.set()
+        thread.join(5)
+
+    assert desk.drain(1) is True
+    assert made[0] is not None
+    assert desk.latest(incident) == (made[0], True)
 
 
 def test_a_live_desk_pays_only_under_its_own_scope(storage: Storage, tmp_path: Path) -> None:
@@ -609,7 +775,7 @@ def test_a_live_desk_pays_only_under_its_own_scope(storage: Storage, tmp_path: P
         scope = None
 
     with pytest.raises(ValueError, match="story:merge"):
-        StoryDesk(Live(), stories(tmp_path), NAMES)  # type: ignore[arg-type]
+        StoryDesk(Live(), stories(tmp_path))  # type: ignore[arg-type]
 
 
 # The desk the environment asks for, and the server.
@@ -632,17 +798,21 @@ def test_the_mock_scenarios_fire_gets_a_stand_ins_story_that_says_so(tmp_path: P
     assert desk.refresh_all(engine.snapshot()) == 1
 
     (fire_id,) = [i.id for i in engine.incidents() if i.category == "fire"]
+    closure_headline = ingest.store.search(kinds=["traffic"])[-1].data["headline"]
     story = client.get(f"/api/incidents/{fire_id}").json()["incident"]["story"]
     assert (story["model"], story["stand_in"], story["current"]) == ("fake", True, True)
-    assert [claim["text"] for claim in story["claims"]] == [
-        "The radio says crews are at work at the 400 block of Hayes St.",
-        "Crews report alarm level 3.",
-        "Crews mention an evacuation on the radio.",
-        "511 lists a traffic event at this place.",
-        "An aircraft was seen nearby.",
+    assert [(claim["kind"], claim["text"]) for claim in story["claims"]] == [
+        ("status", "The radio said: crews at work."),
+        ("alarm", "The radio said: alarm level 3."),
+        (
+            "evacuation",
+            "Crews mention an evacuation. That is radio traffic, not an official order.",
+        ),
+        ("closure", f"511 updated: {closure_headline}"),
+        ("aircraft", "A helicopter (MOCKH1) circled nearby for about 13 min, as low as 320 m."),
     ]
+    assert "headline" not in story
     evacuation, closure = story["claims"][2], story["claims"][3]
-    assert evacuation["note"] == "That is radio traffic, not an official order."
     assert (evacuation["confidence"], closure["confidence"]) == ("medium", "official")
     assert closure["sources"][0]["credit"]["text"] == "data provided by 511.org"
     for claim in story["claims"]:
@@ -702,5 +872,82 @@ def test_the_server_writes_the_stories_of_its_incidents_and_stops_cleanly(
         assert (story["model"], story["stand_in"]) == ("fake", True)
 
     # The server has shut down: the desk asks for nothing more and writes nothing.
+    with pytest.raises(StoriesError, match="closed"):
+        desk.stories.save_state({})
+
+
+def test_shutting_down_admits_no_paid_work_before_it_waits_for_anything(
+    rows: Rows, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    incident = fire(rows)
+    app = create_app()
+    seen: list[str] = []
+
+    async def sweeping(_taps: Any, stop: asyncio.Event) -> None:
+        # The first thing a shutdown waits for, and the wait can be a long one.
+        await stop.wait()
+        try:
+            app.state.stories.refresh(incident, at(6))
+            seen.append("a story was paid for")
+        except EmberClosedError:
+            seen.append("refused")
+
+    monkeypatch.setattr(main_module, "_sweep_tap_media", sweeping)
+    monkeypatch.setattr(main_module, "STORY_SECONDS", 3600)
+    with TestClient(app):
+        pass
+
+    assert seen == ["refused"]
+
+
+def test_the_pollers_are_closed_to_paid_work_when_the_story_desk_could_not_be(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    closed: list[str] = []
+
+    class Desk:
+        def close(self) -> None:
+            raise RuntimeError("Jane Doe")
+
+    class Pollers:
+        def close_paid(self) -> None:
+            closed.append("pollers")
+
+    main_module._close_paid(Desk(), Pollers())  # type: ignore[arg-type]
+    main_module._close_paid(None, None)
+
+    assert closed == ["pollers"]
+    assert "Paid work could not be closed (RuntimeError)." in caplog.text
+    assert "Jane" not in caplog.text
+
+
+def test_a_pass_that_does_not_end_does_not_keep_the_server_from_stopping(
+    storage: Storage,
+    tmp_path: Path,
+    writer: Writer,
+    wall: list[datetime],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(main_module, "STOP_SECONDS", 0.05)
+    desk = desk_of(tmp_path, storage, writer, wall)
+    stuck = threading.Event()
+
+    async def stopping() -> float:
+        telling = asyncio.create_task(asyncio.to_thread(stuck.wait, 20))
+        await asyncio.sleep(0.05)
+        began = time.monotonic()
+        try:
+            await main_module._stop_stories(desk, telling)
+            return time.monotonic() - began
+        finally:
+            stuck.set()
+
+    with caplog.at_level(logging.WARNING):
+        took = asyncio.run(stopping())
+
+    assert took < 5
+    assert "had not ended when the server shut down" in caplog.text
+    # Whatever the pass does next, it writes nothing: the file is closed.
     with pytest.raises(StoriesError, match="closed"):
         desk.stories.save_state({})

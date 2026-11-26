@@ -7,7 +7,6 @@ from beacon.ember import EmberClient, SpendScope, Storage
 from beacon.ember.client import default_data_dir
 from beacon.ember.pricing import parse_usd
 from beacon.incident import Engine
-from beacon.redact import NO_NAMES
 from beacon.story.desk import SCOPE, StoryDesk
 from beacon.story.stand_in import stand_in_writer
 from beacon.story.store import Stories
@@ -35,10 +34,9 @@ def open_stories(env: Mapping[str, str], engine: Engine) -> StoryDesk | None:
     is set without a live Ember, and StoriesError when the file was begun as the
     other mode's."""
     data_dir = default_data_dir(env)
-    names = engine.names or NO_NAMES
     if engine.mode == "mock":
         ember = EmberClient.fake(Storage.under(data_dir), stand_in_writer)
-        return StoryDesk(ember, Stories(data_dir / "story" / "mock.sqlite3", "mock"), names)
+        return StoryDesk(ember, Stories(data_dir / "story" / "mock.sqlite3", "mock"))
     budget = env.get(BUDGET_VARIABLE, "").strip()
     if not budget:
         logger.warning(
@@ -62,4 +60,4 @@ def open_stories(env: Mapping[str, str], engine: Engine) -> StoryDesk | None:
             f"{BUDGET_VARIABLE} is set, and a story is written by a live Ember and "
             "cannot be replayed: set REPLAY=0, MODEL_API_KEY, and EMBER_SPENT_BEFORE_USD."
         )
-    return StoryDesk(ember, Stories(data_dir / "story" / "live.sqlite3", "live"), names)
+    return StoryDesk(ember, Stories(data_dir / "story" / "live.sqlite3", "live"))
