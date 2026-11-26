@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 from beacon import __version__
 from beacon.api import health, sources, taps
 from beacon.ingest import IngestConfigError, build
-from beacon.radio import forbid_core_dumps
+from beacon.radio import core_dump_problem, forbid_core_dumps
 from beacon.taps import Taps, open_taps
 
 _REQUEST_PARTS = frozenset({"body", "query", "path", "header", "cookie"})
@@ -28,6 +28,10 @@ SWEEP_SECONDS = 60.0
 PRIVATE_PATHS = ("/api/taps",)
 
 logger = logging.getLogger("beacon")
+
+
+class ServerSetupError(Exception):
+    """The server cannot be run on this host as it is. The text says what to change."""
 
 
 def _is_private(path: object) -> bool:
@@ -105,6 +109,12 @@ async def _sweep_tap_media(taps: Taps, stop: asyncio.Event) -> None:
                     "deleted. They are handed to nobody. Look at the taps directory.",
                     swept.failed,
                 )
+            if swept.unlisted:
+                logger.error(
+                    "%d directories of taps' media could not be listed, and nothing in "
+                    "them was swept. Look at the taps directory.",
+                    swept.unlisted,
+                )
             if swept.unchecked:
                 logger.error(
                     "The evidence store could not say whether %d files of taps' media "
@@ -124,14 +134,26 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     if setting not in ("0", "1"):
         raise IngestConfigError(f"{INGEST_VARIABLE} must be 1 or 0, not {setting!r}.")
     # This process holds what people send with a tap in memory, the place as the
-    # phone gave it included. Before it takes one, it is made a process of which
-    # no core is written, to a file or to a collector. Where that cannot be done,
-    # it takes no taps.
-    private = forbid_core_dumps()
-    if not private:
-        logger.error(
-            "This server takes no taps: it could not be kept from leaving a core dump, "
-            "which would hold what a tap sent, the place as the phone gave it included."
+    # phone gave it included, from the moment the HTTP server has read a request:
+    # before any route is asked. So before a request is served, it is made a
+    # process of which no core is written, to a file or to a collector. A process
+    # that cannot be marked so still writes no core file, and where cores go to a
+    # collector, which that does not stop, the server does not start.
+    if not forbid_core_dumps():
+        if core_dump_problem() is not None:
+            raise ServerSetupError(
+                "Beacon does not start on this host as it is. It could not mark itself "
+                "as a process of which no core dump is made (prctl PR_SET_DUMPABLE), "
+                "and the host hands core dumps to a collector (kernel.core_pattern "
+                "begins with | or @, or cannot be read), which a crash would hand what "
+                "a tap sent. Set kernel.core_pattern to a file name, such as core. "
+                "Until then, `python -m beacon.taps` deletes the media of earlier taps "
+                "whose hour is over."
+            )
+        logger.warning(
+            "This server could not mark itself as a process of which no core dump is "
+            "made. Its core size limit of nothing keeps a crash from writing a core "
+            "file, and this host hands cores to no collector."
         )
     # The pollers first: a setting of theirs that is refused leaves no store behind.
     ingest = build(os.environ) if setting == "1" else None
@@ -140,10 +162,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     stop = asyncio.Event()
     # Whatever of this is begun is ended below, however far the beginning got.
     try:
-        if private:
-            taps = open_taps(os.environ)
-            app.state.taps = taps
-            sweeping = asyncio.create_task(_sweep_tap_media(taps, stop))
+        taps = open_taps(os.environ)
+        app.state.taps = taps
+        sweeping = asyncio.create_task(_sweep_tap_media(taps, stop))
         if ingest is not None:
             app.state.ingest = ingest
             ingest.start()

@@ -1,5 +1,7 @@
 """A tap's photo and clip: what is stripped from them, and how long they are kept."""
 
+import errno
+import fcntl
 import io
 import os
 import sqlite3
@@ -7,13 +9,17 @@ import stat
 import subprocess
 import sys
 import wave
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from beacon.radio import ConversionStopped, Ffmpeg
 from beacon.taps import media as tap_media
+from beacon.taps.__main__ import main as sweep_main
+from beacon.taps.__main__ import sweep_once
 from beacon.taps.media import (
     KEPT,
     MAX_CLIP_BYTES,
@@ -525,8 +531,7 @@ def test_media_that_cannot_be_counted_is_not_taken_to_be_nothing(
     # to have looked.
     with pytest.raises(PermissionError):
         media.keep(OTHER, "photo", b"a picture", NOON)
-    with pytest.raises(PermissionError):
-        media.sweep(NOON + KEPT)
+    assert media.sweep(NOON + KEPT) == Swept(deleted=0, unlisted=1)
 
     monkeypatch.undo()
     assert [file.name for file in (tmp_path / "mock").iterdir()] == [f"{TAP}.photo.jpg"]
@@ -617,7 +622,15 @@ def test_a_file_is_on_the_disk_with_its_age_and_its_directories_before_it_is_nam
     real_fsync, real_utime, real_replace = os.fsync, os.utime, os.replace
 
     def fsync(descriptor: int) -> None:
-        done.append(("sync", os.path.relpath(os.readlink(f"/proc/self/fd/{descriptor}"), tmp_path)))
+        # Which file or directory under the test's own it is, by what the system
+        # says of the descriptor and of each path.
+        synced = os.fstat(descriptor)
+        (name,) = (
+            str(path.relative_to(tmp_path))
+            for path in (tmp_path, *tmp_path.rglob("*"))
+            if (path.stat().st_dev, path.stat().st_ino) == (synced.st_dev, synced.st_ino)
+        )
+        done.append(("sync", name))
         real_fsync(descriptor)
 
     def utime(target: object, times: tuple[float, float]) -> None:
@@ -665,3 +678,86 @@ def test_a_file_is_not_read_after_the_moment_its_tap_was_told_whatever_its_own_a
     assert media.read(TAP, "photo", NOON + KEPT, kept_until) is None
 
     assert not path.exists()
+
+
+def test_a_directory_that_cannot_be_listed_keeps_nothing_in_the_other_past_its_hour(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    live = TapMedia(tmp_path, "live")
+    live.keep(OTHER, "photo", b"a picture", NOON)
+    live.close()
+    media = TapMedia(tmp_path, "mock")
+    media.keep(TAP, "photo", b"a picture", NOON)
+    real_iterdir = Path.iterdir
+
+    def iterdir(self: Path) -> Iterator[Path]:
+        if self.name == "live":
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+
+    swept = media.sweep(NOON + KEPT)
+
+    # The one that could be listed was swept, and the other is said not to have been.
+    assert swept == Swept(deleted=1, unlisted=1)
+    assert kept(tmp_path) == [f"live/{OTHER}.photo.jpg"]
+    # What all of it takes cannot be counted, so nothing more is kept.
+    with pytest.raises(PermissionError):
+        media.keep(TAP, "clip", b"a clip", NOON + KEPT)
+    assert kept(tmp_path) == [f"live/{OTHER}.photo.jpg"]
+
+
+def test_a_lock_that_cannot_be_had_leaves_no_file_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened: list[int] = []
+    closed: list[int] = []
+    real_open, real_close = os.open, os.close
+
+    def open_(*args: Any, **kwargs: Any) -> int:
+        opened.append(real_open(*args, **kwargs))
+        return opened[-1]
+
+    def close(descriptor: int) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    def no_locks(_descriptor: int, _operation: int) -> None:
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    monkeypatch.setattr(os, "open", open_)
+    monkeypatch.setattr(os, "close", close)
+    monkeypatch.setattr(fcntl, "flock", no_locks)
+
+    # Not taken by another: that the lock could not be had at all is its own error.
+    with pytest.raises(OSError, match="No locks available") as failure:
+        TapMedia(tmp_path / "taps", "mock")
+
+    assert not isinstance(failure.value, MediaLockedError)
+    assert opened
+    assert sorted(opened) == sorted(closed)
+
+
+def test_media_whose_hour_is_over_is_deleted_without_a_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("BEACON_DATA_DIR", str(tmp_path))
+    # No tap was ever taken here, and sweeping leaves no directory behind.
+    assert sweep_once(NOON) == Swept(deleted=0)
+    assert list(tmp_path.iterdir()) == []
+    for mode, tap_id in (("mock", TAP), ("live", OTHER)):
+        media = TapMedia(tmp_path / "taps", mode)  # type: ignore[arg-type]
+        media.keep(tap_id, "photo", b"a picture", datetime.now(UTC) - KEPT)
+        media.keep(tap_id, "clip", b"a clip", datetime.now(UTC))
+        media.close()
+
+    sweep_main()
+
+    assert kept(tmp_path / "taps") == [f"live/{OTHER}.clip.wav", f"mock/{TAP}.clip.wav"]
+    assert capsys.readouterr().out == "Deleted 2 files of taps' media whose hour is over.\n"
+    # A server that is running sweeps for itself, and is left to.
+    server = TapMedia(tmp_path / "taps", "mock")
+    with pytest.raises(SystemExit, match="A Beacon server is running on this data directory"):
+        sweep_main()
+    server.close()

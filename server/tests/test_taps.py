@@ -23,7 +23,7 @@ from beacon.api import taps as api_taps
 from beacon.api.taps import MAX_BODY_BYTES
 from beacon.evidence import EvidenceStore, EvidenceStoreError, Point
 from beacon.ingest import build
-from beacon.main import create_app
+from beacon.main import ServerSetupError, create_app
 from beacon.radio import ConversionStopped, ConversionUnavailable
 from beacon.taps import (
     KEPT,
@@ -953,21 +953,41 @@ def test_a_server_on_a_host_that_collects_core_dumps_takes_no_photos(
     assert "Taps are taken without photos." in caplog.text
 
 
-def test_a_server_that_cannot_be_kept_from_dumping_its_memory_takes_no_taps(
+def test_a_server_that_could_leave_a_core_with_a_collector_does_not_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("BEACON_INGEST", "0")
+    monkeypatch.setenv("BEACON_DATA_DIR", str(tmp_path))
+    # It could not be marked, and its core size limit is nothing to a collector.
+    # The HTTP server holds a request before any route can refuse it, so the
+    # server is not there to be sent one.
+    monkeypatch.setattr(beacon_main, "forbid_core_dumps", lambda: False)
+    monkeypatch.setattr(beacon_main, "core_dump_problem", lambda: "It hands cores on.")
+
+    with (
+        pytest.raises(ServerSetupError, match=r"python -m beacon\.taps") as failure,
+        TestClient(create_app()),
+    ):
+        pass
+
+    assert "kernel.core_pattern" in str(failure.value)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_server_that_cannot_be_marked_runs_where_no_collector_is_handed_a_core(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setenv("BEACON_INGEST", "0")
     monkeypatch.setenv("BEACON_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(beacon_main, "forbid_core_dumps", lambda: False)
+    monkeypatch.setattr(beacon_main, "core_dump_problem", lambda: None)
 
     with TestClient(create_app()) as client:
         response = client.post("/api/taps", json={"location": PHONE})
-        assert client.get("/api/health").status_code == 200
 
-    assert response.status_code == 503
-    assert response.json() == {"detail": "This server is not taking taps."}
-    assert "This server takes no taps" in caplog.text
-    assert not (tmp_path / "taps").exists()
+    # Its core size limit of nothing is enough where a core would be a file.
+    assert response.status_code == 201
+    assert "could not mark itself" in caplog.text
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="The mark is Linux's.")

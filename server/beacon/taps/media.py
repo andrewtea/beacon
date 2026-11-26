@@ -131,6 +131,9 @@ class Swept:
     # Files that may have no row, of which the store could not say. They are left
     # until it can, or until their hour is over, which needs no store.
     unchecked: int = 0
+    # Directories that are there and could not be listed, so that nothing in them
+    # was looked at. What the other directory holds was swept all the same.
+    unlisted: int = 0
 
 
 @dataclass(frozen=True)
@@ -311,18 +314,25 @@ class TapMedia:
         self._writing = threading.Lock()
         _make_directories(root)
         self._lock = os.open(root / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
-        locked = False
-        with contextlib.suppress(BlockingIOError):
+        locked = taken = False
+        try:
             fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             locked = True
-        if not locked:
-            os.close(self._lock)
-            self._lock = -1
+        except BlockingIOError:
+            taken = True
+        finally:
+            # Whatever kept the lock from being had, the file is not left open.
+            if not locked:
+                os.close(self._lock)
+                self._lock = -1
+        if taken:
+            # A data directory of its own is not the way out: the Ember ledger and
+            # the claims on what was paid for are in this one, and are one server's.
             raise_bare(
                 MediaLockedError(
                     "Another Beacon process is taking taps in this data directory. One "
-                    "server process takes them: stop the other, or give this one a data "
-                    "directory of its own."
+                    "server process runs on a data directory: stop the other, and run "
+                    "one worker."
                 )
             )
 
@@ -414,9 +424,11 @@ class TapMedia:
         every file that was being written when Beacon stopped. With `with_rows`,
         which says which of some taps of this store have their rows, a file of this
         store's that has been there for `ORPHANED` with no row is deleted as well:
-        its tap was never taken.
+        its tap was never taken. Each directory is swept whatever becomes of the
+        other: one that cannot be listed is counted, and keeps nothing in the
+        other past its hour.
 
-        Raises OSError when a directory that is there cannot be listed."""
+        Raises OSError when the media was given up (`close`)."""
         # Not while a file is being written, whose unfinished copy this would take.
         with self._writing:
             return self._sweep(now, with_rows)
@@ -427,7 +439,14 @@ class TapMedia:
         over: list[Path] = []
         # The files that are old enough to be missed, by the tap each says it is of.
         unsure: dict[Path, str] = {}
-        for path in self._files():
+        files: list[Path] = []
+        unlisted = 0
+        for directory in self._directories:
+            try:
+                files += _files_in(directory)
+            except OSError:
+                unlisted += 1
+        for path in files:
             try:
                 written = datetime.fromtimestamp(path.stat().st_mtime, UTC)
             except FileNotFoundError:
@@ -454,7 +473,7 @@ class TapMedia:
                 orphaned = [path for path, tap_id in unsure.items() if tap_id not in stored]
                 more, more_undeleted = _delete(orphaned)
                 deleted, undeleted = deleted + more, undeleted + more_undeleted
-        return Swept(deleted, failed + undeleted, unchecked)
+        return Swept(deleted, failed + undeleted, unchecked, unlisted)
 
     def _stored_bytes(self) -> int:
         """What all the media takes, in both stores' directories. Raises OSError
@@ -473,10 +492,7 @@ class TapMedia:
         that is there cannot be listed."""
         files: list[Path] = []
         for directory in self._directories:
-            try:
-                files += [path for path in directory.iterdir() if path.is_file()]
-            except FileNotFoundError:
-                continue
+            files += _files_in(directory)
         return files
 
     def _path(self, tap_id: str, kind: MediaKind) -> Path:
@@ -485,6 +501,15 @@ class TapMedia:
             # is never made into a path.
             raise ValueError("That is not a tap's id and a kind of media.")
         return self._directory / f"{tap_id}.{_SUFFIX[kind]}"
+
+
+def _files_in(directory: Path) -> list[Path]:
+    """Every file in a directory, and none for a directory that is not there.
+    Raises OSError when a directory that is there cannot be listed."""
+    try:
+        return [path for path in directory.iterdir() if path.is_file()]
+    except FileNotFoundError:
+        return []
 
 
 def _delete(paths: list[Path]) -> tuple[int, int]:

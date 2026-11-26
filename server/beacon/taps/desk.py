@@ -279,7 +279,7 @@ class Taps:
         """Delete the media whose hour is over, of this store's taps and the other
         store's, and the files of this store's that have had no row for too long.
 
-        Raises OSError when the media cannot be listed, or the taps are closed."""
+        Raises OSError when the taps are closed."""
         return self._media.sweep(self._clock(), lambda ids: self._store.taken(SOURCE, ids))
 
     def close(self) -> None:
