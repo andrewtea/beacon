@@ -5,7 +5,9 @@ the answer. Around that request it:
 
 - answers from the replay cache when the same request was answered before, which costs $0
 - refuses a live call that could take the ledger past the spending stop
-- refuses a live call whose input is over the per-request token limit
+- refuses a live call whose input is over the per-request token limit, which it finds
+  by sending the input to Meta's token-counting endpoint first
+- keeps the content of a call marked `sensitive` out of everything it writes
 - sets `max_output_tokens` and a reasoning effort on every request
 - writes a ledger row for every call, from which the token trace is exported
 
@@ -17,10 +19,13 @@ A client given a `SpendScope` writes the scope's name on every ledger row it mak
 and refuses a live call that could take the scope's own live spend past the scope's
 budget. That is a second limit under the spending stop, never in place of it.
 
+A live client's stop is the environment's (`SpendingStop.from_env`), whichever way
+the client was built, and there is none until `EMBER_SPENT_BEFORE_USD` is set.
+
 A client runs in one of three modes. Replay-only (`REPLAY=1`, the default) never touches
 the network and fails on a request with no recording. Live (`REPLAY=0`) calls the API on
-a cache miss and records the answer. Fake answers from a function the caller supplies,
-so the agent can run with no key and no recordings.
+a cache miss and records the answer, unless the call is sensitive. Fake answers from a
+function the caller supplies, so the agent can run with no key and no recordings.
 """
 
 import datetime
@@ -31,7 +36,7 @@ import os
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, get_args
 
@@ -45,6 +50,7 @@ from beacon.ember.errors import (
     EmberError,
     EmberRequestError,
     InputTooLargeError,
+    LedgerReplacedError,
     ReplayMissError,
 )
 from beacon.ember.ledger import Call, Ledger, LedgerCall, RowRef, ScopeSpend, Source
@@ -56,6 +62,7 @@ from beacon.ember.pricing import (
     SpendingStop,
     Usage,
     price_nanousd,
+    read_stop_settings,
     to_usd,
 )
 from beacon.ember.replay import ReplayCache, redact, request_hash
@@ -68,6 +75,10 @@ Effort = Literal["minimal", "low", "medium", "high", "xhigh", "max"]
 
 # The API rejects a smaller output limit.
 MIN_OUTPUT_TOKENS = 16
+# Ember's largest output, from https://dev.meta.ai/docs/muse-ember, checked 2026-11-26.
+# The API rejects a larger limit, and the client refuses one first: a request the API
+# answers with an error stays booked against the stop at the most it could have cost.
+MAX_OUTPUT_TOKENS = 524_288
 
 REQUEST_TIMEOUT_SECONDS = 120.0
 
@@ -102,6 +113,19 @@ _INPUT_ITEM_TYPES = frozenset({"message", "reasoning", "function_call", "functio
 
 # The `type` and `code` of an API error are short machine-readable words.
 _ERROR_WORD = re.compile(r"[\w.-]{1,64}")
+
+# The request fields that say how a call was made and hold nothing of what was sent.
+_SETTINGS_FIELDS = frozenset(
+    {"model", "max_output_tokens", "reasoning", "store", "include", "parallel_tool_calls"}
+)
+# An id, a status, or a model name, as the API writes them.
+_ID_WORD = re.compile(r"[\w.:-]{1,128}")
+
+_LOST_SETTLEMENT = (
+    "The Ember ledger file was deleted or replaced while a paid request was out, so the "
+    "call is in no ledger. It may have been billed, and no stop counts it: compare "
+    "Meta's Usage page with the ledger before any more paid calls are made."
+)
 
 
 @dataclass(frozen=True)
@@ -153,9 +177,38 @@ def read_scope_spend(storage: Storage, label: str) -> ScopeSpend | None:
 
 
 def default_data_dir(env: Mapping[str, str]) -> Path:
-    """`BEACON_DATA_DIR`, or the repository's Git-ignored `data/` directory."""
+    """`BEACON_DATA_DIR`, or the repository's Git-ignored `data/` directory.
+
+    Raises EmberConfigError for a relative `BEACON_DATA_DIR`. It would name a different
+    directory from each working directory, and so a ledger of its own for each, and
+    the stop is kept only by processes that share one ledger."""
     configured = env.get("BEACON_DATA_DIR")
-    return Path(configured) if configured else Path(__file__).resolve().parents[3] / "data"
+    if not configured:
+        return Path(__file__).resolve().parents[3] / "data"
+    path = Path(configured)
+    if not path.is_absolute():
+        raise EmberConfigError(
+            f"BEACON_DATA_DIR must be an absolute path, not {configured!r}: a relative "
+            "one names a different Ember ledger from each working directory, and the "
+            "spending stop is counted in one ledger."
+        )
+    return path
+
+
+def _live_stop(env: Mapping[str, str], stop_nanousd: int | None) -> SpendingStop:
+    """The stop a live client keeps: the environment's, for every one of them, so a
+    stop an operator sets holds whichever way the client was built. `stop_nanousd`
+    lowers it for one client and cannot raise it."""
+    configured = SpendingStop.from_env(env)
+    if stop_nanousd is None:
+        return configured
+    if isinstance(stop_nanousd, int) and stop_nanousd > configured.ledger_nanousd:
+        raise ValueError(
+            f"stop_nanousd can lower the spending stop and cannot raise it above the "
+            f"${to_usd(configured.ledger_nanousd):.2f} the environment sets."
+        )
+    # Anything that is not an amount is refused when the stop is made.
+    return replace(configured, ledger_nanousd=stop_nanousd)
 
 
 @dataclass(frozen=True)
@@ -208,19 +261,39 @@ class EmberClient:
         storage: Storage,
         *,
         api_key: str | None = None,
+        env: Mapping[str, str] | None = None,
         http_client: httpx2.Client | None = None,
         responder: Responder | None = None,
-        stop: SpendingStop | None = None,
+        stop_nanousd: int | None = None,
         pacer: Pacer | None = None,
         scope: SpendScope | None = None,
     ) -> None:
         """Prefer `from_env`, `replay_only`, `live`, or `fake`."""
         if api_key is not None and responder is not None:
             raise ValueError("A client is either live or fake, not both.")
-        if http_client is not None and api_key is None:
-            raise ValueError("http_client is only used by a live client, which needs api_key.")
-        if pacer is not None and api_key is None:
-            raise ValueError("pacer is only used by a live client, which needs api_key.")
+        for name, value in (
+            ("http_client", http_client),
+            ("pacer", pacer),
+            ("stop_nanousd", stop_nanousd),
+        ):
+            if value is not None and api_key is None:
+                raise ValueError(f"{name} is only used by a live client, which needs api_key.")
+        # Every client that can spend keeps the stop the environment sets, however it
+        # was built. It is read before anything is written, so a client that is
+        # refused leaves no files.
+        self._stop = (
+            None
+            if api_key is None
+            else _live_stop(os.environ if env is None else env, stop_nanousd)
+        )
+        if self._stop is not None and not storage.ledger_db.is_absolute():
+            # As `default_data_dir` refuses a relative BEACON_DATA_DIR: the stop is
+            # counted in one ledger file, and a relative path is a different file
+            # from each working directory.
+            raise EmberConfigError(
+                f"A client that can spend needs an absolute ledger path, not "
+                f"{str(storage.ledger_db)!r}."
+            )
         self._storage = storage
         self._ledger = Ledger(storage.ledger_db)
         self._cache = ReplayCache(storage.replay_dir)
@@ -242,8 +315,6 @@ class EmberClient:
             )
         )
         self._responder = responder
-        # `SpendingStop` holds itself under the account's ceiling when it is made.
-        self._stop = SpendingStop() if stop is None else stop
         self._pacer = pacer
         self._scope = scope
 
@@ -256,16 +327,17 @@ class EmberClient:
         pacer: Pacer | None = None,
         scope: SpendScope | None = None,
     ) -> "EmberClient":
-        """Replay-only unless `REPLAY=0`, which needs `MODEL_API_KEY`. A live client
-        stops where `EMBER_STOP_USD` and `EMBER_SPENT_BEFORE_USD` say
-        (`SpendingStop.from_env`), and is the only kind that uses `pacer`.
+        """Replay-only unless `REPLAY=0`, which needs `MODEL_API_KEY` and
+        `EMBER_SPENT_BEFORE_USD`. A live client stops where `EMBER_STOP_USD` says, and
+        is the only kind that uses `pacer`.
 
-        Raises EmberConfigError when a setting cannot be read, in either mode."""
+        Raises EmberConfigError when a setting cannot be read, in either mode, and when
+        live mode lacks one it needs."""
         env = os.environ if env is None else env
         storage = storage or Storage.under(default_data_dir(env))
         # Read in replay mode too, so a mistyped stop is found before the day a key
         # is set.
-        stop = SpendingStop.from_env(env)
+        read_stop_settings(env)
         replay = env.get("REPLAY", "1")
         if replay == "1":
             return cls.replay_only(storage, scope=scope)
@@ -277,7 +349,7 @@ class EmberClient:
                 "REPLAY=0 asks for live Ember calls, but MODEL_API_KEY is not set. "
                 "Set the key, or use REPLAY=1 to replay recorded responses."
             )
-        return cls.live(storage, api_key=api_key, stop=stop, pacer=pacer, scope=scope)
+        return cls.live(storage, api_key=api_key, env=env, pacer=pacer, scope=scope)
 
     @classmethod
     def replay_only(cls, storage: Storage, *, scope: SpendScope | None = None) -> "EmberClient":
@@ -289,21 +361,30 @@ class EmberClient:
         storage: Storage,
         *,
         api_key: str,
+        env: Mapping[str, str] | None = None,
         http_client: httpx2.Client | None = None,
-        stop: SpendingStop | None = None,
+        stop_nanousd: int | None = None,
         pacer: Pacer | None = None,
         scope: SpendScope | None = None,
     ) -> "EmberClient":
-        """`http_client` replaces the HTTP transport, which is how tests stand in for the
-        API. `stop` is where live spend stops, by default $3.00 in the ledger
-        (`beacon.ember.pricing`). `pacer` spaces the requests and
-        has a call tried again after a 429. `scope` holds the client's calls to a
-        budget of their own as well."""
+        """A client that can spend. Its stop is read from `env`, by default the
+        process's environment, as `from_env` reads it: `EMBER_STOP_USD` on top of
+        `EMBER_SPENT_BEFORE_USD`, which must be set. `stop_nanousd` lowers the stop for
+        this client and cannot raise it.
+
+        `http_client` replaces the HTTP transport, which is how tests stand in for the
+        API. `pacer` spaces the requests and has a call tried again after a 429.
+        `scope` holds the client's calls to a budget of their own as well.
+
+        Raises EmberConfigError when the environment's stop cannot be read or
+        `EMBER_SPENT_BEFORE_USD` is not set, and ValueError for a `stop_nanousd` above
+        the environment's stop."""
         return cls(
             storage,
             api_key=api_key,
+            env=env,
             http_client=http_client,
-            stop=stop,
+            stop_nanousd=stop_nanousd,
             pacer=pacer,
             scope=scope,
         )
@@ -321,8 +402,8 @@ class EmberClient:
         return self._sdk is not None
 
     @property
-    def stop(self) -> SpendingStop:
-        """Where this client's live spend stops."""
+    def stop(self) -> SpendingStop | None:
+        """Where this client's live spend stops. None for a client that cannot spend."""
         return self._stop
 
     def spent_usd(self) -> float:
@@ -356,6 +437,7 @@ class EmberClient:
         task: str,
         effort: Effort,
         max_output_tokens: int,
+        sensitive: bool,
         input: str | Sequence[Mapping[str, Any]],
         instructions: str | None = None,
         tools: Sequence[Mapping[str, Any]] | None = None,
@@ -363,16 +445,25 @@ class EmberClient:
         parallel_tool_calls: bool | None = None,
         prompt_cache_key: str | None = None,
     ) -> EmberResponse:
-        """Send one request to Muse Ember. `task` labels the call in the ledger; the
-        other arguments are the Responses API fields of the same names. There is no
-        `tool_choice`, because Meta supports only its default, `auto`. Media must be
-        inline (`data:` URLs or base64) or an uploaded `file_id`, never a remote URL.
+        """Send one request to Muse Ember. `task` labels the call in the ledger, and
+        the arguments from `input` on are the Responses API fields of the same names.
+        There is no `tool_choice`, because Meta supports only its default, `auto`.
+        Media must be inline (`data:` URLs or base64) or an uploaded `file_id`, never a
+        remote URL.
 
-        Raises BudgetExceededError or InputTooLargeError when a live call is refused
-        (LedgerReplacedError, a BudgetExceededError, when the ledger file was replaced
-        under a running client),
+        `sensitive` says whether the request or the answer can hold what Beacon must
+        not store, such as a patient's details, a name, or a house number in EMS radio
+        traffic. Every call says which. Of a sensitive call the ledger keeps the
+        accounting and the request's hash and none of the request's or the answer's content, and
+        the answer is neither recorded for replay nor replayed: made again, the call
+        is paid for again, and replay-only mode refuses it.
+
+        Raises BudgetExceededError or InputTooLargeError when a live call is refused,
         ReplayMissError when replay-only mode has no recording, and EmberCallError when
-        the API fails. A failed call is not retried, except by a client with a pacer
+        the API fails. Raises LedgerReplacedError, a BudgetExceededError, when the
+        ledger file was replaced under a running client: before a paid request, which
+        is then not sent, or while one was out, which may then have been billed and is
+        in no ledger. A failed call is not retried, except by a client with a pacer
         after the API answers 429: each such attempt is a call of its own in the ledger.
         A client with a pacer raises RateLimitHoldError when the API asks for a wait
         longer than the pacer makes, to the call that was told so and to every call
@@ -381,6 +472,11 @@ class EmberClient:
         if not isinstance(task, str) or not task:
             raise EmberRequestError(
                 "task must be a non-empty label, such as 'extract_transmission'."
+            )
+        if not isinstance(sensitive, bool):
+            raise EmberRequestError(
+                f"sensitive must be True or False, not {sensitive!r}: True when the "
+                "request or the answer can hold what Beacon must not store."
             )
         body = _build_body(
             effort=effort,
@@ -399,19 +495,32 @@ class EmberClient:
             task=task,
             effort=effort,
             max_output_tokens=max_output_tokens,
-            request=redact(body),
+            request=_withheld_request(body) if sensitive else redact(body),
             scope=None if self._scope is None else self._scope.label,
         )
 
         if self._responder is not None:
             started = time.perf_counter()
             response = _as_json(self._responder(body), "The fake Ember response")
-            return self._record_free(call, "fake", response, _elapsed_ms(started))
+            return self._record_free(call, "fake", response, _elapsed_ms(started), sensitive)
+
+        if sensitive:
+            # Never recorded, so there is nothing to replay and nothing to wait for
+            # another caller to record.
+            if self._sdk is None or self._stop is None:
+                raise ReplayMissError(
+                    f"Replay-only mode makes no API calls, and a sensitive call (task "
+                    f"{task!r}) is never recorded, so there is nothing to replay. Make it "
+                    "with REPLAY=0 and MODEL_API_KEY, or use a fake client."
+                )
+            return self._call_until_answered(self._sdk, self._stop, body, call, sensitive)
 
         recording = self._cache.get(call.request_hash)
         if recording is not None:
-            return self._record_free(call, "replay", recording.response, recording.latency_ms)
-        if self._sdk is None:
+            return self._record_free(
+                call, "replay", recording.response, recording.latency_ms, sensitive
+            )
+        if self._sdk is None or self._stop is None:
             raise ReplayMissError(
                 f"No recorded Ember response for request {call.request_hash} (task {task!r}) "
                 f"in {self._cache.path(call.request_hash).parent}. Replay-only mode makes no "
@@ -422,22 +531,34 @@ class EmberClient:
             # answer while this one waited for the lock.
             recording = self._cache.get(call.request_hash)
             if recording is not None:
-                return self._record_free(call, "replay", recording.response, recording.latency_ms)
-            attempt = 0
-            while True:
-                try:
-                    return self._call_live(self._sdk, body, call)
-                except EmberCallError as error:
-                    # Only a rate limit is waited out. Any other failure may have been
-                    # billed and may fail the same way again. A wait too long to sit
-                    # through is raised by `back_off` as a RateLimitHoldError.
-                    if (
-                        self._pacer is None
-                        or error.status_code != _RATE_LIMITED
-                        or not self._pacer.back_off(attempt, error.retry_after)
-                    ):
-                        raise
-                    attempt += 1
+                return self._record_free(
+                    call, "replay", recording.response, recording.latency_ms, sensitive
+                )
+            return self._call_until_answered(self._sdk, self._stop, body, call, sensitive)
+
+    def _call_until_answered(
+        self,
+        sdk: openai.OpenAI,
+        stop: SpendingStop,
+        body: dict[str, Any],
+        call: Call,
+        sensitive: bool,
+    ) -> EmberResponse:
+        attempt = 0
+        while True:
+            try:
+                return self._call_live(sdk, stop, body, call, sensitive)
+            except EmberCallError as error:
+                # Only a rate limit is waited out. Any other failure may have been
+                # billed and may fail the same way again. A wait too long to sit
+                # through is raised by `back_off` as a RateLimitHoldError.
+                if (
+                    self._pacer is None
+                    or error.status_code != _RATE_LIMITED
+                    or not self._pacer.back_off(attempt, error.retry_after)
+                ):
+                    raise
+                attempt += 1
 
     def _pace(self) -> None:
         if self._pacer is not None:
@@ -449,12 +570,13 @@ class EmberClient:
         source: Literal["replay", "fake"],
         response: dict[str, Any],
         latency_ms: int,
+        sensitive: bool,
     ) -> EmberResponse:
         try:
             usage = Usage.from_response(response)
         except ValueError as error:
             raise EmberError(f"The {source} response for {call.request_hash}: {error}") from error
-        safe, _holds_no_media = _for_disk(response)
+        safe, _recordable = _stored(response, sensitive)
         row = self._ledger.record(
             call, source=source, usage=usage, latency_ms=latency_ms, response=safe
         )
@@ -462,17 +584,31 @@ class EmberClient:
             response, usage, latency_ms, source, call.request_hash, row.id, row.generation
         )
 
-    def _call_live(self, sdk: openai.OpenAI, body: dict[str, Any], call: Call) -> EmberResponse:
+    def _settle_sent(self, row: RowRef, **outcome: Any) -> None:
+        """Settle a call whose paid request was answered. Raises LedgerReplacedError
+        when the ledger file it was reserved in is gone: the call is then in no ledger,
+        and its cost counts toward no stop."""
+        if not self._ledger.settle(row, **outcome):
+            raise LedgerReplacedError(_LOST_SETTLEMENT)
+
+    def _call_live(
+        self,
+        sdk: openai.OpenAI,
+        stop: SpendingStop,
+        body: dict[str, Any],
+        call: Call,
+        sensitive: bool,
+    ) -> EmberResponse:
         # Before any request at all, as the stop below is. A replaced ledger holds
         # none of what was spent.
         self._ledger.require_opened_file()
         spent = self._ledger.spent_nanousd()
-        if spent >= self._stop.ledger_nanousd:
+        if spent >= stop.ledger_nanousd:
             # Checked again, atomically, when the call is reserved. This early check
             # keeps a client that is over the stop from making any request at all.
             raise BudgetExceededError(
                 f"Refused: the Ember ledger holds ${to_usd(spent):.6f} of live spend, which "
-                f"reaches the ${to_usd(self._stop.ledger_nanousd):.2f} stop."
+                f"reaches the ${to_usd(stop.ledger_nanousd):.2f} stop."
             )
         if self._scope is not None:
             scoped = self._ledger.scope_spend(self._scope.label).spent_nanousd
@@ -502,13 +638,17 @@ class EmberClient:
         row = self._ledger.reserve(
             call,
             reserved_nanousd=reserved,
-            budget_nanousd=self._stop.ledger_nanousd,
+            budget_nanousd=stop.ledger_nanousd,
             scope_budget_nanousd=None if self._scope is None else self._scope.budget_nanousd,
         )
         try:
             # The last thing before the request that costs money, so a cooldown that
             # began while the tokens were counted or the call was reserved holds it.
             self._pace()
+            # That wait can be long, and the ledger file can go during it, taking the
+            # reservation with it. A request sent now would be paid for and settled
+            # nowhere, so it is not sent.
+            self._ledger.require_opened_file()
         except BaseException:
             # The request was not sent, so it cost nothing.
             self._ledger.settle(
@@ -516,7 +656,7 @@ class EmberClient:
                 status="error",
                 cost_nanousd=0,
                 latency_ms=round(counting * 1000),
-                error="Not sent: the client stopped while waiting for the rate limit.",
+                error="Not sent: the client stopped before the paid request.",
             )
             raise
         # The time the two requests took, without the wait between them.
@@ -531,13 +671,15 @@ class EmberClient:
             # A request that never left this machine cost nothing. After any other
             # failure the model may have run, so the reservation stays.
             never_sent = _was_never_sent(error)
-            self._ledger.settle(
+            settled = self._ledger.settle(
                 row,
                 status="error" if never_sent else "unknown",
                 cost_nanousd=0 if never_sent else reserved,
                 latency_ms=_elapsed_ms(started),
                 error=_summary(error),
             )
+            if not settled and not never_sent:
+                raise LedgerReplacedError(_LOST_SETTLEMENT) from error
             raise EmberCallError(
                 _describe(error),
                 status_code=getattr(error, "status_code", None),
@@ -546,12 +688,12 @@ class EmberClient:
 
         latency_ms = _elapsed_ms(started)
         # `safe` is what is written to disk. The caller gets the response as the API sent it.
-        safe, holds_no_media = _for_disk(response)
+        safe, recordable = _stored(response, sensitive)
         try:
             usage = Usage.from_response(response)
         except ValueError as error:
             message = "The API answered without usable token counts"
-            self._ledger.settle(
+            self._settle_sent(
                 row,
                 status="unknown",
                 cost_nanousd=reserved,
@@ -567,7 +709,7 @@ class EmberClient:
         if not answered:
             shown = status if isinstance(status, str) and status.isidentifier() else "unknown"
             message = f"The response ended with status {shown}."
-        self._ledger.settle(
+        self._settle_sent(
             row,
             status="ok" if answered else "error",
             cost_nanousd=usage.cost_nanousd,
@@ -578,12 +720,13 @@ class EmberClient:
         )
         if message is not None:
             raise EmberCallError(message)
-        if holds_no_media:
+        if recordable:
             self._cache.put(
                 call.request_hash, request=call.request, response=response, latency_ms=latency_ms
             )
-        # Otherwise the answer itself holds media. A recording must be exact to be
-        # replayed and must not hold media, so this answer is not recorded.
+        # Otherwise the call is sensitive, or the answer itself holds media. A
+        # recording must be exact to be replayed and must hold neither, so this
+        # answer is not recorded.
         return EmberResponse(
             response, usage, latency_ms, "live", call.request_hash, row.id, row.generation
         )
@@ -601,11 +744,11 @@ def _build_body(
     if (
         not isinstance(max_output_tokens, int)
         or isinstance(max_output_tokens, bool)
-        or max_output_tokens < MIN_OUTPUT_TOKENS
+        or not MIN_OUTPUT_TOKENS <= max_output_tokens <= MAX_OUTPUT_TOKENS
     ):
         raise EmberRequestError(
-            f"max_output_tokens must be an integer of at least {MIN_OUTPUT_TOKENS}, "
-            f"not {max_output_tokens!r}."
+            f"max_output_tokens must be an integer from {MIN_OUTPUT_TOKENS} to "
+            f"{MAX_OUTPUT_TOKENS:,}, not {max_output_tokens!r}."
         )
     for tool in optional.get("tools") or ():
         if not isinstance(tool, Mapping) or tool.get("type") != "function":
@@ -650,6 +793,60 @@ def _check_input_item(item: Any) -> None:
             f"An input item of type {kind!r} is not allowed. Input items are messages or "
             f"one of {sorted(_INPUT_ITEM_TYPES)}."
         )
+
+
+def _stored(response: Mapping[str, Any], sensitive: bool) -> tuple[dict[str, Any], bool]:
+    """The copy of a response that goes in the ledger, and whether the response may be
+    recorded for replay as it is."""
+    if sensitive:
+        return _withheld_response(response), False
+    return _for_disk(response)
+
+
+def _withheld(value: Any) -> str:
+    """What stands in for a value that is not stored: its size as JSON. No digest of
+    it is kept, because a short text, such as a name, can be found from its digest by
+    guessing. The call's `request_hash` covers the whole request."""
+    text = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return f"<withheld: {len(text)} chars>"
+
+
+def _withheld_request(body: Mapping[str, Any]) -> dict[str, Any]:
+    """What the ledger keeps of a sensitive request: how the call was made, and the
+    size of each field that holds what was sent."""
+    return {
+        "withheld": "sensitive",
+        **{
+            name: value if name in _SETTINGS_FIELDS else _withheld(value)
+            for name, value in body.items()
+        },
+    }
+
+
+def _withheld_response(response: Mapping[str, Any]) -> dict[str, Any]:
+    """What the ledger keeps of a sensitive answer: its id, status, and model when they
+    are the short words the API writes, the token counts, and the size of the output."""
+    kept: dict[str, Any] = {
+        name: response[name]
+        for name in ("id", "object", "status", "model")
+        if isinstance(response.get(name), str) and _ID_WORD.fullmatch(response[name])
+    }
+    if isinstance(response.get("usage"), Mapping):
+        kept["usage"] = _counts(response["usage"])
+    return {"withheld": "sensitive", **kept, "output": _withheld(response.get("output"))}
+
+
+def _counts(usage: Mapping[str, Any]) -> dict[str, Any]:
+    """A usage object's numbers and nothing else it might hold."""
+    counts: dict[str, Any] = {}
+    for name, value in usage.items():
+        if not isinstance(name, str) or not _ID_WORD.fullmatch(name):
+            continue
+        if isinstance(value, Mapping):
+            counts[name] = _counts(value)
+        elif isinstance(value, int) and not isinstance(value, bool):
+            counts[name] = value
+    return counts
 
 
 def _for_disk(response: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:

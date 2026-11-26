@@ -65,9 +65,11 @@ _guard("connect_ex")
 def offline_environment(
     monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
-    """Start every test in replay mode without a key, whatever earlier tests changed,
-    and with a data directory of its own, so no test writes to the repository's
-    `data/` or sees what another test stored."""
+    """Start every test in replay mode without a key or a spending stop, whatever
+    earlier tests or the shell set, and with a data directory of its own, so no test
+    writes to the repository's `data/` or sees what another test stored."""
     monkeypatch.setenv("REPLAY", "1")
     monkeypatch.delenv("MODEL_API_KEY", raising=False)
+    monkeypatch.delenv("EMBER_STOP_USD", raising=False)
+    monkeypatch.delenv("EMBER_SPENT_BEFORE_USD", raising=False)
     monkeypatch.setenv("BEACON_DATA_DIR", str(tmp_path_factory.mktemp("data")))

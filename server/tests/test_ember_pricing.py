@@ -1,7 +1,7 @@
 import pytest
 
 from beacon.ember import EmberConfigError, SpendingStop
-from beacon.ember.pricing import Usage, parse_usd, price_nanousd
+from beacon.ember.pricing import Usage, parse_usd, price_nanousd, read_stop_settings
 
 
 def test_cached_input_is_billed_at_the_cached_rate_instead_of_the_input_rate() -> None:
@@ -42,13 +42,27 @@ def test_usage_that_cannot_be_priced_is_rejected(usage: object) -> None:
         Usage.from_response({"usage": usage})
 
 
-def test_the_stop_defaults_to_three_dollars_above_an_account_that_had_spent_nothing() -> None:
-    assert SpendingStop() == SpendingStop(ledger_nanousd=3_000_000_000, spent_before_nanousd=0)
-    assert SpendingStop.from_env({}) == SpendingStop()
-    # A variable that is set and empty, as an unfilled line of a .env file is, is unset.
-    assert SpendingStop.from_env({"EMBER_STOP_USD": "", "EMBER_SPENT_BEFORE_USD": " "}) == (
-        SpendingStop()
+def test_the_stop_defaults_to_three_dollars_and_what_was_spent_before_has_no_default() -> None:
+    assert SpendingStop.from_env({"EMBER_SPENT_BEFORE_USD": "0"}) == SpendingStop(
+        ledger_nanousd=3_000_000_000, spent_before_nanousd=0
     )
+    # An account that had spent $8.00 has $1.00 left under the ceiling, so a guess of
+    # $0.00 would admit $3.00 more: there is no stop until the page has been read.
+    # A variable that is set and empty, as an unfilled line of a .env file is, is unset.
+    for env in ({}, {"EMBER_STOP_USD": "1"}, {"EMBER_STOP_USD": "", "EMBER_SPENT_BEFORE_USD": " "}):
+        with pytest.raises(EmberConfigError, match="EMBER_SPENT_BEFORE_USD is not set"):
+            SpendingStop.from_env(env)
+    # What reads the settings without spending tells an unset amount from zero.
+    assert read_stop_settings({}) == (3_000_000_000, None)
+    assert read_stop_settings({"EMBER_STOP_USD": "1", "EMBER_SPENT_BEFORE_USD": "0"}) == (
+        1_000_000_000,
+        0,
+    )
+    # Neither amount can be left out of a stop, or passed without its name.
+    with pytest.raises(TypeError):
+        SpendingStop(ledger_nanousd=3_000_000_000)
+    with pytest.raises(TypeError):
+        SpendingStop(3_000_000_000, 0)
 
 
 def test_the_stop_and_what_was_spent_before_it_are_read_from_the_environment() -> None:
@@ -58,24 +72,30 @@ def test_the_stop_and_what_was_spent_before_it_are_read_from_the_environment() -
 
 
 def test_the_stop_and_what_was_spent_before_it_cannot_pass_nine_dollars_together() -> None:
-    assert SpendingStop(ledger_nanousd=9_000_000_000).ledger_nanousd == 9_000_000_000
+    SpendingStop(ledger_nanousd=9_000_000_000, spent_before_nanousd=0)
     SpendingStop(ledger_nanousd=3_000_000_000, spent_before_nanousd=6_000_000_000)
 
     with pytest.raises(ValueError, match=r"would pass \$9\.00"):
-        SpendingStop(ledger_nanousd=9_000_000_001)
+        SpendingStop(ledger_nanousd=9_000_000_001, spent_before_nanousd=0)
     with pytest.raises(ValueError, match="Lower EMBER_STOP_USD"):
         SpendingStop(ledger_nanousd=3_000_000_000, spent_before_nanousd=6_000_000_001)
-    # The default $3.00 stop on top of $6.01 already spent.
+    # The default $3.00 stop on top of $6.01 already spent, in live mode and in the
+    # reading that replay mode does.
     with pytest.raises(EmberConfigError, match=r"\$3\.00 on top of \$6\.01"):
         SpendingStop.from_env({"EMBER_SPENT_BEFORE_USD": "6.01"})
+    with pytest.raises(EmberConfigError, match=r"\$3\.00 on top of \$6\.01"):
+        read_stop_settings({"EMBER_SPENT_BEFORE_USD": "6.01"})
+    # With the earlier spend unknown, the stop alone is still held under the ceiling.
+    with pytest.raises(EmberConfigError, match=r"would pass \$9\.00"):
+        read_stop_settings({"EMBER_STOP_USD": "9.01"})
 
 
 @pytest.mark.parametrize("amount", [-1, True, 1.5, "3"])
 def test_a_stop_is_a_whole_number_of_nano_dollars(amount: object) -> None:
     with pytest.raises(ValueError, match="nano-dollars"):
-        SpendingStop(ledger_nanousd=amount)
+        SpendingStop(ledger_nanousd=amount, spent_before_nanousd=0)
     with pytest.raises(ValueError, match="nano-dollars"):
-        SpendingStop(spent_before_nanousd=amount)
+        SpendingStop(ledger_nanousd=0, spent_before_nanousd=amount)
 
 
 def test_a_dollar_amount_is_read_exactly() -> None:
@@ -83,6 +103,31 @@ def test_a_dollar_amount_is_read_exactly() -> None:
     assert parse_usd(" $4.25 ") == 4_250_000_000
     assert parse_usd("0.000000001") == 1
     assert parse_usd("0") == 0
+    # Zeros past the ninth place change nothing, however many there are.
+    assert parse_usd("9." + "0" * 40) == 9_000_000_000
+
+
+def test_an_amount_a_hair_from_nine_dollars_is_never_rounded_to_it() -> None:
+    # Arithmetic at a fixed precision reads both of these as exactly 9.
+    under = "8." + "9" * 32
+    over = "9." + "0" * 32 + "1"
+    for text in (under, over):
+        with pytest.raises(ValueError, match="finer than a nano-dollar"):
+            parse_usd(text)
+        with pytest.raises(EmberConfigError, match=r"^EMBER_STOP_USD: "):
+            read_stop_settings({"EMBER_STOP_USD": text})
+
+    # The nearest amounts that can be written, on each side of the ceiling.
+    at = {"EMBER_SPENT_BEFORE_USD": "0", "EMBER_STOP_USD": "9"}
+    assert parse_usd("8.999999999") == 8_999_999_999
+    assert SpendingStop.from_env(at).ledger_nanousd == 9_000_000_000
+    with pytest.raises(EmberConfigError, match=r"would pass \$9\.00"):
+        SpendingStop.from_env(at | {"EMBER_STOP_USD": "9.000000001"})
+    with pytest.raises(EmberConfigError, match=r"would pass \$9\.00"):
+        SpendingStop.from_env(at | {"EMBER_SPENT_BEFORE_USD": "0.000000001"})
+    # More digits than a float holds are still counted, not rounded.
+    with pytest.raises(EmberConfigError, match=r"would pass \$9\.00"):
+        SpendingStop.from_env(at | {"EMBER_STOP_USD": "1" + "0" * 30})
 
 
 @pytest.mark.parametrize(

@@ -4,7 +4,11 @@
 
     ember = EmberClient.from_env()
     answer = ember.respond(
-        task="extract_transmission", effort="low", max_output_tokens=1024, input="..."
+        task="extract_transmission",
+        effort="low",
+        max_output_tokens=1024,
+        sensitive=True,
+        input="...",
     )
 
 See `client` for what the client does around each call, and `fake` for running with no key.

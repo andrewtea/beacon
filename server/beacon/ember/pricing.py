@@ -8,7 +8,6 @@ ledger sums and budget comparisons are exact.
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal
 from typing import Any
 
 from beacon.ember.errors import EmberConfigError
@@ -46,17 +45,16 @@ ACCOUNT_CEILING_NANOUSD = 9 * NANOUSD_PER_USD
 # ledger began. The ledger counts only Beacon's own calls, so that is $3.00 of live
 # spend in the ledger whatever the page said.
 DEFAULT_STOP_NANOUSD = 3 * NANOUSD_PER_USD
-# What the page said that day is needed only to keep the two together under the
-# ceiling. Nobody has read it off the page yet. The default assumes $0.00, because
-# the only other project on the account, Forte, records that it never made a real
-# Ember call. Set EMBER_SPENT_BEFORE_USD when the page says otherwise.
-DEFAULT_SPENT_BEFORE_NANOUSD = 0
 
 STOP_VARIABLE = "EMBER_STOP_USD"
+# What the page said before Beacon's first call has no default. The ledger cannot see
+# that spend, and a guess of $0.00 on an account that had spent $8.00 would let the
+# $3.00 stop take the account past its credit. A live client is refused until someone
+# has read the page and set this, to 0 when that is what the page says.
 SPENT_BEFORE_VARIABLE = "EMBER_SPENT_BEFORE_USD"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class SpendingStop:
     """Where live spend stops.
 
@@ -66,8 +64,8 @@ class SpendingStop:
     ledger cannot see that spend, so the two are added and held under the ceiling
     when the stop is made, not when a call is."""
 
-    ledger_nanousd: int = DEFAULT_STOP_NANOUSD
-    spent_before_nanousd: int = DEFAULT_SPENT_BEFORE_NANOUSD
+    ledger_nanousd: int
+    spent_before_nanousd: int
 
     def __post_init__(self) -> None:
         for amount in (self.ledger_nanousd, self.spent_before_nanousd):
@@ -84,21 +82,43 @@ class SpendingStop:
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "SpendingStop":
-        """`EMBER_STOP_USD` and `EMBER_SPENT_BEFORE_USD`, each a dollar amount such as
-        `2.50`. One that is unset or empty takes its default."""
-        try:
-            return cls(
-                ledger_nanousd=_usd_setting(env, STOP_VARIABLE, DEFAULT_STOP_NANOUSD),
-                spent_before_nanousd=_usd_setting(
-                    env, SPENT_BEFORE_VARIABLE, DEFAULT_SPENT_BEFORE_NANOUSD
-                ),
+        """The stop a live client keeps: `EMBER_STOP_USD`, which is $3.00 when unset or
+        empty, on top of `EMBER_SPENT_BEFORE_USD`, which has no default.
+
+        Raises EmberConfigError as `read_stop_settings` does, and when
+        `EMBER_SPENT_BEFORE_USD` is unset or empty."""
+        ledger, spent_before = read_stop_settings(env)
+        if spent_before is None:
+            raise EmberConfigError(
+                f"{SPENT_BEFORE_VARIABLE} is not set. A paid Ember call needs the total "
+                "that Meta's Usage page (https://dev.meta.ai/usage, Muse Ember, from "
+                "Nov 23) showed before Beacon's first call, because the stop is counted on "
+                "top of it. Read it off the page and set the variable to it, or to 0 when "
+                "the page shows no spend."
             )
-        except ValueError as error:
-            raise EmberConfigError(str(error)) from error
+        return cls(ledger_nanousd=ledger, spent_before_nanousd=spent_before)
+
+
+def read_stop_settings(env: Mapping[str, str]) -> tuple[int, int | None]:
+    """`EMBER_STOP_USD` and `EMBER_SPENT_BEFORE_USD` as nano-dollars, each a dollar
+    amount such as `2.50`. An unset or empty stop is $3.00, and an unset or empty
+    spent-before is None.
+
+    Raises EmberConfigError when either cannot be read, or when the two together would
+    pass the ceiling."""
+    try:
+        ledger = _usd_setting(env, STOP_VARIABLE)
+        spent_before = _usd_setting(env, SPENT_BEFORE_VARIABLE)
+        ledger = DEFAULT_STOP_NANOUSD if ledger is None else ledger
+        # Made only to be checked against the ceiling.
+        SpendingStop(ledger_nanousd=ledger, spent_before_nanousd=spent_before or 0)
+    except ValueError as error:
+        raise EmberConfigError(str(error)) from error
+    return ledger, spent_before
 
 
 # Digits with an optional fraction: no sign, no exponent, no separators.
-_USD = re.compile(r"\$?([0-9]+(?:\.[0-9]+)?)")
+_USD = re.compile(r"\$?([0-9]+)(?:\.([0-9]+))?")
 
 
 def parse_usd(text: str) -> int:
@@ -108,16 +128,19 @@ def parse_usd(text: str) -> int:
     match = _USD.fullmatch(text.strip())
     if match is None:
         raise ValueError(f"{text!r} is not a dollar amount, such as 3 or 0.50.")
-    amount = Decimal(match[1]) * NANOUSD_PER_USD
-    if amount != amount.to_integral_value():
-        raise ValueError(f"{text!r} is finer than a nano-dollar.")
-    return int(amount)
+    # Read digit by digit, in whole numbers. A decimal type rounds a long fraction to
+    # its working precision before it can be checked, which reads 8.99...9 as 9.
+    fraction = (match[2] or "").rstrip("0")
+    if len(fraction) > 9:
+        raise ValueError(f"{text!r} is a dollar amount finer than a nano-dollar.")
+    return int(match[1]) * NANOUSD_PER_USD + int(fraction.ljust(9, "0"))
 
 
-def _usd_setting(env: Mapping[str, str], name: str, default: int) -> int:
+def _usd_setting(env: Mapping[str, str], name: str) -> int | None:
+    """The amount a variable holds, or None when it is unset or empty."""
     text = env.get(name, "").strip()
     if not text:
-        return default
+        return None
     try:
         return parse_usd(text)
     except ValueError as error:

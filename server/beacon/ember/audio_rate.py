@@ -5,15 +5,21 @@ This sends clips of known length through the Ember client, reads the input token
 each answer was billed for, and fits a line through them: the slope is the rate, and
 the intercept is what a request costs before any audio.
 
-    REPLAY=0 MODEL_API_KEY=... uv run --project server python scripts/measure_audio_rate.py
+    export REPLAY=0 MODEL_API_KEY=... EMBER_SPENT_BEFORE_USD=...
+    uv run --project server python scripts/measure_audio_rate.py
 
 The clips are generated tones unless `--clips` names a folder of WAV files. A tone is
 not speech: if Ember bills audio by its length the rate is the same, and if it does
 not, only recordings of the radio traffic Beacon will send give the real number.
 
-Every call goes through `EmberClient`, so it is in the ledger, held by the spending
-stop and by a scope of its own, and recorded: running the command again replays the
-answers and costs nothing.
+Every call goes through `EmberClient`, so it is in the ledger and held by the spending
+stop and by a scope of its own. The scope is the same every time the command runs, so
+`--budget` is the most the measurement may spend over all its runs, not per run.
+
+The tones' answers are recorded, so running the command again replays them and costs
+nothing. Clips from a folder can be recordings of radio traffic, so their calls are
+made as sensitive ones: nothing of them is stored but the accounting, and a rerun is
+paid for again, under the same budget.
 """
 
 import argparse
@@ -27,7 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
-from beacon.ember.client import EmberClient, SpendScope
+from beacon.ember.client import MIN_OUTPUT_TOKENS, EmberClient, SpendScope
 from beacon.ember.errors import EmberError, ReplayMissError
 from beacon.ember.pricing import STANDARD, parse_usd, to_usd
 
@@ -37,8 +43,6 @@ SCOPE = "measure-audio-rate"
 # shows in the cheapest calls.
 TONE_SECONDS = (2, 4, 6, 8, 10, 15, 20, 30, 45, 60)
 DEFAULT_BUDGET = "0.05"
-# The answer is not read, so it gets the smallest output limit the API takes.
-MAX_OUTPUT_TOKENS = 16
 PROMPT = "Reply with the single word ok."
 
 _SAMPLE_RATE = 16_000
@@ -93,16 +97,26 @@ def tone_clip(seconds: int) -> Clip:
 
 
 def read_clip(path: Path) -> Clip:
-    """A WAV file and its length. Raises ValueError when it is not one, or is empty."""
+    """A WAV file and its length. Raises ValueError when it is not one, holds no
+    audio, or is cut short of the length its header declares."""
     data = path.read_bytes()
     try:
         with wave.open(io.BytesIO(data), "rb") as file:
-            frames, rate = file.getnframes(), file.getframerate()
+            declared, rate = file.getnframes(), file.getframerate()
+            frame_bytes = file.getnchannels() * file.getsampwidth()
+            held = len(file.readframes(declared))
     except (wave.Error, EOFError) as error:
         raise ValueError(f"{path.name} is not a WAV file: {error}") from error
-    if frames <= 0 or rate <= 0:
+    if declared <= 0 or rate <= 0 or frame_bytes <= 0:
         raise ValueError(f"{path.name} holds no audio.")
-    return Clip(path.name, frames / rate, data)
+    if held != declared * frame_bytes:
+        # The length would be the header's and the audio sent would be shorter, which
+        # puts a wrong point on the line.
+        raise ValueError(
+            f"{path.name} is cut short: its header declares {declared:,} frames and it "
+            f"holds {held // frame_bytes:,}."
+        )
+    return Clip(path.name, declared / rate, data)
 
 
 def read_clips(directory: Path) -> list[Clip]:
@@ -111,8 +125,9 @@ def read_clips(directory: Path) -> list[Clip]:
     return sorted(clips, key=lambda clip: clip.seconds)
 
 
-def measure(ember: EmberClient, clips: Sequence[Clip]) -> AudioRate:
+def measure(ember: EmberClient, clips: Sequence[Clip], *, sensitive: bool) -> AudioRate:
     """One Ember call per clip, and the line through what they were billed.
+    `sensitive` is `EmberClient.respond`'s: True for clips that can hold radio traffic.
 
     Raises ValueError unless the clips have at least two different lengths, which a
     line needs. Raises what `EmberClient.respond` raises."""
@@ -123,7 +138,9 @@ def measure(ember: EmberClient, clips: Sequence[Clip]) -> AudioRate:
         answer = ember.respond(
             task=TASK,
             effort="minimal",
-            max_output_tokens=MAX_OUTPUT_TOKENS,
+            # The answer is not read, so it gets the smallest output limit the API takes.
+            max_output_tokens=MIN_OUTPUT_TOKENS,
+            sensitive=sensitive,
             input=[
                 {
                     "role": "user",
@@ -203,7 +220,8 @@ def main(
     parser.add_argument(
         "--budget",
         default=DEFAULT_BUDGET,
-        help=f"the most these calls may spend, in dollars (default {DEFAULT_BUDGET})",
+        help="the most the measurement may spend over all its runs, in dollars "
+        f"(default {DEFAULT_BUDGET})",
     )
     options = parser.parse_args(argv)
     try:
@@ -214,12 +232,17 @@ def main(
             else read_clips(options.clips)
         )
         ember = EmberClient.from_env(env, scope=SpendScope(SCOPE, budget))
-        rate = measure(ember, clips)
+        rate = measure(ember, clips, sensitive=options.clips is not None)
     except ReplayMissError:
+        rerun = (
+            "the tones' answers are recorded, so a rerun costs nothing"
+            if options.clips is None
+            else "nothing of a folder's clips is recorded, so a rerun is paid for again"
+        )
         print(
             "No recorded measurement to replay. Measuring needs real Ember calls: run "
-            f"again with REPLAY=0 and MODEL_API_KEY set. It spends at most ${options.budget}, "
-            "and the answers are recorded, so a rerun costs nothing.",
+            "again with REPLAY=0, MODEL_API_KEY, and EMBER_SPENT_BEFORE_USD set. The "
+            f"measurement spends at most ${options.budget} over all its runs, and {rerun}.",
             file=out,
         )
         return 1

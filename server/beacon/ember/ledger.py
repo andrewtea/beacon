@@ -246,12 +246,13 @@ class Ledger:
         usage: Usage | None = None,
         response: Mapping[str, Any] | None = None,
         error: str | None = None,
-    ) -> None:
-        """Replace a live call's reservation with its outcome. `response` must already
-        be redacted. A reservation made in a ledger file that has since been replaced
-        went with that file, and nothing is written."""
+    ) -> bool:
+        """Replace a live call's reservation with its outcome, and return whether it
+        was written. `response` must already be redacted. A reservation made in a
+        ledger file that has since been replaced went with that file: nothing is
+        written, and the answer is False."""
         with self._transaction() as db:
-            db.execute(
+            cursor = db.execute(
                 """
                 UPDATE ember_calls SET
                     status = ?, cost_nanousd = ?, latency_ms = ?, input_tokens = ?,
@@ -271,6 +272,7 @@ class Ledger:
                     row.generation,
                 ),
             )
+            return cursor.rowcount == 1
 
     def record(
         self,

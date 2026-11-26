@@ -2,6 +2,8 @@
 
 import base64
 import io
+import json
+import sqlite3
 import wave
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,7 @@ from beacon.ember.audio_rate import (
     Measurement,
     main,
     measure,
+    read_clip,
     read_clips,
     report,
     tone_clip,
@@ -45,7 +48,7 @@ def storage(tmp_path: Path) -> Storage:
 def test_the_rate_is_the_slope_of_billed_tokens_over_clip_length(storage: Storage) -> None:
     ember = EmberClient.fake(storage, bills_by_length)
 
-    rate = measure(ember, [tone_clip(seconds) for seconds in (2, 3, 10)])
+    rate = measure(ember, [tone_clip(seconds) for seconds in (2, 3, 10)], sensitive=False)
 
     assert [(made.name, made.seconds, made.input_tokens) for made in rate.measurements] == [
         ("tone-2s", 2.0, 160),
@@ -64,9 +67,44 @@ def test_a_rate_needs_clips_of_two_lengths(storage: Storage) -> None:
     ember = EmberClient.fake(storage, bills_by_length)
 
     with pytest.raises(ValueError, match="two different lengths"):
-        measure(ember, [tone_clip(5), tone_clip(5)])
+        measure(ember, [tone_clip(5), tone_clip(5)], sensitive=False)
     with pytest.raises(ValueError, match="two different lengths"):
-        measure(ember, [])
+        measure(ember, [], sensitive=False)
+
+
+def test_clips_that_can_hold_radio_traffic_leave_nothing_of_the_answer_on_disk(
+    storage: Storage,
+) -> None:
+    def transcribes(body: dict[str, Any]) -> dict[str, Any]:
+        return bills_by_length(body) | {
+            "output": fake_response(text="Medic 52, 1458 Hayes Street")["output"]
+        }
+
+    rate = measure(
+        EmberClient.fake(storage, transcribes), [tone_clip(1), tone_clip(2)], sensitive=True
+    )
+
+    assert rate.tokens_per_second == pytest.approx(25)
+    with sqlite3.connect(storage.ledger_db) as db:
+        rows = db.execute("SELECT request, response, input_tokens FROM ember_calls").fetchall()
+    assert [tokens for _request, _response, tokens in rows] == [135, 160]
+    assert "Hayes" not in json.dumps(rows)
+    assert all(json.loads(request)["withheld"] == "sensitive" for request, _, _ in rows)
+
+
+def test_a_clip_cut_short_of_its_declared_length_is_refused(tmp_path: Path) -> None:
+    whole = tone_clip(2).wav
+    (tmp_path / "whole.wav").write_bytes(whole)
+    assert read_clip(tmp_path / "whole.wav").seconds == 2.0
+
+    # The header still declares two seconds, and half of the audio is gone.
+    (tmp_path / "cut.wav").write_bytes(whole[: len(whole) // 2])
+    with pytest.raises(ValueError, match=r"cut\.wav is cut short: its header declares"):
+        read_clip(tmp_path / "cut.wav")
+    # One byte short is short.
+    (tmp_path / "cut.wav").write_bytes(whole[:-1])
+    with pytest.raises(ValueError, match="cut short"):
+        read_clips(tmp_path)
 
 
 def test_a_folder_of_wav_files_is_read_shortest_first_with_each_files_length(
@@ -110,9 +148,54 @@ def test_the_command_makes_no_call_without_a_key_and_says_what_it_needs(tmp_path
     status = main([], env={"BEACON_DATA_DIR": str(tmp_path)}, out=out)
 
     assert status == 1
-    assert "run again with REPLAY=0 and MODEL_API_KEY set" in out.getvalue()
-    assert "at most $0.05" in out.getvalue()
+    assert "REPLAY=0, MODEL_API_KEY, and EMBER_SPENT_BEFORE_USD set" in out.getvalue()
+    assert "at most $0.05 over all its runs" in out.getvalue()
+    assert "the tones' answers are recorded, so a rerun costs nothing" in out.getvalue()
     assert not (tmp_path / "ember" / "replay").exists()
+
+
+def test_the_command_says_a_folders_clips_are_paid_for_on_every_run(tmp_path: Path) -> None:
+    clips = tmp_path / "clips"
+    clips.mkdir()
+    for seconds in (1, 2):
+        (clips / f"{seconds}.wav").write_bytes(tone_clip(seconds).wav)
+    out = io.StringIO()
+
+    status = main(["--clips", str(clips)], env={"BEACON_DATA_DIR": str(tmp_path)}, out=out)
+
+    assert status == 1
+    assert "nothing of a folder's clips is recorded, so a rerun is paid for again" in (
+        out.getvalue()
+    )
+
+
+@pytest.mark.parametrize(("from_folder", "kept"), [(True, False), (False, True)])
+def test_the_command_stores_the_answers_about_tones_and_not_about_a_folders_clips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, from_folder: bool, kept: bool
+) -> None:
+    clips = tmp_path / "clips"
+    clips.mkdir()
+    for seconds in (1, 2):
+        (clips / f"{seconds}.wav").write_bytes(tone_clip(seconds).wav)
+    storage = Storage.under(tmp_path / "data")
+
+    def transcribes(body: dict[str, Any]) -> dict[str, Any]:
+        return bills_by_length(body) | {"output": fake_response(text="1458 Hayes")["output"]}
+
+    # The command's client is replaced by a stand-in, which answers with what a model
+    # could say about radio traffic.
+    monkeypatch.setattr(
+        EmberClient,
+        "from_env",
+        classmethod(lambda cls, env, scope: EmberClient.fake(storage, transcribes, scope=scope)),
+    )
+
+    status = main(["--clips", str(clips)] if from_folder else [], env={}, out=io.StringIO())
+
+    assert status == 0
+    with sqlite3.connect(storage.ledger_db) as db:
+        stored = json.dumps(db.execute("SELECT request, response FROM ember_calls").fetchall())
+    assert ("Hayes" in stored) == kept
 
 
 @pytest.mark.parametrize(
@@ -120,6 +203,12 @@ def test_the_command_makes_no_call_without_a_key_and_says_what_it_needs(tmp_path
     [
         (["--budget", "lots"], {}, "'lots' is not a dollar amount"),
         ([], {"REPLAY": "0"}, "MODEL_API_KEY is not set"),
+        (
+            [],
+            {"REPLAY": "0", "MODEL_API_KEY": "test-key"},
+            "EMBER_SPENT_BEFORE_USD is not set",
+        ),
+        ([], {"BEACON_DATA_DIR": "data"}, "BEACON_DATA_DIR must be an absolute path"),
         ([], {"EMBER_STOP_USD": "three"}, "EMBER_STOP_USD"),
     ],
 )
