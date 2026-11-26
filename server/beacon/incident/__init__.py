@@ -21,6 +21,7 @@ from beacon.incident.engine import HORIZON, Engine, Snapshot
 from beacon.incident.inforce import Standing, standings
 from beacon.incident.model import (
     CONFIDENCE_RANK,
+    Conflict,
     Credit,
     Entry,
     Incident,
@@ -39,6 +40,7 @@ __all__ = [
     "NO_BLOCKS",
     "Blocks",
     "CallGroup",
+    "Conflict",
     "Credit",
     "Engine",
     "Entry",

@@ -31,6 +31,14 @@ SignalKind = Literal[
     "aircraft_circling",
     "taps",
 ]
+ConflictKind = Literal[
+    # An all-clear was reported on the radio after an official alert for the place was
+    # issued that is in force, or after an order or a warning was published.
+    "all_clear_on_radio",
+    # A notice that names a street of the incident, published after the radio's
+    # calls said what it is, is about another hazard.
+    "hazard",
+]
 OfficialState = Literal[
     "in_force", "replaced", "cancelled", "not_listed", "ended", "unknown", "published"
 ]
@@ -104,17 +112,45 @@ class Official:
     issued_at: datetime
     until: datetime | None
     issuer: str | None
-    # The authority's own words, for an alert. None for a notice, whose words are a
-    # model's reading and are not shown until the redaction pass has read them.
+    # For an alert, the authority's own words. For a notice, a model's reading of
+    # the document, and only what the redaction pass let through whole
+    # (`beacon.redact.reading`): show it as Beacon's reading, beside `source.url`,
+    # and never as the authority's words or as what to do.
     headline: str | None
     instruction: str | None
     # True for a notice: what Beacon has is a model's reading of the document at
     # `source.url`, which is the authority speaking.
     reading: bool
     source: Source
-    # The fields of an alert that are left out because the stored text may have
-    # been cut. Whoever shows the alert says it has more, and links the original.
+    # The fields that are not all here because there was more than Beacon keeps:
+    # an alert's text that may have been cut, and what a notice's row says of its
+    # own (`data["incomplete"]`). Whoever shows it says it has more, and links the
+    # original.
     incomplete: tuple[str, ...] = ()
+    # A notice's summary and the areas it names, as a model read them, on the same
+    # terms as `instruction`. The areas are all there or none is.
+    summary: str | None = None
+    areas: tuple[str, ...] = ()
+    # The fields of a notice that the row holds and the redaction pass did not let
+    # through, so they are left out whole: `issuer`, `headline`, `instruction`,
+    # `summary`, `areas`. Whoever shows the notice says that it has more.
+    withheld: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Conflict:
+    """Radio traffic and an official source that do not say the same thing about an
+    incident. The official source outranks the radio, and `text` says so and why.
+    Code finds these and words them; no model weighs one source against another."""
+
+    kind: ConflictKind
+    text: str
+    # How far to trust that the two disagree, which is as far as the weakest row
+    # it rests on: a call that was only partly made out makes it `low`.
+    confidence: Confidence
+    # The official rows, which are the ones that hold, and the radio rows.
+    official: tuple[Source, ...]
+    radio: tuple[Source, ...]
 
 
 @dataclass(frozen=True)
@@ -168,6 +204,8 @@ class Incident:
     taps_more: bool
     aircraft_more: bool
     signals: tuple[Signal, ...]
+    # Where the radio and an official source disagree, and which holds.
+    conflicts: tuple[Conflict, ...]
     # Whether any row it is built from is a stand-in's. It is then one too.
     stand_in: bool
     # The rows it is built from, taps left out.

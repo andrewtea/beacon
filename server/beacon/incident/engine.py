@@ -27,6 +27,7 @@ from beacon.evidence import Evidence, EvidenceStore, Kind, Mode, Point
 from beacon.incident.build import build_incidents
 from beacon.incident.model import Incident
 from beacon.incident.places import Blocks
+from beacon.redact import Names
 
 # How far back the engine reads. An incident older than this is gone from it, and one
 # that has gone on for longer loses its first calls.
@@ -76,10 +77,14 @@ class Engine:
         store: EvidenceStore,
         blocks: Blocks,
         *,
+        names: Names | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        """`names` are the names a text may hold to pass the redaction pass. With
+        none, no word of a notice is shown."""
         self._store = store
         self._blocks = blocks
+        self._names = names
         self._clock = (lambda: datetime.now(UTC)) if clock is None else clock
         self._working = threading.Lock()
         self._made: Snapshot | None = None
@@ -97,6 +102,11 @@ class Engine:
     @property
     def blocks(self) -> Blocks:
         return self._blocks
+
+    @property
+    def names(self) -> Names | None:
+        """The names a text may hold to pass the redaction pass, or None."""
+        return self._names
 
     def incidents(self) -> list[Incident]:
         """Every incident whose calls are within `HORIZON`, newest first."""
@@ -191,6 +201,7 @@ class Engine:
         found = build_incidents(
             rows,
             blocks=self._blocks,
+            names=self._names,
             now=now,
             nearby=nearby,
             unresolved_before=unresolved_before,

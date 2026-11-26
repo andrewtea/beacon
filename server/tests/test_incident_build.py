@@ -9,9 +9,13 @@ from beacon.evidence import NewEvidence, Point
 from beacon.incident import NO_BLOCKS, Blocks, Engine, Incident
 from beacon.incident.build import CREDIT_511
 from beacon.ingest import nws, traffic511
+from beacon.redact import Names
 from tests.incident_rows import HAYES, Rows, area, at, mock_store
 
 BLOCKS = Blocks.of([("Hayes St", 400, HAYES.lat, HAYES.lon)])
+NAMES = Names.of(
+    streets=("Hayes St", "Gough St", "Octavia St"), places=("Civic Center Plaza", "An Agency")
+)
 FAR = Point(37.7636, -122.4783)
 
 
@@ -20,8 +24,10 @@ def rows(tmp_path: Path) -> Rows:
     return Rows(mock_store(tmp_path))
 
 
-def incidents(rows: Rows, minute: float, blocks: Blocks = BLOCKS) -> list[Incident]:
-    return Engine(rows.store, blocks, clock=lambda: at(minute)).incidents()
+def incidents(
+    rows: Rows, minute: float, blocks: Blocks = BLOCKS, names: Names | None = None
+) -> list[Incident]:
+    return Engine(rows.store, blocks, names=names, clock=lambda: at(minute)).incidents()
 
 
 def fire(rows: Rows, **fields: object) -> None:
@@ -170,6 +176,18 @@ def test_an_alerts_instruction_is_the_authoritys_own_and_a_notices_words_are_not
     assert "Jane" not in shown
     assert "432" not in shown
     assert "An Agency" not in shown
+    # With no list of names nothing of the notice passes, and all of it is withheld.
+    assert official_notice.withheld == ("headline", "instruction", "summary", "issuer", "areas")
+
+    # With the lists, every text that names a person is still left out whole. The
+    # issuer is a listed public body and nothing else, so it is shown.
+    (incident,) = incidents(rows, 10, names=NAMES)
+    official_notice = incident.official[1]
+    assert official_notice.issuer == "An Agency"
+    assert official_notice.withheld == ("headline", "instruction", "summary", "areas")
+    shown = repr(incident)
+    assert "Jane" not in shown
+    assert "432" not in shown
     assert "Janedoe" not in shown
     (entry,) = [entry for entry in incident.timeline if entry.kind == "notice"]
     assert entry.text == (
@@ -177,6 +195,93 @@ def test_an_alerts_instruction_is_the_authoritys_own_and_a_notices_words_are_not
         "document. Read the document for what it says."
     )
     assert entry.details["streets"] == ["Hayes St"]
+
+
+def test_a_notices_words_are_shown_as_a_reading_when_the_whole_text_passes(rows: Rows) -> None:
+    fire(rows)
+    notice = rows.notice(
+        6,
+        "evacuation_order",
+        streets=("Hayes St", "Gough St"),
+        issuer="San Francisco Department of Emergency Management",
+        title="Evacuation Order: 400 block of Hayes St",
+        areas=["Both sides of Hayes St between Gough St and Octavia St", "Civic Center Plaza"],
+        instruction="Leave now, on foot. Do not use Hayes St.",
+        summary="Everyone on Hayes St between Gough St and Octavia St is ordered to leave.",
+        incomplete=["title", "streets"],
+    )
+
+    (incident,) = incidents(rows, 10, names=NAMES)
+
+    (official,) = incident.official
+    assert (official.reading, official.source.url, official.state) == (
+        True,
+        notice.url,
+        "published",
+    )
+    assert official.issuer == "San Francisco Department of Emergency Management"
+    assert official.instruction == "Leave now, on foot. Do not use Hayes St."
+    assert official.summary == (
+        "Everyone on Hayes St between Gough St and Octavia St is ordered to leave."
+    )
+    assert official.areas == (
+        "Both sides of Hayes St between Gough St and Octavia St",
+        "Civic Center Plaza",
+    )
+    # A title in title case has capitals in the middle of a sentence, as a name
+    # has, and is left out. What the row says is not all there is said too.
+    assert (official.headline, official.withheld) == (None, ("headline",))
+    assert official.incomplete == ("headline", "streets")
+    # The timeline's line still shows none of the words.
+    (line,) = [entry for entry in incident.timeline if entry.kind == "notice"]
+    assert "Leave" not in repr(line)
+
+
+def test_a_notices_areas_are_shown_all_together_or_not_at_all(rows: Rows) -> None:
+    fire(rows)
+    rows.notice(
+        6,
+        "evacuation_order",
+        areas=["Hayes St between Gough St and Octavia St", "432 Hayes St, the home of Jane Doe"],
+        instruction="Leave now.",
+    )
+
+    (incident,) = incidents(rows, 10, names=NAMES)
+
+    (official,) = incident.official
+    assert (official.areas, official.instruction) == ((), "Leave now.")
+    assert official.withheld == ("areas",)
+
+
+def test_nothing_is_read_of_a_press_release_whatever_its_row_holds(rows: Rows) -> None:
+    fire(rows)
+    # Ingest keeps no text of a press release. A row that held one all the same,
+    # in words that would pass, is shown none of.
+    rows.notice(
+        6,
+        "press_release",
+        streets=(),
+        issuer="San Francisco Fire Department",
+        title="The fire is out.",
+        areas=["Hayes St"],
+        instruction="Leave now.",
+        summary="The fire on Hayes St is out.",
+        incomplete=["summary"],
+    )
+
+    (incident,) = incidents(rows, 10, names=NAMES)
+
+    (official,) = incident.official
+    assert (official.type, official.reading) == ("press_release", True)
+    assert (
+        official.issuer,
+        official.headline,
+        official.instruction,
+        official.summary,
+        official.areas,
+        official.withheld,
+        official.incomplete,
+    ) == (None, None, None, None, (), (), ())
 
 
 def test_a_dropped_alert_is_what_beacon_saw_and_never_an_all_clear(rows: Rows) -> None:
@@ -472,7 +577,7 @@ def test_a_text_that_may_have_been_cut_is_left_out_whole_and_said_to_be(rows: Ro
     assert "Residents may return" not in repr(incident)
     (closure,) = [entry for entry in incident.timeline if entry.kind == "closure"]
     assert closure.text == (
-        "511 lists an event here. Its text is longer than Beacon keeps: read it at 511.org."
+        "511 lists an event. Its text is longer than Beacon keeps: read it at 511.org."
     )
     assert "ccc" not in repr(incident)
 
@@ -536,6 +641,145 @@ def test_a_warning_is_named_as_a_warning_and_never_as_an_order(rows: Rows) -> No
         "an authority. This is"
     )
     assert signal.sources[0].evidence_id == warning.id
+
+
+def test_an_all_clear_on_the_radio_does_not_end_an_alert_or_lift_an_order(rows: Rows) -> None:
+    fire(rows)
+    alert = rows.alert(2, "shelter")
+    order = rows.notice(3, "evacuation_order")
+    assert incidents(rows, 5)[0].conflicts == ()
+
+    said = rows.radio(10, "fire", "under_control", units=("E36",), details=("all_clear",))
+    (incident,) = incidents(rows, 12)
+
+    by_alert, by_order = incident.conflicts
+    assert (by_alert.kind, by_order.kind) == ("all_clear_on_radio", "all_clear_on_radio")
+    assert by_alert.text == (
+        "An all-clear was reported on the radio after this official alert was issued. The "
+        "alert, whose area holds this place, is in force. An official source outranks "
+        "radio traffic: the alert is what holds, and radio traffic does not end it."
+    )
+    assert [source.evidence_id for source in by_alert.official] == [alert.id]
+    assert [source.evidence_id for source in by_alert.radio] == [said.id]
+    assert by_order.text == (
+        "An all-clear was reported on the radio after an evacuation order that names a "
+        "street of this incident was published by an authority. An official source "
+        "outranks radio traffic: radio traffic lifts no official notice. "
+        "Whether the notice still holds is for its authority to say. This is Beacon's "
+        "reading of the document. Read the document for what it says."
+    )
+    assert [source.url for source in by_order.official] == [order.url]
+    # Each is trusted as little as the weakest row it rests on: a call heard clear.
+    assert (by_alert.confidence, by_order.confidence) == ("medium", "medium")
+    # Neither says who gave the all-clear: the row names units, and not a speaker.
+    for conflict in (by_alert, by_order):
+        assert "rews" not in conflict.text
+
+    # Once the alert is cancelled, the radio is at odds with the order only.
+    rows.alert(20, "gone", message_type="Cancel", replaces=("shelter",), point=None)
+    (incident,) = incidents(rows, 25)
+    assert [conflict.official[0].evidence_id for conflict in incident.conflicts] == [order.id]
+
+
+def test_what_was_said_on_the_radio_is_told_without_saying_who_said_it(rows: Rows) -> None:
+    fire(rows)
+    # A dispatcher relaying these leaves the same row as a crew saying them.
+    said = rows.radio(
+        2,
+        "fire",
+        "working",
+        units=("E36",),
+        details=("evacuation", "shelter_in_place", "road_closed", "aircraft_overhead", "all_clear"),
+    )
+
+    (incident,) = incidents(rows, 5)
+
+    (line,) = [
+        entry
+        for entry in incident.timeline
+        if said.id in [source.evidence_id for source in entry.sources]
+    ]
+    not_an_order = "That is radio traffic, not an official order."
+    assert line.text == (
+        f"Fire: crews at work. An evacuation mentioned. {not_an_order} Sheltering in "
+        f"place mentioned. {not_an_order} A road reported closed. An aircraft mentioned "
+        f"overhead. All clear said. {not_an_order} Units: E36."
+    )
+    (signal,) = [signal for signal in incident.signals if signal.kind == "evacuation_on_radio"]
+    assert signal.text == f"An evacuation was mentioned on the radio. {not_an_order}"
+    for text in (line.text, signal.text):
+        assert "Crews" not in text
+
+
+def test_an_all_clear_said_before_the_alert_or_the_order_is_not_at_odds_with_it(
+    rows: Rows,
+) -> None:
+    fire(rows)
+    early = rows.radio(1, "fire", "under_control", units=("E36",), details=("all_clear",))
+    rows.alert(2, "shelter")
+    rows.notice(3, "evacuation_order")
+
+    # Crews who said all clear before either was issued said nothing about them.
+    (incident,) = incidents(rows, 5)
+    told = {source.evidence_id for entry in incident.timeline for source in entry.sources}
+    assert early.id in told
+    assert incident.conflicts == ()
+
+
+def test_an_all_clear_is_set_against_only_what_was_issued_before_it(rows: Rows) -> None:
+    fire(rows)
+    alert = rows.alert(2, "shelter")
+    said = rows.radio(
+        2.5, "fire", "under_control", units=("E36",), details=("all_clear",), clarity="partial"
+    )
+    rows.notice(3, "evacuation_order")
+
+    (conflict,) = incidents(rows, 5)[0].conflicts
+
+    assert [source.evidence_id for source in conflict.official] == [alert.id]
+    assert [source.evidence_id for source in conflict.radio] == [said.id]
+    # A call that was only partly made out: whether the two disagree is as unsure.
+    assert conflict.confidence == "low"
+
+
+def test_a_notice_about_another_hazard_than_the_radios_is_said_to_outrank_it(rows: Rows) -> None:
+    first = rows.radio(0, "other", "dispatched", units=("E36",), street="Hayes St", block=400)
+    called = rows.radio(1, "fire", "working", units=("E36",))
+    rows.notice(5, "advisory", hazard="smoke")  # smoke goes with a fire
+    rows.notice(6, "advisory", hazard="other")  # says nothing
+    rows.notice(7, "press_release", hazard="hazmat", streets=())  # keeps no hazard to weigh
+    notice = rows.notice(8, "shelter_in_place", hazard="hazmat")
+
+    (incident,) = incidents(rows, 10)
+
+    (conflict,) = incident.conflicts
+    assert conflict.kind == "hazard"
+    assert conflict.text == (
+        "Radio traffic called this a fire. A notice an authority published later, "
+        "which names a street of this incident, is about hazardous materials, as "
+        "Beacon reads it. Where the two are about the same thing, the official notice "
+        "outranks radio traffic. This is Beacon's reading of the document. Read the "
+        "document for what it says."
+    )
+    assert [source.evidence_id for source in conflict.official] == [notice.id]
+    # The call that named it a fire, not the first call.
+    assert [source.evidence_id for source in conflict.radio] == [called.id]
+    assert first.id != called.id
+    # A reading at `high` and a call heard clear at `medium`.
+    assert conflict.confidence == "medium"
+
+
+def test_a_notice_is_not_set_against_what_the_radio_said_after_it(rows: Rows) -> None:
+    rows.radio(0, "other", "dispatched", units=("E36",), street="Hayes St", block=400)
+    rows.notice(1, "shelter_in_place", hazard="hazmat")
+    # Crews got there after the notice and called it a fire: the later word is the
+    # radio's, and the notice does not outrank what it was written before.
+    rows.radio(2, "fire", "working", units=("E36",))
+
+    (incident,) = incidents(rows, 10)
+
+    assert incident.category == "fire"
+    assert incident.conflicts == ()
 
 
 def test_a_signal_carries_its_sources_its_confidence_and_what_its_source_requires(
