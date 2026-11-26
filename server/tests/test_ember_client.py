@@ -1145,6 +1145,44 @@ def test_an_error_that_is_not_the_clients_own_is_not_passed_on_from_a_sensitive_
         ask(ember)
 
 
+def test_a_sensitive_failure_has_nothing_under_it_when_the_caller_is_handling_an_error(
+    storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fails(body: dict[str, Any]) -> dict[str, Any]:
+        raise RuntimeError("the stand-in failed")
+
+    def breaks(*_arguments: Any, **_options: Any) -> None:
+        raise sqlite3.OperationalError("the ledger failed")
+
+    rejecting = MetaApi(create=lambda _request: _says_the_name(400)).client(storage)
+    answering = EmberClient.fake(storage, Script([fake_response()]))
+    cases: list[tuple[EmberClient, dict[str, Any], type[EmberError]]] = [
+        # The client's own errors: a refused request and a failed call.
+        (answering, {"effort": "none"}, EmberRequestError),
+        (rejecting, {}, EmberCallError),
+        # Errors that are not: a stand-in's, and one from under the client.
+        (EmberClient.fake(storage, fails), {}, EmberError),
+        (answering, {}, EmberError),
+    ]
+    for number, (ember, overrides, kind) in enumerate(cases):
+        if number == len(cases) - 1:
+            monkeypatch.setattr(Ledger, "record", breaks)
+        # The caller is recovering from an extraction that failed, and what it is
+        # handling holds what was said.
+        try:
+            raise ValueError(SAID)
+        except ValueError:
+            with pytest.raises(EmberError) as raised:
+                ask(ember, sensitive=True, input="Try again.", **overrides)
+
+        error = raised.value
+        assert type(error) is kind
+        assert (error.__cause__, error.__context__) == (None, None)
+        shown = "".join(traceback.format_exception(error)).lower()
+        assert "jane" not in shown
+        assert "heel" not in shown
+
+
 def test_a_sensitive_call_is_waited_out_after_a_rate_limit_like_any_other(
     storage: Storage,
 ) -> None:

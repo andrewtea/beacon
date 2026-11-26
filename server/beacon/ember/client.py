@@ -511,10 +511,17 @@ class EmberClient:
             return self._respond(sensitive=True, **request)
         except Exception as error:
             failure = error
-        # Raised outside the handler, so that nothing is chained under it. Whatever
-        # failed, the error under it can hold the request or the API's reply: an SDK
-        # error holds the API's message, and a decoder's holds the whole document.
-        raise _withheld_failure(failure)
+        # Nothing is chained under the error that is raised. Whatever failed, the
+        # error under it can hold the request or the API's reply: an SDK error holds
+        # the API's message, and a decoder's holds the whole document.
+        safe = _withheld_failure(failure)
+        try:
+            raise safe from None
+        finally:
+            # Leaving this handler is not enough. The caller may itself be handling
+            # an error when it calls, and Python puts that one under whatever is
+            # raised meanwhile: it is the caller's, and it is not this call's to show.
+            safe.__context__ = None
 
     def _respond(
         self,
