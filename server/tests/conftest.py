@@ -73,3 +73,14 @@ def offline_environment(
     monkeypatch.delenv("EMBER_STOP_USD", raising=False)
     monkeypatch.delenv("EMBER_SPENT_BEFORE_USD", raising=False)
     monkeypatch.setenv("BEACON_DATA_DIR", str(tmp_path_factory.mktemp("data")))
+    # No test asks a real source anything: the pollers run on the mock scenario
+    # unless a test names a live source itself, with a transport of its own.
+    for name in (
+        "BEACON_LIVE_SOURCES",
+        "BEACON_INGEST",
+        "BEACON_511_API_KEY",
+        "BEACON_OPENSKY_PERMITTED",
+        "OPENSKY_CLIENT_ID",
+        "OPENSKY_CLIENT_SECRET",
+    ):
+        monkeypatch.delenv(name, raising=False)
