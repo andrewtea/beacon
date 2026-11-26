@@ -8,6 +8,8 @@ export const PENDING_MS = 1_000
 export const OPEN_MS = 10_000
 export const OVER_MS = 60_000
 export const WATCHING_MS = 15_000
+// What is near a saved place is asked for again while its view is open.
+export const PLACES_MS = 30_000
 
 export const incidentCadence = (answer: IncidentAnswer): number =>
   answer.incident.open ? OPEN_MS : OVER_MS

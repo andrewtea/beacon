@@ -419,9 +419,11 @@ def post_slowly(
     receive: Any,
     headers: list[tuple[bytes, bytes]] | None = None,
     mode: bytes | None = b"mock",
+    path: str = "/api/taps",
 ) -> tuple[int, dict[str, Any]]:
     """What the app answers a tap whose body arrives as `receive` hands it over.
-    `mode` is the mode the tap says its sender was shown, or None to say none."""
+    `mode` is the mode the tap says its sender was shown, or None to say none.
+    `path` is the route, for another one that reads its body itself."""
     sent: list[dict[str, Any]] = []
     scope = {
         "type": "http",
@@ -429,8 +431,8 @@ def post_slowly(
         "http_version": "1.1",
         "method": "POST",
         "scheme": "http",
-        "path": "/api/taps",
-        "raw_path": b"/api/taps",
+        "path": path,
+        "raw_path": path.encode(),
         "query_string": b"",
         "root_path": "",
         "headers": [

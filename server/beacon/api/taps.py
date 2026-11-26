@@ -6,6 +6,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from beacon.api.body import read_body
 from beacon.api.incidents import CreditOut, IncidentSummary, cited_credit, summary_of
 from beacon.evidence import Evidence
 from beacon.incident import Engine, Snapshot
@@ -361,26 +362,13 @@ def _take(
 async def _body(request: Request) -> bytes:
     """The request's body. Answers 413 as soon as it is longer than a tap may be,
     and 408 when it has not arrived whole within `RECEIVE_SECONDS`."""
-    declared = request.headers.get("content-length", "").strip()
-    if declared.isascii() and declared.isdigit():
-        # Compared as text first: a header can be longer than a number may be.
-        digits = declared.lstrip("0")
-        if len(digits) > len(str(MAX_BODY_BYTES)) or int(digits or "0") > MAX_BODY_BYTES:
-            raise HTTPException(413, _TOO_LARGE)
-    body = bytearray()
-    late = False
-    try:
-        async with asyncio.timeout(RECEIVE_SECONDS):
-            async for piece in request.stream():
-                # Before it is copied, so no more is held than a tap may be.
-                if len(body) + len(piece) > MAX_BODY_BYTES:
-                    raise HTTPException(413, _TOO_LARGE)
-                body += piece
-    except TimeoutError:
-        late = True
-    if late:
-        raise HTTPException(408, _TOO_SLOW)
-    return bytes(body)
+    return await read_body(
+        request,
+        most=MAX_BODY_BYTES,
+        seconds=RECEIVE_SECONDS,
+        too_large=_TOO_LARGE,
+        too_slow=_TOO_SLOW,
+    )
 
 
 def _tap_row(request: Request, tap_id: str) -> tuple[Taps, Evidence, Snapshot]:
