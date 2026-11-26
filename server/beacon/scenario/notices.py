@@ -20,11 +20,13 @@ The host is under `.example`, which no one can register.
 import base64
 import functools
 import hashlib
-from collections.abc import Mapping
+import json
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
+from beacon.ember import fake_response
 from beacon.scenario.fire import INVENTED
 from beacon.scenario.pdf import text_pdf
 
@@ -93,8 +95,8 @@ NOTICES: tuple[MockNotice, ...] = (
                 "point is open at Civic Center Plaza."
             ),
             summary=(
-                "Everyone in the buildings on Hayes St between Gough St and Octavia St is "
-                "ordered to leave because of a spreading building fire."
+                f"{INVENTED} Everyone in the buildings on Hayes St between Gough St and "
+                "Octavia St is ordered to leave because of a spreading building fire."
             ),
         ),
     ),
@@ -128,7 +130,10 @@ NOTICES: tuple[MockNotice, ...] = (
                 "Residents may return, except to 400 through 450 Hayes St, which stay "
                 "closed until the Fire Department has inspected them."
             ),
-            summary="The evacuation order for Hayes St between Gough St and Octavia St is lifted.",
+            summary=(
+                f"{INVENTED} The evacuation order for Hayes St between Gough St and "
+                "Octavia St is lifted."
+            ),
         ),
     ),
     MockNotice(
@@ -158,6 +163,10 @@ NOTICES: tuple[MockNotice, ...] = (
         ),
     ),
 )
+
+
+# What the stand-in makes of a document that is not the story's.
+_NOT_A_NOTICE = _form("other", "none", issuer=None)
 
 
 def document_url(notice: MockNotice) -> str:
@@ -242,9 +251,20 @@ def stand_in_form(body: Mapping[str, Any], start: datetime | None = None) -> dic
             digest = hashlib.sha256(base64.b64decode(data.partition(",")[2])).hexdigest()
             notice = _read_by_digest().get(digest)
             if notice is None:
-                return _form("other", "none", issuer=None)
+                return dict(_NOT_A_NOTICE)
             return _filled(notice.read, start)
     return None
+
+
+def stand_in_reader(start: datetime) -> Callable[[Mapping[str, Any]], Mapping[str, Any]]:
+    """A responder for `EmberClient.fake` that answers `read_notice` for the
+    documents of a story that began at `start`, with `stand_in_form`."""
+
+    def respond(body: Mapping[str, Any]) -> Mapping[str, Any]:
+        form = stand_in_form(body, start)
+        return fake_response(text=json.dumps(form if form is not None else _NOT_A_NOTICE))
+
+    return respond
 
 
 def _filled(form: dict[str, Any], start: datetime | None) -> dict[str, Any]:

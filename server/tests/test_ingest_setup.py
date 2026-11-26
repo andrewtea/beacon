@@ -149,16 +149,21 @@ def test_with_no_live_source_the_pollers_play_the_whole_invented_fire(
     assert {row.confidence for row in by_address["beac02"]} == {"medium"}
 
     everything = store.search(limit=5000)
-    assert len(everything) == 4 + 4 + 98 + 19
-    # Everything is the invented scenario's, and the radio also a stand-in Ember's.
-    assert {(row.kind == "radio", row.origin, row.stand_in, row.model) for row in everything} == {
+    assert len(everything) == 4 + 4 + 98 + 19 + 3
+    # Everything is the invented scenario's, and what Ember would have heard or
+    # read is also a stand-in Ember's.
+    by_ember = ("radio", "notice")
+    assert {(row.kind in by_ember, row.origin, row.stand_in, row.model) for row in everything} == {
         (False, "mock", True, None),
         (True, "mock", True, "fake"),
     }
-    # Every text a person could read says it was made up. A radio row has no text.
+    # Every text a person could read says it was made up. A radio row has no text,
+    # and neither has the row of a press release.
     for row in everything:
         if row.kind == "aircraft":
             assert row.data["callsign"].startswith("MOCK")
+        elif row.kind == "notice":
+            assert row.data["summary"] is None or INVENTED in row.data["summary"]
         elif row.kind != "radio" and "change" not in row.data:
             assert INVENTED in (row.data.get("description") or row.data["headline"])
 
@@ -218,7 +223,8 @@ def test_the_radio_of_the_mock_scenario_tells_the_fire_through_a_stand_in_for_em
     # The stand-in spent nothing, and each call was "heard" once.
     with sqlite3.connect(tmp_path / "ember" / "ledger.sqlite3") as db:
         heard = db.execute(
-            "SELECT source, task, cost_nanousd, COUNT(*) FROM ember_calls GROUP BY 1, 2, 3"
+            "SELECT source, task, cost_nanousd, COUNT(*) FROM ember_calls "
+            "WHERE task = 'extract_transmission' GROUP BY 1, 2, 3"
         ).fetchall()
     assert heard == [("fake", "extract_transmission", 0, 19)]
     # No audio is kept: the store, the ledger, and nothing else.
@@ -243,14 +249,20 @@ def test_a_mock_store_first_opened_shows_a_fire_already_under_way(
         "511.org/mock-1002@" + story(20).isoformat(),
     ]
     # The helicopter has been there since minute 5, seen every thirty seconds.
-    assert ingest.store.count_by_source() == {"nws": 2, "511": 3, "opensky": 31, "openmhz": 10}
+    assert ingest.store.count_by_source() == {
+        "nws": 2,
+        "511": 3,
+        "opensky": 31,
+        "openmhz": 10,
+        "notices": 1,
+    }
     assert ingest.store.state("scenario") == {
         "start": START.isoformat(),
         "played_to": NOON.isoformat(),
         # How each poller's last poll went, for a process that goes on from here.
         "polls": {
             name: {"polled_at": NOON.isoformat(), "ok": True, "partial": False}
-            for name in ("nws", "opensky", "511", "openmhz")
+            for name in ("nws", "opensky", "511", "openmhz", "notices")
         },
     }
     # The clock is let go when the story has been played up to now.
@@ -405,6 +417,7 @@ def test_a_restart_after_the_story_has_ended_still_says_how_the_last_polls_went(
         PollerStatus("opensky", story(105), True),
         PollerStatus("511", story(104), True),
         PollerStatus("openmhz", story(105), True),
+        PollerStatus("notices", story(104), True),
     ]
 
 
@@ -477,7 +490,13 @@ def test_a_setting_that_names_no_source_is_mock_mode_through_and_through(
     assert ingest.scenario is not None
     assert (ingest.store.mode, ingest.store.path.name) == ("mock", "mock.sqlite3")
     assert open_store(env).path == ingest.store.path
-    assert ingest.store.count_by_source() == {"nws": 2, "511": 3, "opensky": 31, "openmhz": 10}
+    assert ingest.store.count_by_source() == {
+        "nws": 2,
+        "511": 3,
+        "opensky": 31,
+        "openmhz": 10,
+        "notices": 1,
+    }
 
 
 def test_a_name_that_is_not_a_source_is_refused(env: dict[str, str]) -> None:
@@ -803,12 +822,12 @@ def test_a_list_of_names_that_cannot_be_read_is_refused(
     assert not (Path(env["BEACON_DATA_DIR"]) / "evidence").exists()
 
 
-def test_the_mock_scenarios_radio_is_closed_and_waited_for_with_the_pollers(
+def test_the_mock_scenarios_paying_pollers_are_closed_and_waited_for_with_the_pollers(
     env: dict[str, str], time: Time
 ) -> None:
     ingest = build(env, Clock(time))
 
-    assert [work.name for work in ingest.paid] == ["openmhz"]
+    assert [work.name for work in ingest.paid] == ["openmhz", "notices"]
 
 
 def test_what_a_stand_in_answered_cannot_be_stored_as_a_real_sources(
@@ -1178,5 +1197,179 @@ def test_the_mock_and_live_stores_are_kept_apart_in_one_data_directory(
 
     assert (live.mode, live.path.name) == ("live", "live.sqlite3")
     assert live.count_by_source() == {}
-    assert open_store(env).count_by_source() == {"nws": 2, "511": 3, "opensky": 31, "openmhz": 10}
+    assert open_store(env).count_by_source() == {
+        "nws": 2,
+        "511": 3,
+        "opensky": 31,
+        "openmhz": 10,
+        "notices": 1,
+    }
     assert (open_store(env).mode, open_store(env).path.name) == ("mock", "mock.sqlite3")
+
+
+def test_the_notices_of_the_mock_scenario_tell_the_fire_through_a_stand_in_for_ember(
+    env: dict[str, str], time: Time, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    ingest = build(env, Clock(time))
+    time.moment = NOON + timedelta(minutes=100)
+    with caplog.at_level(logging.WARNING):
+        ingest.catch_up()
+
+    order, lifted, release = ingest.store.search(kinds=["notice"])
+    host = "https://notices.sf-mock.example"
+    # Each is stored by the poll after the feed lists it, at the time it was published.
+    assert [(row.occurred_at, row.url) for row in (order, lifted, release)] == [
+        (story(19), f"{host}/documents/evacuation-order-hayes-st.pdf"),
+        (story(74), f"{host}/documents/all-clear-hayes-st.pdf"),
+        (story(88), f"{host}/documents/press-release-hayes-st-fire.pdf"),
+    ]
+    assert {(row.source, row.origin, row.model, row.confidence) for row in (order, lifted)} == {
+        ("notices", "mock", "fake", "official")
+    }
+    assert (order.data["notice_type"], lifted.data["notice_type"]) == (
+        "evacuation_order",
+        "all_clear",
+    )
+    assert order.data["issued_at"] == story(19).isoformat()
+    assert order.data["streets"] == ["Hayes St", "Gough St", "Octavia St", "Franklin St"]
+    assert order.data["instruction"].startswith("Leave now, on foot, toward Franklin St.")
+    assert order.data["page"] == f"{host}/notices/evacuation-order-hayes-st"
+    # An order's own words name addresses, and are kept as its words.
+    assert lifted.data["areas"][1] == "400 through 450 Hayes St stay closed"
+    # The stand-in filled the press release's form in with a person and a house
+    # number. The row has what it is, who issued it, when, and a street.
+    assert release.data == {
+        "notice_type": "press_release",
+        "hazard": "fire",
+        "issuer": "San Francisco Fire Department",
+        "title": None,
+        "issued_at": story(88).isoformat(),
+        "effective_until": None,
+        "areas": [],
+        "streets": ["Hayes St"],
+        "instruction": None,
+        "summary": None,
+        "page": f"{host}/notices/press-release-hayes-st-fire",
+        "published": story(88).isoformat(),
+    }
+    # The document on a host nobody named was not fetched, and was said once.
+    assert caplog.text.count("notices sent 1 items Beacon could not read.") == 1
+
+    # The stand-in spent nothing, and each document was "read" once.
+    with sqlite3.connect(tmp_path / "ember" / "ledger.sqlite3") as db:
+        read = db.execute(
+            "SELECT source, task, cost_nanousd, COUNT(*) FROM ember_calls "
+            "WHERE task = 'read_notice' GROUP BY 1, 2, 3"
+        ).fetchall()
+    assert read == [("fake", "read_notice", 0, 3)]
+
+    # No document is kept, nor what the row of a press release leaves out. The
+    # ledger and the trace, which are published, hold no word of any notice.
+    def on_disk(directory: Path) -> bytes:
+        return b"".join(path.read_bytes() for path in directory.rglob("*") if path.is_file())
+
+    for word in (b"%PDF", b"Jane", b"432 Hayes"):
+        assert word not in on_disk(tmp_path)
+    assert b"reception point" in on_disk(tmp_path / "evidence")
+    for word in (b"reception point", b"Evacuation", b"Hayes"):
+        assert word not in on_disk(tmp_path / "ember")
+
+
+def test_the_mock_scenario_serves_its_notices_as_a_feed_and_documents(time: Time) -> None:
+    scenario = Scenario(start=START)
+    feed_url = "https://notices.sf-mock.example/feed.json"
+
+    with SourceHttp(scenario_transport(scenario, time)) as http:
+        feed = json.loads(fetch(http, "GET", feed_url, source="notices", max_bytes=100_000))
+        # At the story's twentieth minute the order is out, and nothing after it.
+        listed = [item["url"].rsplit("/", 1)[-1] for item in feed["items"]]
+        assert listed == ["evacuation-order-hayes-st", "elsewhere", "street-cleaning"]
+        (attachment,) = feed["items"][0]["attachments"]
+        document = fetch(http, "GET", attachment["url"], source="notices", max_bytes=100_000)
+        with pytest.raises(SourceError, match=r"^notices answered HTTP 404\.$"):
+            fetch(
+                http,
+                "GET",
+                "https://notices.sf-mock.example/documents/no-such.pdf",
+                source="notices",
+                max_bytes=100_000,
+            )
+
+    # A one-page PDF that says what it is: made up.
+    assert document.startswith(b"%PDF-1.4\n")
+    assert document.rstrip().endswith(b"%%EOF")
+    assert b"(EVACUATION ORDER) Tj" in document
+    assert f"({INVENTED}) Tj".encode() in document
+    assert INVENTED in feed["title"]
+
+
+NOTICES = {
+    "BEACON_LIVE_SOURCES": "notices",
+    "BEACON_NOTICES_FEED_URL": "https://notices.example.org/feed.json",
+    "BEACON_NOTICES_BUDGET_USD": "0.50",
+    "REPLAY": "0",
+    "MODEL_API_KEY": "key-from-the-env",
+}
+
+
+@pytest.mark.parametrize(
+    ("settings", "message"),
+    [
+        (NOTICES | {"BEACON_NOTICES_FEED_URL": ""}, "needs BEACON_NOTICES_FEED_URL"),
+        (
+            NOTICES | {"BEACON_NOTICES_FEED_URL": "http://notices.example.org/feed.json"},
+            "the https address of a JSON Feed",
+        ),
+        (
+            NOTICES | {"BEACON_NOTICES_HOSTS": "https://files.example.org/notices"},
+            "BEACON_NOTICES_HOSTS is a list of host names",
+        ),
+        # Every document is paid for, so the most it may cost has no default.
+        (NOTICES | {"BEACON_NOTICES_BUDGET_USD": ""}, "needs BEACON_NOTICES_BUDGET_USD"),
+        (NOTICES | {"BEACON_NOTICES_BUDGET_USD": "250"}, "needs BEACON_NOTICES_BUDGET_USD"),
+        # A reading cannot be replayed, so a client that only replays cannot make one.
+        (NOTICES | {"REPLAY": "1"}, "read by a live Ember and cannot be replayed"),
+    ],
+)
+def test_notices_are_not_read_for_real_without_a_feed_a_budget_and_a_live_ember(
+    env: dict[str, str], monkeypatch: pytest.MonkeyPatch, settings: dict[str, str], message: str
+) -> None:
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+
+    with pytest.raises(IngestConfigError, match=message) as refused:
+        build(env | settings)
+
+    assert "key-from-the-env" not in str(refused.value)
+    assert (refused.value.__cause__, refused.value.__context__) == (None, None)
+    assert not (Path(env["BEACON_DATA_DIR"]) / "evidence").exists()
+
+
+def test_naming_notices_builds_their_poller_with_a_live_ember_under_a_budget_of_its_own(
+    env: dict[str, str], time: Time, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+    scopes: list[SpendScope | None] = []
+    from_env = EmberClient.from_env
+
+    def remember(*args: Any, scope: SpendScope | None = None, **options: Any) -> EmberClient:
+        scopes.append(scope)
+        return from_env(*args, scope=scope, **options)
+
+    monkeypatch.setattr(EmberClient, "from_env", remember)
+    settings = RADIO | NOTICES | {"BEACON_LIVE_SOURCES": "notices,openmhz"}
+    settings |= {"BEACON_NOTICES_HOSTS": "Files.Example.org"}
+
+    ingest = build(env | settings, Clock(time))
+
+    assert (ingest.store.mode, ingest.http.origin, ingest.scenario) == ("live", "live", None)
+    assert [status.name for status in ingest.runner.status()] == ["openmhz", "notices"]
+    # Each paying poller has a client of its own, under a budget of its own, and
+    # both are told when Beacon stops.
+    assert scopes == [
+        SpendScope("ingest:openmhz", 250_000_000),
+        SpendScope("ingest:notices", 500_000_000),
+    ]
+    radio, notices = ingest.paid
+    assert notices._hosts == {"notices.example.org", "files.example.org"}
+    assert radio._ember is not notices._ember
+    ingest.close()

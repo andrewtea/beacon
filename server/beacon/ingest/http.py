@@ -86,7 +86,9 @@ logging.getLogger("httpcore2").setLevel(logging.WARNING)
 
 class SourceError(Exception):
     """A source could not be read. `status` is the HTTP status when it answered with
-    an error, and `retry_after` the seconds it asked the caller to wait, when it did."""
+    an error, and `retry_after` the seconds it asked the caller to wait, when it did.
+    `too_large` says that it answered, with more than the caller reads from it: the
+    one failure that asking again does not mend."""
 
     def __init__(
         self,
@@ -95,11 +97,13 @@ class SourceError(Exception):
         *,
         status: int | None = None,
         retry_after: float | None = None,
+        too_large: bool = False,
     ) -> None:
         super().__init__(f"{source} {problem}.")
         self.source = source
         self.status = status
         self.retry_after = retry_after
+        self.too_large = too_large
 
 
 _PACKED_ANOTHER_WAY = "packed its reply in a way Beacon does not read"
@@ -318,7 +322,9 @@ class SourceHttp:
                     room = max_bytes + 1 - len(body)
                     body += chunk if unpack is None else unpack.feed(chunk, room)
                     if len(body) > max_bytes:
-                        return SourceError(source, "sent more than Beacon reads from it")
+                        return SourceError(
+                            source, "sent more than Beacon reads from it", too_large=True
+                        )
                 if unpack is not None and not unpack.complete:
                     # Cut short, or not gzip to its end: part of a reply is no reply.
                     return SourceError(source, _PACKED_ANOTHER_WAY)

@@ -22,9 +22,15 @@ A source needs no code change to go live, only its name in that list and what it
               BEACON_RADIO_UNITS_FILE name the lists of streets and units a row
               may name, and without one a row names none. BEACON_OPENMHZ_EMS_TALKGROUPS
               and BEACON_OPENMHZ_MEDIA_HOSTS are optional.
+    notices   BEACON_NOTICES_FEED_URL, the https address of a JSON Feed that lists
+              an authority's notices as PDF attachments; BEACON_NOTICES_BUDGET_USD,
+              the most reading them may cost; and a live Ember (REPLAY=0,
+              MODEL_API_KEY, EMBER_SPENT_BEFORE_USD). BEACON_NOTICES_HOSTS names
+              hosts a document may be on besides the feed's own.
 
-Radio is the one source that costs money: every call is heard by Ember. In mock mode
-the calls are tones and a stand-in for Ember "hears" them, which costs nothing.
+Radio and notices are the sources that cost money: every call is heard by Ember, and
+every document read by it. In mock mode the calls are tones and the documents are
+invented, and a stand-in for Ember "hears" and "reads" them, which costs nothing.
 
 The mock scenario is played on a clock of its own. Its story begins twenty minutes
 before a mock store is first opened and runs in real time from there, in steps of ten
@@ -47,6 +53,7 @@ from beacon.ember.client import REQUEST_TIMEOUT_SECONDS, default_data_dir
 from beacon.ember.pricing import parse_usd
 from beacon.evidence import EvidenceStore, Mode
 from beacon.ingest.http import SourceHttp
+from beacon.ingest.notices import NoticeFeed
 from beacon.ingest.nws import NwsAlerts
 from beacon.ingest.openmhz import PAGE_SIZE as OPENMHZ_PAGE_SIZE
 from beacon.ingest.openmhz import OpenMhzRadio
@@ -56,10 +63,11 @@ from beacon.ingest.traffic511 import Traffic511
 from beacon.radio import Ffmpeg, Known, core_dump_problem, forbid_core_dumps
 from beacon.radio.vocabulary import read_names
 from beacon.scenario import DURATION, Scenario, scenario_transport, stand_in_ember
+from beacon.scenario import notices as scenario_notices
 from beacon.scenario import radio as scenario_radio
 
 # The sources that can be named in BEACON_LIVE_SOURCES.
-SOURCES = ("nws", "opensky", "511", "openmhz")
+SOURCES = ("nws", "opensky", "511", "openmhz", "notices")
 
 LIVE_SOURCES_VARIABLE = "BEACON_LIVE_SOURCES"
 KEY_511_VARIABLE = "BEACON_511_API_KEY"
@@ -73,9 +81,14 @@ OPENMHZ_MEDIA_HOSTS_VARIABLE = "BEACON_OPENMHZ_MEDIA_HOSTS"
 OPENMHZ_BUDGET_VARIABLE = "BEACON_OPENMHZ_BUDGET_USD"
 RADIO_STREETS_VARIABLE = "BEACON_RADIO_STREETS_FILE"
 RADIO_UNITS_VARIABLE = "BEACON_RADIO_UNITS_FILE"
+NOTICES_FEED_VARIABLE = "BEACON_NOTICES_FEED_URL"
+NOTICES_HOSTS_VARIABLE = "BEACON_NOTICES_HOSTS"
+NOTICES_BUDGET_VARIABLE = "BEACON_NOTICES_BUDGET_USD"
 
-# The label of the spending scope every live radio call is made under.
+# The label of the spending scope every live radio call is made under, and the one
+# every live reading of a notice is made under.
 RADIO_SCOPE = "ingest:openmhz"
+NOTICES_SCOPE = "ingest:notices"
 
 # A mock store that is begun starts its story this long ago, so the first thing a
 # developer sees is a fire in progress and not an empty city.
@@ -299,7 +312,8 @@ def build(env: Mapping[str, str], clock: Clock | None = None) -> Ingest:
     http = SourceHttp(scenario_transport(scenario, clock.now))
     # Stands in for Ember: it spends nothing, and what it "hears" in the story's
     # tones is the story's own. Its rows say `model == "fake"`.
-    ember = EmberClient.fake(Storage.under(default_data_dir(env)), stand_in_ember)
+    storage = Storage.under(default_data_dir(env))
+    ember = EmberClient.fake(storage, stand_in_ember)
     radio = OpenMhzRadio(
         http,
         ember,
@@ -310,15 +324,23 @@ def build(env: Mapping[str, str], clock: Clock | None = None) -> Ingest:
         # The story's own streets and units, where real radio has the city's.
         known=scenario_radio.KNOWN,
     )
+    # A client of its own, as each paying poller has, which "reads" the story's
+    # documents as the other "hears" its tones.
+    notices = NoticeFeed(
+        http,
+        EmberClient.fake(storage, scenario_notices.stand_in_reader(scenario.start)),
+        feed_url=scenario_notices.FEED_URL,
+    )
     pollers = [
         NwsAlerts(http),
         OpenSkyAircraft(http, interval_seconds=SIGNED_IN_INTERVAL_SECONDS),
         Traffic511(http, api_key="mock"),
         radio,
+        notices,
     ]
     last = _saved_polls(store.state(_SCENARIO_STATE).get("polls"))
     runner = Runner(pollers, store, clock, last=last)
-    return Ingest(store, runner, clock, http, scenario, [radio])
+    return Ingest(store, runner, clock, http, scenario, [radio, notices])
 
 
 def source_pollers(
@@ -360,6 +382,8 @@ def source_pollers(
         pollers.append(Traffic511(http, api_key=token))
     if "openmhz" in sources:
         pollers.append(_radio_poller(env, http))
+    if "notices" in sources:
+        pollers.append(_notice_poller(env, http))
     return pollers
 
 
@@ -388,13 +412,8 @@ def _radio_poller(env: Mapping[str, str], http: SourceHttp) -> OpenMhzRadio:
             f"{OPENMHZ_EMS_TALKGROUPS_VARIABLE} names a talkgroup that "
             f"{OPENMHZ_TALKGROUPS_VARIABLE} does not."
         )
-    hosts = [host.strip().lower() for host in env.get(OPENMHZ_MEDIA_HOSTS_VARIABLE, "").split(",")]
-    hosts = [host for host in hosts if host]
-    if not all(_HOST.fullmatch(host) for host in hosts):
-        raise IngestConfigError(
-            f"{OPENMHZ_MEDIA_HOSTS_VARIABLE} is a list of host names, such as media.example.org."
-        )
-    scope = _radio_scope(env)
+    hosts = _hosts(env, OPENMHZ_MEDIA_HOSTS_VARIABLE)
+    scope = _scope(env, RADIO_SCOPE, OPENMHZ_BUDGET_VARIABLE)
     if scope is None:
         raise IngestConfigError(
             f"{names}, which needs {OPENMHZ_BUDGET_VARIABLE}: the most, in dollars, that "
@@ -462,11 +481,53 @@ def _known(env: Mapping[str, str]) -> Known:
     return known
 
 
-def _radio_scope(env: Mapping[str, str]) -> SpendScope | None:
-    """The spending scope live radio calls are made under, with the budget the
-    environment sets for it, or None when that is not a dollar amount a scope takes."""
+def _notice_poller(env: Mapping[str, str], http: SourceHttp) -> NoticeFeed:
+    """The poller for a real feed of notices, read by a live Ember under a budget
+    of its own.
+
+    Raises IngestConfigError when the feed, the budget, or a live Ember is missing."""
+    names = f"{LIVE_SOURCES_VARIABLE} names notices"
+    feed_url = env.get(NOTICES_FEED_VARIABLE, "").strip()
+    hosts = _hosts(env, NOTICES_HOSTS_VARIABLE)
+    scope = _scope(env, NOTICES_SCOPE, NOTICES_BUDGET_VARIABLE)
+    if scope is None:
+        raise IngestConfigError(
+            f"{names}, which needs {NOTICES_BUDGET_VARIABLE}: the most, in dollars, that "
+            "reading notices may cost over every run. It has no default, because every "
+            "document is paid for."
+        )
+    ember = EmberClient.from_env(env, scope=scope)
+    if ember.mode != "live":
+        raise IngestConfigError(
+            f"{names}, and a notice is read by a live Ember and cannot be replayed: "
+            "set REPLAY=0, MODEL_API_KEY, and EMBER_SPENT_BEFORE_USD."
+        )
     try:
-        return SpendScope(RADIO_SCOPE, parse_usd(env.get(OPENMHZ_BUDGET_VARIABLE, "")))
+        return NoticeFeed(http, ember, feed_url=feed_url, document_hosts=hosts)
+    except ValueError:
+        # Not the error itself, which would be chained to a setting.
+        pass
+    raise IngestConfigError(
+        f"{names}, which needs {NOTICES_FEED_VARIABLE}: the https address of a JSON Feed "
+        "(jsonfeed.org) that lists an authority's notices as PDF attachments."
+    )
+
+
+def _hosts(env: Mapping[str, str], variable: str) -> list[str]:
+    """The host names a setting lists. Raises IngestConfigError for what is not one."""
+    hosts = [host.strip().lower() for host in env.get(variable, "").split(",")]
+    hosts = [host for host in hosts if host]
+    if not all(_HOST.fullmatch(host) for host in hosts):
+        raise IngestConfigError(f"{variable} is a list of host names, such as media.example.org.")
+    return hosts
+
+
+def _scope(env: Mapping[str, str], label: str, variable: str) -> SpendScope | None:
+    """The spending scope a paying poller's calls are made under, with the budget
+    the environment sets for it, or None when that is not a dollar amount a scope
+    takes."""
+    try:
+        return SpendScope(label, parse_usd(env.get(variable, "")))
     except ValueError:
         return None
 
