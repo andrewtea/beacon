@@ -101,7 +101,7 @@ Each source has a poller in [`server/beacon/ingest/`](server/beacon/ingest) that
 
 Rows are never changed. A source that revises what it said gets a new row: an NWS update is a new message, and each version of a 511 event is stored under the event's id and its update time.
 
-**NWS and 511 do not announce that something ended; it goes missing from their next answer.** When an item has been missing from two answers in a row that were read in full, and for an alert before the time it said it would end, the poller stores a row whose `data` says `"change": "not_listed"` and names the row it is about. That row is what Beacon saw, not an all-clear from an authority, so its confidence is `medium` and not `official`. When the same item is listed again, as night road work is every night, a `"change": "listed_again"` row says so.
+**An item that goes missing from a source's answers has not been officially ended.** NWS and 511 answer with what is active now, and mostly an alert or closure that is over is simply absent from the next answer. NWS can also cancel an alert outright, with a `Cancel` message: that is a row like any other, and it is the authority speaking, so it stays `official`. Absence is different. When an item has been missing from two answers in a row that were read in full, and for an alert before the time it said it would end, the poller stores a row whose `data` says `"change": "not_listed"` and names the row it is about. That row is what Beacon saw, not an all-clear from an authority, so its confidence is `medium` and not `official`. When the same item is listed again, as night road work is every night, a `"change": "listed_again"` row says so.
 
 | Source | What is asked | Kept | Terms |
 | --- | --- | --- | --- |
@@ -111,7 +111,7 @@ Rows are never changed. A source that revises what it said gets a new row: an NW
 
 ### Mock and live
 
-**With `BEACON_LIVE_SOURCES` unset, which is the default, no real source is asked anything.** The pollers are the real ones, and where the network would be stands the mock scenario in [`server/beacon/scenario/`](server/beacon/scenario): an invented three-alarm fire on the 400 block of Hayes St, told as what NWS, OpenSky, and 511 would have answered minute by minute. A helicopter circles, 511 closes Hayes St and widens the closure, a shelter-in-place warning is issued, narrowed, and dropped, and the closure stops being listed. Nothing in it happened; its texts say "Invented for Beacon's mock scenario", and its rows have the origin `mock`. The story begins twenty minutes before a mock store is first opened and is played in real time for 105 minutes, after which nothing more is stored. A restart goes on from where the story had been played to. To play it again, delete `data/evidence/mock.sqlite3`.
+**With `BEACON_LIVE_SOURCES` unset, which is the default, no real source is asked anything.** The pollers are the real ones, and where the network would be stands the mock scenario in [`server/beacon/scenario/`](server/beacon/scenario): an invented three-alarm fire on the 400 block of Hayes St, told as what NWS, OpenSky, and 511 would have answered minute by minute. A helicopter circles, 511 closes Hayes St and widens the closure, a shelter-in-place warning is issued, narrowed, and dropped, and the closure stops being listed. Nothing in it happened; its texts say "Invented for Beacon's mock scenario", and its rows have the origin `mock`. The story begins twenty minutes before a mock store is first opened and is played in real time for 105 minutes, after which nothing more is stored. A restart goes on from where the story had been played to, and a step in which a poller failed is played again ten seconds later, not passed over. To play it again, delete `data/evidence/mock.sqlite3`.
 
 There are two store files, `data/evidence/mock.sqlite3` and `data/evidence/live.sqlite3`, and **the live store refuses any row a stand-in had a part in**: one from the mock scenario, or one a fake Ember wrote. So a source that is not named in `BEACON_LIVE_SOURCES` does not run beside the live ones; it is off. Anything read from the mock store is a stand-in's, and has to be labeled as one wherever it is shown.
 
@@ -131,6 +131,10 @@ cd server
 uv run python -m beacon.ingest            # poll once, print what the store holds
 uv run python -m beacon.ingest --follow   # keep polling
 ```
+
+A request to a source is given 60 seconds from the lookup of its name to the last byte of its reply, however slowly the source sends, and a reply that is cut short is refused whole. A source that asks for a wait (`Retry-After`) gets it, counted from when it answered, up to a week. When the server shuts down, a request that is out is cancelled and a write that is waiting gives up, so nothing is asked or stored after shutdown; a poll is stored whole or not at all, and is made again at the next start.
+
+The store files are SQLite in write-ahead mode, so each has a `-wal` and a `-shm` file beside it while it is in use. Copy all three, or none.
 
 A poller's failure is logged as one fixed sentence, such as `511 answered HTTP 401.`, and never with the address that was asked, which for 511 holds the token, or with anything the source replied. The HTTP libraries' own request and header logs are switched off for the same reason, at every level.
 

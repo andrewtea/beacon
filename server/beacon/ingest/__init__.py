@@ -9,7 +9,7 @@ See `setup` for how a source goes live, `runner` for the loop, and a source's ow
 module (`nws`, `opensky`, `traffic511`) for what its rows hold.
 """
 
-from beacon.ingest.http import SourceError
+from beacon.ingest.http import SourceError, SourceHttp
 from beacon.ingest.runner import Clock, Poller, PollerStatus, PollReport, Runner
 from beacon.ingest.setup import (
     SOURCES,
@@ -31,6 +31,7 @@ __all__ = [
     "PollerStatus",
     "Runner",
     "SourceError",
+    "SourceHttp",
     "build",
     "live_sources",
     "open_store",

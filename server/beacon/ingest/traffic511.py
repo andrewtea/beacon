@@ -18,6 +18,14 @@ time. 511 does not say when an event is over: when one stops being listed, a row
 records that Beacon no longer sees it listed, and another if it is listed again, as
 night work is every night (`beacon.ingest.listing`).
 
+An answer comes in pages, and an event counts as no longer listed only when every
+page was read and each said plainly where it stood: its `pagination` object repeats
+the offset that was asked for, and either names a next page or does not. A page that
+says anything else is read for its events, and the list is not taken as whole. That
+shape is the specification's and Open511's. No real answer has been read yet, there
+being no token, so if 511 sends something else the events are still stored and only
+"no longer listed" waits on a look at a real answer.
+
 The token goes in the query string, which is where 511 reads it, so the address of a
 request is never logged or put in an error (`beacon.ingest.http`).
 """
@@ -25,13 +33,12 @@ request is never logged or put in an error (`beacon.ingest.http`).
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
-import httpx2
-
+from beacon.errors import raise_bare
 from beacon.evidence import Evidence, EvidenceStore, NewEvidence, Origin
 from beacon.ingest.area import SAN_FRANCISCO, Bounds, centre
-from beacon.ingest.http import SourceError, fetch, read_json
+from beacon.ingest.http import SourceError, SourceHttp, fetch, read_json
 from beacon.ingest.listing import compare_listing, listed_again_row, not_listed_row
 from beacon.ingest.runner import PollReport
 
@@ -67,17 +74,17 @@ class Traffic511:
 
     def __init__(
         self,
-        http: httpx2.Client,
+        http: SourceHttp,
         *,
         api_key: str,
-        origin: Origin,
         bounds: Bounds = SAN_FRANCISCO,
     ) -> None:
         if not api_key:
             raise ValueError("511 needs an API token.")
         self._http = http
         self._api_key = api_key
-        self._origin: Origin = origin
+        # What a stand-in for the network answered is a stand-in's, whoever asks.
+        self._origin: Origin = http.origin
         self._bounds = bounds
         # How long to wait before the next poll. It is set after each poll from the
         # number of requests the poll made, so the quota is kept by requests.
@@ -107,15 +114,18 @@ class Traffic511:
                         "offset": str(offset),
                     },
                 )
-                page = parse_events(read_json(body, SOURCE), self._origin, self._bounds)
+                page = parse_events(
+                    read_json(body, SOURCE), self._origin, self._bounds, offset=offset
+                )
                 events += page.events
                 unreadable += page.unreadable
-                if not page.more:
+                if page.following == "none":
                     complete = True
                     break
-                if page.count == 0:
-                    # A page that holds nothing and says another follows: the answer
-                    # contradicts itself, and is not taken as the whole list.
+                if page.following == "unclear" or page.count == 0:
+                    # The page does not say where it stands, or holds nothing and
+                    # says another follows. Its events are kept, and the answer is
+                    # not taken as the whole list.
                     break
                 offset += page.count
         finally:
@@ -143,21 +153,24 @@ class Page:
     unreadable: int
     # How many events the page held, read or not, which is how far to move on.
     count: int
-    # Whether the answer says another page follows.
-    more: bool
+    # Whether the answer says another page follows, says none does, or does not say
+    # either in a way Beacon can rely on.
+    following: Literal["more", "none", "unclear"]
 
 
-def parse_events(payload: Any, origin: Origin, bounds: Bounds = SAN_FRANCISCO) -> Page:
+def parse_events(
+    payload: Any, origin: Origin, bounds: Bounds = SAN_FRANCISCO, *, offset: int = 0
+) -> Page:
     """The active events of an answer that lie inside `bounds`, how many events
-    could not be read, and whether the answer says another page follows. An event
-    outside the bounds, or an archived one, is left out and not counted. An event
-    with no status, or one the specification does not have, is counted as
-    unreadable: it may be an active event.
+    could not be read, and what the answer says follows it. An event outside the
+    bounds, or an archived one, is left out and not counted. An event with no
+    status, or one the specification does not have, is counted as unreadable: it
+    may be an active event. `offset` is the offset the page was asked for.
 
     Raises SourceError when the answer is not an events object."""
     listed = payload.get("events") if isinstance(payload, dict) else None
     if not isinstance(listed, list):
-        raise SourceError(SOURCE, "sent a reply Beacon cannot read")
+        raise_bare(SourceError(SOURCE, "sent a reply Beacon cannot read"))
     events: list[NewEvidence] = []
     unreadable = 0
     for item in listed:
@@ -170,9 +183,26 @@ def parse_events(payload: Any, origin: Origin, bounds: Bounds = SAN_FRANCISCO) -
             unreadable += 1
         elif bounds.holds(event.point):
             events.append(event)
-    pagination = payload.get("pagination")
-    next_url = pagination.get("next_url") if isinstance(pagination, dict) else None
-    return Page(events, unreadable, len(listed), isinstance(next_url, str) and bool(next_url))
+    return Page(events, unreadable, len(listed), _following(payload.get("pagination"), offset))
+
+
+def _following(pagination: Any, offset: int) -> Literal["more", "none", "unclear"]:
+    """What a page's `pagination` object says comes after it. It is relied on only
+    when it is an object that repeats the offset that was asked for, and whose
+    `next_url` is an address or is absent. The address itself is never asked:
+    Beacon moves on by its own count."""
+    if not isinstance(pagination, dict):
+        return "unclear"
+    at = pagination.get("offset")
+    # An offset written as text is read as the number it is.
+    if isinstance(at, str) and at.isascii() and at.isdigit():
+        at = int(at)
+    if isinstance(at, bool) or not isinstance(at, int) or at != offset:
+        return "unclear"
+    next_url = pagination.get("next_url")
+    if next_url is None:
+        return "none"
+    return "more" if isinstance(next_url, str) and next_url.strip() else "unclear"
 
 
 def _event(item: dict[str, Any], origin: Origin) -> NewEvidence | None:

@@ -23,11 +23,10 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
-import httpx2
-
+from beacon.errors import raise_bare
 from beacon.evidence import EvidenceStore, NewEvidence, Origin, Point
 from beacon.ingest.area import SAN_FRANCISCO, Bounds
-from beacon.ingest.http import SourceError, fetch, read_json
+from beacon.ingest.http import SourceError, SourceHttp, fetch, read_json
 from beacon.ingest.runner import PollReport
 
 SOURCE = "opensky"
@@ -70,9 +69,8 @@ class OpenSkyAircraft:
 
     def __init__(
         self,
-        http: httpx2.Client,
+        http: SourceHttp,
         *,
-        origin: Origin,
         client_id: str | None = None,
         client_secret: str | None = None,
         bounds: Bounds = SAN_FRANCISCO,
@@ -82,7 +80,8 @@ class OpenSkyAircraft:
         if (client_id is None) != (client_secret is None):
             raise ValueError("An OpenSky client id and secret are given together.")
         self._http = http
-        self._origin: Origin = origin
+        # What a stand-in for the network answered is a stand-in's, whoever asks.
+        self._origin: Origin = http.origin
         self._credentials = None if client_id is None else (client_id, client_secret)
         self._bounds = bounds
         self._monotonic = monotonic
@@ -149,7 +148,7 @@ class OpenSkyAircraft:
             )
             token = reply.get("access_token") if isinstance(reply, dict) else None
             if not isinstance(token, str) or not token:
-                raise SourceError(SOURCE, "sent no access token")
+                raise_bare(SourceError(SOURCE, "sent no access token"))
             lifetime = reply.get("expires_in")
             # OpenSky's tokens last 30 minutes.
             seconds = float(lifetime) if _is_number(lifetime) and lifetime > 0 else 1800.0
@@ -163,12 +162,17 @@ def parse_states(payload: Any, origin: Origin) -> tuple[list[NewEvidence], int]:
     `MAX_ALTITUDE_M`, and how many state vectors could not be read. `states` is null
     when the box is empty.
 
-    Raises SourceError when the answer is not a states object."""
-    if not isinstance(payload, dict) or not isinstance(payload.get("states"), list | None):
-        raise SourceError(SOURCE, "sent a reply Beacon cannot read")
+    Raises SourceError when the answer is not a states object. One with no `states`
+    at all is not an empty sky: an error can arrive as an object too."""
+    if (
+        not isinstance(payload, dict)
+        or "states" not in payload
+        or not isinstance(payload["states"], list | None)
+    ):
+        raise_bare(SourceError(SOURCE, "sent a reply Beacon cannot read"))
     aircraft: list[NewEvidence] = []
     unreadable = 0
-    for state in payload.get("states") or []:
+    for state in payload["states"] or []:
         # The fields are positional. `category` is the eighteenth, sent with `extended`.
         if not isinstance(state, list) or len(state) < 17:
             unreadable += 1

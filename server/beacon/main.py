@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import os
-import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -18,8 +17,6 @@ from beacon.ingest import IngestConfigError, build
 _REQUEST_PARTS = frozenset({"body", "query", "path", "header", "cookie"})
 
 INGEST_VARIABLE = "BEACON_INGEST"
-# How long shutdown waits for the pollers, before and after it closes their client.
-_STOP_SECONDS = 5.0
 
 logger = logging.getLogger("beacon")
 
@@ -36,22 +33,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
         return
     ingest = build(os.environ)
-    stop = threading.Event()
-    thread = threading.Thread(target=ingest.run, args=(stop,), name="beacon-ingest", daemon=True)
     app.state.ingest = ingest
-    thread.start()
+    ingest.start()
     try:
         yield
     finally:
-        stop.set()
-        # The pollers begin no poll once they are told to stop. One that is out is
-        # given a moment to finish, off the event loop, and then its HTTP client is
-        # closed under it, so no request is made after the server has gone.
-        await asyncio.to_thread(thread.join, _STOP_SECONDS)
-        ingest.close()
-        await asyncio.to_thread(thread.join, _STOP_SECONDS)
-        if thread.is_alive():
-            logger.warning("The pollers had not stopped when the server shut down.")
+        # Off the event loop, and not returned from until the pollers can ask no
+        # source and store no row: nothing of theirs outlives the server.
+        if not await asyncio.to_thread(ingest.stop):
+            logger.warning("The pollers' thread had not ended when the server shut down.")
 
 
 async def _validation_error(_request: Request, error: RequestValidationError) -> JSONResponse:

@@ -14,17 +14,25 @@ it has to be doubted on that account. `beacon.ingest.open_store` picks the file 
 
 Rows are never changed. A source that revises what it said, as 511 does when it
 updates an event, gets a new row under a new reference.
+
+The file is in SQLite's write-ahead mode, so reading never waits for a write, and a
+write waits only for another write. While the store is in use there are two more
+files beside it, ending `-wal` and `-shm`, and they belong to it.
 """
 
 import json
 import math
 import sqlite3
+import threading
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, get_args
+
+from beacon.errors import raise_bare
 
 # What a row is about. A kind can have more than one source over time: aircraft can
 # come from OpenSky or airplanes.live.
@@ -39,6 +47,11 @@ ModelSource = Literal["live", "replay", "fake"]
 Mode = Literal["live", "mock"]
 
 _EARTH_RADIUS_M = 6_371_008.8
+
+# How long a write waits for another write to finish, and how often it looks.
+_WRITE_WAIT_SECONDS = 30.0
+_WRITE_LOOK_SECONDS = 0.05
+_CLOSED = "The evidence store is closed and takes no more rows."
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS evidence (
@@ -172,6 +185,10 @@ class EvidenceStore:
             raise ValueError(f"mode must be one of {get_args(Mode)}.")
         self._path = path
         self._mode: Mode = mode
+        self._closed = threading.Event()
+        # Held to close the store, and by a write from its last look at whether the
+        # store is closed to its commit, so that no write lands after `close` returns.
+        self._closing = threading.Lock()
         path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()):
             pass
@@ -183,6 +200,17 @@ class EvidenceStore:
     @property
     def path(self) -> Path:
         return self._path
+
+    @property
+    def closed(self) -> bool:
+        return self._closed.is_set()
+
+    def close(self) -> None:
+        """Take no more rows. A write that is waiting for the file gives up at once,
+        one that is being committed is finished first, and when this returns nothing
+        is written through this store again. Reading goes on working."""
+        with self._closing:
+            self._closed.set()
 
     def add(
         self,
@@ -198,14 +226,16 @@ class EvidenceStore:
         saved in the same transaction, so a poller never remembers a poll whose rows
         were lost, or the other way round.
 
-        Raises EvidenceStoreError when the live store is handed a stand-in's row, or
-        a row's data is not JSON."""
+        Raises EvidenceStoreError when the live store is handed a stand-in's row, a
+        row's data is not JSON, or the store is closed, before or during the write."""
         recorded_ms = _to_ms(datetime.now(UTC) if now is None else now)
         rows = [self._row(item, recorded_ms) for item in items]
         saved = None if state is None else (state[0], _json(state[1], "A poller's state"))
         added: list[Evidence] = []
         with closing(self._connect()) as db:
-            db.execute("BEGIN IMMEDIATE")
+            if not self._begin_write(db):
+                raise_bare(EvidenceStoreError(_CLOSED))
+            closed = False
             try:
                 for row in rows:
                     cursor = db.execute(
@@ -227,10 +257,15 @@ class EvidenceStore:
                         "updated_ms = excluded.updated_ms",
                         (*saved, recorded_ms),
                     )
+                with self._closing:
+                    closed = self._closed.is_set()
+                    db.execute("ROLLBACK" if closed else "COMMIT")
             except BaseException:
-                db.execute("ROLLBACK")
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
                 raise
-            db.execute("COMMIT")
+        if closed:
+            raise_bare(EvidenceStoreError(_CLOSED))
         return added
 
     def state(self, name: str) -> dict[str, Any]:
@@ -319,11 +354,35 @@ class EvidenceStore:
             rows = db.execute(query, (*values, limit)).fetchall()
         return [_evidence(row) for row in rows]
 
+    def _begin_write(self, db: sqlite3.Connection) -> bool:
+        """Take the file's write lock, waiting for another writer to finish for up
+        to `_WRITE_WAIT_SECONDS`. False when the store is closed, which a write that
+        is waiting learns at once: SQLite's own wait cannot be called off.
+
+        Raises sqlite3.OperationalError when the other writer has not finished."""
+        # In write-ahead mode this is the only wait a write has: nothing after it
+        # waits for a reader, so the rest of the write needs no patience either.
+        db.execute("PRAGMA busy_timeout = 0")
+        give_up = time.monotonic() + _WRITE_WAIT_SECONDS
+        while not self._closed.is_set():
+            try:
+                db.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as error:
+                busy = error.sqlite_errorcode & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+                if not busy or time.monotonic() >= give_up:
+                    raise
+            else:
+                return True
+            self._closed.wait(_WRITE_LOOK_SECONDS)
+        return False
+
     def _row(self, item: NewEvidence, recorded_ms: int) -> tuple[Any, ...]:
         if self._mode == "live" and item.stand_in:
-            raise EvidenceStoreError(
-                "The live evidence store holds nothing a stand-in produced: this row "
-                "comes from the mock scenario or a fake Ember, and belongs in the mock store."
+            raise_bare(
+                EvidenceStoreError(
+                    "The live evidence store holds nothing a stand-in produced: this row "
+                    "comes from the mock scenario or a fake Ember, and belongs in the mock store."
+                )
             )
         return (
             item.kind,
@@ -355,6 +414,8 @@ class EvidenceStore:
             except sqlite3.OperationalError:
                 begun = None
             if begun is None:
+                # Kept in the file, so it is set once, when the file is begun.
+                db.execute("PRAGMA journal_mode = WAL")
                 db.executescript(_SCHEMA)
                 # Of two connections that begin a file at once, one mode is kept.
                 db.execute(
@@ -362,14 +423,17 @@ class EvidenceStore:
                     (self._mode,),
                 )
                 begun = db.execute(_MODE).fetchone()
-            if begun[0] != self._mode:
-                raise EvidenceStoreError(
-                    f"{self._path} is the {begun[0]} evidence store, and was opened as the "
-                    f"{self._mode} one. A store is one or the other for life."
-                )
         except BaseException:
             db.close()
             raise
+        if begun[0] != self._mode:
+            db.close()
+            raise_bare(
+                EvidenceStoreError(
+                    f"{self._path} is the {begun[0]} evidence store, and was opened as the "
+                    f"{self._mode} one. A store is one or the other for life."
+                )
+            )
         return db
 
 
@@ -397,9 +461,10 @@ def _json(value: Mapping[str, Any], what: str) -> str:
         return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
     except (TypeError, ValueError):
         pass
-    # Raised outside the handler, so the encoder's error is not kept under it, and
-    # the value is not repeated: it can be what a source or a person sent.
-    raise EvidenceStoreError(f"{what} is not JSON.")
+    # Raised outside the handler and bare, so neither the encoder's error nor one the
+    # caller is handling is kept under it, and the value is not repeated: it can be
+    # what a source or a person sent.
+    raise_bare(EvidenceStoreError(f"{what} is not JSON."))
 
 
 def _evidence(row: Sequence[Any]) -> Evidence:

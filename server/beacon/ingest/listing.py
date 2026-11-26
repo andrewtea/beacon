@@ -1,7 +1,8 @@
 """Noticing when a source stops listing something, and when it lists it again.
 
-NWS and 511 answer with what is active now. An alert that is cancelled, or a closure
-that is lifted, is not announced: it is missing from the next answer. A poller hands
+NWS and 511 answer with what is active now. An alert that is dropped, or a closure
+that is lifted, is mostly not announced: it is missing from the next answer. (NWS can
+also cancel an alert outright, and that message is a row of its own.) A poller hands
 `compare_listing` what the source lists now and gets back the rows whose items have
 gone, so it can store that they are no longer listed, and the rows whose items have
 come back after that, so it can store that they are listed again.

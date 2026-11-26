@@ -8,7 +8,7 @@ import httpx2
 import pytest
 
 from beacon.evidence import EvidenceStore
-from beacon.ingest.http import SourceError, http_client
+from beacon.ingest.http import SourceError, SourceHttp
 from beacon.ingest.nws import NwsAlerts, parse_alerts
 
 NOON = datetime(2026, 11, 27, 20, 0, tzinfo=UTC)
@@ -69,7 +69,7 @@ class Feed:
 
 @pytest.fixture
 def store(tmp_path: Path) -> EvidenceStore:
-    return EvidenceStore(tmp_path / "evidence.sqlite3", "live")
+    return EvidenceStore(tmp_path / "evidence.sqlite3", "mock")
 
 
 @pytest.fixture
@@ -79,7 +79,7 @@ def feed() -> Feed:
 
 @pytest.fixture
 def poller(feed: Feed) -> NwsAlerts:
-    return NwsAlerts(http_client(httpx2.MockTransport(feed)), origin="live")
+    return NwsAlerts(SourceHttp(httpx2.MockTransport(feed)))
 
 
 def refs(store: EvidenceStore) -> list[str]:
@@ -117,7 +117,8 @@ def test_an_alert_becomes_an_official_row_with_its_times_and_text(
     # When the hazard ends (06:00 UTC the next day), not when the message expires.
     assert alert.until == datetime(2026, 11, 28, 6, 0, tzinfo=UTC)
     assert (alert.point, alert.place) == (None, "San Francisco")
-    assert (alert.confidence, alert.origin, alert.model) == ("official", "live", None)
+    # The poller was given a stand-in for the network, so the row is a stand-in's.
+    assert (alert.confidence, alert.origin, alert.model) == ("official", "mock", None)
     assert alert.data == {
         "event": "Wind Advisory",
         "message_type": "Alert",
@@ -426,8 +427,7 @@ def test_a_failed_poll_stores_nothing_and_forgets_nothing(store: EvidenceStore, 
     feed.listed = [feature("shelter.1")]
     answers = [feed, lambda request: httpx2.Response(503, text="down"), feed, feed]
     poller = NwsAlerts(
-        http_client(httpx2.MockTransport(lambda request: answers.pop(0)(request))),
-        origin="live",
+        SourceHttp(httpx2.MockTransport(lambda request: answers.pop(0)(request))),
     )
     poller.poll(store, NOON)
     feed.listed = []

@@ -18,22 +18,23 @@ A source needs no code change to go live, only its name in that list and what it
 The mock scenario is played on a clock of its own. Its story begins twenty minutes
 before a mock store is first opened and runs in real time from there, in steps of ten
 seconds, and how far it has been played is kept in the store, so a restart goes on
-from the step after the last one that was finished.
+from the step after the last one that was finished. A step in which a poller failed
+is not finished: it is played again, ten seconds later by the real clock, and only
+the pollers that failed in it poll again.
 """
 
+import logging
 import threading
 from collections.abc import Mapping
-from dataclasses import dataclass
 from datetime import datetime, timedelta
-
-import httpx2
+from typing import Any
 
 from beacon.ember.client import default_data_dir
-from beacon.evidence import EvidenceStore, Mode, Origin
-from beacon.ingest.http import http_client
+from beacon.evidence import EvidenceStore, Mode
+from beacon.ingest.http import SourceHttp
 from beacon.ingest.nws import NwsAlerts
 from beacon.ingest.opensky import SIGNED_IN_INTERVAL_SECONDS, OpenSkyAircraft
-from beacon.ingest.runner import Clock, Poller, Runner
+from beacon.ingest.runner import Clock, Poller, PollerStatus, Runner
 from beacon.ingest.traffic511 import Traffic511
 from beacon.scenario import DURATION, Scenario, scenario_transport
 
@@ -58,30 +59,49 @@ _SCENARIO_STATE = "scenario"
 # Nothing in the story changes after that, and it is played no further.
 _AFTER_THE_STORY = timedelta(minutes=10)
 
+# How long `Ingest.stop` waits for the pollers' thread to end. Nothing it could be
+# doing takes that long once its client and its store are closed.
+STOP_SECONDS = 5.0
+
+logger = logging.getLogger("beacon.ingest")
+
 
 class IngestConfigError(Exception):
     """The environment asks for pollers that cannot be built."""
 
 
-@dataclass(frozen=True)
 class Ingest:
-    store: EvidenceStore
-    runner: Runner
-    clock: Clock
-    http: httpx2.Client
-    # The story the pollers are fed, in mock mode.
-    scenario: Scenario | None
+    """The store, the pollers, and the clock they share, and the thread they run on."""
 
-    def catch_up(self, stop: threading.Event | None = None) -> None:
+    def __init__(
+        self,
+        store: EvidenceStore,
+        runner: Runner,
+        clock: Clock,
+        http: SourceHttp,
+        scenario: Scenario | None,
+    ) -> None:
+        self.store = store
+        self.runner = runner
+        self.clock = clock
+        self.http = http
+        # The story the pollers are fed, in mock mode.
+        self.scenario = scenario
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def catch_up(self, stop: threading.Event | None = None) -> bool:
         """In mock mode, play the story from the step after the last one that was
-        finished up to now. It does nothing in live mode: a real source cannot be
-        asked what it said earlier.
+        finished up to now, and say whether it got there. It does nothing in live
+        mode: a real source cannot be asked what it said earlier.
 
-        How far the story has been played is saved after each step, apart from
-        anything else the store holds. A step that was cut short is played again,
-        and playing a step twice stores nothing twice."""
+        How far the story has been played is saved after each step, with how each
+        poller's last poll went, apart from anything else the store holds. A step
+        that was cut short is played again, and playing a step twice stores nothing
+        twice. A step in which a poller failed is not saved as played, and the
+        playing ends there, with False: the caller plays it again later."""
         if self.scenario is None:
-            return
+            return True
         played = self.store.state(_SCENARIO_STATE).get("played_to")
         moment = (
             datetime.fromisoformat(played) + SCENARIO_STEP
@@ -90,17 +110,38 @@ class Ingest:
         )
         end = min(self.clock.now(), self.scenario.start + DURATION + _AFTER_THE_STORY)
         try:
-            while moment <= end and not (stop is not None and stop.is_set()):
+            while moment <= end:
+                if stop is not None and stop.is_set():
+                    return False
                 self.clock.hold(moment)
-                self.runner.step(stop)
+                results = self.runner.step(stop, failed_stay_due=True)
                 if stop is not None and stop.is_set():
                     # The step may not have polled every source, so it is not done.
-                    break
-                state = {"start": self.scenario.start.isoformat(), "played_to": moment.isoformat()}
-                self.store.add([], state=(_SCENARIO_STATE, state), now=moment)
+                    return False
+                if any(isinstance(result, Exception) for result in results.values()):
+                    return False
+                state = {
+                    "start": self.scenario.start.isoformat(),
+                    "played_to": moment.isoformat(),
+                    "polls": {
+                        status.name: {"polled_at": status.polled_at.isoformat(), "ok": status.ok}
+                        for status in self.runner.status()
+                        if status.polled_at is not None
+                    },
+                }
+                try:
+                    self.store.add([], state=(_SCENARIO_STATE, state), now=moment)
+                except Exception as error:
+                    # The step is played again, which stores nothing twice.
+                    if not self.store.closed:
+                        logger.error(
+                            "A step of the mock scenario was not saved (%s).", type(error).__name__
+                        )
+                    return False
                 moment += SCENARIO_STEP
         finally:
             self.clock.hold(None)
+        return True
 
     def run(self, stop: threading.Event) -> None:
         """Poll until `stop` is set. In mock mode that is playing the story as the
@@ -110,11 +151,39 @@ class Ingest:
             return
         while not stop.is_set():
             self.catch_up(stop)
+            # The next step is this far off, and so is another try at one that failed.
             stop.wait(SCENARIO_STEP.total_seconds())
 
+    def start(self) -> None:
+        """Run the pollers on a thread of their own until `stop` is called."""
+        if self._thread is not None:
+            raise RuntimeError("The pollers were already started.")
+        self._thread = threading.Thread(
+            target=self.run, args=(self._stop,), name="beacon-ingest", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self, timeout: float = STOP_SECONDS) -> bool:
+        """Stop the pollers, and say whether their thread has ended. It blocks for
+        up to `timeout` seconds, so a server calls it off its event loop.
+
+        Whatever the thread is doing is called off, not waited for: a request that
+        is out is cancelled, and a write that is waiting for the file gives up. A
+        poll is stored whole or not at all, so nothing is left half done, and the
+        poll is made again when Beacon next runs. Whether or not the thread has
+        ended, it can ask no source and store no row after this returns."""
+        self._stop.set()
+        self.close()
+        if self._thread is None:
+            return True
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
     def close(self) -> None:
-        """Close the HTTP client, which ends any request a poller has out."""
+        """Close the HTTP client, which ends any request a poller has out, and the
+        store, which then takes no more rows."""
         self.http.close()
+        self.store.close()
 
 
 def live_sources(env: Mapping[str, str]) -> tuple[str, ...]:
@@ -153,33 +222,35 @@ def build(env: Mapping[str, str], clock: Clock | None = None) -> Ingest:
     live = live_sources(env)
     if live:
         # Checked before the store is opened, so a refused setting leaves no file.
-        http = http_client()
-        pollers = source_pollers(live, env, http, origin="live")
+        http = SourceHttp()
+        pollers = source_pollers(live, env, http)
         store = open_store(env)
         return Ingest(store, Runner(pollers, store, clock), clock, http, None)
     store = open_store(env)
     scenario = _scenario(store, clock.now())
-    http = http_client(scenario_transport(scenario, clock.now))
+    http = SourceHttp(scenario_transport(scenario, clock.now))
     pollers = [
-        NwsAlerts(http, origin="mock"),
-        OpenSkyAircraft(http, origin="mock", interval_seconds=SIGNED_IN_INTERVAL_SECONDS),
-        Traffic511(http, api_key="mock", origin="mock"),
+        NwsAlerts(http),
+        OpenSkyAircraft(http, interval_seconds=SIGNED_IN_INTERVAL_SECONDS),
+        Traffic511(http, api_key="mock"),
     ]
-    return Ingest(store, Runner(pollers, store, clock), clock, http, scenario)
+    last = _saved_polls(store.state(_SCENARIO_STATE).get("polls"))
+    return Ingest(store, Runner(pollers, store, clock, last=last), clock, http, scenario)
 
 
 def source_pollers(
-    sources: tuple[str, ...], env: Mapping[str, str], http: httpx2.Client, *, origin: Origin
+    sources: tuple[str, ...], env: Mapping[str, str], http: SourceHttp
 ) -> list[Poller]:
     """The pollers for these sources, with the settings each needs read from `env`.
-    `build` calls it with the real network and the origin `live`. A test hands it a
-    stand-in for the network, and then the origin is `mock`, because what a stand-in
-    answers is not a real source's however the request was made.
+    `build` hands it the real network. A test hands it a stand-in for the network,
+    and the rows are then `mock` ones, because that is the origin of such a client
+    (`beacon.ingest.http.SourceHttp`): what a stand-in answers is not a real
+    source's however the request was made, and there is no way to say otherwise.
 
     Raises IngestConfigError when a source lacks a setting it needs."""
     pollers: list[Poller] = []
     if "nws" in sources:
-        pollers.append(NwsAlerts(http, origin=origin))
+        pollers.append(NwsAlerts(http))
     if "opensky" in sources:
         if env.get(OPENSKY_PERMITTED_VARIABLE) != "1":
             raise IngestConfigError(
@@ -196,17 +267,26 @@ def source_pollers(
                 f"{OPENSKY_ID_VARIABLE} and {OPENSKY_SECRET_VARIABLE} are set together, "
                 "or neither is."
             )
-        pollers.append(
-            OpenSkyAircraft(http, origin=origin, client_id=client_id, client_secret=client_secret)
-        )
+        pollers.append(OpenSkyAircraft(http, client_id=client_id, client_secret=client_secret))
     if "511" in sources:
-        api_key = env.get(KEY_511_VARIABLE)
-        if not api_key:
+        token = env.get(KEY_511_VARIABLE)
+        if not token:
             raise IngestConfigError(
                 f"{LIVE_SOURCES_VARIABLE} names 511, which needs {KEY_511_VARIABLE}."
             )
-        pollers.append(Traffic511(http, api_key=api_key, origin=origin))
+        pollers.append(Traffic511(http, api_key=token))
     return pollers
+
+
+def _saved_polls(saved: Any) -> list[PollerStatus]:
+    """How each poller's last poll went, as a finished step of the story saved it."""
+    polls: list[PollerStatus] = []
+    for name, poll in (saved if isinstance(saved, dict) else {}).items():
+        polled_at = poll.get("polled_at") if isinstance(poll, dict) else None
+        ok = poll.get("ok") if isinstance(poll, dict) else None
+        if isinstance(polled_at, str) and isinstance(ok, bool):
+            polls.append(PollerStatus(name, datetime.fromisoformat(polled_at), ok))
+    return polls
 
 
 def _scenario(store: EvidenceStore, now: datetime) -> Scenario:

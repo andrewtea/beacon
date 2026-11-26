@@ -151,13 +151,120 @@ def test_a_wait_too_long_to_be_a_date_does_not_stop_the_other_pollers(
 
     time.moment = seconds(30)
     runner.step()
-    # The longest any source is left alone is six hours, whatever it asked for. A
-    # wait that is no number at all counts as none.
-    time.moment = seconds(6 * 3600)
-    runner.step()
-    assert fine.polled == [seconds(0), seconds(30), seconds(6 * 3600)]
+    # The longest any source is left alone is a week, whatever it asked for. A wait
+    # that is no number at all counts as none.
+    week = 7 * 86_400
+    for count in (week - 1, week):
+        time.moment = seconds(count)
+        runner.step()
+    # A second after its last poll, the other poller is not due again.
+    assert fine.polled == [seconds(0), seconds(30), seconds(week - 1)]
     usable = asked == asked and asked != float("inf")
-    assert limited.polled == [seconds(0)] + ([] if usable else [seconds(30)]) + [seconds(6 * 3600)]
+    assert limited.polled == (
+        [seconds(0), seconds(week)] if usable else [seconds(0), seconds(30), seconds(week - 1)]
+    )
+
+
+def test_a_wait_of_most_of_a_day_is_kept_in_full(store: EvidenceStore, time: Time) -> None:
+    # A quota that is spent for the day comes back at midnight, hours away.
+    spent = FakePoller("opensky", 240)
+    spent.failures = [SourceError("opensky", "answered HTTP 429", status=429, retry_after=80_000)]
+    runner = Runner([spent], store, Clock(time))
+
+    for count in (0, 6 * 3600, 79_999, 80_000):
+        time.moment = seconds(count)
+        runner.step()
+
+    assert spent.polled == [seconds(0), seconds(80_000)]
+
+
+def test_the_wait_a_source_asks_for_is_counted_from_when_it_answered(
+    store: EvidenceStore, time: Time
+) -> None:
+    slow, limited = FakePoller("slow", 30), FakePoller("limited", 30)
+
+    def take_a_minute(store: EvidenceStore, now: datetime) -> PollReport:
+        time.moment += timedelta(seconds=60)
+        return PollReport(added=0)
+
+    def refuse_after_fifty_seconds(store: EvidenceStore, now: datetime) -> PollReport:
+        # The third page of an answer, say: the refusal comes well into the poll.
+        limited.polled.append(now)
+        time.moment += timedelta(seconds=50)
+        raise SourceError("limited", "answered HTTP 429", status=429, retry_after=600)
+
+    slow.poll = take_a_minute  # type: ignore[method-assign]
+    limited.poll = refuse_after_fifty_seconds  # type: ignore[method-assign]
+    runner = Runner([slow, limited], store, Clock(time))
+    # The step begins at 0, and the source says "in 600 seconds" at 110.
+    runner.step()
+    limited.poll = lambda store, now: limited.polled.append(now) or PollReport(added=0)  # type: ignore[method-assign]
+
+    for count in (600, 709, 710):
+        time.moment = seconds(count)
+        runner.step()
+
+    assert limited.polled == [seconds(0), seconds(710)]
+
+
+def test_a_poller_that_failed_can_be_left_due_at_the_same_moment(
+    store: EvidenceStore, time: Time
+) -> None:
+    down, fine = FakePoller("down", 30), FakePoller("fine", 30)
+    down.failures = [SourceError("down", "could not be reached"), ValueError("still down")]
+    runner = Runner([down, fine], store, Clock(time))
+
+    first = runner.step(failed_stay_due=True)
+    second = runner.step(failed_stay_due=True)
+    third = runner.step(failed_stay_due=True)
+
+    # Only the poller that failed polls again at that moment, until it succeeds.
+    assert [sorted(results) for results in (first, second, third)] == [
+        ["down", "fine"],
+        ["down"],
+        ["down"],
+    ]
+    assert runner.step(failed_stay_due=True) == {}
+    assert (down.polled, fine.polled) == ([NOON, NOON, NOON], [NOON])
+    assert runner.status()[0] == PollerStatus("down", NOON, True)
+
+
+def test_a_runner_can_be_told_how_the_last_polls_of_an_earlier_process_went(
+    store: EvidenceStore, time: Time
+) -> None:
+    earlier = [PollerStatus("nws", seconds(-600), True), PollerStatus("gone", seconds(-600), False)]
+    runner = Runner(
+        [FakePoller("nws", 30), FakePoller("511", 30)], store, Clock(time), last=earlier
+    )
+
+    assert runner.status() == [
+        PollerStatus("nws", seconds(-600), True),
+        PollerStatus("511", None, None),
+    ]
+    # It is what is shown until the poller polls again, which it does at once.
+    assert sorted(runner.step()) == ["511", "nws"]
+    assert runner.status()[0] == PollerStatus("nws", NOON, True)
+
+
+def test_a_poll_cut_short_by_stopping_is_not_reported_as_the_sources_failure(
+    store: EvidenceStore, time: Time, caplog: pytest.LogCaptureFixture
+) -> None:
+    stop = threading.Event()
+    asking, next_one = FakePoller("asking", 30), FakePoller("next", 30)
+
+    def be_cut_short(store: EvidenceStore, now: datetime) -> PollReport:
+        stop.set()
+        raise SourceError("asking", "was not read, because Beacon is stopping")
+
+    asking.poll = be_cut_short  # type: ignore[method-assign]
+    runner = Runner([asking, next_one], store, Clock(time))
+
+    with caplog.at_level(logging.DEBUG):
+        results = runner.step(stop)
+
+    assert list(results) == ["asking"]
+    assert caplog.text == ""
+    assert runner.status() == [PollerStatus("asking", None, None), PollerStatus("next", None, None)]
 
 
 def test_the_interval_is_read_after_each_poll(store: EvidenceStore, time: Time) -> None:

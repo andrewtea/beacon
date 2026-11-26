@@ -4,16 +4,23 @@ The exchanges here are real ones with a server on this machine, so the HTTP libr
 and the transport under it do everything they do on the network, logging included.
 """
 
+import contextlib
 import gzip
 import logging
 import threading
+import time
+import tracemalloc
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx2
 import pytest
 
-from beacon.ingest.http import SourceError, fetch, http_client, read_json
+from beacon.ingest import http as source_http
+from beacon.ingest.http import SourceError, SourceHttp, fetch, read_json
+from beacon.ingest.nws import parse_alerts
+from beacon.ingest.opensky import parse_states
+from beacon.ingest.traffic511 import parse_events
 
 TOKEN = "secret-token-123"
 
@@ -64,7 +71,7 @@ def server() -> Iterator[Server]:
 
 
 def get(server: Server, *, max_bytes: int = 1000) -> bytes:
-    with http_client() as http:
+    with SourceHttp() as http:
         return fetch(
             http, "GET", server.url, source="511", max_bytes=max_bytes, params={"api_key": TOKEN}
         )
@@ -91,14 +98,47 @@ def test_a_gzipped_reply_is_unpacked_no_further_than_the_cap(server: Server) -> 
     bomb = gzip.compress(bytes(100_000_000))
     assert len(bomb) < 200_000
     server.reply = lambda handler: send(handler, 200, bomb, Content_Encoding="gzip")
-    with pytest.raises(SourceError, match="sent more than Beacon reads") as failure:
-        get(server)
-    (reading,) = [entry for entry in failure.traceback if entry.name == "fetch"]
-    assert len(reading.frame.f_locals["body"]) == 1001
+    tracemalloc.start()
+    try:
+        with pytest.raises(SourceError, match="sent more than Beacon reads"):
+            get(server)
+        _now, most = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert most < 5_000_000
 
     server.reply = lambda handler: send(handler, 200, b"not gzip", Content_Encoding="gzip")
-    with pytest.raises(SourceError, match=r"^511 could not be reached\.$"):
+    with pytest.raises(SourceError, match="packed its reply in a way Beacon does not read"):
         get(server)
+
+
+def test_a_gzipped_reply_is_read_to_the_end_of_every_part_or_not_at_all(server: Server) -> None:
+    first, second = gzip.compress(b'{"events": ['), gzip.compress(b"1, 2]}")
+
+    # Gzip allows a reply in several parts, one after another, and all are the reply.
+    server.reply = lambda handler: send(handler, 200, first + second, Content_Encoding="gzip")
+    assert get(server) == b'{"events": [1, 2]}'
+    # The cap is on all of them together.
+    with pytest.raises(SourceError, match="sent more than Beacon reads"):
+        get(server, max_bytes=17)
+    assert get(server, max_bytes=18) == b'{"events": [1, 2]}'
+
+    whole = gzip.compress(b'{"events": []}')
+    for cut_short in (
+        # Without its checksum and length, with half of them, and with a second part
+        # that only begins.
+        whole[:-8],
+        whole[:-4],
+        whole + second[:5],
+        # Something after the end that is not gzip.
+        whole + b"{}",
+        b"",
+    ):
+        server.reply = lambda handler, body=cut_short: send(
+            handler, 200, body, Content_Encoding="gzip"
+        )
+        with pytest.raises(SourceError, match="packed its reply in a way Beacon does not read"):
+            get(server)
 
 
 def test_a_reply_packed_another_way_is_refused(server: Server) -> None:
@@ -180,9 +220,16 @@ def test_a_failure_keeps_nothing_of_an_error_the_caller_was_handling(server: Ser
         _while_handling(ValueError(f"api_key={TOKEN}"), lambda: get(server))
     assert _everything_under(failure.value) == [failure.value]
 
-    with pytest.raises(SourceError) as failure:
-        _while_handling(ValueError("Jane Doe"), lambda: read_json(b"not json", "nws"))
-    assert _everything_under(failure.value) == [failure.value]
+    for reading in (
+        lambda: read_json(b"not json", "nws"),
+        # What reads the JSON raises the same way.
+        lambda: parse_alerts({"title": "Jane Doe"}, "mock"),
+        lambda: parse_events(["Jane Doe"], "mock"),
+        lambda: parse_states({"message": "Jane Doe"}, "mock"),
+    ):
+        with pytest.raises(SourceError) as failure:
+            _while_handling(ValueError("Jane Doe"), reading)
+        assert _everything_under(failure.value) == [failure.value]
 
 
 def test_no_log_line_at_any_level_holds_the_address_of_a_request(
@@ -209,6 +256,90 @@ def test_no_log_line_at_any_level_holds_the_address_of_a_request(
     assert "api_key" not in caplog.text
 
 
+def _drip(handler: BaseHTTPRequestHandler, pieces: list[bytes], apart: float) -> None:
+    # Beacon hangs up at its deadline, and the next piece then has nowhere to go.
+    with contextlib.suppress(OSError):
+        for piece in pieces:
+            handler.wfile.write(piece)
+            handler.wfile.flush()
+            time.sleep(apart)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # Nothing at all, headers a line at a time, and a body a byte at a time. No
+        # single wait in the last two is long: it is the whole that is.
+        lambda handler: time.sleep(3),
+        lambda handler: _drip(
+            handler, [b"HTTP/1.1 200 OK\r\n"] + [b"X-Slow: 1\r\n"] * 60, apart=0.05
+        ),
+        lambda handler: _drip(
+            handler, [b"HTTP/1.1 200 OK\r\nContent-Length: 60\r\n\r\n"] + [b"x"] * 60, apart=0.05
+        ),
+    ],
+    ids=["silent", "slow headers", "slow body"],
+)
+def test_an_exchange_that_takes_too_long_as_a_whole_is_given_up_on(
+    server: Server, monkeypatch: pytest.MonkeyPatch, reply: Reply
+) -> None:
+    monkeypatch.setattr(source_http, "MAX_SECONDS", 0.5)
+    server.reply = reply
+    began = time.monotonic()
+
+    with pytest.raises(SourceError) as failure:
+        get(server)
+
+    assert str(failure.value) == "511 took too long to answer."
+    assert _everything_under(failure.value) == [failure.value]
+    # At the deadline, and not when the source would have finished, three seconds in.
+    assert 0.5 <= time.monotonic() - began < 2.5
+
+
+def test_closing_the_client_ends_an_exchange_that_is_out_and_refuses_the_next(
+    server: Server,
+) -> None:
+    asked = threading.Event()
+
+    def never_answer(handler: BaseHTTPRequestHandler) -> None:
+        asked.set()
+        time.sleep(3)
+
+    server.reply = never_answer
+    http = SourceHttp()
+    failures: list[BaseException] = []
+
+    def ask() -> None:
+        try:
+            fetch(http, "GET", server.url, source="511", max_bytes=1000)
+        except SourceError as failure:
+            failures.append(failure)
+
+    asking = threading.Thread(target=ask)
+    asking.start()
+    assert asked.wait(5)
+    began = time.monotonic()
+
+    http.close()
+    asking.join(2)
+
+    assert not asking.is_alive()
+    assert time.monotonic() - began < 1
+    assert http.closed
+    with pytest.raises(SourceError) as refused:
+        fetch(http, "GET", server.url, source="511", max_bytes=1000)
+    assert [str(failure) for failure in (*failures, refused.value)] == [
+        "511 was not read, because Beacon is stopping."
+    ] * 2
+    # The second was never sent.
+    assert len(server.paths) == 1
+
+
+def test_a_client_says_whether_it_asks_the_network_or_a_stand_in() -> None:
+    assert SourceHttp().origin == "live"
+    assert SourceHttp(httpx2.MockTransport(lambda request: httpx2.Response(200))).origin == "mock"
+
+
 def test_a_stand_in_for_the_network_is_read_the_way_the_network_is() -> None:
     packed = gzip.compress(b'{"events": []}')
 
@@ -219,7 +350,7 @@ def test_a_stand_in_for_the_network_is_read_the_way_the_network_is() -> None:
             )
         return httpx2.Response(200, json={"events": []}, headers={"Retry-After": "3"})
 
-    http = http_client(httpx2.MockTransport(stand_in))
+    http = SourceHttp(httpx2.MockTransport(stand_in))
 
     for path in ("/plain", "/packed"):
         body = fetch(http, "GET", f"https://api.511.org{path}", source="511", max_bytes=100)

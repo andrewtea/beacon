@@ -1,6 +1,9 @@
 """The evidence store: what it keeps, what it refuses, and how rows are found."""
 
 import sqlite3
+import threading
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -269,3 +272,112 @@ def test_the_database_itself_refuses_a_row_outside_the_schema(store: EvidenceSto
     with sqlite3.connect(store.path) as db, pytest.raises(sqlite3.IntegrityError):
         # A latitude with no longitude is not a place.
         db.execute("UPDATE evidence SET lat = 37.7")
+
+
+def _while_handling(error: Exception, call: Callable[[], object]) -> None:
+    """Make a call the way a caller does who is itself handling an error."""
+    try:
+        raise error
+    except type(error):
+        call()
+
+
+def test_a_refusal_keeps_nothing_of_an_error_the_caller_was_handling(
+    store: EvidenceStore,
+) -> None:
+    store.close()
+    for refused_call in (
+        lambda: store.add([row("not json", data={"when": NOON})]),
+        lambda: store.add([row("invented", origin="mock")]),
+        lambda: store.add([row("too late")]),
+        lambda: EvidenceStore(store.path, "mock"),
+    ):
+        with pytest.raises(EvidenceStoreError) as refused:
+            _while_handling(ValueError("Jane Doe, 1458 Hayes St"), refused_call)
+
+        assert (refused.value.__cause__, refused.value.__context__) == (None, None)
+
+
+def test_a_closed_store_takes_no_more_rows_and_still_answers(store: EvidenceStore) -> None:
+    store.add([row("before")], state=("nws", {"listed": ["before"]}))
+    assert not store.closed
+
+    store.close()
+
+    assert store.closed
+    with pytest.raises(EvidenceStoreError, match=r"^The evidence store is closed and takes no"):
+        store.add([row("after")], state=("nws", {"listed": ["after"]}))
+    assert refs(store.search()) == ["before"]
+    assert store.state("nws") == {"listed": ["before"]}
+    # Another process's store on the same file is its own, and is not closed by this.
+    assert len(EvidenceStore(store.path, "live").add([row("elsewhere")])) == 1
+
+
+def _write_on_a_thread(store: EvidenceStore, ref: str) -> tuple[threading.Thread, list[object]]:
+    outcome: list[object] = []
+
+    def write() -> None:
+        try:
+            outcome.append(store.add([row(ref)], state=("nws", {"listed": [ref]})))
+        except EvidenceStoreError as refused:
+            outcome.append(refused)
+
+    writing = threading.Thread(target=write)
+    writing.start()
+    return writing, outcome
+
+
+def test_a_write_waits_for_another_writer_to_finish(store: EvidenceStore) -> None:
+    other = sqlite3.connect(store.path, isolation_level=None)
+    other.execute("BEGIN IMMEDIATE")
+    writing, outcome = _write_on_a_thread(store, "patient")
+    time.sleep(0.3)
+    assert writing.is_alive()
+
+    other.execute("COMMIT")
+    writing.join(5)
+
+    assert not writing.is_alive()
+    assert refs(outcome[0]) == refs(store.search()) == ["patient"]
+    other.close()
+
+
+def test_a_write_that_is_waiting_gives_up_at_once_when_the_store_is_closed(
+    store: EvidenceStore,
+) -> None:
+    other = sqlite3.connect(store.path, isolation_level=None)
+    other.execute("BEGIN IMMEDIATE")
+    writing, outcome = _write_on_a_thread(store, "late")
+    time.sleep(0.3)
+    assert writing.is_alive()
+    began = time.monotonic()
+
+    store.close()
+    writing.join(5)
+
+    assert not writing.is_alive()
+    assert time.monotonic() - began < 1
+    assert [str(refused) for refused in outcome] == [
+        "The evidence store is closed and takes no more rows."
+    ]
+    # The other writer finishes, and the write that gave up does not land behind it.
+    other.execute("COMMIT")
+    other.close()
+    assert store.search() == []
+    assert store.state("nws") == {}
+
+
+def test_a_write_does_not_wait_for_a_reader(store: EvidenceStore) -> None:
+    store.add([row("first")])
+    reader = sqlite3.connect(store.path, isolation_level=None)
+    reader.execute("BEGIN")
+    assert reader.execute("SELECT COUNT(*) FROM evidence").fetchone() == (1,)
+    began = time.monotonic()
+
+    store.add([row("second")])
+
+    assert time.monotonic() - began < 1
+    assert refs(store.search()) == ["first", "second"]
+    # The reader still sees the store as it was when it began to read.
+    assert reader.execute("SELECT COUNT(*) FROM evidence").fetchone() == (1,)
+    reader.close()

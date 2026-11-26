@@ -60,7 +60,8 @@ def test_the_server_runs_the_pollers_on_the_mock_scenario_while_it_is_up() -> No
     assert answer["mode"] == "mock"
     assert [source["name"] for source in answer["sources"]] == ["nws", "opensky", "511"]
     # When the server has shut down, the pollers have stopped and can ask nothing more.
-    assert ingest.http.is_closed
+    assert ingest.http.closed
+    assert ingest.store.closed
     assert "beacon-ingest" not in [thread.name for thread in threading.enumerate()]
 
 

@@ -8,7 +8,7 @@ a moment, which is how the mock scenario is played (`beacon.ingest.setup`).
 import logging
 import math
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -18,8 +18,10 @@ from beacon.ingest.http import SourceError
 
 logger = logging.getLogger("beacon.ingest")
 
-# The longest a poller is left alone, whatever wait a source asks for.
-MAX_WAIT_SECONDS = 6 * 3600.0
+# The longest a poller is left alone, whatever wait a source asks for. A quota that
+# is spent for the day asks for most of a day, and gets it; a week is more than any
+# source means, and keeps the arithmetic on dates inside what a date can hold.
+MAX_WAIT_SECONDS = 7 * 86_400.0
 
 
 @dataclass(frozen=True)
@@ -69,7 +71,16 @@ class Clock:
 
 
 class Runner:
-    def __init__(self, pollers: Sequence[Poller], store: EvidenceStore, clock: Clock) -> None:
+    def __init__(
+        self,
+        pollers: Sequence[Poller],
+        store: EvidenceStore,
+        clock: Clock,
+        *,
+        last: Iterable[PollerStatus] = (),
+    ) -> None:
+        """`last` is how the pollers' last polls went in an earlier process, for a
+        runner that goes on where that one stopped and may have nothing left to poll."""
         names = [poller.name for poller in pollers]
         if len(set(names)) != len(names):
             raise ValueError("Two pollers have the same name.")
@@ -78,7 +89,7 @@ class Runner:
         self._clock = clock
         # When each poller is next due. A poller that has never run is due at once.
         self._due: dict[str, datetime] = {}
-        self._last: dict[str, PollerStatus] = {}
+        self._last = {status.name: status for status in last if status.name in names}
 
     def status(self) -> list[PollerStatus]:
         """How each poller's last poll went, in the order the pollers were given."""
@@ -87,13 +98,20 @@ class Runner:
             last.get(poller.name, PollerStatus(poller.name, None, None)) for poller in self._pollers
         ]
 
-    def step(self, stop: threading.Event | None = None) -> dict[str, PollReport | Exception]:
+    def step(
+        self, stop: threading.Event | None = None, *, failed_stay_due: bool = False
+    ) -> dict[str, PollReport | Exception]:
         """Poll every poller that is due now, and return what each one did. No
         further poller is begun once `stop` is set.
 
-        A poller that fails is tried again after its interval, or after the wait the
-        source asked for when that is longer. Its failure is logged by its kind, and
-        the other pollers run."""
+        A poller that fails is tried again after its interval, or when the wait the
+        source asked for is over, if that is later. That wait is counted from when
+        the source answered, which for a poll of several requests can be well after
+        the step began. Its failure is logged by its kind, and the other pollers run.
+
+        With `failed_stay_due`, a poller that fails stays due at this same moment.
+        The mock scenario is played that way: a step that failed is played again,
+        and only the pollers that failed in it poll again."""
         now = self._clock.now()
         results: dict[str, PollReport | Exception] = {}
         for poller in self._pollers:
@@ -102,29 +120,38 @@ class Runner:
             due = self._due.get(poller.name)
             if due is not None and now < due:
                 continue
-            asked = 0.0
+            asked: object = None
             try:
                 report = poller.poll(self._store, now)
-            except SourceError as error:
-                # A source's error has a fixed text.
-                logger.warning("%s", error)
-                asked = error.retry_after or 0.0
-                results[poller.name] = error
             except Exception as error:
-                # Only the kind of error is logged. Its text and its traceback can
-                # repeat what the poller was reading, which for radio is the traffic.
-                logger.error("The %s poller failed (%s).", poller.name, type(error).__name__)
                 results[poller.name] = error
+                if stop is not None and stop.is_set():
+                    # Stopping is what cut the poll short. That is no news about the
+                    # source, and the poll is made again when Beacon next runs.
+                    break
+                if isinstance(error, SourceError):
+                    # A source's error has a fixed text.
+                    logger.warning("%s", error)
+                    asked = error.retry_after
+                else:
+                    # Only the kind of error is logged. Its text and its traceback
+                    # can repeat what the poller was reading, which for radio is
+                    # the traffic.
+                    logger.error("The %s poller failed (%s).", poller.name, type(error).__name__)
             else:
                 if report.unreadable:
                     logger.warning(
                         "%s sent %d items Beacon could not read.", poller.name, report.unreadable
                     )
                 results[poller.name] = report
-            self._due[poller.name] = now + timedelta(seconds=_wait(poller, asked))
-            self._last[poller.name] = PollerStatus(
-                poller.name, now, isinstance(results[poller.name], PollReport)
-            )
+            ok = isinstance(results[poller.name], PollReport)
+            if ok or not failed_stay_due:
+                self._due[poller.name] = max(
+                    now + timedelta(seconds=_seconds(poller.interval_seconds) or 1.0),
+                    # The clock, read again: the source asked when it answered.
+                    self._clock.now() + timedelta(seconds=_seconds(asked)),
+                )
+            self._last[poller.name] = PollerStatus(poller.name, now, ok)
         return results
 
     def run(self, stop: threading.Event, *, sleep: Callable[[float], object] | None = None) -> None:
@@ -137,13 +164,11 @@ class Runner:
             wait(max(1.0, (soonest - now).total_seconds()))
 
 
-def _wait(poller: Poller, asked: float) -> float:
-    """How long until the poller's next poll: its interval, or the wait the source
-    asked for when that is longer, and never more than `MAX_WAIT_SECONDS`. A wait
-    that is not a usable number, from the poller or the source, counts as none."""
-    waits = [
-        seconds
-        for seconds in (poller.interval_seconds, asked)
-        if isinstance(seconds, int | float) and math.isfinite(seconds) and seconds > 0
-    ]
-    return min(max(waits, default=1.0), MAX_WAIT_SECONDS)
+def _seconds(wait: object) -> float:
+    """A wait in seconds, from a poller or a source, and never more than
+    `MAX_WAIT_SECONDS`. One that is not a usable number counts as none."""
+    if isinstance(wait, bool) or not isinstance(wait, int | float):
+        return 0.0
+    if not math.isfinite(wait) or wait <= 0:
+        return 0.0
+    return min(float(wait), MAX_WAIT_SECONDS)

@@ -8,7 +8,7 @@ import httpx2
 import pytest
 
 from beacon.evidence import EvidenceStore
-from beacon.ingest.http import SourceError, http_client
+from beacon.ingest.http import SourceError, SourceHttp
 from beacon.ingest.traffic511 import Traffic511, parse_events
 
 NOON = datetime(2026, 11, 27, 20, 0, tzinfo=UTC)
@@ -64,6 +64,8 @@ class Feed:
         self.page = 500
         # A server that says another page follows whatever it has sent.
         self.always_more = False
+        # What the server sends as `pagination`, when it is not what it should be.
+        self.pagination: Any = MISSING
 
     def __call__(self, request: httpx2.Request) -> httpx2.Response:
         self.requests.append(request)
@@ -77,6 +79,8 @@ class Feed:
         }
         if offset + size < len(self.listed) or self.always_more:
             answer["pagination"]["next_url"] = f"/traffic/events/?offset={offset + size}"
+        if self.pagination is not MISSING:
+            answer["pagination"] = self.pagination
         # 511 begins its replies with a byte order mark.
         return httpx2.Response(
             200, content=b"\xef\xbb\xbf" + httpx2.Response(200, json=answer).content
@@ -85,7 +89,7 @@ class Feed:
 
 @pytest.fixture
 def store(tmp_path: Path) -> EvidenceStore:
-    return EvidenceStore(tmp_path / "evidence.sqlite3", "live")
+    return EvidenceStore(tmp_path / "evidence.sqlite3", "mock")
 
 
 @pytest.fixture
@@ -95,7 +99,7 @@ def feed() -> Feed:
 
 @pytest.fixture
 def poller(feed: Feed) -> Traffic511:
-    return Traffic511(http_client(httpx2.MockTransport(feed)), api_key="token-abc", origin="live")
+    return Traffic511(SourceHttp(httpx2.MockTransport(feed)), api_key="token-abc")
 
 
 def refs(store: EvidenceStore) -> list[str]:
@@ -142,7 +146,8 @@ def test_an_event_becomes_an_official_row_for_that_version_of_it(
     assert closure.place == "Hayes St from Gough St to Octavia St"
     assert (closure.confidence, closure.origin, closure.until, closure.url) == (
         "official",
-        "live",
+        # The poller was given a stand-in for the network, so the row is a stand-in's.
+        "mock",
         None,
         None,
     )
@@ -200,7 +205,7 @@ def test_only_active_events_inside_the_city_are_kept() -> None:
     assert kept.place == "US-101 N at Cesar Chavez St"
     # A lane is closed and the road is not.
     assert kept.data["closure"] is False
-    assert (page.unreadable, page.count, page.more) == (0, 4, False)
+    assert (page.unreadable, page.count, page.following) == (0, 4, "none")
 
 
 def test_an_event_whose_status_cannot_be_told_is_unreadable_and_not_left_out() -> None:
@@ -406,6 +411,68 @@ def test_every_page_is_read_before_anything_counts_as_missing(
     assert len(refs(store)) == 5
 
 
+@pytest.mark.parametrize(
+    ("pagination", "following"),
+    [
+        ({"offset": 500}, "none"),
+        ({"offset": 500, "next_url": None}, "none"),
+        ({"offset": "500", "next_url": "/traffic/events?offset=1000"}, "more"),
+        # No pagination at all, or one that is not an object.
+        (MISSING, "unclear"),
+        (None, "unclear"),
+        (["/traffic/events?offset=1000"], "unclear"),
+        # An object that does not say which page this is, or names another one.
+        ({}, "unclear"),
+        ({"next_url": "/traffic/events?offset=1000"}, "unclear"),
+        ({"offset": 0}, "unclear"),
+        ({"offset": True}, "unclear"),
+        ({"offset": 500.0}, "unclear"),
+        ({"offset": "five hundred"}, "unclear"),
+        # A next page that is not an address.
+        ({"offset": 500, "next_url": 7}, "unclear"),
+        ({"offset": 500, "next_url": ""}, "unclear"),
+        ({"offset": 500, "next_url": {"href": "/traffic/events"}}, "unclear"),
+    ],
+)
+def test_a_page_is_relied_on_only_when_it_says_plainly_where_it_stands(
+    pagination: Any, following: str
+) -> None:
+    payload = {"events": [event(1)]} | ({} if pagination is MISSING else {"pagination": pagination})
+
+    page = parse_events(payload, "mock", offset=500)
+
+    # Its events are read either way.
+    assert (len(page.events), page.following) == (1, following)
+
+
+def test_a_page_that_does_not_say_where_it_stands_keeps_its_events_and_clears_nothing(
+    store: EvidenceStore, feed: Feed, poller: Traffic511
+) -> None:
+    feed.listed = [event(1), event(2)]
+    poller.poll(store, NOON)
+
+    # Event 1 is missing from answer after answer, and none of them says whether it
+    # is the whole list.
+    feed.listed = [event(2), event(3)]
+    feed.pagination = {"offset": 0, "next_url": 7}
+    added = [poller.poll(store, minutes(count)).added for count in (2, 4, 6)]
+
+    assert added == [1, 0, 0]
+    assert len(feed.requests) == 4
+    assert [row.data["event_id"] for row in store.search()] == [
+        "511.org/1",
+        "511.org/2",
+        "511.org/3",
+    ]
+
+    # Once the answers say it plainly, two of them without the event are enough.
+    feed.pagination = MISSING
+    poller.poll(store, minutes(8))
+    assert len(store.search()) == 3
+    poller.poll(store, minutes(10))
+    assert [row.data.get("change") for row in store.search()] == [None, None, None, "not_listed"]
+
+
 def test_an_answer_with_more_pages_than_beacon_reads_clears_nothing(
     store: EvidenceStore, feed: Feed, poller: Traffic511
 ) -> None:
@@ -455,9 +522,8 @@ def test_a_failed_poll_is_charged_for_the_requests_it_made(
     feed.listed = [event(1), event(2), event(3)]
     answers = iter([feed, feed, lambda request: httpx2.Response(500)])
     poller = Traffic511(
-        http_client(httpx2.MockTransport(lambda request: next(answers)(request))),
+        SourceHttp(httpx2.MockTransport(lambda request: next(answers)(request))),
         api_key="token-abc",
-        origin="live",
     )
 
     with pytest.raises(SourceError, match="answered HTTP 500"):
@@ -469,9 +535,7 @@ def test_a_failed_poll_is_charged_for_the_requests_it_made(
 
 def test_a_refused_token_fails_the_poll_without_being_repeated(store: EvidenceStore) -> None:
     feed = Feed()
-    poller = Traffic511(
-        http_client(httpx2.MockTransport(feed)), api_key="wrong-token-xyz", origin="live"
-    )
+    poller = Traffic511(SourceHttp(httpx2.MockTransport(feed)), api_key="wrong-token-xyz")
 
     with pytest.raises(SourceError) as failure:
         poller.poll(store, NOON)
@@ -483,4 +547,4 @@ def test_a_refused_token_fails_the_poll_without_being_repeated(store: EvidenceSt
 
 def test_a_poller_without_a_token_cannot_be_made() -> None:
     with pytest.raises(ValueError, match="511 needs an API token"):
-        Traffic511(http_client(), api_key="", origin="live")
+        Traffic511(SourceHttp(), api_key="")

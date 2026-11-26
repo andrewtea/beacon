@@ -1,23 +1,36 @@
 """Building the pollers from the environment, and the mock scenario played through them."""
 
 import itertools
+import logging
+import sqlite3
+import threading
+import time as system_time
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 import httpx2
 import pytest
 
-from beacon.evidence import Evidence, EvidenceStore, NewEvidence
+from beacon.evidence import Evidence, EvidenceStore, EvidenceStoreError, NewEvidence
 from beacon.ingest import (
     Clock,
+    Ingest,
     IngestConfigError,
+    PollerStatus,
+    PollReport,
     Runner,
+    SourceError,
     build,
     live_sources,
     open_store,
     source_pollers,
 )
-from beacon.ingest.http import http_client
+from beacon.ingest.http import SourceHttp, fetch
+from beacon.ingest.nws import NwsAlerts
+from beacon.ingest.opensky import OpenSkyAircraft
+from beacon.ingest.traffic511 import Traffic511
 from beacon.scenario import FIRE, INVENTED, Scenario, scenario_transport
 
 NOON = datetime(2026, 11, 27, 20, 0, tzinfo=UTC)
@@ -161,6 +174,10 @@ def test_a_mock_store_first_opened_shows_a_fire_already_under_way(
     assert ingest.store.state("scenario") == {
         "start": START.isoformat(),
         "played_to": NOON.isoformat(),
+        # How each poller's last poll went, for a process that goes on from here.
+        "polls": {
+            name: {"polled_at": NOON.isoformat(), "ok": True} for name in ("nws", "opensky", "511")
+        },
     }
     # The clock is let go when the story has been played up to now.
     assert ingest.clock.now() == NOON
@@ -224,6 +241,95 @@ def test_a_step_cut_short_by_a_crash_is_played_again_without_counting_twice(
     assert changes(second.store) == [
         ("not_listed", ALERT + "shelter.001.2", story(72)),
         ("not_listed", "511.org/mock-1002@" + story(20).isoformat(), story(82)),
+    ]
+
+
+def test_a_step_in_which_a_poll_failed_is_played_again_and_nothing_is_missed(
+    env: dict[str, str], time: Time, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    polled: list[tuple[str, datetime]] = []
+    for poller in (NwsAlerts, OpenSkyAircraft, Traffic511):
+
+        def poll(
+            self: Any, store: EvidenceStore, now: datetime, poll: Any = poller.poll
+        ) -> PollReport:
+            polled.append((self.name, now))
+            # At minute 6 the helicopter has just begun to circle. OpenSky cannot be
+            # read, twice, in the one step in which all three sources are asked.
+            if (self.name, now) == ("opensky", story(6)) and polled.count(polled[-1]) < 3:
+                raise SourceError("opensky", "could not be reached")
+            return poll(self, store, now)
+
+        monkeypatch.setattr(poller, "poll", poll)
+    ingest = build(env, Clock(time))
+
+    # The playing ends at the step that failed, which is not saved as played.
+    assert ingest.catch_up() is False
+    last_played = (story(6) - timedelta(seconds=10)).isoformat()
+    assert ingest.store.state("scenario")["played_to"] == last_played
+    assert ingest.runner.status()[1] == PollerStatus("opensky", story(6), False)
+    assert ingest.clock.now() == NOON
+    # Played again in the same process, it fails again and is still not passed over.
+    assert ingest.catch_up() is False
+    assert ingest.store.state("scenario")["played_to"] == last_played
+
+    # The third time the source answers, and the story goes on to now.
+    assert ingest.catch_up() is True
+    assert ingest.store.state("scenario")["played_to"] == NOON.isoformat()
+    # Only the poller that failed was asked again for that moment.
+    assert [name for name, moment in polled if moment == story(6)] == [
+        "nws",
+        "opensky",
+        "511",
+        "opensky",
+        "opensky",
+    ]
+    helicopter = [row.occurred_at for row in ingest.store.search(kinds=["aircraft"], limit=1000)]
+    assert story(6) in helicopter
+    assert {later - earlier for earlier, later in itertools.pairwise(helicopter)} == {
+        timedelta(seconds=30)
+    }
+
+
+def test_a_step_that_failed_is_played_again_by_the_process_that_comes_after(
+    env: dict[str, str], time: Time, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    poll = OpenSkyAircraft.poll
+
+    def fail_at_minute_five(self: Any, store: EvidenceStore, now: datetime) -> PollReport:
+        if now == story(5):
+            raise SourceError("opensky", "could not be reached")
+        return poll(self, store, now)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(OpenSkyAircraft, "poll", fail_at_minute_five)
+        assert build(env, Clock(time)).catch_up() is False
+
+    # The process ends there. The next one is asked about minute 5 again.
+    second = build(env, Clock(time))
+    assert second.catch_up() is True
+    helicopter = [row.occurred_at for row in second.store.search(kinds=["aircraft"], limit=1000)]
+    assert helicopter[0] == story(5)
+    assert len(helicopter) == 31
+
+
+def test_a_restart_after_the_story_has_ended_still_says_how_the_last_polls_went(
+    env: dict[str, str], time: Time
+) -> None:
+    first = build(env, Clock(time))
+    time.moment = NOON + timedelta(days=1)
+    first.catch_up()
+    finished = first.runner.status()
+
+    second = build(env, Clock(time))
+
+    # Nothing is left to poll, so what the earlier process saw is all there is to say.
+    assert second.catch_up() is True
+    assert second.runner.status() == finished
+    assert finished == [
+        PollerStatus("nws", story(104), True),
+        PollerStatus("opensky", story(105), True),
+        PollerStatus("511", story(104), True),
     ]
 
 
@@ -358,6 +464,8 @@ def test_naming_a_source_builds_its_poller_on_the_live_store_and_asks_nothing_ye
     # There is no story to play, and building opens no connection.
     ingest.catch_up()
     assert ingest.scenario is None
+    # The pollers are given the network, which is what makes their rows `live`.
+    assert ingest.http.origin == "live"
     assert (ingest.store.mode, ingest.store.path.name) == ("live", "live.sqlite3")
     assert [(status.name, status.ok) for status in ingest.runner.status()] == [
         ("nws", None),
@@ -396,10 +504,7 @@ def test_each_source_is_asked_with_the_settings_the_environment_holds(
     }
     store = EvidenceStore(tmp_path / "disposable.sqlite3", "mock")
     pollers = source_pollers(
-        ("nws", "opensky", "511"),
-        settings,
-        http_client(httpx2.MockTransport(network)),
-        origin="mock",
+        ("nws", "opensky", "511"), settings, SourceHttp(httpx2.MockTransport(network))
     )
     runner = Runner(pollers, store, Clock(time))
 
@@ -419,6 +524,138 @@ def test_each_source_is_asked_with_the_settings_the_environment_holds(
     # With an account OpenSky is asked every thirty seconds.
     time.moment = NOON + timedelta(seconds=30)
     assert list(runner.step()) == ["opensky"]
+
+
+def test_what_a_stand_in_answered_cannot_be_stored_as_a_real_sources(
+    tmp_path: Path, time: Time, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The pollers a live deployment would build, from the same settings, but handed
+    # the invented scenario where the network would be.
+    stand_in = SourceHttp(scenario_transport(Scenario(start=START), time))
+    pollers = source_pollers(
+        ("nws", "opensky", "511"), OPENSKY | {"BEACON_511_API_KEY": "key-from-the-env"}, stand_in
+    )
+    live = EvidenceStore(tmp_path / "live.sqlite3", "live")
+
+    results = Runner(pollers, live, Clock(time)).step()
+
+    # Their rows are `mock` ones, because the client says so and nothing else can,
+    # and the live store refuses every one of them.
+    assert stand_in.origin == "mock"
+    assert {name: type(result).__name__ for name, result in results.items()} == {
+        "nws": "EvidenceStoreError",
+        "opensky": "EvidenceStoreError",
+        "511": "EvidenceStoreError",
+    }
+    assert live.count_by_source() == {}
+    assert "poller failed (EvidenceStoreError)" in caplog.text
+
+
+class Silent:
+    """A loopback server that takes a request and never answers it."""
+
+    def __init__(self) -> None:
+        self.asked = threading.Event()
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                outer.asked.set()
+                system_time.sleep(5)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self._server.server_port}/"
+        threading.Thread(target=self._server.serve_forever, args=(0.01,), daemon=True).start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+def test_stopping_calls_off_a_request_that_is_out_and_leaves_no_thread(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    server = Silent()
+    http = SourceHttp()
+
+    class Asking:
+        name = "slow"
+        interval_seconds = 30.0
+
+        def poll(self, store: EvidenceStore, now: datetime) -> PollReport:
+            fetch(http, "GET", server.url, source="slow", max_bytes=10)
+            row = NewEvidence(
+                kind="alert",
+                source="slow",
+                ref="1",
+                occurred_at=now,
+                confidence="low",
+                origin="live",
+            )
+            return PollReport(added=len(store.add([row], now=now)))
+
+    store = EvidenceStore(tmp_path / "live.sqlite3", "live")
+    clock = Clock()
+    ingest = Ingest(store, Runner([Asking()], store, clock), clock, http, None)
+    ingest.start()
+    assert server.asked.wait(5)
+    began = system_time.monotonic()
+
+    with caplog.at_level(logging.DEBUG, logger="beacon"):
+        stopped = ingest.stop()
+
+    # The source would have kept the poller waiting for twenty seconds.
+    assert stopped is True
+    assert system_time.monotonic() - began < 2
+    assert "beacon-ingest" not in [thread.name for thread in threading.enumerate()]
+    assert store.count_by_source() == {}
+    # Being stopped is not a failure of the source's, and is not logged as one.
+    assert caplog.text == ""
+    server.close()
+
+
+def test_stopping_calls_off_a_write_that_is_waiting_and_nothing_is_stored_afterwards(
+    env: dict[str, str], time: Time
+) -> None:
+    ingest = build(env, Clock(time))
+    # Something else is in the middle of a write to the store, as a route can be.
+    other = sqlite3.connect(ingest.store.path, isolation_level=None)
+    other.execute("BEGIN IMMEDIATE")
+    ingest.start()
+    system_time.sleep(0.3)
+    began = system_time.monotonic()
+
+    stopped = ingest.stop()
+
+    assert stopped is True
+    assert system_time.monotonic() - began < 2
+    assert "beacon-ingest" not in [thread.name for thread in threading.enumerate()]
+    # The other write ends. Nothing of the pollers' follows it into the store: the
+    # first step of the story was never stored, and is not marked as played.
+    other.execute("COMMIT")
+    other.close()
+    system_time.sleep(0.2)
+    after = open_store(env)
+    assert after.count_by_source() == {}
+    assert after.state("scenario") == {"start": START.isoformat()}
+    with pytest.raises(EvidenceStoreError, match="is closed and takes no more rows"):
+        ingest.store.add([], state=("scenario", {}))
+
+
+def test_the_pollers_are_started_once(env: dict[str, str], time: Time) -> None:
+    ingest = build(env, Clock(time))
+    ingest.start()
+
+    with pytest.raises(RuntimeError, match="already started"):
+        ingest.start()
+
+    assert ingest.stop() is True
+    # Stopping what never started, or has stopped, is no error.
+    assert ingest.stop() is True
+    assert build(env, Clock(time)).stop() is True
 
 
 def test_the_mock_and_live_stores_are_kept_apart_in_one_data_directory(

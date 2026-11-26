@@ -6,20 +6,20 @@ relays for local authorities, such as a shelter-in-place warning. The API needs 
 key, only a User-Agent that says who is asking, and its data is public domain.
 
 Each alert message is one row. An update is a new message with a new id that names
-the one it replaces, so it is a new row. NWS does not say when an alert is dropped:
-when one stops being listed before the time it said it would end, a row records that
-Beacon no longer sees it listed, and another if it is listed again
-(`beacon.ingest.listing`).
+the one it replaces, so it is a new row. NWS can cancel an alert with a `Cancel`
+message, which is a row like any other and as official. Mostly it does not, and an
+alert that is dropped is just gone: when one stops being listed before the time it
+said it would end, a row records that Beacon no longer sees it listed, and another
+if it is listed again (`beacon.ingest.listing`).
 """
 
 from datetime import datetime
 from typing import Any
 
-import httpx2
-
+from beacon.errors import raise_bare
 from beacon.evidence import Evidence, EvidenceStore, NewEvidence, Origin
 from beacon.ingest.area import centre
-from beacon.ingest.http import SourceError, fetch, read_json
+from beacon.ingest.http import SourceError, SourceHttp, fetch, read_json
 from beacon.ingest.listing import compare_listing, listed_again_row, not_listed_row
 from beacon.ingest.runner import PollReport
 
@@ -48,13 +48,13 @@ class NwsAlerts:
 
     def __init__(
         self,
-        http: httpx2.Client,
+        http: SourceHttp,
         *,
-        origin: Origin,
         zones: tuple[str, ...] = SAN_FRANCISCO_ZONES,
     ) -> None:
         self._http = http
-        self._origin: Origin = origin
+        # What a stand-in for the network answered is a stand-in's, whoever asks.
+        self._origin: Origin = http.origin
         self._zones = zones
 
     def poll(self, store: EvidenceStore, now: datetime) -> PollReport:
@@ -98,7 +98,7 @@ def parse_alerts(payload: Any, origin: Origin) -> tuple[list[NewEvidence], int]:
     Raises SourceError when the answer is not a feature collection."""
     features = payload.get("features") if isinstance(payload, dict) else None
     if not isinstance(features, list):
-        raise SourceError(SOURCE, "sent a reply Beacon cannot read")
+        raise_bare(SourceError(SOURCE, "sent a reply Beacon cannot read"))
     alerts: list[NewEvidence] = []
     unreadable = 0
     for feature in features:

@@ -9,7 +9,7 @@ import httpx2
 import pytest
 
 from beacon.evidence import EvidenceStore, Point
-from beacon.ingest.http import SourceError, http_client
+from beacon.ingest.http import SourceError, SourceHttp
 from beacon.ingest.opensky import MAX_ALTITUDE_M, OpenSkyAircraft, parse_states
 
 NOON = datetime(2026, 11, 27, 20, 0, tzinfo=UTC)
@@ -85,7 +85,7 @@ class Api:
 
 @pytest.fixture
 def store(tmp_path: Path) -> EvidenceStore:
-    return EvidenceStore(tmp_path / "evidence.sqlite3", "live")
+    return EvidenceStore(tmp_path / "evidence.sqlite3", "mock")
 
 
 @pytest.fixture
@@ -95,8 +95,7 @@ def api() -> Api:
 
 def signed_in(api: Api, clock: list[float]) -> OpenSkyAircraft:
     return OpenSkyAircraft(
-        http_client(httpx2.MockTransport(api)),
-        origin="live",
+        SourceHttp(httpx2.MockTransport(api)),
         client_id="beacon-client",
         client_secret="s3cret",
         monotonic=lambda: clock[0],
@@ -106,7 +105,7 @@ def signed_in(api: Api, clock: list[float]) -> OpenSkyAircraft:
 def test_without_an_account_the_poller_asks_for_the_city_and_polls_within_the_free_quota(
     store: EvidenceStore, api: Api
 ) -> None:
-    poller = OpenSkyAircraft(http_client(httpx2.MockTransport(api)), origin="live")
+    poller = OpenSkyAircraft(SourceHttp(httpx2.MockTransport(api)))
 
     poller.poll(store, NOON)
 
@@ -132,7 +131,7 @@ def test_an_aircraft_becomes_a_row_named_by_its_address_and_the_time_of_its_posi
     store: EvidenceStore, api: Api
 ) -> None:
     api.states = [state()]
-    poller = OpenSkyAircraft(http_client(httpx2.MockTransport(api)), origin="live")
+    poller = OpenSkyAircraft(SourceHttp(httpx2.MockTransport(api)))
 
     first = poller.poll(store, NOON)
     # OpenSky answers with the same position until the aircraft reports a new one.
@@ -147,7 +146,8 @@ def test_an_aircraft_becomes_a_row_named_by_its_address_and_the_time_of_its_posi
     )
     assert aircraft.occurred_at == NOON
     assert aircraft.point == Point(37.7766, -122.4236)
-    assert (aircraft.confidence, aircraft.origin, aircraft.url) == ("high", "live", None)
+    # The poller was given a stand-in for the network, so the row is a stand-in's.
+    assert (aircraft.confidence, aircraft.origin, aircraft.url) == ("high", "mock", None)
     assert aircraft.data == {
         "icao24": "a1b2c3",
         "callsign": "N123AB",
@@ -222,12 +222,16 @@ def test_a_state_vector_beacon_cannot_read_is_counted_or_passed_over() -> None:
 
 def test_an_empty_sky_is_not_an_error(store: EvidenceStore, api: Api) -> None:
     api.states = None
-    poller = OpenSkyAircraft(http_client(httpx2.MockTransport(api)), origin="live")
+    poller = OpenSkyAircraft(SourceHttp(httpx2.MockTransport(api)))
 
     assert poller.poll(store, NOON).added == 0
 
 
-@pytest.mark.parametrize("payload", [[], {"states": {}}, {"states": "none"}, None])
+@pytest.mark.parametrize(
+    "payload",
+    # The last two are objects without `states`, as an error can be: not an empty sky.
+    [[], {"states": {}}, {"states": "none"}, None, {}, {"time": 1_795_723_200}],
+)
 def test_an_answer_that_is_not_a_states_object_is_an_error(payload: Any) -> None:
     with pytest.raises(SourceError, match=r"^opensky sent a reply Beacon cannot read\.$"):
         parse_states(payload, "live")
@@ -300,8 +304,7 @@ def test_credentials_the_token_endpoint_refuses_fail_the_poll_without_being_repe
     store: EvidenceStore, api: Api
 ) -> None:
     poller = OpenSkyAircraft(
-        http_client(httpx2.MockTransport(api)),
-        origin="live",
+        SourceHttp(httpx2.MockTransport(api)),
         client_id="beacon-client",
         client_secret="wrong-s3cret",
     )
@@ -320,8 +323,7 @@ def test_a_token_reply_without_a_token_fails_the_poll(store: EvidenceStore) -> N
         return httpx2.Response(200, json={"expires_in": 1800})
 
     poller = OpenSkyAircraft(
-        http_client(httpx2.MockTransport(no_token)),
-        origin="live",
+        SourceHttp(httpx2.MockTransport(no_token)),
         client_id="beacon-client",
         client_secret="s3cret",
     )
@@ -334,7 +336,7 @@ def test_a_spent_quota_is_reported_with_the_wait_opensky_asks_for(store: Evidenc
     def spent(request: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(429, headers={"X-Rate-Limit-Retry-After-Seconds": "5400"})
 
-    poller = OpenSkyAircraft(http_client(httpx2.MockTransport(spent)), origin="live")
+    poller = OpenSkyAircraft(SourceHttp(httpx2.MockTransport(spent)))
 
     with pytest.raises(SourceError) as failure:
         poller.poll(store, NOON)
@@ -344,4 +346,4 @@ def test_a_spent_quota_is_reported_with_the_wait_opensky_asks_for(store: Evidenc
 
 def test_an_id_without_a_secret_is_refused() -> None:
     with pytest.raises(ValueError, match="given together"):
-        OpenSkyAircraft(http_client(), origin="live", client_id="beacon-client")
+        OpenSkyAircraft(SourceHttp(), client_id="beacon-client")

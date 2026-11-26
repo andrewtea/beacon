@@ -3,7 +3,7 @@
     from beacon.scenario import Scenario, scenario_transport
 
     scenario = Scenario(start=clock.now())
-    http = http_client(scenario_transport(scenario, clock.now))
+    http = SourceHttp(scenario_transport(scenario, clock.now))
 
 See `fire` for the story and `transport` for how it stands in for the network.
 """
