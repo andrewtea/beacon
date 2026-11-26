@@ -69,12 +69,17 @@ class OfficialOut(_Read):
     # `source.url`, and shows none of its words yet.
     reading: bool
     source: SourceOut
+    # The fields of an alert left out because the stored text may have been cut:
+    # the alert has more, at `source.url`.
+    incomplete: list[str]
 
 
 class SignalOut(_Read):
     kind: str
     text: str
-    evidence_ids: list[int]
+    confidence: Literal["official", "high", "medium", "low"]
+    # The rows the signal rests on, each with its link and its credit.
+    sources: list[SourceOut]
 
 
 class TrackOut(_Read):
@@ -105,7 +110,11 @@ class IncidentSummary(_Read):
     streets: list[str]
     units: list[str]
     alarm: int | None
+    # Taps, not people. `taps_more` says there were more than were counted.
     taps: int
+    taps_more: bool
+    # Whether more positions of aircraft were near it than were read.
+    aircraft_more: bool
     signals: list[SignalOut]
     # True when any row the incident is built from is a stand-in's: the invented
     # scenario, or a fake Ember. It is then to be labeled as one.
@@ -122,8 +131,9 @@ class Incidents(BaseModel):
     # `mock` when the evidence is the invented scenario's.
     mode: Literal["live", "mock"]
     as_of: datetime
-    # Whether there was more evidence than the engine reads at once, so that an
-    # incident can lack its oldest lines.
+    # Whether there was more evidence than the engine reads at once: an incident
+    # can then lack its oldest lines, count fewer taps than there were, or show an
+    # old alert as `unknown`.
     partial: bool
     incidents: list[IncidentSummary]
 
@@ -147,16 +157,17 @@ def incidents(request: Request, everything: bool = Query(False, alias="all")) ->
     """The incidents that are going on, and the ones that ended in the last two
     hours, newest first. With `all=true`, every incident the engine has."""
     engine = _engine(request)
-    now = engine.now()
+    # One reading for the whole answer: its incidents, its moment, and its flag.
+    snapshot = engine.snapshot()
     listed = [
         incident
-        for incident in engine.incidents()
-        if everything or incident.open or now - incident.updated_at <= LISTED_AFTER
+        for incident in snapshot.incidents
+        if everything or incident.open or snapshot.as_of - incident.updated_at <= LISTED_AFTER
     ]
     return Incidents(
         mode=engine.mode,
-        as_of=now,
-        partial=engine.partial,
+        as_of=snapshot.as_of,
+        partial=snapshot.partial,
         incidents=[IncidentSummary.model_validate(incident) for incident in listed],
     )
 
@@ -165,12 +176,13 @@ def incidents(request: Request, everything: bool = Query(False, alias="all")) ->
 def incident(request: Request, incident_id: str) -> IncidentAnswer:
     """One incident with its timeline, every line with its source and confidence."""
     engine = _engine(request)
-    found: Incident | None = engine.get(incident_id)
+    snapshot = engine.snapshot()
+    found: Incident | None = snapshot.get(incident_id)
     if found is None:
         raise HTTPException(404, "There is no such incident.")
     return IncidentAnswer(
         mode=engine.mode,
-        as_of=engine.now(),
-        partial=engine.partial,
+        as_of=snapshot.as_of,
+        partial=snapshot.partial,
         incident=IncidentDetail.model_validate(found),
     )

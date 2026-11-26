@@ -14,6 +14,18 @@ def at(minute: float) -> datetime:
     return NOON + timedelta(minutes=minute)
 
 
+def area(middle: Point, half_m: float = 400.0, *, hole_m: float | None = None) -> dict[str, Any]:
+    """A GeoJSON square around a point, with a square hole in its middle if asked."""
+
+    def ring(half: float) -> list[list[float]]:
+        lat, lon = half / 111_320.0, half / 88_000.0
+        corners = [(-lon, -lat), (lon, -lat), (lon, lat), (-lon, lat), (-lon, -lat)]
+        return [[middle.lon + east, middle.lat + north] for east, north in corners]
+
+    rings = [ring(half_m)] + ([] if hole_m is None else [ring(hole_m)])
+    return {"type": "Polygon", "coordinates": rings}
+
+
 def mock_store(tmp_path: Path) -> EvidenceStore:
     return EvidenceStore(tmp_path / "evidence" / "mock.sqlite3", "mock")
 
@@ -77,7 +89,11 @@ class Rows:
         message_type: str = "Alert",
         replaces: tuple[str, ...] = (),
         point: Point | None = HAYES,
+        geometry: Any = "around the point",
+        **data: Any,
     ) -> Evidence:
+        if geometry == "around the point":
+            geometry = None if point is None else area(point)
         return self._add(
             kind="alert",
             source="nws",
@@ -93,8 +109,9 @@ class Rows:
                 "headline": f"Headline of {ref}",
                 "instruction": f"Instruction of {ref}",
                 "replaces": list(replaces),
-                "geometry": None,
-            },
+                "geometry": geometry,
+            }
+            | data,
         )
 
     def traffic(
@@ -106,6 +123,7 @@ class Rows:
         road: str = "Hayes St",
         point: Point | None = HAYES,
         closed: bool = True,
+        headline: str | None = None,
     ) -> Evidence:
         return self._add(
             kind="traffic",
@@ -116,7 +134,7 @@ class Rows:
             point=point,
             data={
                 "event_id": event_id,
-                "headline": f"Activity on {road}",
+                "headline": headline or f"Activity on {road}",
                 "created": at(minute if created is None else created).isoformat(),
                 "roads": [{"name": road, "closed": closed}],
                 "closure": closed,

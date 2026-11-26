@@ -33,7 +33,10 @@ SAN_FRANCISCO_ZONES = ("CAZ006", "CAC075")
 
 _MAX_BYTES = 5_000_000
 # An alert's text is kept whole up to this length, which is longer than NWS writes.
-_MAX_TEXT = 8_000
+# A stored text of this length may have been cut, and a reader that relays it as the
+# authority's words leaves such a text out (`beacon.incident.build`).
+MAX_TEXT = 8_000
+MAX_HEADLINE = 500
 _SEVERITIES = frozenset({"Extreme", "Severe", "Moderate", "Minor", "Unknown"})
 _URGENCIES = frozenset({"Immediate", "Expected", "Future", "Past", "Unknown"})
 _CERTAINTIES = frozenset({"Observed", "Likely", "Possible", "Unlikely", "Unknown"})
@@ -156,9 +159,9 @@ def _alert(
             "certainty": _one_of(properties.get("certainty"), _CERTAINTIES),
             "response": _text(properties.get("response"), 50),
             "sender": _text(properties.get("senderName"), 200),
-            "headline": _text(properties.get("headline"), 500),
-            "description": _text(properties.get("description"), _MAX_TEXT),
-            "instruction": _text(properties.get("instruction"), _MAX_TEXT),
+            "headline": _text(properties.get("headline"), MAX_HEADLINE),
+            "description": _text(properties.get("description"), MAX_TEXT),
+            "instruction": _text(properties.get("instruction"), MAX_TEXT),
             "onset": _iso(_time(properties.get("onset"))),
             "expires": _iso(expires),
             "ends": _iso(ends),

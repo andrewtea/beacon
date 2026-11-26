@@ -8,7 +8,8 @@ import pytest
 from beacon.evidence import Point
 from beacon.incident import NO_BLOCKS, Blocks, Engine, Incident
 from beacon.incident.build import CREDIT_511
-from tests.incident_rows import HAYES, Rows, at, mock_store
+from beacon.ingest import nws, traffic511
+from tests.incident_rows import HAYES, Rows, area, at, mock_store
 
 BLOCKS = Blocks.of([("Hayes St", 400, HAYES.lat, HAYES.lon)])
 FAR = Point(37.7636, -122.4783)
@@ -245,7 +246,12 @@ def test_taps_are_counted_and_never_pointed_at_one_by_one(rows: Rows) -> None:
     (incident,) = incidents(rows, 5)
 
     (entry,) = [entry for entry in incident.timeline if entry.kind == "taps"]
-    assert entry.text == '3 people nearby pressed "What\'s that?" while this was going on.'
+    # Taps, and not people: three taps can be one person.
+    assert entry.text == (
+        '3 taps of "What\'s that?" came from nearby while this was going on. Beacon '
+        "cannot tell whether they are from different people."
+    )
+    assert "people nearby" not in repr(incident)
     (source,) = entry.sources
     assert (source.evidence_id, source.confidence, source.stand_in) == (None, "low", False)
     assert (entry.confidence, incident.taps) == ("low", 3)
@@ -313,3 +319,196 @@ def test_what_is_said_after_now_is_not_yet_known(rows: Rows) -> None:
     (incident,) = incidents(rows, 10)
 
     assert (incident.alarm, incident.official, len(incident.timeline)) == (2, (), 1)
+
+
+def test_an_alert_applies_only_where_its_area_holds_the_place(rows: Rows) -> None:
+    fire(rows)
+    # Drawn around a middle 300 m north of the fire, and reaching only 150 m from it.
+    north = Point(HAYES.lat + 300 / 111_320, HAYES.lon)
+    rows.alert(1, "near", point=north, geometry=area(north, 150))
+    # Drawn around the fire, with the fire's own block cut out of it.
+    rows.alert(2, "hole", geometry=area(HAYES, 400, hole_m=100))
+    # An alert with a middle and no area drawn says nothing of which places it holds.
+    rows.alert(3, "undrawn", geometry=None)
+    inside = rows.alert(4, "inside", geometry=area(HAYES, 400))
+
+    (incident,) = incidents(rows, 10)
+
+    assert [item.source.evidence_id for item in incident.official] == [inside.id]
+    (signal,) = incident.signals
+    assert (signal.kind, signal.text) == (
+        "official_alert",
+        "An official alert whose area holds this place is in force.",
+    )
+
+
+def test_a_text_that_may_have_been_cut_is_left_out_whole_and_said_to_be(rows: Rows) -> None:
+    fire(rows)
+    cut = "Residents may return" + "." * (nws.MAX_TEXT - 20)
+    assert len(cut) == nws.MAX_TEXT
+    rows.alert(1, "long", instruction=cut, headline="h" * nws.MAX_HEADLINE)
+    rows.alert(2, "short", instruction="x" * (nws.MAX_TEXT - 1))
+    rows.traffic(3, headline="c" * traffic511.MAX_HEADLINE)
+
+    (incident,) = incidents(rows, 10)
+
+    long, short = incident.official
+    assert (long.instruction, long.headline, long.incomplete) == (
+        None,
+        None,
+        ("headline", "instruction"),
+    )
+    assert (len(short.instruction or ""), short.incomplete) == (nws.MAX_TEXT - 1, ())
+    assert "Residents may return" not in repr(incident)
+    (closure,) = [entry for entry in incident.timeline if entry.kind == "closure"]
+    assert closure.text == (
+        "511 lists an event here. Its text is longer than Beacon keeps: read it at 511.org."
+    )
+    assert "ccc" not in repr(incident)
+
+
+def test_a_notice_that_names_no_street_is_nobodys_unless_it_is_a_press_release(
+    rows: Rows,
+) -> None:
+    fire(rows)
+    order = rows.notice(5, "evacuation_order")
+    # An all-clear for somewhere Beacon cannot tell: it names no street at all.
+    rows.notice(20, "all_clear", streets=())
+    press = rows.notice(30, "press_release", streets=())
+
+    (incident,) = incidents(rows, 40)
+
+    assert [(item.source.evidence_id, item.state) for item in incident.official] == [
+        (order.id, "published"),
+        (press.id, "published"),
+    ]
+    assert [signal.kind for signal in incident.signals] == ["official_order"]
+
+
+def test_an_all_clear_lifts_only_an_order_that_names_a_street_it_names(rows: Rows) -> None:
+    rows.radio(0, "fire", "working", units=("E36",), street="Hayes St", cross_street="Gough St")
+    # Both notices are the incident's, each by one of its two streets, and they
+    # are about different places.
+    order = rows.notice(5, "evacuation_order", streets=("Hayes St", "Octavia St"))
+    clear = rows.notice(20, "all_clear", streets=("Gough St", "Fell St"))
+
+    (incident,) = incidents(rows, 30)
+
+    assert [(item.source.evidence_id, item.state, item.ended_by) for item in incident.official] == [
+        (order.id, "published", None),
+        (clear.id, "published", None),
+    ]
+
+
+def test_a_signal_carries_its_sources_its_confidence_and_what_its_source_requires(
+    rows: Rows,
+) -> None:
+    fire(rows, alarm=2, details=("evacuation",))
+    closure = rows.traffic(2)
+    notice = rows.notice(3, "evacuation_order")
+    alert = rows.alert(4, "shelter")
+    for minute in (5, 6, 7):
+        rows.tap(minute)
+
+    (incident,) = incidents(rows, 10)
+
+    by_kind = {signal.kind: signal for signal in incident.signals}
+    assert {kind: signal.confidence for kind, signal in by_kind.items()} == {
+        "alarm": "medium",
+        "evacuation_on_radio": "medium",
+        "official_order": "high",
+        "official_alert": "official",
+        "closure": "official",
+        "taps": "low",
+    }
+    assert all(signal.sources and signal.text for signal in incident.signals)
+    # 511's credit goes with the signal, wherever the signal is shown.
+    (source,) = by_kind["closure"].sources
+    assert (source.evidence_id, source.credit) == (closure.id, CREDIT_511)
+    # The order is a reading, said to be one, with the document's link.
+    (source,) = by_kind["official_order"].sources
+    assert (source.evidence_id, source.url, source.model) == (notice.id, notice.url, "fake")
+    assert "This is Beacon's reading of the document." in by_kind["official_order"].text
+    assert by_kind["official_alert"].sources[0].evidence_id == alert.id
+    # Taps are one source that names none of them.
+    (source,) = by_kind["taps"].sources
+    assert (source.evidence_id, source.source, source.stand_in) == (None, "app", False)
+
+
+def test_an_event_that_closes_no_road_says_nothing_of_where_an_incident_is(rows: Rows) -> None:
+    fire(rows)
+    rows.tap(2)
+    slow = rows.traffic(3, closed=False)
+
+    (incident,) = incidents(rows, 5, NO_BLOCKS)
+
+    # The event is on the incident's street, so it is a line of its timeline.
+    assert [entry.sources[0].evidence_id for entry in incident.timeline[1:]] == [slow.id]
+    assert (incident.point, incident.point_from, incident.taps) == (None, None, 0)
+    assert incident.signals == ()
+
+
+def test_an_incident_the_radio_cleared_takes_nothing_more_from_its_place(rows: Rows) -> None:
+    fire(rows)
+    rows.tap(2)
+    rows.radio(10, "fire", "cleared", units=("E36", "T6"))
+    # After the clearance: a tap, a closure, and a helicopter are not this incident's.
+    rows.tap(15)
+    rows.traffic(20)
+    rows.aircraft(22, HAYES, altitude_m=200)
+    # A notice still follows: an all-clear and a press release come after.
+    order = rows.notice(5, "evacuation_order")
+    clear = rows.notice(30, "all_clear")
+
+    (incident,) = incidents(rows, 40)
+
+    assert (incident.status, incident.taps, incident.aircraft) == ("cleared", 1, ())
+    assert [entry.kind for entry in incident.timeline] == [
+        "radio",
+        "taps",
+        "notice",
+        "radio",
+        "notice",
+    ]
+    assert [(item.source.evidence_id, item.state) for item in incident.official] == [
+        (order.id, "lifted"),
+        (clear.id, "published"),
+    ]
+
+
+def test_one_low_position_is_one_sighting_and_no_more_is_said_of_it(rows: Rows) -> None:
+    fire(rows)
+    rows.aircraft(2, HAYES, icao24="once01", altitude_m=250)
+    for minute in (4, 5, 6):
+        rows.aircraft(minute, HAYES, icao24="more01", altitude_m=250, category=None)
+
+    (incident,) = incidents(rows, 10)
+
+    assert [entry.text for entry in incident.timeline if entry.kind == "aircraft"] == [
+        "A helicopter (TEST1) was seen low nearby, once, as low as 250 m.",
+        "An aircraft (TEST1) was seen low nearby over about 2 min, as low as 250 m.",
+    ]
+
+
+def test_a_later_message_about_an_alert_is_a_line_and_not_an_alert_for_the_place(
+    rows: Rows,
+) -> None:
+    fire(rows)
+    first = rows.alert(1, "first")
+    # The update is drawn for somewhere else, and the cancellation for nowhere.
+    rows.alert(5, "second", message_type="Update", replaces=("first",), point=FAR)
+    rows.alert(8, "third", message_type="Cancel", replaces=("second",), point=None)
+
+    (incident,) = incidents(rows, 10)
+
+    assert [(item.source.evidence_id, item.state) for item in incident.official] == [
+        (first.id, "replaced")
+    ]
+    assert [
+        entry.details["message_type"] for entry in incident.timeline if entry.kind == "alert"
+    ] == [
+        "Alert",
+        "Update",
+        "Cancel",
+    ]
+    assert incident.signals == ()

@@ -389,6 +389,7 @@ class EvidenceStore:
         include_unlocated: bool = False,
         newest_first: bool = False,
         limit: int = 500,
+        up_to_id: int | None = None,
     ) -> list[Evidence]:
         """Rows by kind, source, time, and place, oldest first unless `newest_first`.
 
@@ -403,7 +404,11 @@ class EvidenceStore:
 
         `near` with `radius_m` keeps the rows whose point is within that many metres.
         A row with no point, such as a city-wide alert or a transmission whose
-        location was not found, is left out unless `include_unlocated` is true."""
+        location was not found, is left out unless `include_unlocated` is true.
+
+        `up_to_id` leaves out the rows stored after the row of that id. A reader
+        that makes several searches notes `last_id` first and hands it to each, so
+        that all of them see the same rows whatever is stored meanwhile."""
         if (near is None) != (radius_m is None):
             raise ValueError("near and radius_m are given together.")
         if radius_m is not None and not (math.isfinite(radius_m) and radius_m >= 0):
@@ -422,6 +427,9 @@ class EvidenceStore:
         if end is not None:
             where.append("occurred_ms <= ?")
             values.append(_to_ms(end))
+        if up_to_id is not None:
+            where.append("id <= ?")
+            values.append(up_to_id)
         if near is not None:
             located = "(lat IS NOT NULL AND distance_m(lat, lon, ?, ?) <= ?)"
             where.append(f"({located} OR lat IS NULL)" if include_unlocated else located)

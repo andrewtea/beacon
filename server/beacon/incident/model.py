@@ -29,7 +29,7 @@ SignalKind = Literal[
     "taps",
 ]
 OfficialState = Literal[
-    "in_force", "replaced", "cancelled", "not_listed", "ended", "published", "lifted"
+    "in_force", "replaced", "cancelled", "not_listed", "ended", "unknown", "published", "lifted"
 ]
 
 
@@ -91,6 +91,7 @@ class Official:
     type: str
     # `published` is a notice that no other notice Beacon has read lifts. Beacon
     # does not say such an order is in force: it has only read the document.
+    # `unknown` is an alert that may have been ended by a row that was not read.
     state: OfficialState
     # The row that ended it, when one did: an update, a cancellation, the row that
     # says it is no longer listed, or the all-clear Beacon reads as lifting it.
@@ -106,6 +107,9 @@ class Official:
     # `source.url`, which is the authority speaking.
     reading: bool
     source: Source
+    # The fields of an alert that are left out because the stored text may have
+    # been cut. Whoever shows the alert says it has more, and links the original.
+    incomplete: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -116,7 +120,11 @@ class Signal:
 
     kind: SignalKind
     text: str
-    evidence_ids: tuple[int, ...]
+    # How far to trust it, which is as far as the weakest row it rests on.
+    confidence: Confidence
+    # The rows it rests on, each with its feed, its link, and the credit its
+    # source's terms require, so a signal shown by itself still carries them.
+    sources: tuple[Source, ...]
 
 
 @dataclass(frozen=True)
@@ -143,8 +151,14 @@ class Incident:
     timeline: tuple[Entry, ...]
     official: tuple[Official, ...]
     aircraft: tuple[Track, ...]
-    # How many taps came from near it while it was going on.
+    # How many taps came from near it while it was going on. Taps, not people:
+    # nothing tells one sender from another.
     taps: int
+    # Whether there were more taps than were read, so that `taps` is a lower bound,
+    # and whether there were more positions of aircraft, so that a track can be
+    # missing or cut short.
+    taps_more: bool
+    aircraft_more: bool
     signals: tuple[Signal, ...]
     # Whether any row it is built from is a stand-in's. It is then one too.
     stand_in: bool

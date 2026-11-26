@@ -137,3 +137,51 @@ def test_a_call_stored_late_is_put_where_its_time_puts_it(rows: Rows) -> None:
 
     assert [row.data["status"] for row in fire.rows] == ["dispatched", "on_scene"]
     assert fire.status == "on_scene"
+
+
+def test_a_call_that_gives_only_the_street_goes_to_the_incident_its_units_are_on(
+    rows: Rows,
+) -> None:
+    rows.radio(0, "fire", "working", units=("E1",), street="Hayes St", block=400)
+    rows.radio(5, "alarm", "dispatched", units=("E2",), street="Hayes St", block=700)
+    rows.radio(6, "fire", "working", units=("E1",), street="Hayes St", details=("knocked_down",))
+
+    first, second = groups(rows)
+
+    assert ([row.data["block"] for row in first.rows], first.block) == ([400, None], 400)
+    assert (len(second.rows), second.block) == (1, 700)
+
+
+def test_an_intersection_is_one_place_whichever_street_is_named_first(rows: Rows) -> None:
+    rows.radio(
+        0, "collision", "dispatched", units=("E1",), street="Hayes St", cross_street="Gough St"
+    )
+    rows.radio(
+        2, "collision", "on_scene", units=("T3",), street="Gough St", cross_street="Hayes St"
+    )
+    # Another cross street of the same street is another place.
+    rows.radio(3, "alarm", "dispatched", units=("E9",), street="Hayes St", cross_street="Laguna St")
+
+    collision, alarm = groups(rows)
+
+    assert (len(collision.rows), collision.street, collision.cross_street) == (
+        2,
+        "Hayes St",
+        "Gough St",
+    )
+    assert (len(alarm.rows), alarm.cross_street) == (1, "Laguna St")
+
+
+def test_a_unit_named_on_a_second_incident_has_left_the_first(rows: Rows) -> None:
+    rows.radio(0, "fire", "working", units=("E1", "E2"), street="Hayes St", block=400)
+    rows.radio(5, "alarm", "dispatched", units=("E9",), street="Irving St", block=1900)
+    # E2 is heard with E9, with no place given: it has gone to the alarm.
+    rows.radio(6, "alarm", "en_route", units=("E9", "E2"))
+    rows.radio(8, "alarm", "on_scene", units=("E2",))
+    rows.radio(9, "fire", "under_control", units=("E1",))
+
+    fire, alarm = groups(rows)
+
+    assert [row.data["status"] for row in fire.rows] == ["working", "under_control"]
+    assert [row.data["status"] for row in alarm.rows] == ["dispatched", "en_route", "on_scene"]
+    assert (fire.active, alarm.active) == ({"E1"}, {"E9", "E2"})

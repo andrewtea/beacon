@@ -19,7 +19,10 @@ message is later than the message and can be anywhere, so it is searched for wit
 distance filter and no upper bound on its age, as `AGENTS.md` says.
 
 A notice is lifted only by another notice. `lifted` says which all-clear Beacon
-reads as lifting which order, among notices already matched to one incident. Both
+reads as lifting which order, among notices already matched to one incident: an
+earlier order about the same hazard that names a street the all-clear names too.
+Two notices that name no street in common are about different places as far as
+Beacon can tell, and the order stays as it was. Both
 are a model's readings of documents, so the result is how Beacon reads them and
 never an instruction: an all-clear can have exceptions that only the document gives.
 """
@@ -31,8 +34,11 @@ from datetime import datetime
 from typing import Literal
 
 from beacon.evidence import Evidence
+from beacon.radio.vocabulary import clean_street
 
-State = Literal["in_force", "replaced", "cancelled", "not_listed", "ended", "cancellation"]
+State = Literal[
+    "in_force", "replaced", "cancelled", "not_listed", "ended", "cancellation", "unknown"
+]
 
 # The types of notice an all-clear can lift.
 _LIFTED_BY_ALL_CLEAR = frozenset({"evacuation_order", "evacuation_warning", "shelter_in_place"})
@@ -43,7 +49,8 @@ class Standing:
     """How one alert message or one version of a traffic event stands."""
 
     # `cancellation` is an NWS `Cancel` message itself: it ends others and is never
-    # in force.
+    # in force. `unknown` is a message that nothing read here ends, when not every
+    # row that could end it was read (`beacon.incident.build.build_incidents`).
     state: State
     # The row that ended it: the message that replaced or cancelled it, the later
     # version of the event, or the row that says it is no longer listed.
@@ -86,17 +93,27 @@ def standings(rows: Iterable[Evidence], now: datetime) -> dict[int, Standing]:
 def lifted(notices: Sequence[Evidence]) -> dict[int, Evidence]:
     """Which all-clear Beacon reads as lifting which order, among the notices of
     one incident: the id of each order's row, and the all-clear's row. An all-clear
-    lifts the orders about the same hazard that were published before it."""
+    lifts the orders about the same hazard that were published before it and name
+    a street it names too."""
     found: dict[int, Evidence] = {}
     ordered = sorted(notices, key=_order)
     for place, notice in enumerate(ordered):
         if notice.data.get("notice_type") != "all_clear":
             continue
+        streets = set(notice_streets(notice))
         for earlier in ordered[:place]:
             lifts = earlier.data.get("notice_type") in _LIFTED_BY_ALL_CLEAR
-            if lifts and earlier.data.get("hazard") == notice.data.get("hazard"):
+            same_hazard = earlier.data.get("hazard") == notice.data.get("hazard")
+            if lifts and same_hazard and streets & set(notice_streets(earlier)):
                 found.setdefault(earlier.id, notice)
     return found
+
+
+def notice_streets(row: Evidence) -> list[str]:
+    """The streets a notice row names, each in the form Beacon keeps a street in."""
+    streets = row.data.get("streets")
+    cleaned = (clean_street(street) for street in (streets if isinstance(streets, list) else []))
+    return [street for street in cleaned if street is not None]
 
 
 def _alert_standing(

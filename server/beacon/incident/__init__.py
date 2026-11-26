@@ -3,7 +3,7 @@
     from beacon.incident import open_engine
 
     engine = open_engine(os.environ, store)
-    for incident in engine.incidents():
+    for incident in engine.snapshot().incidents:
         incident.title, incident.status, incident.place      # "Fire at the 400 block of Hayes St"
         for entry in incident.timeline:
             entry.text, entry.confidence, entry.sources      # what one source said, and which
@@ -17,7 +17,7 @@ blocks that gives a radio call's place a point, and `engine` for the reader.
 from beacon.incident.aircraft import Track, tracks
 from beacon.incident.build import build_incidents, incident_id, source_of, weakest
 from beacon.incident.calls import IDLE, CallGroup, group_calls
-from beacon.incident.engine import HORIZON, Engine
+from beacon.incident.engine import HORIZON, Engine, Snapshot
 from beacon.incident.inforce import Standing, lifted, standings
 from beacon.incident.model import (
     CONFIDENCE_RANK,
@@ -46,6 +46,7 @@ __all__ = [
     "IncidentConfigError",
     "Official",
     "Signal",
+    "Snapshot",
     "Source",
     "Standing",
     "Track",

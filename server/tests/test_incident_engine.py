@@ -10,6 +10,7 @@ from beacon.evidence import EvidenceStore
 from beacon.incident import (
     BLOCKS_VARIABLE,
     NO_BLOCKS,
+    Blocks,
     Engine,
     IncidentConfigError,
     open_engine,
@@ -17,8 +18,9 @@ from beacon.incident import (
 from beacon.ingest import Clock, build
 from beacon.main import create_app
 from beacon.scenario import FIRE, INVENTED
-from tests.incident_rows import NOON, Rows, at, mock_store
+from tests.incident_rows import HAYES, NOON, Rows, at, mock_store
 
+BLOCKS = Blocks.of([("Hayes St", 400, HAYES.lat, HAYES.lon)])
 # A mock store begins its story twenty minutes before it is first opened.
 START = NOON - timedelta(minutes=20)
 
@@ -176,9 +178,108 @@ def test_a_flood_of_taps_crowds_no_call_out_of_what_the_engine_reads(
     engine = open_engine({}, rows.store, clock=lambda: at(5))
     (incident,) = engine.incidents()
 
-    # The call is still read, and the taps are counted up to the most that are read.
+    # The call is still read. The taps are counted up to the most that are read,
+    # and the count is said to be a lower bound.
     assert (incident.title, incident.taps) == ("Fire at the 400 block of Hayes St", 4)
+    assert (incident.taps_more, engine.partial) == (True, True)
+    (entry,) = [entry for entry in incident.timeline if entry.kind == "taps"]
+    assert entry.text.startswith("At least 4 taps of")
+    (signal,) = incident.signals
+    assert signal.text == "At least 4 taps from nearby."
+
+
+def test_exactly_as_many_rows_as_the_engine_reads_is_not_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("beacon.incident.engine.MAX_ROWS", 2)
+    monkeypatch.setattr("beacon.incident.engine.MAX_NEARBY", 2)
+    rows = Rows(mock_store(tmp_path))
+    rows.radio(0, "fire", "working", units=("E36",), street="Hayes St", block=400)
+    rows.radio(1, "fire", "working", units=("E36",))
+    rows.tap(2)
+    rows.tap(3)
+
+    engine = open_engine({}, rows.store, clock=lambda: at(5))
+    (incident,) = engine.incidents()
+    assert (len(incident.timeline), incident.taps, incident.taps_more) == (3, 2, False)
     assert not engine.partial
+
+    rows.radio(4, "fire", "working", units=("E36",))
+    assert engine.partial
+
+
+def test_an_old_alert_is_not_said_to_be_in_force_when_what_could_end_it_was_not_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows = Rows(mock_store(tmp_path))
+    # Issued a day ago for two days, and cancelled fifteen hours ago, which is
+    # before the twelve hours the engine reads.
+    old = rows.alert(-1440, "old", until=1440)
+    rows.alert(-900, "cancel", until=None, message_type="Cancel", replaces=("old",), point=None)
+    for step in range(4):
+        rows.traffic(-800 + step, f"511.org/{step}", road="Lincoln Way", point=None)
+    rows.radio(0, "fire", "working", units=("E36",), street="Hayes St", block=400)
+
+    def official() -> tuple[list[tuple[int | None, str]], list[str], bool]:
+        snapshot = open_engine({}, rows.store, clock=lambda: at(5)).snapshot()
+        (incident,) = snapshot.incidents
+        return (
+            [(item.source.evidence_id, item.state) for item in incident.official],
+            [signal.kind for signal in incident.signals],
+            snapshot.partial,
+        )
+
+    # Everything is read: the cancellation is found, whatever its age.
+    assert official() == ([(old.id, "cancelled")], [], False)
+
+    # Too many rows since the alert to read them all: the cancellation is among
+    # the ones left out, and nothing is said either way.
+    monkeypatch.setattr("beacon.incident.engine.MAX_ROWS", 3)
+    assert official() == ([(old.id, "unknown")], [], True)
+
+
+def test_a_reading_is_of_one_state_of_the_store(tmp_path: Path) -> None:
+    rows = Rows(mock_store(tmp_path))
+    rows.radio(0, "fire", "working", units=("E36",), street="Hayes St", block=400)
+    rows.tap(1)
+    moment = [at(5)]
+
+    class WrittenTo(EvidenceStore):
+        """A store that is written to while it is being read."""
+
+        def search(self, **asked):  # type: ignore[no-untyped-def]
+            if asked["kinds"] == ["tap"]:
+                rows.tap(2)
+            return super().search(**asked)
+
+    engine = Engine(WrittenTo(rows.store.path, "mock"), BLOCKS, clock=lambda: moment[0])
+    first = engine.snapshot()
+
+    # The tap stored while the reading was under way is in none of it.
+    assert (first.incidents[0].taps, first.last_id) == (1, 2)
+    assert first.get(first.incidents[0].id) is first.incidents[0]
+    # It is in all of the next, which the new row brings about at once.
+    second = engine.snapshot()
+    assert (second.incidents[0].taps, second.last_id) == (2, 3)
+    assert second is not first
+
+
+def test_the_routes_answer_from_one_reading(tmp_path: Path) -> None:
+    rows = Rows(mock_store(tmp_path))
+    rows.radio(0, "fire", "working", units=("E36",), street="Hayes St", block=400)
+    moment = [at(1)]
+    app = create_app()
+    app.state.incidents = open_engine({}, rows.store, clock=lambda: moment[0])
+    client = TestClient(app)
+    first = client.get("/api/incidents").json()
+
+    # Two seconds on, with no new row: the same reading, and its own moment.
+    moment[0] = at(1) + timedelta(seconds=2)
+    again = client.get("/api/incidents").json()
+    one = client.get(f"/api/incidents/{first['incidents'][0]['id']}").json()
+
+    assert first["as_of"] == again["as_of"] == one["as_of"] == "2026-11-27T20:01:00Z"
+    assert again == first
 
 
 def test_an_alert_older_than_the_horizon_is_still_ended_by_what_replaced_it(tmp_path: Path) -> None:

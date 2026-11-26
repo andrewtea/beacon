@@ -14,11 +14,17 @@ incident for it, or leaves it out. The rules, in the order they apply:
   either, so it is never "cleared": it is open until it has gone quiet.
 - **A place is what an incident is.** A call that names a street joins the incident
   at that street and block, and never one at another place, whatever units it
-  shares with it: a unit that is sent on from one call to the next names both.
+  shares with it: a unit that is sent on from one call to the next names both. Two
+  blocks of one street are two places, and so are two cross streets of one street
+  when no block is given; an intersection is one place whichever of its streets is
+  named first. A call that gives a street and nothing more fits every incident on
+  that street, and goes to the one its units are on.
 - **Units tie the rest together.** A call that names no street joins the incident
   whose units it names, which is how most calls are tied: `E36 on scene` gives no
-  address. When no incident has its units, it opens one with no place yet, which the
-  first call to name those units with a street then gives its place.
+  address. A unit is on one incident at a time: a call that is taken into an
+  incident takes its units off the others. When no incident has its units, it opens
+  one with no place yet, which the first call to name those units with a street
+  then gives its place.
 - **An incident goes quiet.** One that has not been heard from for `IDLE` takes no
   more calls, and a later call at its block opens a new incident. So does a new
   dispatch to a block whose incident was cleared.
@@ -112,11 +118,27 @@ class CallGroup:
         """The units that were named and not since cleared."""
         return set(self.named) - self.released
 
-    def _fits(self, call: "_Call") -> bool:
-        """Whether a call that names a street is at this incident's place."""
+    def _fits(self, call: "_Call") -> int:
+        """How well a call that names a street fits this incident's place: 2 when
+        it is the same block or the same intersection, 1 when nothing it says
+        speaks against it, and 0 when it is somewhere else.
+
+        An intersection is the same one whichever of its streets is named first.
+        Two calls on one street are somewhere else when they give different
+        blocks, or give no block and different cross streets."""
+        if (
+            call.cross_street is not None
+            and call.block is None
+            and (self.street, self.cross_street) == (call.cross_street, call.street)
+        ):
+            return 2
         if self.street != call.street:
-            return False
-        return self.block is None or call.block is None or self.block == call.block
+            return 0
+        if self.block is not None and call.block is not None:
+            return 2 if self.block == call.block else 0
+        if self.cross_street is not None and call.cross_street is not None:
+            return 2 if self.cross_street == call.cross_street else 0
+        return 1
 
     def _take(self, row: Evidence, call: "_Call") -> None:
         self.rows.append(row)
@@ -183,26 +205,30 @@ def group_calls(rows: Iterable[Evidence]) -> list[CallGroup]:
                 continue
             group = CallGroup(medical=call.medical, category=call.category)
             groups.append(group)
-        if call.street is not None:
-            # A unit is at one place at a time: named at this one, it has left the
-            # others, and a later call that names only the unit belongs here.
-            for other in live:
-                if other is not group:
-                    other.released |= set(call.units) & set(other.named)
+        # A unit is on one incident at a time, among the medical ones and among the
+        # others: named on this one, it has left the rest, and a later call that
+        # names only the unit belongs here.
+        for other in live:
+            if other is not group:
+                other.released |= set(call.units) & set(other.named)
         group._take(row, call)
     return groups
 
 
 def _placed(live: list[CallGroup], call: _Call) -> CallGroup | None:
     """The incident a call that names a street belongs to, or None for a new one."""
+    units = set(call.units)
     # A new dispatch to a place whose incident is over is a new incident.
     here = [
-        group
-        for group in live
+        (group._fits(call), len(group.active & units), group.last_at, place, group)
+        for place, group in enumerate(live)
         if group._fits(call) and not (group.over and call.status == "dispatched")
     ]
     if here:
-        return max(here, key=lambda group: group.last_at)
+        # The one whose place it names outright; among incidents it only does not
+        # speak against, as `Hayes St` does of two blocks of Hayes St, the one its
+        # units are on; and then the one heard from last.
+        return max(here)[-1]
     # An incident that has no place yet, whose units this call names, gets this one.
     return _by_units([group for group in live if group.street is None], call)
 

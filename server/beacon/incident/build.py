@@ -10,21 +10,28 @@ What is attached, and why it is taken to belong:
 - **A 511 event** that was created while the incident was going on, on a road the
   incident's calls name or within `CLOSURE_M` of its point. Road work that was there
   all day is not, because it was not created then.
-- **An NWS alert drawn for an area** that holds the incident's point, or whose middle
-  is within `ALERT_M` of it, while the incident was going on. A city-wide alert, which
-  has no area of its own, is about the city and not about this incident.
+- **An NWS alert drawn for an area** that holds the incident's point, holes left out,
+  while the incident was going on. Being near the middle of an alert's area is not
+  being in it, and a city-wide alert, which has no area of its own, is about the
+  city and not about this incident. A later message that updates or cancels such an
+  alert is a line of the timeline.
 - **A notice** that names one of the incident's streets and was published while it
   was going on or in the hours after. A press release keeps no streets, so it is
-  attached only when exactly one incident of its hazard is in its time.
+  attached when exactly one incident of its hazard is in its time; any other notice
+  that names no street is attached to nothing.
 - **Taps** from near the point while it was going on, which are counted and never
   listed.
 - **Aircraft** that circled or came low over the point.
 
+An incident the radio has cleared takes nothing more by time and place: a closure, a
+tap, or an aircraft after that can be the next incident's. A notice still follows,
+because an all-clear and a press release come after.
+
 A medical response gets none of these. It is its crews and its block.
 
 An incident's point is the middle of its block when somebody listed the block
-(`beacon.incident.places`), else the middle of a closure 511 lists on its street,
-else nothing. With no point it is matched to nothing by distance.
+(`beacon.incident.places`), else the middle of an event in which 511 lists a road of
+its as closed, else nothing. With no point it is matched to nothing by distance.
 
 The wording here is where the product's rules about words are kept:
 
@@ -32,7 +39,9 @@ The wording here is where the product's rules about words are kept:
 - What crews say on the radio about an evacuation, a shelter, or an all-clear is
   written as radio traffic and said not to be an official order.
 - An official alert's instruction is the authority's own words, shown as such
-  (`Official.instruction`). Beacon writes no instruction itself.
+  (`Official.instruction`). Beacon writes no instruction itself. A text that is as
+  long as its poller keeps may have been cut, so it is left out whole and named in
+  `Official.incomplete`: the original is where to read it.
 - A notice is written as a document of its type that was published, with its link.
   Its words are a model's reading, and none of them is shown here: the redaction
   pass has to read them first.
@@ -49,7 +58,7 @@ from typing import Any
 from beacon.evidence import Confidence, Evidence, Kind, Point
 from beacon.incident.aircraft import NEAR_M, Track, tracks
 from beacon.incident.calls import IDLE, CallGroup, group_calls
-from beacon.incident.inforce import Standing, lifted, standings
+from beacon.incident.inforce import Standing, lifted, notice_streets, standings
 from beacon.incident.model import (
     CONFIDENCE_RANK,
     Credit,
@@ -60,12 +69,12 @@ from beacon.incident.model import (
     Source,
 )
 from beacon.incident.places import Blocks
+from beacon.ingest import nws, traffic511
 from beacon.notice import ORDERS
 from beacon.radio.vocabulary import MEDICAL_EVENT, clean_street, place_in_words
 
-# How far from an incident's point a closure, an alert's middle, and a tap may be.
+# How far from an incident's point a closure and a tap may be.
 CLOSURE_M = 300.0
-ALERT_M = 500.0
 TAP_M = 400.0
 # How long before an incident's first call, and after its last, something said about
 # its place is still taken to be about it.
@@ -82,10 +91,11 @@ MANY_TAPS = 3
 CREDIT_511 = Credit("data provided by 511.org", "https://511.org")
 
 # Hands back the rows of one kind within so many metres of a point, between two
-# moments. Taps and aircraft are asked for this way, incident by incident: there can
-# be a great many of either, few of them near anything, and read with the other rows
-# they would crowd those out of what the engine reads at once.
-Nearby = Callable[[Kind, Point, float, datetime, datetime], Sequence[Evidence]]
+# moments, and whether there were more of them than it hands back. Taps and aircraft
+# are asked for this way, incident by incident: there can be a great many of either,
+# few of them near anything, and read with the other rows they would crowd those out
+# of what the engine reads at once.
+Nearby = Callable[[Kind, Point, float, datetime, datetime], tuple[Sequence[Evidence], bool]]
 
 _LABELS = {
     "openmhz": "Fire and EMS dispatch radio, as Ember heard it",
@@ -169,12 +179,22 @@ def build_incidents(
     blocks: Blocks,
     now: datetime,
     nearby: Nearby | None = None,
+    unresolved_before: datetime | None = None,
 ) -> list[Incident]:
     """The incidents the rows tell of at `now`, newest first. `rows` holds the
     radio, traffic, alert, and notice rows to read. Taps and aircraft are asked for
-    through `nearby`, incident by incident; without it an incident has neither."""
+    through `nearby`, incident by incident; without it an incident has neither.
+
+    `unresolved_before` says that the rows which can end an alert or a closure were
+    not all read, and from when they were: a message from that moment or earlier
+    that nothing read here ends is then `unknown`, and is not said to be in force."""
     known = [row for row in rows if row.occurred_at <= now]
     states = standings(known, now)
+    if unresolved_before is not None:
+        by_id = {row.id: row for row in known}
+        for row_id, standing in list(states.items()):
+            if standing.in_force and by_id[row_id].occurred_at <= unresolved_before:
+                states[row_id] = Standing("unknown")
     by_kind: dict[str, list[Evidence]] = {}
     for row in sorted(known, key=_order):
         by_kind.setdefault(row.kind, []).append(row)
@@ -189,7 +209,9 @@ def build_incidents(
 
 def incident_id(opener: Evidence) -> str:
     """The id of the incident a row opened: a digest of the row's source and its
-    reference there, so the same story gives the same id in any store."""
+    reference there. The row that opens an incident is the one of its rows that was
+    stored first, so the id is this store's: another store that took the same calls
+    in another order can name the incident by another of them."""
     return "inc-" + hashlib.sha256(f"{opener.source}\x1f{opener.ref}".encode()).hexdigest()[:16]
 
 
@@ -211,28 +233,36 @@ def _incident(
     official: list[Official] = []
     signals: list[Signal] = []
     track_list: list[Track] = []
-    taps = 0
+    near_taps: list[Evidence] = []
+    taps_more = aircraft_more = False
     point = blocks.point(group.street, group.block)
     point_from = "blocks" if point is not None else None
     streets = _streets(group)
-    start, end = group.opened_at - BEFORE, group.last_at + IDLE
+    start = group.opened_at - BEFORE
+    # Once the radio has cleared it, what happens at its place is no longer taken
+    # to be about it: the next thing there can be the next incident's.
+    end = group.last_at if group.over else group.last_at + IDLE
     members = list(group.rows)
     if not group.medical:
         closures = []
         for versions in events.values():
-            created = _created(versions)
-            if not start <= created <= end:
+            if not start <= _created(versions) <= end:
                 continue
             named = _roads(versions) & set(streets)
             near = point is not None and any(
                 row.point is not None and row.point.distance_m(point) <= CLOSURE_M
                 for row in versions
             )
-            if named or near:
-                closures.append(versions)
-                if point is None and named and versions[-1].point is not None:
-                    point, point_from = versions[-1].point, "closure"
-        alerts = _alerts_at(by_kind.get("alert", []), point, start, end)
+            if not (named or near):
+                continue
+            closures.append(versions)
+            # Only a version that lists a road as closed says where the incident is.
+            closed = [
+                row for row in versions if row.data.get("closure") is True and row.point is not None
+            ]
+            if point is None and named and closed:
+                point, point_from = closed[-1].point, "closure"
+        alerts, revisions = _alerts_at(by_kind.get("alert", []), point, start, end)
         notices = _notices_for(group, by_kind.get("notice", []), streets, press, start)
         changes = _changes(by_kind, closures, alerts)
         for versions in closures:
@@ -240,29 +270,33 @@ def _incident(
             members += versions
         for alert in alerts:
             entries.append(_alert_entry(alert, states))
-            if alert.data.get("message_type") != "Cancel":
-                official.append(_official_alert(alert, states[alert.id]))
+            official.append(_official_alert(alert, states[alert.id]))
+        # A later message that updates or cancels one of them is a line of the
+        # timeline. It is not listed as an alert for this place: its own area or
+        # time may not be this incident's.
+        entries += [_alert_entry(revision, states) for revision in revisions]
         entries += [_change_entry(change) for change in changes]
         ended = lifted(notices)
         for notice in notices:
             entries.append(_notice_entry(notice, streets))
             official.append(_official_notice(notice, ended.get(notice.id), now))
-        members += [*alerts, *changes, *notices]
+        members += [*alerts, *revisions, *changes, *notices]
         if point is not None and nearby is not None:
             until = min(end, now)
-            near_taps = sorted(nearby("tap", point, TAP_M, start, until), key=_order)
-            taps = len(near_taps)
+            found, taps_more = nearby("tap", point, TAP_M, start, until)
+            near_taps = sorted(found, key=_order)
+            positions, aircraft_more = nearby("aircraft", point, NEAR_M, start, until)
             track_list = [
                 track
-                for track in tracks(nearby("aircraft", point, NEAR_M, start, until), point)
+                for track in tracks(positions, point)
                 if track.circling or (track.low and track.nearest_m <= NEAR_M / 2)
             ]
             for track in track_list:
                 entries.append(_aircraft_entry(track))
                 members += track.rows
             if near_taps:
-                entries.append(_taps_entry(near_taps))
-        signals = _signals(group, official, closures, states, track_list, taps)
+                entries.append(_taps_entry(near_taps, taps_more))
+        signals = _signals(group, official, closures, states, track_list, near_taps, taps_more)
     entries.sort(key=lambda entry: entry.at)
     in_force = any(item.state == "in_force" for item in official)
     updated_at = max(entry.at for entry in entries)
@@ -284,7 +318,9 @@ def _incident(
         timeline=tuple(entries),
         official=tuple(official),
         aircraft=tuple(track_list),
-        taps=taps,
+        taps=len(near_taps),
+        taps_more=taps_more,
+        aircraft_more=aircraft_more,
         signals=tuple(signals),
         stand_in=any(row.stand_in for row in members),
         evidence_ids=tuple(sorted({row.id for row in members})),
@@ -377,12 +413,15 @@ def _radio_entry(row: Evidence) -> Entry:
 
 
 def _traffic_entry(row: Evidence, states: dict[int, Standing], *, first: bool) -> Entry:
-    headline = row.data.get("headline")
+    headline = _whole(row.data.get("headline"), traffic511.MAX_HEADLINE)
+    lists = "511 lists" if first else "511 updated"
     return Entry(
         at=row.occurred_at,
         kind="closure",
         # The headline is 511's own words.
-        text=f"{'511 lists' if first else '511 updated'}: {headline}",
+        text=f"{lists}: {headline}"
+        if headline is not None
+        else f"{lists} an event here. Its text is longer than Beacon keeps: read it at 511.org.",
         confidence=row.confidence,
         sources=(source_of(row),),
         details={
@@ -403,7 +442,7 @@ def _alert_entry(row: Evidence, states: dict[int, Standing]) -> Entry:
         data.get("message_type"), "issued an alert"
     )
     # The event and the headline are the authority's own words.
-    headline = data.get("headline")
+    headline = _whole(data.get("headline"), nws.MAX_HEADLINE)
     text = f"{sender} {verb}, {data.get('event')}" + (f": {headline}" if headline else ".")
     return Entry(
         at=row.occurred_at,
@@ -451,13 +490,17 @@ def _notice_entry(row: Evidence, streets: Sequence[str]) -> Entry:
             # The streets of the incident that the notice names too. They are the
             # incident's own names, which were on a list when a call gave them. A
             # street only the notice names is a word a model wrote, and is not shown.
-            "streets": [street for street in streets if street in _clean_streets(row)],
+            "streets": [street for street in streets if street in notice_streets(row)],
             "incomplete": row.data.get("incomplete") or [],
         },
     )
 
 
 def _official_alert(row: Evidence, standing: Standing) -> Official:
+    kept = {
+        "headline": _whole(row.data.get("headline"), nws.MAX_HEADLINE),
+        "instruction": _whole(row.data.get("instruction"), nws.MAX_TEXT),
+    }
     return Official(
         kind="alert",
         type=str(row.data.get("event")),
@@ -466,8 +509,11 @@ def _official_alert(row: Evidence, standing: Standing) -> Official:
         issued_at=row.occurred_at,
         until=row.until,
         issuer=row.data.get("sender"),
-        headline=row.data.get("headline"),
-        instruction=row.data.get("instruction"),
+        headline=kept["headline"],
+        instruction=kept["instruction"],
+        incomplete=tuple(
+            name for name, text in kept.items() if text is None and row.data.get(name) is not None
+        ),
         reading=False,
         source=source_of(row),
     )
@@ -499,25 +545,32 @@ def _official_notice(row: Evidence, lifted_by: Evidence | None, now: datetime) -
 def _aircraft_entry(track: Track) -> Entry:
     what = "A helicopter" if track.category == "rotorcraft" else "An aircraft"
     name = f" ({track.callsign})" if track.callsign else ""
-    did = "circled nearby" if track.circling else "passed low nearby"
-    minutes = max(1, round(track.minutes))
+    # Only what the positions show: one position is one sighting, and says nothing
+    # of how long the aircraft was there or which way it went.
+    if track.circling:
+        did = f"circled nearby for about {max(1, round(track.minutes))} min"
+    elif track.positions == 1:
+        did = "was seen low nearby, once"
+    elif track.minutes >= 1:
+        did = f"was seen low nearby over about {round(track.minutes)} min"
+    else:
+        did = "was seen low nearby"
     height = "" if track.lowest_m is None else f", as low as {round(track.lowest_m)} m"
+    ends = {track.rows[0].id: track.rows[0], track.rows[-1].id: track.rows[-1]}
     return Entry(
         at=track.first_seen,
         kind="aircraft",
-        text=f"{what}{name} {did} for about {minutes} min{height}.",
+        text=f"{what}{name} {did}{height}.",
         confidence=weakest([row.confidence for row in track.rows]),
         # The first and the last position stand for the track.
-        sources=tuple(
-            source_of(row)
-            for row in {track.rows[0].id: track.rows[0], track.rows[-1].id: track.rows[-1]}.values()
-        ),
+        sources=tuple(source_of(row) for row in ends.values()),
         details={
             "icao24": track.icao24,
             "callsign": track.callsign,
             "category": track.category,
             "first_seen": track.first_seen.isoformat(),
             "last_seen": track.last_seen.isoformat(),
+            "positions": track.positions,
             "circling": track.circling,
             "low": track.low,
             "nearest_m": round(track.nearest_m),
@@ -526,29 +579,22 @@ def _aircraft_entry(track: Track) -> Entry:
     )
 
 
-def _taps_entry(near: Sequence[Evidence]) -> Entry:
-    """One line for all the taps from near an incident, oldest first in `near`."""
+def _taps_entry(near: Sequence[Evidence], more: bool) -> Entry:
+    """One line for all the taps from near an incident, oldest first in `near`.
+    `more` says there were more of them than were read."""
     count = len(near)
-    people = "1 person" if count == 1 else f"{count} people"
     return Entry(
         at=near[0].occurred_at,
         kind="taps",
-        text=f'{people} nearby pressed "What\'s that?" while this was going on.',
+        text=f'{_taps_words(count, more)} of "What\'s that?" came from nearby while this was '
+        "going on. Beacon cannot tell whether they are from different people.",
         confidence="low",
-        sources=(
-            Source(
-                kind="tap",
-                source="app",
-                label=_LABELS["app"],
-                confidence="low",
-                at=near[0].occurred_at,
-                evidence_id=None,
-                url=None,
-                # A person's tap is nobody's stand-in.
-                stand_in=False,
-            ),
-        ),
-        details={"count": count, "last_at": near[-1].occurred_at.isoformat()},
+        sources=(_taps_source(near[0].occurred_at),),
+        details={
+            "count": count,
+            "at_least": more,
+            "last_at": near[-1].occurred_at.isoformat(),
+        },
     )
 
 
@@ -558,23 +604,38 @@ def _signals(
     closures: Sequence[Sequence[Evidence]],
     states: dict[int, Standing],
     track_list: Sequence[Track],
-    taps: int,
+    near_taps: Sequence[Evidence],
+    taps_more: bool,
 ) -> list[Signal]:
     signals: list[Signal] = []
+
+    def of(rows: Sequence[Evidence]) -> list[Source]:
+        return [source_of(row) for row in rows]
+
     if group.alarm is not None and group.alarm >= 2:
         rows = [row for row in group.rows if row.data.get("alarm") == group.alarm]
-        signals.append(Signal("alarm", f"Alarm level {group.alarm}.", _ids(rows)))
+        signals.append(_signal("alarm", f"Alarm level {group.alarm} on the radio.", of(rows)))
     evacuating = [row for row in group.rows if "evacuation" in (row.data.get("details") or [])]
     if evacuating:
         signals.append(
-            Signal(
+            _signal(
                 "evacuation_on_radio",
                 f"Crews mention an evacuation. {_NOT_AN_ORDER}",
-                _ids(evacuating),
+                of(evacuating),
             )
         )
     if len(group.named) >= MANY_UNITS:
-        signals.append(Signal("many_units", f"{len(group.named)} units named.", _ids(group.rows)))
+        # The calls that named a unit for the first time.
+        seen: set[str] = set()
+        naming = []
+        for row in group.rows:
+            units = {unit for unit in row.data.get("units") or [] if isinstance(unit, str)}
+            if units - seen:
+                naming.append(row)
+            seen |= units
+        signals.append(
+            _signal("many_units", f"{len(group.named)} units named on the radio.", of(naming))
+        )
     orders = [
         item
         for item in official
@@ -584,39 +645,45 @@ def _signals(
     ]
     if orders:
         signals.append(
-            Signal(
+            _signal(
                 "official_order",
-                "An authority published an order that no notice Beacon has read lifts.",
-                tuple(item.source.evidence_id for item in orders if item.source.evidence_id),
+                "An authority published an order that no notice Beacon has read lifts. " + _READING,
+                [item.source for item in orders],
             )
         )
     alerts = [item for item in official if item.kind == "alert" and item.state == "in_force"]
     if alerts:
         signals.append(
-            Signal(
+            _signal(
                 "official_alert",
-                "An official alert for this place is in force.",
-                tuple(item.source.evidence_id for item in alerts if item.source.evidence_id),
+                "An official alert whose area holds this place is in force.",
+                [item.source for item in alerts],
             )
         )
     closed = [
         versions[-1]
         for versions in closures
-        if versions[-1].data.get("closure") and states[versions[-1].id].in_force
+        if versions[-1].data.get("closure") is True and states[versions[-1].id].in_force
     ]
     if closed:
-        signals.append(Signal("closure", "511 lists a road closed.", _ids(closed)))
+        signals.append(_signal("closure", "511 lists a road closed.", of(closed)))
     circling = [track for track in track_list if track.circling]
     if circling:
         signals.append(
-            Signal(
+            _signal(
                 "aircraft_circling",
                 "An aircraft circled nearby.",
-                tuple(track.rows[0].id for track in circling),
+                of([track.rows[0] for track in circling]),
             )
         )
-    if taps >= MANY_TAPS:
-        signals.append(Signal("taps", f"{taps} taps from nearby.", ()))
+    if len(near_taps) >= MANY_TAPS:
+        signals.append(
+            _signal(
+                "taps",
+                f"{_taps_words(len(near_taps), taps_more)} from nearby.",
+                [_taps_source(near_taps[0].occurred_at)],
+            )
+        )
     return signals
 
 
@@ -656,26 +723,35 @@ def _roads(versions: Sequence[Evidence]) -> set[str]:
 
 def _alerts_at(
     alerts: Sequence[Evidence], point: Point | None, start: datetime, end: datetime
-) -> list[Evidence]:
-    """The alert messages drawn for an area that holds `point`, or has its middle
-    near it, and whose span touches the incident's, with the messages that cancel
-    them."""
+) -> tuple[list[Evidence], list[Evidence]]:
+    """The alert messages that apply to `point` while the incident was going on,
+    and the later messages that update or cancel them.
+
+    A message applies when the area it was drawn for holds the point, holes left
+    out, and its span touches the incident's. Being near the middle of an area is
+    not being in it. A message that revises one of those is handed back apart: it
+    belongs on the timeline, and whether it applies here itself is not known."""
     if point is None:
-        return []
+        return [], []
     found: list[Evidence] = []
     for row in alerts:
-        if "change" in row.data or row.point is None:
+        if "change" in row.data or row.data.get("message_type") == "Cancel":
             continue
-        here = row.point.distance_m(point) <= ALERT_M or _inside(row.data.get("geometry"), point)
-        if here and row.occurred_at <= end and (row.until is None or row.until >= start):
+        if not _inside(row.data.get("geometry"), point):
+            continue
+        if row.occurred_at <= end and (row.until is None or row.until >= start):
             found.append(row)
     refs = {row.ref for row in found}
-    for row in alerts:
+    revisions: list[Evidence] = []
+    # In the order they were sent, so a revision of a revision is found too.
+    for row in sorted(alerts, key=_order):
         named = row.data.get("replaces")
-        cancels = row.data.get("message_type") == "Cancel" and isinstance(named, list)
-        if cancels and refs & set(named) and row not in found:
-            found.append(row)
-    return sorted(found, key=_order)
+        if "change" in row.data or row.ref in refs or not isinstance(named, list):
+            continue
+        if refs & {ref for ref in named if isinstance(ref, str)}:
+            revisions.append(row)
+            refs.add(row.ref)
+    return sorted(found, key=_order), revisions
 
 
 def _changes(
@@ -702,6 +778,9 @@ def _notices_for(
     press: dict[int, int],
     start: datetime,
 ) -> list[Evidence]:
+    """The notices about an incident: the ones that name one of its streets, and a
+    press release matched to it (`_press_matches`). A notice that names no street
+    and is not a press release is about nowhere Beacon can tell, and is nobody's."""
     found = []
     for row in notices:
         if row.data.get("notice_type") in (None, "other"):
@@ -709,18 +788,20 @@ def _notices_for(
             continue
         if not start <= row.occurred_at <= group.last_at + NOTICE_AFTER:
             continue
-        if set(_clean_streets(row)) & set(streets) or press.get(row.id) == id(group):
+        if set(notice_streets(row)) & set(streets) or press.get(row.id) == id(group):
             found.append(row)
     return found
 
 
 def _press_matches(groups: Sequence[CallGroup], notices: Sequence[Evidence]) -> dict[int, int]:
-    """Which incident each notice that names no street is about: the one incident of
-    its hazard in its time, when there is exactly one. The incident is named by the
-    identity of its group."""
+    """Which incident each press release is about: the one incident of its hazard
+    in its time, when there is exactly one. A press release's row keeps no streets,
+    so there is nothing else to match it by; it orders nothing and lifts nothing,
+    so a wrong match adds a line and changes no standing. The incident is named by
+    the identity of its group."""
     matches: dict[int, int] = {}
     for row in notices:
-        if _clean_streets(row) or row.data.get("notice_type") in (None, "other"):
+        if row.data.get("notice_type") != "press_release":
             continue
         hazard = row.data.get("hazard")
         about = [
@@ -735,15 +816,9 @@ def _press_matches(groups: Sequence[CallGroup], notices: Sequence[Evidence]) -> 
     return matches
 
 
-def _clean_streets(row: Evidence) -> list[str]:
-    streets = row.data.get("streets")
-    cleaned = (clean_street(street) for street in (streets if isinstance(streets, list) else []))
-    return [street for street in cleaned if street is not None]
-
-
 def _inside(geometry: Any, point: Point) -> bool:
-    """Whether a GeoJSON polygon or multipolygon holds a point, by its outer rings.
-    A ring's positions are longitude first."""
+    """Whether a GeoJSON polygon or multipolygon holds a point: inside an outer
+    ring and in none of that polygon's holes. A ring's positions are longitude first."""
     if not isinstance(geometry, dict):
         return False
     coordinates = geometry.get("coordinates")
@@ -753,10 +828,13 @@ def _inside(geometry: Any, point: Point) -> bool:
         polygons = coordinates if isinstance(coordinates, list) else []
     else:
         return False
-    return any(
-        isinstance(polygon, list) and polygon and _in_ring(polygon[0], point)
-        for polygon in polygons
-    )
+    for polygon in polygons:
+        if not isinstance(polygon, list) or not polygon:
+            continue
+        outer, *holes = polygon
+        if _in_ring(outer, point) and not any(_in_ring(hole, point) for hole in holes):
+            return True
+    return False
 
 
 def _in_ring(ring: Any, point: Point) -> bool:
@@ -792,3 +870,43 @@ def _unit_order(unit: str) -> tuple[str, int]:
 
 def _order(row: Evidence) -> tuple[datetime, int]:
     return (row.occurred_at, row.id)
+
+
+def _whole(text: object, limit: int) -> str | None:
+    """A text a poller stored, or None when it is as long as the poller keeps. It
+    may then have been cut, and a cut text can say the opposite of the whole one:
+    an instruction without its exception. So it is left out, and the original is
+    where to read it."""
+    return text if isinstance(text, str) and len(text) < limit else None
+
+
+def _taps_source(at: datetime) -> Source:
+    """The source line of a claim that rests on taps, which names none of them."""
+    return Source(
+        kind="tap",
+        source="app",
+        label=_LABELS["app"],
+        confidence="low",
+        at=at,
+        evidence_id=None,
+        url=None,
+        # A person's tap is nobody's stand-in.
+        stand_in=False,
+    )
+
+
+def _taps_words(count: int, more: bool) -> str:
+    """How many taps, in words. Taps, and not people: nothing tells one sender
+    from another, so three taps can be one person."""
+    counted = "1 tap" if count == 1 else f"{count} taps"
+    return f"At least {counted}" if more else counted
+
+
+def _signal(kind: str, text: str, sources: Sequence[Source]) -> Signal:
+    """A signal with the sources it rests on, trusted as little as the weakest."""
+    return Signal(
+        kind=kind,  # type: ignore[arg-type]
+        text=text,
+        confidence=weakest([source.confidence for source in sources]),
+        sources=tuple(sources),
+    )

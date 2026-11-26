@@ -1,19 +1,26 @@
 """The incident engine: the evidence store read as the incidents going on now.
 
     engine = open_engine(os.environ, store)
-    engine.incidents()                 # every incident of the last twelve hours
-    engine.get("inc-3f2a9c1d5b7e0a64")
+    snapshot = engine.snapshot()       # one reading: the incidents, and as of when
+    snapshot.incidents, snapshot.as_of, snapshot.partial
+    snapshot.get("inc-3f2a9c1d5b7e0a64")
 
 Nothing the engine works out is stored. An incident is a function of the evidence
 rows (`beacon.incident.build`), so there is no second record that could disagree with
 the first, and a store that is deleted and begun again takes its incidents with it.
 What is worked out is kept in memory for as long as the store has no new row, and
 for a few seconds at most, because what is in force also changes with the time.
+
+A reading is of one state of the store. The engine notes the id of the newest row
+when it begins, and every search of the reading looks no further, so a row that is
+stored while it reads is in none of it and in all of the next. A caller takes one
+`Snapshot` and answers from it, and never puts two readings together.
 """
 
 import logging
 import threading
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from beacon.evidence import Evidence, EvidenceStore, Kind, Mode, Point
@@ -22,8 +29,7 @@ from beacon.incident.model import Incident
 from beacon.incident.places import Blocks
 
 # How far back the engine reads. An incident older than this is gone from it, and one
-# that has gone on for longer loses its first calls, and with them its id. An incident
-# counts at most `MAX_NEARBY` taps.
+# that has gone on for longer loses its first calls.
 HORIZON = timedelta(hours=12)
 # The most rows read, the newest first, so that what is left out is the oldest.
 MAX_ROWS = 20_000
@@ -36,6 +42,30 @@ _KINDS = ("radio", "traffic", "alert", "notice")
 MAX_NEARBY = 5_000
 
 logger = logging.getLogger("beacon.incident")
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    """One reading of the store: the incidents, the moment they are as of, and
+    whether anything was left out of the reading."""
+
+    as_of: datetime
+    # Newest first.
+    incidents: tuple[Incident, ...]
+    # Whether there were more rows than the engine reads: the oldest rows of the
+    # last twelve hours, the taps or the aircraft near an incident, or the rows that
+    # can end an old alert. An incident can then lack its first lines, count fewer
+    # taps than there were, or show an alert as `unknown`.
+    partial: bool
+    # The id of the newest evidence row the reading took in.
+    last_id: int
+
+    def get(self, incident_id: str) -> Incident | None:
+        """The incident of that id, or None when the reading has none."""
+        for incident in self.incidents:
+            if incident.id == incident_id:
+                return incident
+        return None
 
 
 class Engine:
@@ -52,7 +82,7 @@ class Engine:
         self._blocks = blocks
         self._clock = (lambda: datetime.now(UTC)) if clock is None else clock
         self._working = threading.Lock()
-        self._made: tuple[int, datetime, list[Incident], bool] | None = None
+        self._made: Snapshot | None = None
 
     @property
     def mode(self) -> Mode:
@@ -68,73 +98,106 @@ class Engine:
     def blocks(self) -> Blocks:
         return self._blocks
 
-    def now(self) -> datetime:
-        return self._clock()
-
     def incidents(self) -> list[Incident]:
         """Every incident whose calls are within `HORIZON`, newest first."""
-        return list(self._read()[2])
+        return list(self.snapshot().incidents)
+
+    def get(self, incident_id: str) -> Incident | None:
+        """The incident of that id, or None when the engine has none."""
+        return self.snapshot().get(incident_id)
 
     @property
     def partial(self) -> bool:
-        """Whether the last reading left rows out because there were more than
-        `MAX_ROWS` of them: the oldest, so an incident can lack its first lines."""
-        return self._read()[3]
+        """Whether the latest reading left rows out (`Snapshot.partial`)."""
+        return self.snapshot().partial
 
-    def _read(self) -> tuple[int, datetime, list[Incident], bool]:
+    def snapshot(self) -> Snapshot:
+        """The incidents as of now, from one state of the store. The same reading
+        is handed out again while the store has no new row and it is not yet
+        `FRESH` old."""
         now = self._clock()
         with self._working:
             last = self._store.last_id()
             made = self._made
-            if made is not None and made[0] == last and timedelta(0) <= now - made[1] < FRESH:
+            if (
+                made is not None
+                and made.last_id == last
+                and timedelta(0) <= now - made.as_of < FRESH
+            ):
                 return made
-            rows = self._store.search(
-                kinds=_KINDS, start=now - HORIZON, end=now, newest_first=True, limit=MAX_ROWS
-            )
-            partial = len(rows) >= MAX_ROWS
-            # What ends an alert or a closure is a later row of the same source,
-            # and it can be from before the horizon when the message it ends is
-            # found by a span that began earlier still. So every alert and traffic
-            # row since the oldest message found is read too, whatever its age.
-            messages = [row for row in rows if row.kind in ("alert", "traffic")]
-            earliest = min((row.occurred_at for row in messages), default=now)
-            if earliest < now - HORIZON:
-                later = self._store.search(
-                    kinds=("alert", "traffic"),
-                    start=earliest,
-                    end=now,
-                    newest_first=True,
-                    limit=MAX_ROWS,
-                )
-                partial = partial or len(later) >= MAX_ROWS
-                have = {row.id for row in rows}
-                rows += [row for row in later if row.id not in have]
-            if partial and not (made is not None and made[3]):
-                logger.warning(
-                    "The incident engine read the newest %d rows and left older ones "
-                    "out, so an incident can lack its first lines.",
-                    MAX_ROWS,
-                )
-            found = build_incidents(rows, blocks=self._blocks, now=now, nearby=self._nearby)
-            self._made = (last, now, found, partial)
-            return self._made
+            made = self._read(now, last, was_partial=made is not None and made.partial)
+            self._made = made
+            return made
 
-    def get(self, incident_id: str) -> Incident | None:
-        """The incident of that id, or None when the engine has none."""
-        for incident in self.incidents():
-            if incident.id == incident_id:
-                return incident
-        return None
-
-    def _nearby(
-        self, kind: Kind, point: Point, radius_m: float, start: datetime, end: datetime
-    ) -> Sequence[Evidence]:
-        return self._store.search(
-            kinds=[kind],
-            start=start,
-            end=end,
-            near=point,
-            radius_m=radius_m,
+    def _read(self, now: datetime, last: int, *, was_partial: bool) -> Snapshot:
+        most = MAX_ROWS
+        # One more than is used, which says whether there were more.
+        rows = self._store.search(
+            kinds=_KINDS,
+            start=now - HORIZON,
+            end=now,
+            up_to_id=last,
             newest_first=True,
-            limit=MAX_NEARBY,
+            limit=most + 1,
         )
+        partial = len(rows) > most
+        rows = rows[:most]
+        # What ends an alert or a closure is a later row of the same source, and it
+        # can be from before the horizon when the message it ends is found by a span
+        # that began earlier still. So every alert and traffic row since the oldest
+        # message found is read too, whatever its age.
+        unresolved_before: datetime | None = None
+        messages = [row for row in rows if row.kind in ("alert", "traffic")]
+        earliest = min((row.occurred_at for row in messages), default=now)
+        if earliest < now - HORIZON:
+            later = self._store.search(
+                kinds=("alert", "traffic"),
+                start=earliest,
+                end=now,
+                up_to_id=last,
+                newest_first=True,
+                limit=most + 1,
+            )
+            if len(later) > most:
+                # The oldest of them were left out, and one of those can be what
+                # ended a message older than the oldest that was read: of such a
+                # message it is not known whether it is in force.
+                later = later[:most]
+                unresolved_before = later[-1].occurred_at
+                partial = True
+            have = {row.id for row in rows}
+            rows += [row for row in later if row.id not in have]
+        overflowed = [False]
+
+        def nearby(
+            kind: Kind, point: Point, radius_m: float, start: datetime, end: datetime
+        ) -> tuple[Sequence[Evidence], bool]:
+            found = self._store.search(
+                kinds=[kind],
+                start=start,
+                end=end,
+                near=point,
+                radius_m=radius_m,
+                up_to_id=last,
+                newest_first=True,
+                limit=MAX_NEARBY + 1,
+            )
+            more = len(found) > MAX_NEARBY
+            overflowed[0] = overflowed[0] or more
+            return found[:MAX_NEARBY], more
+
+        found = build_incidents(
+            rows,
+            blocks=self._blocks,
+            now=now,
+            nearby=nearby,
+            unresolved_before=unresolved_before,
+        )
+        partial = partial or overflowed[0]
+        if partial and not was_partial:
+            logger.warning(
+                "The incident engine found more rows than it reads at once and left "
+                "some out: an incident can lack its first lines, count fewer taps than "
+                "there were, or show an old alert as unknown."
+            )
+        return Snapshot(as_of=now, incidents=tuple(found), partial=partial, last_id=last)
