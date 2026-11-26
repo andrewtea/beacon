@@ -20,7 +20,8 @@ shown**:
   it is left out and counted (`Draft.left_out`).
 - **Code writes the sentence**, from the cited rows' own fields, as what was said
   or seen then: a story's sentence is read apart from its line, so it is in the past
-  tense and carries its time. What crews said about an evacuation, sheltering, or
+  tense and carries its time, and it names no speaker, because a row keeps what
+  was said and not who said it. What was said about an evacuation, sheltering, or
   an all-clear is written with "That is radio traffic, not an official order.", as
   it is in the timeline.
   The version of a 511 event that is in force, an aircraft, and taps are told in
@@ -86,25 +87,27 @@ CHANGE_SAID = {
         "When Beacon checked, 511 was listing again a traffic event it had stopped listing."
     ),
 }
-# What is said of a detail a call gave: what crews said then, in the past tense. A
-# story's sentence is read apart from its line, and "rescue in progress" from a call
-# of half an hour ago is not in progress now.
+# What is said of a detail a call gave: what was said on the radio then, in the past
+# tense. A story's sentence is read apart from its line, and "rescue in progress"
+# from a call of half an hour ago is not in progress now. No sentence says who said
+# it or who did it: a row keeps the detail and not the speaker, and a dispatcher who
+# relays a request for police is no crew that requested them.
 DETAIL_SAID = {
-    "smoke_showing": "Crews reported smoke showing.",
-    "fire_showing": "Crews reported fire showing.",
-    "working_fire": "Crews declared a working fire.",
-    "additional_alarm": "Crews called an additional alarm.",
-    "exposure_threatened": "Crews reported neighbouring buildings threatened.",
-    "rescue_in_progress": "Crews reported a rescue in progress.",
-    "evacuation": f"Crews mentioned an evacuation. {NOT_AN_ORDER}",
-    "shelter_in_place": f"Crews mentioned sheltering in place. {NOT_AN_ORDER}",
-    "police_requested": "Crews requested police.",
-    "utilities_requested": "Crews requested utilities.",
-    "road_closed": "Crews reported a road closed.",
-    "aircraft_overhead": "Crews mentioned an aircraft overhead.",
-    "knocked_down": "Crews reported the fire knocked down.",
-    "overhaul": "Crews reported overhaul under way.",
-    "all_clear": f"Crews said all clear. {NOT_AN_ORDER}",
+    "smoke_showing": "Radio traffic reported smoke showing.",
+    "fire_showing": "Radio traffic reported fire showing.",
+    "working_fire": "Radio traffic reported a working fire declared.",
+    "additional_alarm": "Radio traffic reported an additional alarm called.",
+    "exposure_threatened": "Radio traffic reported neighbouring buildings threatened.",
+    "rescue_in_progress": "Radio traffic reported a rescue in progress.",
+    "evacuation": f"An evacuation was mentioned on the radio. {NOT_AN_ORDER}",
+    "shelter_in_place": f"Sheltering in place was mentioned on the radio. {NOT_AN_ORDER}",
+    "police_requested": "Radio traffic reported a request for police.",
+    "utilities_requested": "Radio traffic reported a request for utilities.",
+    "road_closed": "Radio traffic reported a road closed.",
+    "aircraft_overhead": "Radio traffic mentioned an aircraft overhead.",
+    "knocked_down": "Radio traffic reported the fire knocked down.",
+    "overhaul": "Radio traffic reported overhaul under way.",
+    "all_clear": f"All clear was said on the radio. {NOT_AN_ORDER}",
 }
 
 # What a point can be about. `status`, `alarm`, `units`, and each detail a call can

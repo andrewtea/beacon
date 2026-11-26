@@ -1,11 +1,13 @@
 """Stories: what is kept of Ember's account of an incident, and when one is paid for."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import sqlite3
 import threading
 import time
+from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -15,6 +17,8 @@ from fastapi.testclient import TestClient
 
 import beacon.main as main_module
 import beacon.story.desk as desk_module
+import beacon.story.merge as merge_module
+import beacon.story.store as store_module
 from beacon.ember import (
     BudgetExceededError,
     EmberCallError,
@@ -47,6 +51,9 @@ from beacon.story import (
 )
 from tests.incident_rows import HAYES, NOON, Rows, at, mock_store
 
+EVACUATION_SAID = (
+    "An evacuation was mentioned on the radio. That is radio traffic, not an official order."
+)
 BLOCKS = Blocks.of([("Hayes St", 400, HAYES.lat, HAYES.lon)])
 NAMES = Names.of(streets=("Hayes St", "Gough St"), units=("E36", "T6", "B2"))
 START = NOON - timedelta(minutes=20)
@@ -117,7 +124,7 @@ def test_code_writes_each_sentence_from_the_rows_its_point_cites(
         # What crews said about an evacuation is radio traffic, and is said so.
         (
             "evacuation",
-            "Crews mentioned an evacuation. That is radio traffic, not an official order.",
+            EVACUATION_SAID,
         ),
         # 511's own words, as the timeline has them.
         ("closure", "511 lists: Activity on Hayes St"),
@@ -256,7 +263,7 @@ def test_no_word_ember_writes_is_read_kept_or_shown(
 
     assert [claim.text for claim in draft.claims] == [
         "The radio said: units on scene.",
-        "Crews mentioned an evacuation. That is radio traffic, not an official order.",
+        EVACUATION_SAID,
     ]
     kept = repr(draft) + everything_on_disk(tmp_path)
     for word in ("safe", "Jane", "go home", "Shelter in place now", "Exit", "is over"):
@@ -334,6 +341,49 @@ def test_a_version_of_a_closure_that_511_has_changed_is_not_told_as_what_511_say
     shown = " ".join(claim.text for claim in draft.claims)
     assert "changed" not in shown
     assert "Gough St" not in shown
+
+
+def test_a_detail_is_told_as_what_was_said_on_the_radio_and_names_nobody_who_said_it(
+    rows: Rows, storage: Storage
+) -> None:
+    rows.radio(0, "fire", "dispatched", units=("E36",), street="Hayes St", block=400)
+    # A dispatcher relays a request: the row keeps the request and not who made it.
+    rows.radio(1, "fire", units=("E36",), details=("police_requested", "working_fire"))
+    rows.radio(2, "fire", units=("E36",), details=("additional_alarm", "utilities_requested"))
+    (incident,) = Engine(rows.store, BLOCKS, names=NAMES, clock=lambda: at(6)).incidents()
+    kinds = ("police_requested", "working_fire", "additional_alarm", "utilities_requested")
+    cites = ([2], [2], [3], [3])
+    script = Script([answer(*zip(kinds, cites, strict=True))])
+
+    draft = merge_incident(EmberClient.fake(storage, script), incident)
+
+    assert [claim.text for claim in draft.claims] == [
+        "Radio traffic reported a request for police.",
+        "Radio traffic reported a working fire declared.",
+        "Radio traffic reported an additional alarm called.",
+        "Radio traffic reported a request for utilities.",
+    ]
+    # No detail's sentence says who spoke or who acted.
+    for text in merge_module.DETAIL_SAID.values():
+        assert "rews" not in text
+        assert "ispatch" not in text
+
+
+def test_the_words_of_a_story_are_not_changed_without_the_files_number() -> None:
+    worded = (
+        merge_module.OLD_CLOSURE,
+        sorted(merge_module.CHANGE_SAID.items()),
+        sorted(merge_module.DETAIL_SAID.items()),
+        sorted(merge_module.STATUS_WORDS.items()),
+    )
+    digest = hashlib.sha256(repr(worded).encode()).hexdigest()[:16]
+
+    # A kept story is shown in the words it was kept in. When this fails because a
+    # sentence changed, raise `_FORMAT` in story/store.py and add the old number to
+    # `_EARLIER`, so that kept stories in the old words are dropped; then put the
+    # new number and digest here.
+    assert (store_module._FORMAT, digest) == (3, "df9585d83d76aaa6")
+    assert store_module._FORMAT not in store_module._EARLIER
 
 
 def test_an_event_that_left_511s_list_and_came_back_is_not_told_as_gone(
@@ -533,35 +583,92 @@ def test_the_live_file_holds_nothing_a_stand_in_wrote_and_a_file_keeps_its_mode(
         Stories(tmp_path / "story" / "live.sqlite3", "mock")
 
 
-def test_a_file_of_an_earlier_shape_keeps_its_claims_and_none_of_its_stories(
-    rows: Rows, storage: Storage, tmp_path: Path
-) -> None:
-    kept = stories(tmp_path)
-    kept.claim("inc-a", "one", at(0), timedelta(0))
-    kept.claim("inc-a", "two", at(1), timedelta(0))
-    # As the first shape kept a story: sentences a model wrote, with no kind and
-    # no time, under a headline.
-    old = {
-        "written_at": at(0.5).isoformat(),
+OLD_STORIES = {
+    # As the first shape kept a story: sentences a model wrote, with no kind and no
+    # time, under a headline.
+    0: {
+        "written_at": "2026-11-27T20:00:30+00:00",
         "headline": "Fire on Hayes St",
         "claims": [{"text": "Exit the building.", "note": None, "confidence": "medium"}],
-    }
-    with sqlite3.connect(tmp_path / "story" / "mock.sqlite3") as db:
-        db.execute(
-            "UPDATE story SET written_at = ?, story = ? WHERE basis = 'one'",
-            (at(0.5).isoformat(), json.dumps(old)),
-        )
-        db.execute("PRAGMA user_version = 0")
+    },
+    # As the second did: this shape's fields, in words that have since changed.
+    2: {
+        "written_at": "2026-11-27T20:00:30+00:00",
+        "claims": [
+            {
+                "kind": "closure",
+                "text": "511 no longer lists this event. That is what Beacon saw, not an "
+                "official reopening.",
+                "at": "2026-11-27T20:00:20+00:00",
+                "confidence": "medium",
+                "sources": [],
+            }
+        ],
+        "left_out": 0,
+        "lines": 4,
+        "lines_left_out": 0,
+        "model": "fake",
+        "stand_in": True,
+        "input_tokens": 1,
+        "cached_tokens": 0,
+        "output_tokens": 1,
+        "reasoning_tokens": 0,
+        "cost_usd": 0.0,
+        "latency_ms": 1,
+    },
+}
+SCHEMA = """
+CREATE TABLE story (incident_id TEXT NOT NULL, basis TEXT NOT NULL, claimed_at TEXT NOT NULL,
+    written_at TEXT, story TEXT, PRIMARY KEY (incident_id, basis));
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT INTO meta VALUES ('mode', 'mock');
+INSERT INTO story VALUES ('inc-a', 'one', '2026-11-27T20:00:00.000000',
+    '2026-11-27T20:00:30.000000', :story);
+INSERT INTO story VALUES ('inc-a', 'two', '2026-11-27T20:01:00.000000', NULL, NULL);
+"""
+
+
+def old_file(tmp_path: Path, shape: int, journal: str = "wal") -> Path:
+    """A mock stories file that says it is of `shape`, as another Beacon left it:
+    one story, and one claim with no story."""
+    path = tmp_path / "story" / "mock.sqlite3"
+    path.parent.mkdir(parents=True)
+    story = json.dumps(OLD_STORIES.get(shape, OLD_STORIES[2]))
+    db = sqlite3.connect(path, isolation_level=None)
+    db.execute(f"PRAGMA journal_mode = {journal}")
+    db.executescript(SCHEMA.replace(":story", "'" + story.replace("'", "''") + "'"))
+    db.execute(f"PRAGMA user_version = {shape}")
+    db.close()
+    return path
+
+
+def file_rows(path: Path) -> list[Any]:
+    with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as db:
+        return [
+            db.execute("PRAGMA user_version").fetchone()[0],
+            db.execute("PRAGMA journal_mode").fetchone()[0],
+            *db.execute("SELECT incident_id, basis, written_at, story FROM story"),
+            *db.execute("SELECT key, value FROM meta"),
+        ]
+
+
+@pytest.mark.parametrize("shape", sorted(OLD_STORIES))
+def test_a_file_of_an_earlier_shape_keeps_its_claims_and_none_of_its_stories(
+    rows: Rows, storage: Storage, tmp_path: Path, shape: int
+) -> None:
+    path = old_file(tmp_path, shape)
 
     opened = stories(tmp_path)
 
-    # The old story is not read, by the route or by the desk, and is not there.
+    # The old story is not read, by the route or by the desk, and is not there: a
+    # story is shown in the words it was kept in, and those are not this Beacon's.
     assert opened.latest("inc-a") is None
-    with sqlite3.connect(tmp_path / "story" / "mock.sqlite3") as db:
-        assert db.execute("SELECT basis, story FROM story ORDER BY basis").fetchall() == [
-            ("one", None),
-            ("two", None),
-        ]
+    assert file_rows(path)[:4] == [
+        store_module._FORMAT,
+        "wal",
+        ("inc-a", "one", None, None),
+        ("inc-a", "two", None, None),
+    ]
     # Its lines were paid for once, and are not paid for again.
     assert not opened.claim("inc-a", "one", at(5), timedelta(0))
     # A new basis gets a story, which is read back, and opening the file again
@@ -571,55 +678,81 @@ def test_a_file_of_an_earlier_shape_keeps_its_claims_and_none_of_its_stories(
     assert stories(tmp_path).latest("inc-a") == written
 
 
-def old_file(tmp_path: Path, shape: int) -> tuple[Path, list[Any]]:
-    """A mock stories file marked as `shape`, with one story in it, and its rows."""
-    kept = stories(tmp_path)
-    kept.claim("inc-a", "one", at(0), timedelta(0))
-    path = tmp_path / "story" / "mock.sqlite3"
-    payload = json.dumps({"written_at": at(0.5).isoformat(), "headline": "x", "claims": []})
-    with sqlite3.connect(path) as db:
-        db.execute(
-            "UPDATE story SET written_at = ?, story = ? WHERE basis = 'one'",
-            (at(0.5).isoformat(), payload),
-        )
-        db.execute(f"PRAGMA user_version = {shape}")
-    return path, file_rows(path)
+@pytest.mark.parametrize("journal", ["delete", "wal"])
+@pytest.mark.parametrize(
+    ("shape", "mode", "why"),
+    [
+        # A shape a newer Beacon wrote, whichever mode it is opened as.
+        (store_module._FORMAT + 1, "mock", "a shape this Beacon does not know"),
+        (store_module._FORMAT + 1, "live", "a shape this Beacon does not know"),
+        (1, "mock", "a shape this Beacon does not know"),
+        # The other mode's file, in an earlier shape and in this one.
+        (0, "live", "begun as the mock one"),
+        (2, "live", "begun as the mock one"),
+        (store_module._FORMAT, "live", "begun as the mock one"),
+    ],
+)
+def test_a_file_that_is_refused_is_left_as_it_was_to_the_byte(
+    tmp_path: Path, shape: int, mode: str, why: str, journal: str
+) -> None:
+    path = old_file(tmp_path, shape, journal)
+    before, rows_before = path.read_bytes(), file_rows(path)
+
+    with pytest.raises(StoriesError, match=why):
+        Stories(path, mode)  # type: ignore[arg-type]
+
+    # No table, no row, no number, and no journal mode of it was written: its story
+    # is there, and it is the file the Beacon that wrote it left.
+    assert path.read_bytes() == before
+    assert file_rows(path) == rows_before
+    assert (rows_before[0], rows_before[1], rows_before[2][3] is not None) == (shape, journal, True)
 
 
-def file_rows(path: Path) -> list[Any]:
-    with sqlite3.connect(path) as db:
-        return [
-            db.execute("PRAGMA user_version").fetchone()[0],
-            *db.execute("SELECT incident_id, basis, written_at, story FROM story"),
-            *db.execute("SELECT key, value FROM meta"),
-        ]
-
-
-def test_a_file_that_is_refused_for_its_mode_is_left_as_it_was(tmp_path: Path) -> None:
-    path, before = old_file(tmp_path, 0)
-
-    with pytest.raises(StoriesError, match="begun as the mock one"):
-        Stories(path, "live")
-
-    # The story of the earlier shape is still there, and the shape is still said
-    # to be the earlier one: the open that was refused dropped nothing.
-    assert file_rows(path) == before
-    assert before[0] == 0
-    assert before[1][3] is not None
-
-
-def test_a_file_in_a_shape_a_newer_beacon_wrote_is_refused_and_left_as_it_is(
+def test_the_advice_for_a_file_in_an_unknown_shape_is_never_to_begin_another(
     tmp_path: Path,
 ) -> None:
-    path, before = old_file(tmp_path, 3)
+    path = old_file(tmp_path, store_module._FORMAT + 1)
 
-    for mode in ("mock", "live"):
-        with pytest.raises(StoriesError, match="a shape this Beacon does not know"):
-            Stories(path, mode)  # type: ignore[arg-type]
+    with pytest.raises(StoriesError) as refused:
+        Stories(path, "mock")
 
-    assert file_rows(path) == before
-    assert before[0] == 3
-    assert before[1][3] is not None
+    # The file is the only record of which lines were paid for.
+    said = str(refused.value)
+    assert "Do not delete the file or move it away" in said
+    assert "paid for again" in said
+    assert "to begin a new one" not in said
+
+
+def test_a_file_another_process_makes_a_newer_shape_while_it_is_opened_is_refused(
+    tmp_path: Path,
+) -> None:
+    path = old_file(tmp_path, 0)
+    # Another, newer Beacon is in the middle of making the file its own shape.
+    other = sqlite3.connect(path, isolation_level=None)
+    other.execute("BEGIN IMMEDIATE")
+    other.execute(f"PRAGMA user_version = {store_module._FORMAT + 1}")
+    came_of_it: list[Any] = []
+
+    def opening() -> None:
+        try:
+            came_of_it.append(Stories(path, "mock"))
+        except StoriesError as error:
+            came_of_it.append(str(error))
+
+    thread = threading.Thread(target=opening)
+    thread.start()
+    time.sleep(0.3)
+    other.execute("COMMIT")
+    other.close()
+    thread.join(10)
+
+    # The shape is looked at under the same lock the file is changed under, so the
+    # file is seen as the other process left it, and refused.
+    assert len(came_of_it) == 1
+    assert isinstance(came_of_it[0], str)
+    assert "a shape this Beacon does not know" in came_of_it[0]
+    assert file_rows(path)[0] == store_module._FORMAT + 1
+    assert file_rows(path)[2][3] is not None
 
 
 def test_a_closed_file_takes_nothing_more_and_is_still_read(
@@ -1034,7 +1167,7 @@ def test_the_mock_scenarios_fire_gets_a_stand_ins_story_that_says_so(tmp_path: P
         ("alarm", "The radio said: alarm level 3."),
         (
             "evacuation",
-            "Crews mentioned an evacuation. That is radio traffic, not an official order.",
+            EVACUATION_SAID,
         ),
         ("closure", f"511 updated: {closure_headline}"),
         ("aircraft", "A helicopter (MOCKH1) circled nearby for about 13 min, as low as 320 m."),
