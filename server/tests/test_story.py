@@ -24,6 +24,7 @@ from beacon.ember import (
     Storage,
     fake_response,
 )
+from beacon.evidence import Point
 from beacon.incident import Blocks, Engine, Incident, open_engine
 from beacon.ingest import Clock, build
 from beacon.ingest.paid import HELD_INTERVAL_SECONDS, UNUSABLE_RUN_LIMIT
@@ -39,6 +40,7 @@ from beacon.story import (
     StoryDesk,
     StoryError,
     basis_of,
+    lines_of,
     merge_incident,
     open_stories,
     stand_in_writer,
@@ -112,10 +114,10 @@ def test_code_writes_each_sentence_from_the_rows_its_point_cites(
         ("status", "The radio said: crews at work."),
         ("alarm", "The radio said: alarm level 2."),
         ("units", "Units named on the radio: E36, T6, B2."),
-        # What crews say about an evacuation is radio traffic, in the engine's words.
+        # What crews said about an evacuation is radio traffic, and is said so.
         (
             "evacuation",
-            "Crews mention an evacuation. That is radio traffic, not an official order.",
+            "Crews mentioned an evacuation. That is radio traffic, not an official order.",
         ),
         # 511's own words, as the timeline has them.
         ("closure", "511 lists: Activity on Hayes St"),
@@ -254,7 +256,7 @@ def test_no_word_ember_writes_is_read_kept_or_shown(
 
     assert [claim.text for claim in draft.claims] == [
         "The radio said: units on scene.",
-        "Crews mention an evacuation. That is radio traffic, not an official order.",
+        "Crews mentioned an evacuation. That is radio traffic, not an official order.",
     ]
     kept = repr(draft) + everything_on_disk(tmp_path)
     for word in ("safe", "Jane", "go home", "Shelter in place now", "Exit", "is over"):
@@ -314,15 +316,17 @@ def test_a_version_of_a_closure_that_511_has_changed_is_not_told_as_what_511_say
     # A version that is not the one in force is told as having been listed, which
     # is all its row shows, and in no word of its own. What followed (a later
     # version, Beacon no longer seeing it listed) is told only by the row that
-    # shows it, at that row's confidence.
+    # shows it, at that row's confidence, as what Beacon saw at that check.
     assert [(claim.text, claim.confidence) for claim in draft.claims] == [
-        ("511 listed a traffic event here.", "official"),
-        ("511 listed a traffic event here.", "official"),
+        ("511 listed a traffic event.", "official"),
+        ("511 listed a traffic event.", "official"),
         (
-            "511 no longer lists this event. That is what Beacon saw, not an official reopening.",
+            "When Beacon checked, 511 was no longer listing a traffic event it had "
+            "listed. That is what Beacon saw then, not an official reopening.",
             "medium",
         ),
     ]
+    assert draft.claims[2].at == at(5.8)
     assert [[source.evidence_id for source in claim.sources] for claim in draft.claims][:2] == [
         [first.id],
         [second.id],
@@ -330,6 +334,63 @@ def test_a_version_of_a_closure_that_511_has_changed_is_not_told_as_what_511_say
     shown = " ".join(claim.text for claim in draft.claims)
     assert "changed" not in shown
     assert "Gough St" not in shown
+
+
+def test_an_event_that_left_511s_list_and_came_back_is_not_told_as_gone(
+    rows: Rows, storage: Storage
+) -> None:
+    fire(rows)
+    (closure,) = rows.store.search(kinds=["traffic"])
+    rows.change(5.5, closure)
+    rows.change(5.8, closure, "listed_again")
+    incident = fire(rows)
+    script = Script([answer(("closure", [6]), ("closure", [7]), ("closure", [4]))])
+
+    draft = merge_incident(EmberClient.fake(storage, script), incident)
+
+    gone, back, listed = draft.claims
+    # The event is listed now. A point that cites the check at which it was missing
+    # says what Beacon saw then, and nothing in the present tense.
+    assert (gone.text, gone.at, gone.confidence) == (
+        "When Beacon checked, 511 was no longer listing a traffic event it had listed. "
+        "That is what Beacon saw then, not an official reopening.",
+        at(5.5),
+        "medium",
+    )
+    assert (back.text, back.at, back.confidence) == (
+        "When Beacon checked, 511 was listing again a traffic event it had stopped listing.",
+        at(5.8),
+        "medium",
+    )
+    assert listed.text == "511 lists: Activity on Hayes St"
+    for claim in (gone, back):
+        assert "no longer lists" not in claim.text
+        assert "lists this event" not in claim.text
+
+
+def test_a_version_of_an_event_that_was_about_another_road_is_not_said_to_be_here(
+    rows: Rows, storage: Storage
+) -> None:
+    rows.radio(0, "fire", "dispatched", units=("E36",), street="Hayes St", block=400)
+    rows.radio(1, "fire", "on_scene", units=("E36",))
+    # 511 first had the event on Ocean Ave, far away, and then on Hayes St. Both
+    # versions are among the incident's lines, because the second is about it.
+    elsewhere = rows.traffic(
+        2, "511.org/9", road="Ocean Ave", point=Point(37.7236, -122.4544), headline="Ocean Ave"
+    )
+    rows.traffic(3, "511.org/9", created=2, headline="Activity on Hayes St")
+    (incident,) = Engine(rows.store, BLOCKS, names=NAMES, clock=lambda: at(6)).incidents()
+    lines, _ = lines_of(incident)
+    (old,) = [n for n, line in enumerate(lines, 1) if line.details.get("state") == "replaced"]
+    script = Script([answer(("closure", [old]))])
+
+    draft = merge_incident(EmberClient.fake(storage, script), incident)
+
+    (claim,) = draft.claims
+    assert claim.text == "511 listed a traffic event."
+    assert "here" not in claim.text
+    assert "Ocean" not in claim.text
+    assert [source.evidence_id for source in claim.sources] == [elsewhere.id]
 
 
 def test_the_stand_in_cites_the_call_that_gave_the_status_and_not_the_newest_call(
@@ -508,6 +569,57 @@ def test_a_file_of_an_earlier_shape_keeps_its_claims_and_none_of_its_stories(
     assert opened.claim("inc-a", "three", at(5), timedelta(0))
     written = opened.write("inc-a", "three", draft_of(rows, storage), stand_in=True, now=at(6))
     assert stories(tmp_path).latest("inc-a") == written
+
+
+def old_file(tmp_path: Path, shape: int) -> tuple[Path, list[Any]]:
+    """A mock stories file marked as `shape`, with one story in it, and its rows."""
+    kept = stories(tmp_path)
+    kept.claim("inc-a", "one", at(0), timedelta(0))
+    path = tmp_path / "story" / "mock.sqlite3"
+    payload = json.dumps({"written_at": at(0.5).isoformat(), "headline": "x", "claims": []})
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "UPDATE story SET written_at = ?, story = ? WHERE basis = 'one'",
+            (at(0.5).isoformat(), payload),
+        )
+        db.execute(f"PRAGMA user_version = {shape}")
+    return path, file_rows(path)
+
+
+def file_rows(path: Path) -> list[Any]:
+    with sqlite3.connect(path) as db:
+        return [
+            db.execute("PRAGMA user_version").fetchone()[0],
+            *db.execute("SELECT incident_id, basis, written_at, story FROM story"),
+            *db.execute("SELECT key, value FROM meta"),
+        ]
+
+
+def test_a_file_that_is_refused_for_its_mode_is_left_as_it_was(tmp_path: Path) -> None:
+    path, before = old_file(tmp_path, 0)
+
+    with pytest.raises(StoriesError, match="begun as the mock one"):
+        Stories(path, "live")
+
+    # The story of the earlier shape is still there, and the shape is still said
+    # to be the earlier one: the open that was refused dropped nothing.
+    assert file_rows(path) == before
+    assert before[0] == 0
+    assert before[1][3] is not None
+
+
+def test_a_file_in_a_shape_a_newer_beacon_wrote_is_refused_and_left_as_it_is(
+    tmp_path: Path,
+) -> None:
+    path, before = old_file(tmp_path, 3)
+
+    for mode in ("mock", "live"):
+        with pytest.raises(StoriesError, match="a shape this Beacon does not know"):
+            Stories(path, mode)  # type: ignore[arg-type]
+
+    assert file_rows(path) == before
+    assert before[0] == 3
+    assert before[1][3] is not None
 
 
 def test_a_closed_file_takes_nothing_more_and_is_still_read(
@@ -922,7 +1034,7 @@ def test_the_mock_scenarios_fire_gets_a_stand_ins_story_that_says_so(tmp_path: P
         ("alarm", "The radio said: alarm level 3."),
         (
             "evacuation",
-            "Crews mention an evacuation. That is radio traffic, not an official order.",
+            "Crews mentioned an evacuation. That is radio traffic, not an official order.",
         ),
         ("closure", f"511 updated: {closure_headline}"),
         ("aircraft", "A helicopter (MOCKH1) circled nearby for about 13 min, as low as 320 m."),

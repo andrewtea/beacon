@@ -20,8 +20,10 @@ is kept here, under the incident's id and the basis it was written from
 - Rows older than `KEPT` are deleted when a new one is claimed: the engine reads
   twelve hours, and an incident older than that has no reader.
 - **A file of an earlier shape keeps its claims and none of its stories.** The
-  shape is the file's `user_version` (`_FORMAT`); opening a file of another one
-  empties its stories, which are never read, and leaves each row as a claim.
+  shape is the file's `user_version` (`_FORMAT`); opening a file of an earlier one
+  (`_EARLIER`) empties its stories, which are never read, and leaves each row as a
+  claim. A file of a shape this Beacon does not know, and a file of the other mode,
+  are refused and not changed.
 """
 
 import json
@@ -45,9 +47,12 @@ KEPT = timedelta(hours=24)
 
 _WAIT_SECONDS = 5.0
 # The shape a story is kept in, as the file's `user_version`. Raise it whenever
-# `_as_json` changes what it writes: a file of an earlier shape then has its stories
-# dropped when it is opened, and keeps its claims.
+# `_as_json` changes what it writes, and add the one it had to `_EARLIER`: a file of
+# an earlier shape then has its stories dropped when it is opened, and keeps its
+# claims. A file of any other shape, which a newer Beacon wrote, is refused as it is.
 _FORMAT = 2
+# The earlier shapes: 0 is a file that says none, which a new file is too.
+_EARLIER = frozenset({0})
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS story (
     incident_id TEXT NOT NULL,
@@ -103,11 +108,24 @@ class Stories:
         self._closing = threading.Lock()
         self._closed = False
         path.parent.mkdir(parents=True, exist_ok=True)
+        # A file that is refused is left as it was: nothing of it is changed before
+        # its shape and its mode are known to be this one's.
+        begun: object = mode
         with closing(self._connect()) as db:
-            db.executescript(_SCHEMA)
-            db.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('mode', ?)", (mode,))
-            begun = db.execute("SELECT value FROM meta WHERE key = 'mode'").fetchone()[0]
-            _drop_old_stories(db)
+            shape = db.execute("PRAGMA user_version").fetchone()[0]
+            known = shape == _FORMAT or shape in _EARLIER
+            if known:
+                db.executescript(_SCHEMA)
+                db.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('mode', ?)", (mode,))
+                begun = db.execute("SELECT value FROM meta WHERE key = 'mode'").fetchone()[0]
+                if begun == mode:
+                    _drop_old_stories(db)
+        if not known:
+            raise StoriesError(
+                "The stories file is in a shape this Beacon does not know: a newer one "
+                "wrote it. It is left as it is. Run the Beacon that wrote it, or move "
+                "the file away to begin a new one."
+            )
         if begun != mode:
             raise StoriesError(
                 f"The stories file was begun as the {begun} one, and cannot be the {mode} one."
@@ -258,7 +276,9 @@ def _drop_old_stories(db: sqlite3.Connection) -> None:
     were paid for once, and are not paid for again."""
     db.execute("BEGIN IMMEDIATE")
     try:
-        if db.execute("PRAGMA user_version").fetchone()[0] != _FORMAT:
+        # Read again, inside the transaction: another process can have opened the
+        # file since. Only a shape known to be an earlier one is dropped.
+        if db.execute("PRAGMA user_version").fetchone()[0] in _EARLIER:
             db.execute("UPDATE story SET story = NULL, written_at = NULL WHERE story IS NOT NULL")
             db.execute(f"PRAGMA user_version = {_FORMAT}")
     except BaseException:

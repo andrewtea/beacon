@@ -577,7 +577,7 @@ def test_a_text_that_may_have_been_cut_is_left_out_whole_and_said_to_be(rows: Ro
     assert "Residents may return" not in repr(incident)
     (closure,) = [entry for entry in incident.timeline if entry.kind == "closure"]
     assert closure.text == (
-        "511 lists an event here. Its text is longer than Beacon keeps: read it at 511.org."
+        "511 lists an event. Its text is longer than Beacon keeps: read it at 511.org."
     )
     assert "ccc" not in repr(incident)
 

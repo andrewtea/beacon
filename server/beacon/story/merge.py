@@ -18,12 +18,16 @@ shown**:
   own rows hold that detail, an `alarm` point calls that gave an alarm level. A
   point that cites nothing, a line that is not there, or a line that does not show
   it is left out and counted (`Draft.left_out`).
-- **Code writes the sentence**, from the cited rows' own fields, in the engine's
-  words: what crews said about an evacuation, sheltering, or an all-clear is written
-  with "That is radio traffic, not an official order.", as it is in the timeline.
-  A 511 event, an aircraft, and taps are told in the timeline's own line; a version
-  of a 511 event that is no longer the one in force is told only as having been
-  listed, because the row a point cites shows no more than that.
+- **Code writes the sentence**, from the cited rows' own fields, as what was said
+  or seen then: a story's sentence is read apart from its line, so it is in the past
+  tense and carries its time. What crews said about an evacuation, sheltering, or
+  an all-clear is written with "That is radio traffic, not an official order.", as
+  it is in the timeline.
+  The version of a 511 event that is in force, an aircraft, and taps are told in
+  the timeline's own line. A version that is no longer in force is told only as
+  having been listed, and not as having been listed here: the row a point cites
+  shows no more than that. A row that records 511's list changing is told as what
+  Beacon saw at that check.
 - **Code gives it its sources and its confidence**: the sources of the lines it
   cites, and the least confidence among them.
 - **Ember is given only the lines of radio, 511 events, aircraft, and taps.** It is
@@ -52,7 +56,7 @@ from beacon.ember import EmberClient
 from beacon.errors import raise_bare
 from beacon.evidence import Confidence
 from beacon.incident import Entry, Incident, Source, weakest
-from beacon.incident.build import DETAIL_WORDS, STATUS_WORDS
+from beacon.incident.build import NOT_AN_ORDER, STATUS_WORDS
 from beacon.radio.vocabulary import MEDICAL_EVENT
 
 TASK = "merge_incident"
@@ -66,8 +70,42 @@ MAX_POINTS = 8
 MAX_CITES = 4
 # The most units one sentence names.
 MAX_UNITS = 12
-# What is said of a version of a 511 event that is not the one in force.
-OLD_CLOSURE = "511 listed a traffic event here."
+# What is said of a version of a 511 event that is not the one in force. Not that
+# it was "here": every version of an event is among an incident's lines once one of
+# them is about its place, and this one can be about another road.
+OLD_CLOSURE = "511 listed a traffic event."
+# What is said of a row that records Beacon seeing a 511 event leave 511's list or
+# come back to it: what Beacon saw at that check, in the past tense. A later check
+# can have seen otherwise, and a point that cites this row alone does not show it.
+CHANGE_SAID = {
+    "not_listed": (
+        "When Beacon checked, 511 was no longer listing a traffic event it had listed. "
+        "That is what Beacon saw then, not an official reopening."
+    ),
+    "listed_again": (
+        "When Beacon checked, 511 was listing again a traffic event it had stopped listing."
+    ),
+}
+# What is said of a detail a call gave: what crews said then, in the past tense. A
+# story's sentence is read apart from its line, and "rescue in progress" from a call
+# of half an hour ago is not in progress now.
+DETAIL_SAID = {
+    "smoke_showing": "Crews reported smoke showing.",
+    "fire_showing": "Crews reported fire showing.",
+    "working_fire": "Crews declared a working fire.",
+    "additional_alarm": "Crews called an additional alarm.",
+    "exposure_threatened": "Crews reported neighbouring buildings threatened.",
+    "rescue_in_progress": "Crews reported a rescue in progress.",
+    "evacuation": f"Crews mentioned an evacuation. {NOT_AN_ORDER}",
+    "shelter_in_place": f"Crews mentioned sheltering in place. {NOT_AN_ORDER}",
+    "police_requested": "Crews requested police.",
+    "utilities_requested": "Crews requested utilities.",
+    "road_closed": "Crews reported a road closed.",
+    "aircraft_overhead": "Crews mentioned an aircraft overhead.",
+    "knocked_down": "Crews reported the fire knocked down.",
+    "overhaul": "Crews reported overhaul under way.",
+    "all_clear": f"Crews said all clear. {NOT_AN_ORDER}",
+}
 
 # What a point can be about. `status`, `alarm`, `units`, and each detail a call can
 # give rest on radio lines; the last three on a line of their own kind.
@@ -75,7 +113,7 @@ POINT_KINDS: tuple[str, ...] = (
     "status",
     "alarm",
     "units",
-    *DETAIL_WORDS,
+    *DETAIL_SAID,
     "closure",
     "aircraft",
     "taps",
@@ -265,7 +303,11 @@ def _sentence(kind: str, cited: Sequence[Entry]) -> str | None:
         if len(cited) != 1 or cited[0].kind != kind:
             return None
         said = details[0]
-        if kind == "closure" and "change" not in said and said.get("state") != "in_force":
+        if kind == "closure" and "change" in said:
+            # What Beacon saw at one check, said as that. None for a change this
+            # does not know.
+            return CHANGE_SAID.get(said["change"])
+        if kind == "closure" and said.get("state") != "in_force":
             # A version of a 511 event that is not the one in force: its words are
             # not what 511 says now. The row shows that 511 listed an event, and
             # that is all the sentence says. What came after it (a later version,
@@ -273,8 +315,8 @@ def _sentence(kind: str, cited: Sequence[Entry]) -> str | None:
             # this point does not cite.
             return OLD_CLOSURE
         # The engine's own line, as the timeline has it: for the version of a 511
-        # event that is in force that is 511's words, and for a change what Beacon
-        # saw and that it is no reopening.
+        # event that is in force that is 511's words, said as 511's, and an
+        # aircraft and taps are told there in the past tense already.
         return cited[0].text
     if any(entry.kind != "radio" for entry in cited):
         return None
@@ -302,10 +344,10 @@ def _sentence(kind: str, cited: Sequence[Entry]) -> str | None:
         shown = list(named)[:MAX_UNITS]
         more = ", and others" if len(named) > MAX_UNITS else ""
         return f"Units named on the radio: {', '.join(shown)}{more}."
-    if kind in DETAIL_WORDS:
+    if kind in DETAIL_SAID:
         if not all(kind in (said.get("details") or []) for said in details):
             return None
-        return DETAIL_WORDS[kind]
+        return DETAIL_SAID[kind]
     return None
 
 

@@ -139,7 +139,7 @@ STATUS_WORDS = {
     "cancelled": "call cancelled",
     "unknown": "radio traffic",
 }
-_NOT_AN_ORDER = "That is radio traffic, not an official order."
+NOT_AN_ORDER = "That is radio traffic, not an official order."
 DETAIL_WORDS = {
     "smoke_showing": "Smoke showing.",
     "fire_showing": "Fire showing.",
@@ -147,15 +147,15 @@ DETAIL_WORDS = {
     "additional_alarm": "Additional alarm called.",
     "exposure_threatened": "Neighbouring buildings threatened.",
     "rescue_in_progress": "Rescue in progress.",
-    "evacuation": f"Crews mention an evacuation. {_NOT_AN_ORDER}",
-    "shelter_in_place": f"Crews mention sheltering in place. {_NOT_AN_ORDER}",
+    "evacuation": f"Crews mention an evacuation. {NOT_AN_ORDER}",
+    "shelter_in_place": f"Crews mention sheltering in place. {NOT_AN_ORDER}",
     "police_requested": "Police requested.",
     "utilities_requested": "Utilities requested.",
     "road_closed": "Crews report a road closed.",
     "aircraft_overhead": "Crews mention an aircraft overhead.",
     "knocked_down": "Fire reported knocked down.",
     "overhaul": "Overhaul under way.",
-    "all_clear": f"Crews say all clear. {_NOT_AN_ORDER}",
+    "all_clear": f"Crews say all clear. {NOT_AN_ORDER}",
 }
 _NOTICE_WORDS = {
     "evacuation_order": "an evacuation order",
@@ -476,7 +476,9 @@ def _traffic_entry(row: Evidence, states: dict[int, Standing], *, first: bool) -
         # The headline is 511's own words.
         text=f"{lists}: {headline}"
         if headline is not None
-        else f"{lists} an event here. Its text is longer than Beacon keeps: read it at 511.org.",
+        # Not "here": every version of an event is in the timeline once one of them
+        # is about this place, and this one can be about another road.
+        else f"{lists} an event. Its text is longer than Beacon keeps: read it at 511.org.",
         confidence=row.confidence,
         sources=(source_of(row),),
         details={
@@ -747,7 +749,7 @@ def _signals(
         signals.append(
             _signal(
                 "evacuation_on_radio",
-                f"Crews mention an evacuation. {_NOT_AN_ORDER}",
+                f"Crews mention an evacuation. {NOT_AN_ORDER}",
                 of(evacuating),
             )
         )
