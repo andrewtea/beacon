@@ -17,6 +17,7 @@ from beacon.api import health, incidents, sources, taps
 from beacon.incident import Engine, open_engine
 from beacon.ingest import IngestConfigError, build
 from beacon.ingest.setup import PAID_SECONDS, STOP_SECONDS, Ingest
+from beacon.investigate import InvestigationDesk, open_investigations
 from beacon.radio import core_dump_problem, forbid_core_dumps
 from beacon.story import StoryDesk, open_stories
 from beacon.taps import Taps, open_taps
@@ -178,6 +179,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     sweeping: asyncio.Task[None] | None = None
     stories: StoryDesk | None = None
     telling: asyncio.Task[None] | None = None
+    investigations: InvestigationDesk | None = None
     stop = asyncio.Event()
     # Whatever of this is begun is ended below, however far the beginning got.
     try:
@@ -193,6 +195,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         if stories is not None:
             app.state.stories = stories
             telling = asyncio.create_task(_tell_stories(stories, engine, stop))
+        # What Ember finds out about a tap: a stand-in's on the mock store, and on
+        # the live store found out only under a budget somebody set.
+        investigations = open_investigations(os.environ, engine, taps)
+        if investigations is not None:
+            app.state.investigations = investigations
         sweeping = asyncio.create_task(_sweep_tap_media(taps, stop))
         if ingest is not None:
             app.state.ingest = ingest
@@ -201,9 +208,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         stop.set()
         # Before anything is waited for, nothing new that costs money is admitted:
-        # not by the story desk, whose pass may be under way on a thread, and not by
-        # the pollers. What is waited for below can take minutes.
-        _close_paid(stories, ingest)
+        # not by the story desk, whose pass may be under way on a thread, not by the
+        # investigator, whose runs are, and not by the pollers. What is waited for
+        # below can take minutes.
+        _close_paid(stories, investigations, ingest)
         # The pollers are stopped while the rest is, so the wait for a paid answer
         # of theirs and the wait for the story desk's run side by side.
         stopping = asyncio.ensure_future(_stop_ingest(ingest))
@@ -219,18 +227,25 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 await _stop_stories(stories, telling)
             finally:
                 try:
-                    if taps is not None:
-                        taps.close()
+                    # Before the taps are closed: a run reads a tap's photo and clip.
+                    await _stop_investigations(investigations)
                 finally:
-                    await stopping
+                    try:
+                        if taps is not None:
+                            taps.close()
+                    finally:
+                        await stopping
 
 
-def _close_paid(stories: StoryDesk | None, ingest: Ingest | None) -> None:
+def _close_paid(
+    stories: StoryDesk | None, investigations: InvestigationDesk | None, ingest: Ingest | None
+) -> None:
     """Admit no more paid work, anywhere in the server, without waiting for
     anything: a call to Ember that had not sent its paid request is refused from
-    here on and costs nothing. The pollers are closed whatever came of closing the
-    story desk."""
+    here on and costs nothing. Each is closed whatever came of closing the ones
+    before it."""
     closers = [] if stories is None else [stories.close]
+    closers += [] if investigations is None else [investigations.close]
     closers += [] if ingest is None else [ingest.close_paid]
     for close in closers:
         try:
@@ -262,6 +277,21 @@ async def _stop_stories(stories: StoryDesk | None, telling: asyncio.Task[None] |
         logger.warning(
             "The pass that has stories made had not ended when the server shut down. "
             "It can ask Ember nothing more and write nothing."
+        )
+
+
+async def _stop_investigations(investigations: InvestigationDesk | None) -> None:
+    """Stop the investigator: wait for the runs whose paid requests are out, end
+    its threads, and close the investigations file."""
+    if investigations is None:
+        return
+    # Off the event loop. The desk was closed already, so nothing new is asked.
+    if not await asyncio.to_thread(investigations.stop, PAID_SECONDS):
+        logger.warning(
+            "A tap was still being investigated when the server shut down. If a paid "
+            "Ember request of its was out, it can still be sent and paid for: it is in "
+            "the Ember ledger, and the tap's answer stays pending and then says it was "
+            "not investigated."
         )
 
 

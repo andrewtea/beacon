@@ -5,6 +5,9 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict
 
 from beacon.incident import Engine, Incident
+from beacon.investigate import InvestigationDesk
+from beacon.investigate import card as words
+from beacon.radio.vocabulary import MEDICAL_EVENT
 from beacon.story import StoryDesk
 
 router = APIRouter()
@@ -118,6 +121,26 @@ class TrackOut(_Read):
     low: bool
 
 
+class CrisisOut(BaseModel):
+    """Crisis mode for an incident. Beacon's investigator decides on it when it
+    looks into a tap: that the incident's signals add up to more than an everyday
+    call. It is a model's decision, on signals code found, and `text` says so. It
+    tells nobody what to do."""
+
+    # Whether it is on now: it was decided on, and the incident is still going on.
+    active: bool
+    decided_at: datetime
+    text: str
+    # The kinds of signal the decision rested on, and those of them the incident
+    # has now, each with the sources it rests on.
+    cited: list[str]
+    signals: list[SignalOut]
+    # Which kind of Ember client decided: `live`, or `fake` for a stand-in.
+    model: str | None
+    # True when a stand-in decided or what it looked at is a stand-in's: label it.
+    stand_in: bool
+
+
 class IncidentSummary(_Read):
     id: str
     category: str
@@ -146,6 +169,8 @@ class IncidentSummary(_Read):
     # True when any row the incident is built from is a stand-in's: the invented
     # scenario, or a fake Ember. It is then to be labeled as one.
     stand_in: bool
+    # Null until the investigator has decided on crisis mode for it.
+    crisis: CrisisOut | None = None
 
 
 class ClaimOut(_Read):
@@ -215,6 +240,37 @@ class IncidentAnswer(BaseModel):
     incident: IncidentDetail
 
 
+def crisis_of(request: Request, incident: Incident) -> CrisisOut | None:
+    """The decision on crisis mode that was made for an incident, with the signals
+    it rests on as the incident has them now. Reading it asks Ember nothing."""
+    desk: InvestigationDesk | None = getattr(request.app.state, "investigations", None)
+    if desk is None or incident.category == MEDICAL_EVENT:
+        return None
+    decision = desk.runs.crisis(incident.id)
+    if decision is None:
+        return None
+    return CrisisOut(
+        active=incident.open,
+        decided_at=decision.decided_at,
+        text=words.CRISIS,
+        cited=list(decision.signals),
+        signals=[
+            SignalOut.model_validate(signal)
+            for signal in incident.signals
+            if signal.kind in decision.signals
+        ],
+        model=decision.model,
+        stand_in=decision.stand_in or incident.stand_in,
+    )
+
+
+def summary_of(request: Request, incident: Incident) -> IncidentSummary:
+    """An incident as the list has it, with its crisis mode."""
+    summary = IncidentSummary.model_validate(incident)
+    summary.crisis = crisis_of(request, incident)
+    return summary
+
+
 def _engine(request: Request) -> Engine:
     engine: Engine | None = getattr(request.app.state, "incidents", None)
     if engine is None:
@@ -238,7 +294,7 @@ def incidents(request: Request, everything: bool = Query(False, alias="all")) ->
         mode=engine.mode,
         as_of=snapshot.as_of,
         partial=snapshot.partial,
-        incidents=[IncidentSummary.model_validate(incident) for incident in listed],
+        incidents=[summary_of(request, incident) for incident in listed],
     )
 
 
@@ -251,6 +307,7 @@ def incident(request: Request, incident_id: str) -> IncidentAnswer:
     if found is None:
         raise HTTPException(404, "There is no such incident.")
     detail = IncidentDetail.model_validate(found)
+    detail.crisis = crisis_of(request, found)
     desk: StoryDesk | None = getattr(request.app.state, "stories", None)
     # Reading a story asks Ember nothing: only the desk's own pass writes one.
     told = None if desk is None else desk.latest(found)

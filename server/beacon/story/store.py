@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from beacon.errors import raise_bare
+from beacon.files import begin_file
 from beacon.incident import Credit, Source
 from beacon.story.merge import Claim, Draft
 
@@ -266,60 +267,27 @@ class Stories:
 
 
 def _begin(path: Path, mode: Mode) -> None:
-    """Make the file at `path` this mode's stories file in this shape, or refuse it.
+    """Make the file at `path` this mode's stories file in this shape, or refuse it
+    and leave it as it was (`beacon.files.begin_file`).
 
-    Everything is decided and done in one transaction that holds the file's write
-    lock from before the file is first read, so no other process can change the
-    file between the look and the act:
-
-    - A file in this shape and of this mode is taken as it is.
-    - A new file, and a file of an earlier shape, are made this shape. The stories
-      of an earlier shape are emptied and never read: they cannot be read as this
-      one, the first held sentences a model wrote, and the next held words that
-      have since changed. Each row stays, as a claim: its lines were paid for once,
-      and are not paid for again.
-    - A file in any other shape, and a file of the other mode, are refused, and
-      **nothing of a refused file is written**: no table, no row, no journal mode.
+    The stories of an earlier shape are emptied and never read: they cannot be read
+    as this one, the first held sentences a model wrote, and the next held words
+    that have since changed. Each row stays, as a claim: its lines were paid for
+    once, and are not paid for again.
 
     Raises StoriesError for a file that is refused."""
-    refusal: str | None
-    # Not `_connect`: that sets the journal mode, which is a write.
-    with closing(sqlite3.connect(path, timeout=_WAIT_SECONDS, isolation_level=None)) as db:
-        db.execute("BEGIN IMMEDIATE")
-        try:
-            shape = db.execute("PRAGMA user_version").fetchone()[0]
-            refusal = _refusal(db, shape, mode)
-            if refusal is None:
-                for statement in _SCHEMA:
-                    db.execute(statement)
-                db.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('mode', ?)", (mode,))
-                if shape != _FORMAT:
-                    db.execute(
-                        "UPDATE story SET story = NULL, written_at = NULL WHERE story IS NOT NULL"
-                    )
-                    db.execute(f"PRAGMA user_version = {_FORMAT}")
-        except BaseException:
-            db.execute("ROLLBACK")
-            raise
-        db.execute("ROLLBACK" if refusal is not None else "COMMIT")
-        if refusal is None:
-            db.execute("PRAGMA journal_mode = WAL")
+    refusal = begin_file(
+        path,
+        mode,
+        what="stories",
+        schema=_SCHEMA,
+        shape=_FORMAT,
+        earlier=_EARLIER,
+        drop=("UPDATE story SET story = NULL, written_at = NULL WHERE story IS NOT NULL",),
+        unknown=_UNKNOWN_SHAPE,
+    )
     if refusal is not None:
         raise StoriesError(refusal)
-
-
-def _refusal(db: sqlite3.Connection, shape: int, mode: Mode) -> str | None:
-    """Why a file is not this mode's stories file, or None when it is or can be
-    made it. It reads and writes nothing."""
-    if shape != _FORMAT and shape not in _EARLIER:
-        return _UNKNOWN_SHAPE
-    has_meta = db.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
-    ).fetchone()
-    begun = db.execute("SELECT value FROM meta WHERE key = 'mode'").fetchone() if has_meta else None
-    if begun is not None and begun[0] != mode:
-        return f"The stories file was begun as the {begun[0]} one, and cannot be the {mode} one."
-    return None
 
 
 def _save_state(db: sqlite3.Connection, state: Mapping[str, Any]) -> None:

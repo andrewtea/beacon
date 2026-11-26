@@ -1,0 +1,962 @@
+"""The investigation desk, the routes that answer a tap, and the server around them."""
+
+import asyncio
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import pytest
+from fastapi.testclient import TestClient
+
+import beacon.investigate.desk as desk_module
+import beacon.main as main_module
+from beacon import taps as beacon_taps
+from beacon.api import taps as api_taps
+from beacon.ember import (
+    BudgetExceededError,
+    EmberCallError,
+    EmberClient,
+    EmberClosedError,
+    InputTooLargeError,
+    LedgerReplacedError,
+    Script,
+    Storage,
+    fake_response,
+)
+from beacon.evidence import EvidenceStore
+from beacon.incident import NO_BLOCKS, Blocks, Engine, open_engine
+from beacon.ingest import Clock, build
+from beacon.ingest.paid import HELD_INTERVAL_SECONDS, UNUSABLE_RUN_LIMIT
+from beacon.investigate import (
+    BUDGET_VARIABLE,
+    QUEUE,
+    InvestigateConfigError,
+    Investigation,
+    InvestigationDesk,
+    Outcome,
+    Run,
+    Runs,
+    RunsError,
+    open_investigations,
+    stand_in_investigator,
+)
+from beacon.investigate import card as words
+from beacon.main import create_app
+from beacon.taps import TapMedia, Taps
+from tests.incident_rows import HAYES, NOON, Rows, at, mock_store
+from tests.test_incident_aircraft import offset
+from tests.test_investigate import BLOCKS, NAMES, TAP, city, form
+from tests.test_taps import PHONE
+
+OTHER = "tap-AAAAAAAA0002"
+THIRD = "tap-AAAAAAAA0003"
+# Three kilometres north of the fire, where the story has nothing.
+FAR = offset(HAYES, 3000, 0)
+START = NOON - timedelta(minutes=20)
+
+
+@pytest.fixture(autouse=True)
+def a_host_that_hands_no_core_to_a_collector(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(beacon_taps, "core_dump_problem", lambda: None)
+
+
+@dataclass
+class World:
+    """One evidence store with its engine and its taps, and the time, which a test
+    moves."""
+
+    path: Path
+    rows: Rows
+    now: list[datetime]
+    engine: Engine
+    taps: Taps
+    storage: Storage
+
+    def desk(self, responder: Any = stand_in_investigator, **more: Any) -> InvestigationDesk:
+        more.setdefault("workers", 0)
+        return InvestigationDesk(
+            EmberClient.fake(self.storage, responder),
+            Runs(self.path / "investigate" / "mock.sqlite3", "mock"),
+            self.engine,
+            self.taps,
+            clock=lambda: self.now[0],
+            wall_clock=lambda: self.now[0],
+            **more,
+        )
+
+    def app(self, desk: InvestigationDesk | None) -> TestClient:
+        app = create_app()
+        app.state.taps, app.state.incidents = self.taps, self.engine
+        if desk is not None:
+            app.state.investigations = desk
+        return TestClient(app)
+
+
+@pytest.fixture
+def world(tmp_path: Path) -> Any:
+    rows = Rows(mock_store(tmp_path))
+    now = [at(6.5)]
+    listed = [(street, block, p.lat, p.lon) for (street, block), p in BLOCKS.points.items()]
+    blocks = Blocks.of([*listed, ("Oak St", 100, FAR.lat, FAR.lon)])
+    engine = Engine(rows.store, blocks, names=NAMES, clock=lambda: now[0])
+    taps = Taps(rows.store, TapMedia(tmp_path / "taps", "mock"), clock=lambda: now[0])
+    made = World(tmp_path, rows, now, engine, taps, Storage.under(tmp_path))
+    city(rows)
+    yield made
+    taps.close()
+
+
+def failing(monkeypatch: pytest.MonkeyPatch, desk: InvestigationDesk, failures: list[Any]) -> list:
+    """Has the desk's Ember raise the errors of `failures`, in order, in place of
+    answering, and returns the list of what it was asked."""
+    ember = desk._ember
+    respond = ember.respond
+    asked: list[str] = []
+
+    def responding(**request: Any) -> Any:
+        asked.append(request["task"])
+        failure = failures.pop(0) if failures else None
+        if failure is not None:
+            raise failure
+        return respond(**request)
+
+    monkeypatch.setattr(ember, "respond", responding)
+    return asked
+
+
+def fire_id(world: World) -> str:
+    (fire,) = [i for i in world.engine.incidents() if i.category == "fire"]
+    return fire.id
+
+
+# The desk.
+
+
+def test_a_tap_is_investigated_once_and_its_run_and_its_decision_are_kept(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world.rows.tap(6, ref=TAP)
+    desk = world.desk()
+    asked = failing(monkeypatch, desk, [])
+
+    run = desk.investigate(TAP)
+
+    assert run is not None
+    assert (run.outcome.status, run.outcome.incident_id) == ("incident", fire_id(world))
+    assert (run.model, run.stand_in, run.started_at) == ("fake", True, at(6.5))
+    assert desk.runs.get(TAP) == (at(6.5), run)
+    decision = desk.runs.crisis(fire_id(world))
+    assert decision is not None
+    assert (decision.stand_in, decision.model) == (True, "fake")
+    # Asked for again, by this desk or the next: nothing is made, and nothing asked.
+    made = len(asked)
+    assert desk.investigate(TAP) is None
+    assert world.desk().investigate(TAP) is None
+    assert len(asked) == made == 3
+    # What is no tap is not looked into, and leaves no claim behind.
+    assert desk.investigate("tap-AAAAAAAA9999") is None
+    assert desk.runs.get("tap-AAAAAAAA9999") is None
+
+
+def test_after_ember_fails_the_desk_passes_taps_over_for_a_while_and_across_a_restart(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for minute, tap_id in ((6, TAP), (6.1, OTHER), (6.2, THIRD), (6.3, "tap-AAAAAAAA0004")):
+        world.rows.tap(minute, ref=tap_id)
+    desk = world.desk()
+    asked = failing(monkeypatch, desk, [None, EmberCallError("The API failed.")])
+
+    cut = desk.investigate(TAP)
+
+    # The run that failed may have been paid for: it is kept, and not made again.
+    assert cut is not None
+    assert (cut.cut_short, cut.outcome.reason, len(cut.rounds)) == (
+        "EmberCallError",
+        "cut_short",
+        1,
+    )
+    assert desk.investigate(TAP) is None
+    # The next tap is passed over, and told so. Ember is asked nothing.
+    world.now[0] += timedelta(seconds=HELD_INTERVAL_SECONDS - 1)
+    assert desk.investigate(OTHER) is None
+    _claimed, skipped = desk.runs.get(OTHER)  # type: ignore[misc]
+    assert skipped.outcome == Outcome(status="unconfirmed", reason="not_investigated")
+    assert len(asked) == 2
+    # A restart does not shorten the hold.
+    again = world.desk()
+    assert again.investigate(THIRD) is None
+    assert again.runs.get(THIRD)[1].outcome.reason == "not_investigated"  # type: ignore[index,union-attr]
+    # Once it is over, a tap is looked into again; one passed over is not.
+    world.now[0] += timedelta(seconds=2)
+    fourth = again.investigate("tap-AAAAAAAA0004")
+    assert fourth is not None
+    assert fourth.outcome.status == "incident"
+    assert again.investigate(OTHER) is None
+
+
+def test_a_tap_ember_was_asked_nothing_about_is_said_not_to_have_been_investigated(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world.rows.tap(6, ref=TAP)
+    world.rows.tap(6.1, ref=OTHER)
+    desk = world.desk()
+    failing(monkeypatch, desk, [BudgetExceededError("The budget for investigate:tap is spent.")])
+
+    run = desk.investigate(TAP)
+
+    assert run is not None
+    assert run.outcome == Outcome(status="unconfirmed", reason="not_investigated")
+    assert (run.calls, run.cut_short) == ([], "BudgetExceededError")
+    # It stays claimed, and the desk leaves Ember alone for a while.
+    assert desk.investigate(TAP) is None
+    assert desk.investigate(OTHER) is None
+    assert desk.runs.get(OTHER)[1].outcome.reason == "not_investigated"  # type: ignore[index,union-attr]
+
+
+def test_a_refusal_after_ember_was_asked_something_leaves_a_run_that_was_cut_short(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world.rows.tap(6, ref=TAP)
+    desk = world.desk()
+    failing(monkeypatch, desk, [None, BudgetExceededError("The budget is spent.")])
+
+    run = desk.investigate(TAP)
+
+    assert run is not None
+    assert (run.outcome.reason, len(run.calls)) == ("cut_short", 1)
+
+
+def test_a_replaced_ledger_stops_the_desk_for_the_life_of_the_process(
+    world: World, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    world.rows.tap(6, ref=TAP)
+    world.rows.tap(6.1, ref=OTHER)
+    desk = world.desk()
+    asked = failing(monkeypatch, desk, [LedgerReplacedError("The ledger was replaced.")])
+
+    run = desk.investigate(TAP)
+
+    # A replaced ledger can follow a request that was sent: it is not "nothing asked".
+    assert run is not None
+    assert run.outcome.reason == "cut_short"
+    assert "The investigator poller has stopped: the Ember ledger was replaced" in caplog.text
+    world.now[0] += timedelta(days=2)
+    assert desk.investigate(OTHER) is None
+    assert len(asked) == 1
+
+
+@pytest.mark.parametrize("failure", [EmberClosedError("Closed."), InputTooLargeError("Too large.")])
+def test_a_closing_client_and_a_request_too_large_are_no_news_about_ember(
+    world: World, monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    world.rows.tap(6, ref=TAP)
+    world.rows.tap(6.1, ref=OTHER)
+    desk = world.desk()
+    failing(monkeypatch, desk, [failure])
+
+    desk.investigate(TAP)
+
+    assert desk.runs.state()["held_until"] is None
+    other = desk.investigate(OTHER)
+    assert other is not None
+    assert other.outcome.status == "incident"
+
+
+def test_answers_that_are_no_form_are_paid_for_once_each_and_hold_the_desk(world: World) -> None:
+    taps = [f"tap-AAAAAAAA10{n:02d}" for n in range(UNUSABLE_RUN_LIMIT + 1)]
+    for tap_id in taps:
+        world.rows.tap(6, ref=tap_id)
+    script = Script([fake_response(text="It is a fire.")] * UNUSABLE_RUN_LIMIT)
+    desk = world.desk(script)
+
+    made = [desk.investigate(tap_id) for tap_id in taps]
+
+    assert [run.outcome.reason for run in made[:-1]] == ["no_answer"] * UNUSABLE_RUN_LIMIT  # type: ignore[union-attr]
+    assert made[-1] is None
+    assert len(script.requests) == UNUSABLE_RUN_LIMIT
+    assert desk.runs.get(taps[-1])[1].outcome.reason == "not_investigated"  # type: ignore[index,union-attr]
+
+
+def test_a_run_that_ends_well_does_not_take_off_the_hold_another_run_put_on_meanwhile(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for tap_id in (TAP, OTHER, THIRD):
+        world.rows.tap(6, ref=tap_id)
+    desk = world.desk()
+    investigate = desk_module.investigate_tap
+    under_way, go = threading.Event(), threading.Event()
+
+    def investigating(ember: EmberClient, scene: Any, **more: Any) -> Investigation:
+        if scene.tap_id == TAP:
+            # The first run is out while the second fails.
+            under_way.set()
+            assert go.wait(5)
+            return investigate(ember, scene, **more)
+        made = investigate(ember, scene, **more)
+        return Investigation(run=made.run, failure=EmberCallError("The API failed."))
+
+    monkeypatch.setattr(desk_module, "investigate_tap", investigating)
+    first = threading.Thread(target=desk.investigate, args=(TAP,))
+    first.start()
+    try:
+        assert under_way.wait(5)
+        desk.investigate(OTHER)
+    finally:
+        go.set()
+        first.join(5)
+
+    # The first run was finished, and the hold the second put on is still on, in
+    # the desk and in what a restart reads.
+    assert desk.runs.get(TAP)[1].outcome.status == "incident"  # type: ignore[index,union-attr]
+    assert desk.runs.state()["held_until"] is not None
+    assert desk.investigate(THIRD) is None
+    assert desk.runs.get(THIRD)[1].outcome.reason == "not_investigated"  # type: ignore[index,union-attr]
+
+
+def test_a_shutdown_waits_from_before_the_claim_until_the_run_is_stored(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world.rows.tap(6, ref=TAP)
+    desk = world.desk()
+    claiming, go = threading.Event(), threading.Event()
+    claim = desk.runs.claim
+
+    def slow_claim(*given: Any) -> bool:
+        claiming.set()
+        assert go.wait(5)
+        return claim(*given)
+
+    monkeypatch.setattr(desk.runs, "claim", slow_claim)
+    made: list[Any] = []
+    thread = threading.Thread(target=lambda: made.append(desk.investigate(TAP)))
+    thread.start()
+    try:
+        assert claiming.wait(5)
+        # The claim is about to be made. A shutdown that closed the file now would
+        # leave a tap claimed that nobody looked into: `drain` says work is out.
+        assert desk.drain(0.05) is False
+    finally:
+        go.set()
+        thread.join(5)
+
+    assert desk.drain(1) is True
+    assert desk.runs.get(TAP) == (at(6.5), made[0])
+
+
+def test_a_tap_that_comes_after_the_desk_is_closed_is_not_claimed_and_not_taken(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world.rows.tap(6, ref=TAP)
+    desk = world.desk()
+    asked = failing(monkeypatch, desk, [])
+
+    desk.close()
+
+    assert desk.active is False
+    assert desk.drain(0.1) is True
+    assert desk.submit(TAP) is False
+    assert desk.investigate(TAP) is None
+    # Nothing was claimed and nothing asked, so the next run of Beacon can look.
+    assert (desk.runs.get(TAP), asked) == (None, [])
+    assert desk.stop(0.1) is True
+    with pytest.raises(RunsError, match="closed"):
+        desk.runs.save_state({})
+
+
+def test_a_tap_that_finds_the_queue_full_is_passed_over_and_costs_nothing(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    desk = world.desk()
+    asked = failing(monkeypatch, desk, [])
+
+    taken = [desk.submit(f"tap-AAAAAAAA2{n:03d}") for n in range(QUEUE + 2)]
+
+    assert taken == [True] * QUEUE + [False, False]
+    assert desk.runs.get("tap-AAAAAAAA2000") is None
+    _claimed, skipped = desk.runs.get(f"tap-AAAAAAAA2{QUEUE:03d}")  # type: ignore[misc]
+    assert skipped.outcome == Outcome(status="unconfirmed", reason="not_investigated")
+    assert asked == []
+
+
+def test_the_desks_threads_look_into_the_taps_handed_in_and_outlive_one_that_fails(
+    world: World, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    world.rows.tap(6, ref=TAP)
+    world.rows.tap(6, ref=OTHER)
+    desk = world.desk(workers=1)
+    investigate = desk.investigate
+
+    def investigating(tap_id: str) -> Run | None:
+        if tap_id == TAP:
+            raise RuntimeError("tap-AAAAAAAA0001 at 37.7766")
+        return investigate(tap_id)
+
+    monkeypatch.setattr(desk, "investigate", investigating)
+
+    assert (desk.submit(TAP), desk.submit(OTHER)) == (True, True)
+    for _ in range(200):
+        found = desk.runs.get(OTHER)
+        if found is not None and found[1] is not None:
+            break
+        time.sleep(0.02)
+
+    assert desk.runs.get(OTHER)[1].outcome.status == "incident"  # type: ignore[index,union-attr]
+    assert "A tap could not be looked into (RuntimeError)." in caplog.text
+    assert "37.77" not in caplog.text
+    assert TAP not in caplog.text
+    assert desk.stop(1) is True
+    assert all(not thread.is_alive() for thread in desk._threads)
+
+
+def test_a_live_desk_pays_only_under_its_own_scope(world: World) -> None:
+    class Live:
+        mode = "live"
+        scope = None
+
+    with pytest.raises(ValueError, match="investigate:tap"):
+        InvestigationDesk(
+            Live(),  # type: ignore[arg-type]
+            Runs(world.path / "investigate" / "mock.sqlite3", "mock"),
+            world.engine,
+            world.taps,
+            workers=0,
+        )
+
+
+# The desk the environment asks for.
+
+
+def test_on_the_mock_store_a_stand_in_investigates_and_says_so(tmp_path: Path) -> None:
+    env = {"BEACON_DATA_DIR": str(tmp_path)}
+    store = mock_store(tmp_path)
+    engine = open_engine(env, store)
+    taps = Taps(store, TapMedia(tmp_path / "taps", "mock"))
+
+    desk = open_investigations(env, engine, taps)
+
+    assert desk is not None
+    try:
+        assert (desk.runs.mode, desk.active) == ("mock", True)
+        assert (tmp_path / "investigate" / "mock.sqlite3").exists()
+    finally:
+        desk.stop(1)
+        taps.close()
+
+
+def test_on_the_live_store_taps_are_investigated_only_under_a_budget_and_by_a_live_ember(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = EvidenceStore(tmp_path / "evidence" / "live.sqlite3", "live")
+    engine = Engine(store, NO_BLOCKS)
+    taps = Taps(store, TapMedia(tmp_path / "taps", "live"))
+    env = {"BEACON_DATA_DIR": str(tmp_path)}
+
+    try:
+        assert open_investigations(env, engine, taps) is None
+        assert "No budget for investigations (BEACON_INVESTIGATE_BUDGET_USD)" in caplog.text
+        with pytest.raises(InvestigateConfigError, match="in dollars"):
+            open_investigations(env | {BUDGET_VARIABLE: "plenty"}, engine, taps)
+        # A budget, and no live Ember to spend it: refused, and no file is left.
+        with pytest.raises(InvestigateConfigError, match="live Ember"):
+            open_investigations(env | {BUDGET_VARIABLE: "0.25"}, engine, taps)
+        assert not (tmp_path / "investigate").exists()
+    finally:
+        taps.close()
+
+
+# The routes.
+
+
+def test_a_tap_on_the_mock_scenario_is_answered_with_the_fire_and_every_part_says_what_it_is(
+    tmp_path: Path,
+) -> None:
+    moment = [NOON]
+    env = {"BEACON_DATA_DIR": str(tmp_path)}
+    ingest = build(env, Clock(lambda: moment[0]))
+    engine = open_engine(env, ingest.store, clock=lambda: moment[0])
+    taps = Taps(ingest.store, TapMedia(tmp_path / "taps", "mock"), clock=lambda: moment[0])
+    desk = InvestigationDesk(
+        EmberClient.fake(Storage.under(tmp_path), stand_in_investigator),
+        Runs(tmp_path / "investigate" / "mock.sqlite3", "mock"),
+        engine,
+        taps,
+        workers=0,
+        clock=lambda: moment[0],
+    )
+    app = create_app()
+    app.state.taps, app.state.incidents, app.state.investigations = taps, engine, desk
+    client = TestClient(app)
+    # Twenty minutes into the story: the fire is at its third alarm.
+    ingest.catch_up()
+
+    receipt = client.post("/api/taps", json={"location": PHONE}).json()
+    waiting = client.get(f"/api/taps/{receipt['id']}").json()
+    desk.investigate(receipt["id"])
+    answer = client.get(f"/api/taps/{receipt['id']}").json()
+    run = client.get(f"/api/taps/{receipt['id']}/run").json()
+    listed = client.get("/api/incidents").json()["incidents"]
+
+    assert receipt["investigating"] is True
+    assert (waiting["status"], waiting["text"]) == ("pending", "Beacon is looking into this tap.")
+    assert (waiting["incident"], waiting["match"], waiting["stand_in"]) == (None, None, False)
+    # The answer: the fire, said to be the investigator's reading and a stand-in's.
+    assert (answer["status"], answer["reason"], answer["mode"]) == ("incident", None, "mock")
+    assert answer["text"] == words.MATCHED
+    assert (answer["model"], answer["stand_in"], answer["stand_in_text"]) == (
+        "fake",
+        True,
+        words.STAND_IN,
+    )
+    fire = answer["incident"]
+    assert (fire["title"], fire["stand_in"]) == ("Fire at the 400 block of Hayes St", True)
+    assert answer["incident_id"] == fire["id"]
+    assert (answer["incident_gone"], answer["incident_gone_text"]) == (False, None)
+    assert answer["match"] == {
+        "confidence": "medium",
+        "text": words.MATCHED,
+        "grounds": [
+            {"kind": "near", "text": "The incident is about 100 m from where the tap came from."},
+            {
+                "kind": "going_on",
+                "text": "The incident was going on when the tap came, or had been shortly before.",
+            },
+            {
+                "kind": "aircraft_overhead",
+                "text": "An aircraft was over the incident shortly before the tap, within "
+                "reach of where the tap came from.",
+            },
+        ],
+        "grounds_dropped": 0,
+    }
+    # Crisis mode: a decision, said to be a model's, on signals that carry sources.
+    crisis = fire["crisis"]
+    assert (crisis["active"], crisis["text"], crisis["model"], crisis["stand_in"]) == (
+        True,
+        words.CRISIS,
+        "fake",
+        True,
+    )
+    assert crisis["cited"] == ["alarm", "evacuation_on_radio", "official_notice", "official_alert"]
+    assert [signal["kind"] for signal in crisis["signals"]] == crisis["cited"]
+    for signal in crisis["signals"]:
+        assert signal["confidence"] in ("official", "high", "medium", "low")
+        assert signal["sources"]
+        assert all(source["stand_in"] for source in signal["sources"])
+    # The medical response a block away was found and not taken, and has no crisis mode.
+    (medical,) = answer["nearby"]
+    assert (medical["title"], medical["crisis"]) == (
+        "Medical response at the 400 block of Fell St",
+        None,
+    )
+    assert answer["nearby_text"] == words.NEARBY
+    assert (answer["watching"], answer["since"], answer["since_text"]) == (False, [], None)
+    assert (answer["ember_calls"], answer["cost_usd"]) == (3, 0.0)
+    # The list of incidents carries the decision too, and names no tap.
+    by_id = {incident["id"]: incident for incident in listed}
+    assert by_id[fire["id"]]["crisis"]["active"] is True
+    assert by_id[medical["id"]]["crisis"] is None
+    assert receipt["id"] not in client.get("/api/incidents").text
+    assert receipt["id"] not in client.get(f"/api/incidents/{fire['id']}").text
+
+    # The run: each round, each call with why, what came back, and what it cost.
+    assert (run["state"], run["mode"], run["model"], run["stand_in"]) == (
+        "finished",
+        "mock",
+        "fake",
+        True,
+    )
+    assert run["stand_in_text"] == words.STAND_IN
+    assert [
+        (round_["n"], [(call["tool"], call["why"], call["ok"]) for call in round_["calls"]])
+        for round_ in run["rounds"]
+    ] == [
+        (1, [("nearby_incidents", "look_for_a_lead", True)]),
+        (
+            2,
+            [
+                ("get_official", "check_the_lead", True),
+                ("get_aircraft", "check_the_lead", True),
+                ("nearby_taps", "check_the_lead", True),
+            ],
+        ),
+    ]
+    first = run["rounds"][0]["calls"][0]
+    assert (first["thinking"], first["thinking_text"], first["lead"]) == (
+        "no_lead",
+        "No lead yet.",
+        None,
+    )
+    # Nearest first: the medical response is nearer, and the fire is the lead.
+    assert first["returned"]["incidents"] == [medical["id"], fire["id"]]
+    assert first["returned_text"] == "Found 2 incidents."
+    assert run["rounds"][1]["calls"][0]["lead"] == fire["id"]
+    assert set(run["rounds"][0]["ember"]) == {
+        "source",
+        "input_tokens",
+        "cached_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cost_usd",
+        "latency_ms",
+    }
+    assert run["final"]["source"] == "fake"
+    assert run["outcome"] == {
+        "status": "incident",
+        "reason": None,
+        "text": words.MATCHED,
+        "incident_id": fire["id"],
+        "grounds": ["near", "going_on", "aircraft_overhead"],
+        "grounds_dropped": 0,
+        "confidence": "medium",
+        "crisis": True,
+        "crisis_signals": crisis["cited"],
+        "crisis_refused": False,
+    }
+    assert (run["ember_calls"], run["cut_short"], run["cut_short_text"]) == (3, None, None)
+    # Nothing of where the phone said it was is in either answer.
+    for text in (client.get(f"/api/taps/{receipt['id']}").text, str(run)):
+        assert "7763549" not in text
+        assert "4244123" not in text
+    desk.stop(1)
+    taps.close()
+
+
+def test_a_tap_with_nothing_near_is_unconfirmed_and_beacon_lists_what_begins_there_since(
+    world: World,
+) -> None:
+    desk = world.desk()
+    client = world.app(desk)
+    where = {"lat": FAR.lat, "lon": FAR.lon}
+    hayes = fire_id(world)
+
+    tap_id = client.post("/api/taps", json={"location": where}).json()["id"]
+    desk.investigate(tap_id)
+    answer = client.get(f"/api/taps/{tap_id}").json()
+
+    assert (answer["status"], answer["reason"]) == ("unconfirmed", "nothing_near")
+    assert answer["text"] == (
+        "Unconfirmed. Beacon's investigator looked and found no incident near where this tap "
+        "came from."
+    )
+    assert (answer["incident"], answer["match"], answer["nearby"]) == (None, None, [])
+    assert (answer["watching"], answer["since"], answer["since_text"]) == (True, [], None)
+    # What the invented fire's evidence has no part in is still a stand-in's answer.
+    assert (answer["stand_in"], answer["model"]) == (True, "fake")
+
+    # Something begins on that block two minutes later. Nobody investigates again.
+    world.rows.radio(8.5, "fire", "dispatched", units=("E36",), street="Oak St", block=100)
+    world.now[0] = at(9)
+    answer = client.get(f"/api/taps/{tap_id}").json()
+    assert (answer["status"], answer["watching"]) == ("unconfirmed", True)
+    (since,) = answer["since"]
+    assert since["title"] == "Fire at the 100 block of Oak St"
+    assert answer["since_text"] == words.SINCE
+    assert "has not investigated" in answer["since_text"]
+    # The fire on Hayes St began before the tap and is far from it: it is not listed.
+    assert since["id"] != hayes
+
+    # Half an hour after the tap, Beacon no longer lists anything for it.
+    world.now[0] = at(6.5 + 31)
+    answer = client.get(f"/api/taps/{tap_id}").json()
+    assert (answer["watching"], answer["since"], answer["since_text"]) == (False, [], None)
+
+
+def test_a_tap_is_pending_while_its_run_is_to_come_and_then_said_not_to_have_one(
+    world: World,
+) -> None:
+    desk = world.desk()
+    client = world.app(desk)
+
+    tap_id = client.post("/api/taps", json={"location": PHONE}).json()["id"]
+
+    def read() -> tuple[str, str | None, str]:
+        answer = client.get(f"/api/taps/{tap_id}").json()
+        return (
+            answer["status"],
+            answer["reason"],
+            client.get(f"/api/taps/{tap_id}/run").json()["state"],
+        )
+
+    # Handed in, and waiting for a thread of the desk's.
+    assert read() == ("pending", None, "pending")
+    world.now[0] += api_taps.WAITING
+    assert read() == ("unconfirmed", "not_investigated", "none")
+    # Claimed: a run is being made, for as long as one can take.
+    desk.runs.claim(tap_id, world.now[0])
+    assert read() == ("pending", None, "pending")
+    world.now[0] += api_taps.RUNNING
+    # It never ended: the server was stopped under it. It may have asked Ember
+    # something, so it is not said not to have been made.
+    assert read() == ("unconfirmed", "cut_short", "lost")
+    answer = client.get(f"/api/taps/{tap_id}").json()
+    assert answer["text"] == "Unconfirmed. The investigation was cut short before it had an answer."
+    assert (answer["model"], answer["investigated_at"], answer["ember_calls"]) == (None, None, 0)
+
+
+def test_a_server_with_no_investigator_takes_the_tap_and_says_it_was_not_investigated(
+    world: World,
+) -> None:
+    client = world.app(None)
+
+    receipt = client.post("/api/taps", json={"location": PHONE}).json()
+    answer = client.get(f"/api/taps/{receipt['id']}").json()
+
+    assert receipt["investigating"] is False
+    assert (answer["status"], answer["reason"]) == ("unconfirmed", "not_investigated")
+    assert answer["text"] == "Unconfirmed. Beacon has no investigation of this tap."
+    assert client.get(f"/api/taps/{receipt['id']}/run").json() == {
+        "mode": "mock",
+        "tap_id": receipt["id"],
+        "state": "none",
+        "started_at": None,
+        "finished_at": None,
+        "evidence_as_of": None,
+        "model": None,
+        "stand_in": False,
+        "stand_in_text": None,
+        "rounds": [],
+        "final": None,
+        "outcome": None,
+        "cut_short": None,
+        "cut_short_text": None,
+        "ember_calls": 0,
+        "input_tokens": 0,
+        "cached_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "cost_usd": 0.0,
+        "latency_ms": 0,
+    }
+
+
+def test_a_closing_desk_takes_no_tap_and_the_receipt_says_so(world: World) -> None:
+    desk = world.desk()
+    client = world.app(desk)
+    desk.close()
+
+    receipt = client.post("/api/taps", json={"location": PHONE}).json()
+
+    assert receipt["investigating"] is False
+    assert client.get(f"/api/taps/{receipt['id']}").json()["reason"] == "not_investigated"
+
+
+@pytest.mark.parametrize("path", ["", "/run"])
+def test_only_a_tap_beacon_has_and_still_answers_for_is_read(world: World, path: str) -> None:
+    world.rows.tap(6, ref=TAP)
+    # A row that is no tap, under a reference shaped like a tap's id.
+    world.rows._add(
+        kind="radio",
+        source="app",
+        ref="tap-AAAAAAAA7777",
+        occurred_at=at(6),
+        confidence="low",
+        point=HAYES,
+        data={},
+    )
+    desk = world.desk()
+    desk.investigate(TAP)
+    client = world.app(desk)
+
+    assert client.get(f"/api/taps/{TAP}{path}").status_code == 200
+    for tap_id in ("tap-AAAAAAAA9999", "tap-AAAAAAAA7777", "x", "a" * 41, "tap.AAAAAAAA"):
+        response = client.get(f"/api/taps/{tap_id}{path}")
+        assert (response.status_code, response.json()) == (404, {"detail": "There is no such tap."})
+    # A day on, its run is no longer kept: it is a tap Beacon does not have, and not
+    # one it is said not to have looked into.
+    world.now[0] += api_taps.ANSWERED + timedelta(minutes=1)
+    response = client.get(f"/api/taps/{TAP}{path}")
+    assert (response.status_code, response.json()) == (404, {"detail": "There is no such tap."})
+
+
+def test_an_incident_beacon_no_longer_has_is_said_to_be_gone_and_not_shown_as_another(
+    world: World,
+) -> None:
+    world.rows.tap(6, ref=TAP)
+    desk = world.desk()
+    run = desk.investigate(TAP)
+    assert run is not None
+    # The run is as it was, and the incident's calls have since been regrouped:
+    # what is kept names an incident this reading does not have.
+    gone = Run(
+        tap_id=OTHER,
+        started_at=run.started_at,
+        finished_at=run.finished_at,
+        outcome=Outcome(
+            status="incident",
+            incident_id="inc-0000000000000000",
+            grounds=("near", "going_on"),
+            confidence="medium",
+        ),
+        model="fake",
+        stand_in=True,
+        as_of=run.as_of,
+    )
+    world.rows.tap(6, ref=OTHER)
+    desk.runs.claim(OTHER, at(6.5))
+    desk.runs.write(gone)
+
+    answer = world.app(desk).get(f"/api/taps/{OTHER}").json()
+
+    assert (answer["status"], answer["incident_id"]) == ("incident", "inc-0000000000000000")
+    assert (answer["incident"], answer["incident_gone"]) == (None, True)
+    assert answer["incident_gone_text"] == words.INCIDENT_GONE
+    assert answer["match"]["grounds"][0]["text"] == (
+        "The incident was within 500 m of where the tap came from."
+    )
+
+
+def test_a_decision_on_crisis_mode_is_not_shown_as_on_once_the_incident_is_over(
+    world: World,
+) -> None:
+    world.rows.tap(6, ref=TAP)
+    desk = world.desk()
+    desk.investigate(TAP)
+    client = world.app(desk)
+    fire = fire_id(world)
+    assert client.get(f"/api/incidents/{fire}").json()["incident"]["crisis"]["active"] is True
+
+    # The alert is cancelled and the radio has it under control and then quiet.
+    world.rows.alert(20, "shelter-cancel", message_type="Cancel", replaces=("shelter",))
+    world.rows.radio(21, "fire", "cleared", units=("E36", "T6", "B2"))
+    world.now[0] = at(22)
+    crisis = client.get(f"/api/incidents/{fire}").json()["incident"]["crisis"]
+
+    assert client.get(f"/api/incidents/{fire}").json()["incident"]["open"] is False
+    assert crisis["active"] is False
+    # The signal that is gone is no longer shown as one it rests on now.
+    assert "official_alert" in crisis["cited"]
+    assert "official_alert" not in [signal["kind"] for signal in crisis["signals"]]
+
+
+def test_a_medical_response_is_never_shown_in_crisis_mode_whatever_is_kept(world: World) -> None:
+    world.rows.tap(6, ref=TAP)
+    desk = world.desk(Script([form()]))
+    (medical,) = [i for i in world.engine.incidents() if i.category == "medical response"]
+    outcome = Outcome(
+        status="incident",
+        incident_id=medical.id,
+        grounds=("near",),
+        confidence="low",
+        crisis=True,
+        crisis_signals=("alarm",),
+    )
+    desk.runs.claim(TAP, at(6.5))
+    desk.runs.write(
+        Run(
+            tap_id=TAP,
+            started_at=at(6.5),
+            finished_at=at(6.5),
+            outcome=outcome,
+            model="fake",
+            stand_in=True,
+        )
+    )
+
+    shown = world.app(desk).get(f"/api/incidents/{medical.id}").json()["incident"]
+
+    assert desk.runs.crisis(medical.id) is not None
+    assert shown["crisis"] is None
+
+
+# The server.
+
+
+def test_the_server_investigates_a_tap_and_stops_cleanly() -> None:
+    with TestClient(create_app()) as client:
+        desk = client.app.state.investigations  # type: ignore[attr-defined]
+        # The pollers play the story's first twenty minutes when they start.
+        for _ in range(200):
+            if any(
+                i["category"] == "fire" for i in client.get("/api/incidents").json()["incidents"]
+            ):
+                break
+            time.sleep(0.05)
+        receipt = client.post("/api/taps", json={"location": PHONE}).json()
+        answer: dict[str, Any] = {}
+        for _ in range(200):
+            answer = client.get(f"/api/taps/{receipt['id']}").json()
+            if answer["status"] != "pending":
+                break
+            time.sleep(0.05)
+        run = client.get(f"/api/taps/{receipt['id']}/run").json()
+
+    assert receipt["investigating"] is True
+    assert (answer["status"], answer["model"], answer["stand_in"]) == ("incident", "fake", True)
+    assert answer["incident"]["category"] == "fire"
+    assert (run["state"], run["outcome"]["incident_id"]) == ("finished", answer["incident_id"])
+    # The server has shut down: the desk takes nothing more and writes nothing.
+    assert desk.active is False
+    assert desk.submit(receipt["id"]) is False
+    with pytest.raises(RunsError, match="closed"):
+        desk.runs.save_state({})
+    assert all(not thread.is_alive() for thread in desk._threads)
+
+
+def test_shutting_down_closes_the_investigator_before_it_waits_for_anything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_app()
+    seen: list[Any] = []
+
+    async def sweeping(_taps: Any, stop: asyncio.Event) -> None:
+        # The first thing a shutdown waits for, and the wait can be a long one.
+        await stop.wait()
+        desk = app.state.investigations
+        seen.append((desk.active, desk.submit(TAP), desk.investigate(TAP)))
+
+    monkeypatch.setattr(main_module, "_sweep_tap_media", sweeping)
+    with TestClient(app):
+        pass
+
+    assert seen == [(False, False, None)]
+
+
+def test_the_pollers_are_closed_to_paid_work_when_the_investigator_could_not_be(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    closed: list[str] = []
+
+    class Desk:
+        def close(self) -> None:
+            raise RuntimeError("Jane Doe")
+
+    class Stories:
+        def close(self) -> None:
+            closed.append("stories")
+
+    class Pollers:
+        def close_paid(self) -> None:
+            closed.append("pollers")
+
+    main_module._close_paid(Stories(), Desk(), Pollers())  # type: ignore[arg-type]
+
+    assert closed == ["stories", "pollers"]
+    assert "Paid work could not be closed (RuntimeError)." in caplog.text
+    assert "Jane" not in caplog.text
+
+
+def test_reading_a_taps_answer_is_as_private_as_sending_the_tap() -> None:
+    assert main_module._is_private(f"/api/taps/{TAP}")
+    assert main_module._is_private(f"/api/taps/{TAP}/run")
+    assert main_module._is_private(f"/served/under/api/taps/{TAP}/run")
+    assert not main_module._is_private("/api/incidents")
+
+
+def test_what_was_there_before_the_investigator_looked_is_not_listed_as_begun_since(
+    world: World,
+) -> None:
+    # An investigator that answers at once, having looked at nothing.
+    desk = world.desk(Script([form()]))
+    client = world.app(desk)
+
+    tap_id = client.post("/api/taps", json={"location": PHONE}).json()["id"]
+    desk.investigate(tap_id)
+    world.now[0] = at(8)
+    answer = client.get(f"/api/taps/{tap_id}").json()
+
+    # The fire a hundred metres off began before the tap: it is not what began since.
+    assert (answer["status"], answer["reason"]) == ("unconfirmed", "not_looked")
+    assert (answer["watching"], answer["since"], answer["nearby"]) == (True, [], [])
