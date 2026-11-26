@@ -5,8 +5,9 @@
     ingest = build(os.environ)   # the mock scenario unless BEACON_LIVE_SOURCES names a source
     ingest.run(stop)             # polls until the threading.Event is set
 
-See `setup` for how a source goes live, `runner` for the loop, and a source's own
-module (`nws`, `opensky`, `traffic511`, `openmhz`) for what its rows hold.
+See `setup` for how a source goes live, `runner` for the loop, a source's own module
+(`nws`, `opensky`, `traffic511`, `openmhz`, `notices`) for what its rows hold, and
+`paid` for what the pollers that pay Ember for each item keep to.
 """
 
 from beacon.ingest.http import SourceError, SourceHttp

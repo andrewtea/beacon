@@ -86,27 +86,25 @@ import hashlib
 import json
 import logging
 import re
-import threading
-from collections.abc import Callable, Collection, Iterator
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn
 from urllib.parse import urlsplit
 
 from beacon.ember import (
-    BudgetExceededError,
-    EmberCallError,
     EmberClient,
     EmberClosedError,
     EmberError,
     InputTooLargeError,
-    LedgerReplacedError,
-    ReplayMissError,
 )
 from beacon.errors import raise_bare
 from beacon.evidence import Confidence, EvidenceStore, EvidenceStoreError, NewEvidence, Origin
 from beacon.ingest.http import SourceError, SourceHttp, fetch, read_json
-from beacon.ingest.runner import MAX_WAIT_SECONDS, PollerHeldError, PollReport
+from beacon.ingest.paid import HELD_INTERVAL_SECONDS as HELD_INTERVAL_SECONDS
+from beacon.ingest.paid import UNUSABLE_RUN_LIMIT as UNUSABLE_RUN_LIMIT
+from beacon.ingest.paid import Hold, PaidDesk, read_hold
+from beacon.ingest.runner import PollReport
 from beacon.radio import (
     AudioError,
     ConversionUnavailable,
@@ -120,6 +118,9 @@ from beacon.radio.audio import container, plain_wav, wav_seconds
 from beacon.radio.vocabulary import Known
 
 SOURCE = "openmhz"
+# The label of the spending scope every live radio call is paid under. A live Ember
+# client that pays under any other is refused (`beacon.ingest.paid`).
+SCOPE = "ingest:openmhz"
 API = "https://api.openmhz.com"
 # San Francisco's P25 system, by the short name OpenMHz gives it.
 SAN_FRANCISCO = "sfp25"
@@ -129,10 +130,6 @@ SAN_FRANCISCO = "sfp25"
 PAGE_SIZE: int | None = None
 
 INTERVAL_SECONDS = 30.0
-# How long the poller leaves Ember alone after Ember refused a call or failed on one.
-HELD_INTERVAL_SECONDS = 600.0
-# This many answers in a row that were no form, and the poller is held as well.
-UNUSABLE_RUN_LIMIT = 3
 
 # How far behind the newest call it has finished with a poll asks again, for the
 # calls whose upload reached OpenMHz late. The first poll asks this far back from
@@ -154,25 +151,9 @@ _MAX_LIST_BYTES = 2_000_000
 _MAX_AUDIO_BYTES = 4_000_000
 _SYSTEM = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
 _CALL_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
-# The refusals after which the request that costs money is known not to have been
-# sent: a spending stop, a client that only replays, and a client that was closed.
-# A replaced ledger is a spending stop by its class and is not among them: it is
-# also raised after a request that was sent could not be settled.
-_NOT_SENT = (BudgetExceededError, ReplayMissError, EmberClosedError)
 # How well Ember says it heard a call decides how far the row is trusted. Ember's
 # own judgment of that is not measured yet, so nothing heard is more than `medium`.
 _CONFIDENCE: dict[str, Confidence] = {"clear": "medium", "partial": "low", "unintelligible": "low"}
-
-_HELD = "The radio poller is leaving Ember alone for a while, after Ember refused or failed."
-_UNUSABLE = (
-    "The radio poller is leaving Ember alone for a while: its answers about calls were "
-    "not filled-in forms, several times in a row."
-)
-_LEDGER_LOST = (
-    "The radio poller has stopped: the Ember ledger was replaced while it ran, so what "
-    "was spent is not known from it. Compare Meta's Usage page with the ledger, then "
-    "start Beacon again."
-)
 
 logger = logging.getLogger("beacon.ingest")
 
@@ -196,22 +177,15 @@ class Call:
 
 
 @dataclass
-class _Progress:
-    """What the poller remembers between polls, in the evidence store."""
+class _Progress(Hold):
+    """What the poller remembers between polls, in the evidence store: how it
+    stands with Ember (`Hold`), and how far it has got."""
 
     # The time of the newest call it has finished with.
-    after_ms: int
-    # Until when it leaves Ember alone, by the wall clock.
-    held_until: datetime | None = None
-    # How many of Ember's last answers in a row were no form.
-    unusable_run: int = 0
+    after_ms: int = 0
 
     def as_state(self) -> dict[str, Any]:
-        return {
-            "after_ms": self.after_ms,
-            "held_until": None if self.held_until is None else self.held_until.isoformat(),
-            "unusable_run": self.unusable_run,
-        }
+        return {"after_ms": self.after_ms} | self.hold_state()
 
 
 class OpenMhzRadio:
@@ -271,14 +245,10 @@ class OpenMhzRadio:
         self._media_hosts = frozenset(host.lower() for host in media_hosts)
         self._page_size = page_size
         self._transcoder = transcoder
-        self._wall_clock = (lambda: datetime.now(UTC)) if wall_clock is None else wall_clock
-        # Set when the Ember ledger was replaced under this process. Nothing is
-        # paid for after that, until an operator has looked and started Beacon again.
-        self._ledger_lost = False
-        # How many claimed calls are being worked on, which is one or none: from
-        # the claim until the call's row is stored or the call is given up.
-        self._working = threading.Condition()
-        self._claimed = 0
+        # What every poller that pays Ember keeps to: `beacon.ingest.paid`.
+        self._paid = PaidDesk(
+            ember, poller="radio", items="calls", scope=SCOPE, wall_clock=wall_clock
+        )
 
     @property
     def origin(self) -> Origin:
@@ -290,7 +260,7 @@ class OpenMhzRadio:
         """Admit no more paid work, and call off a conversion that is running. A
         call the Ember client had already admitted still sends its paid request
         (`EmberClient.close`); `drain` waits for it."""
-        self._ember.close()
+        self._paid.close()
         if self._transcoder is not None:
             self._transcoder.close()
 
@@ -299,31 +269,13 @@ class OpenMhzRadio:
         a claim to be finished with, and say whether it has been: Ember has
         answered, and the row is stored. A shutdown waits for this before it closes
         the store, so that an answer that was paid for is not thrown away."""
-        with self._working:
-            return self._working.wait_for(lambda: self._claimed == 0, timeout)
-
-    @contextlib.contextmanager
-    def _claim_held(self) -> Iterator[None]:
-        with self._working:
-            self._claimed += 1
-        try:
-            yield
-        finally:
-            with self._working:
-                self._claimed -= 1
-                self._working.notify_all()
+        return self._paid.drain(timeout)
 
     def poll(self, store: EvidenceStore, now: datetime) -> PollReport:
         store.refuse_stand_in(self.origin)
-        if self._ledger_lost:
-            raise_bare(PollerHeldError(_LEDGER_LOST, MAX_WAIT_SECONDS))
         saved = store.state(self.name)
         progress = _progress(saved, now)
-        if progress.held_until is not None:
-            left = (progress.held_until - self._wall_clock()).total_seconds()
-            if left > 0:
-                raise_bare(PollerHeldError(_HELD, left))
-            progress.held_until = None
+        self._paid.check(progress)
         listing = self._listing(progress, now, first=not saved)
         calls = [call for call in listing.calls.values() if call.time_ms <= _ms(now)]
         unreadable = listing.unreadable
@@ -350,7 +302,7 @@ class OpenMhzRadio:
             # From here to the row, a shutdown waits (`drain`). A shutdown that
             # falls between the claim and here finds a closed Ember, and at worst
             # the claim cannot be given up: the call is lost, and nothing was paid.
-            with self._claim_held():
+            with self._paid.working():
                 heard = None
                 if audio is not None:
                     heard = self._hear(store, call, audio, progress, now)
@@ -525,17 +477,13 @@ class OpenMhzRadio:
             failure = error
         if failure is not None:
             self._failed(store, call, progress, failure, now)
-        if unusable:
-            progress.unusable_run += 1
-        elif heard is not None:
-            progress.unusable_run = 0
-        if progress.unusable_run >= UNUSABLE_RUN_LIMIT:
-            # After the hold, one more answer of the kind holds the poller again.
-            progress.unusable_run = UNUSABLE_RUN_LIMIT - 1
+        held = None
+        if unusable or heard is not None:
+            held = self._paid.count_answer(progress, usable=heard is not None)
+        if held is not None:
             progress.after_ms = max(progress.after_ms, call.time_ms)
-            progress.held_until = self._wall_clock() + timedelta(seconds=HELD_INTERVAL_SECONDS)
             store.add([], state=(self.name, progress.as_state()), now=now)
-            raise_bare(PollerHeldError(_UNUSABLE, HELD_INTERVAL_SECONDS))
+            raise_bare(held)
         if heard is None:
             progress.after_ms = max(progress.after_ms, call.time_ms)
             store.add([], state=(self.name, progress.as_state()), now=now)
@@ -552,8 +500,7 @@ class OpenMhzRadio:
         """End the poll after Ember refused a call or failed on it. The claim on
         the call is given up only when the paid request is known not to have been
         sent; otherwise the call may have been paid for, and is finished with."""
-        not_sent = isinstance(failure, _NOT_SENT) and not isinstance(failure, LedgerReplacedError)
-        if not_sent:
+        if self._paid.not_sent(failure):
             # When the claim cannot be given up it stays, which loses the call and
             # pays for nothing.
             with contextlib.suppress(EvidenceStoreError):
@@ -563,13 +510,7 @@ class OpenMhzRadio:
         if isinstance(failure, EmberClosedError):
             # Beacon is shutting down. That is no news about Ember.
             raise_bare(failure)
-        if isinstance(failure, LedgerReplacedError):
-            self._ledger_lost = True
-            logger.error("%s", _LEDGER_LOST)
-        asked = failure.retry_after if isinstance(failure, EmberCallError) else None
-        hold = max(HELD_INTERVAL_SECONDS, min(asked or 0.0, MAX_WAIT_SECONDS))
-        # Counted from now, when Ember failed, and kept: a restart does not end it.
-        progress.held_until = self._wall_clock() + timedelta(seconds=hold)
+        self._paid.hold_after(failure, progress)
         with contextlib.suppress(EvidenceStoreError):
             store.add([], state=(self.name, progress.as_state()), now=now)
         # Nothing under it: not the error this was caught as, nor one the caller
@@ -749,21 +690,14 @@ def _progress(saved: dict[str, Any], now: datetime) -> _Progress:
     """What the poller saved last. With nothing saved it begins `OVERLAP` ago, so
     the first poll hears the calls of the last few minutes and not the archive, and
     it never goes back further than `MAX_AGE`."""
-    after_ms, held, run = saved.get("after_ms"), saved.get("held_until"), saved.get("unusable_run")
+    after_ms = saved.get("after_ms")
     if isinstance(after_ms, bool) or not isinstance(after_ms, int):
         after_ms = _ms(now - OVERLAP)
-    held_until = None
-    if isinstance(held, str):
-        with contextlib.suppress(ValueError):
-            held_until = datetime.fromisoformat(held)
-        if held_until is not None and held_until.utcoffset() is None:
-            held_until = None
+    held_until, unusable_run = read_hold(saved)
     return _Progress(
         after_ms=max(after_ms, _ms(now - MAX_AGE)),
         held_until=held_until,
-        unusable_run=run
-        if isinstance(run, int) and not isinstance(run, bool) and 0 <= run <= UNUSABLE_RUN_LIMIT
-        else 0,
+        unusable_run=unusable_run,
     )
 
 

@@ -6,7 +6,8 @@
     http = SourceHttp(scenario_transport(scenario, clock.now))
 
 See `fire` for the story, `radio` for its radio calls and the stand-in for Ember
-that "hears" them, and `transport` for how it stands in for the network.
+that "hears" them, `notices` for its official notices and the stand-in that "reads"
+them, and `transport` for how it stands in for the network.
 """
 
 from beacon.scenario.fire import DURATION, FIRE, INVENTED, Scenario

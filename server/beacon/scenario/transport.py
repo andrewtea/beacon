@@ -5,7 +5,7 @@ be: it answers a request to a source's address with what the scenario says that
 source would have answered at the clock's moment. It is strict about what it is
 asked, so a poller that would be refused by the real source is refused here: NWS
 needs a User-Agent, 511 a token, OpenSky its bounding box, and OpenMHz a time and
-the talkgroups to list.
+the talkgroups to list. The notices feed is on a host of the story's own.
 
 A request to any other address gets a 404, and nothing here opens a connection.
 """
@@ -17,7 +17,7 @@ from typing import Any
 
 import httpx2
 
-from beacon.scenario import radio
+from beacon.scenario import notices, radio
 from beacon.scenario.fire import Scenario
 
 _OPENSKY_BOX = ("lamin", "lomin", "lamax", "lomax")
@@ -56,6 +56,15 @@ def scenario_transport(scenario: Scenario, now: Callable[[], datetime]) -> httpx
             if audio is None:
                 return httpx2.Response(404, text="The mock scenario has no such call.")
             return httpx2.Response(200, content=audio, headers={"content-type": "audio/wav"})
+        if place == ("GET", notices.FEED_HOST, "/feed.json"):
+            return _json(notices.feed(scenario.start, now()), "application/feed+json")
+        if (request.method, url.host) == ("GET", notices.FEED_HOST):
+            document = notices.document(url.path.removeprefix("/documents/"))
+            if document is None:
+                return httpx2.Response(404, text="The mock scenario has no such document.")
+            return httpx2.Response(
+                200, content=document, headers={"content-type": "application/pdf"}
+            )
         return httpx2.Response(404, text="The mock scenario has no such source.")
 
     return httpx2.MockTransport(answer)

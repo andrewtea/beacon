@@ -23,6 +23,7 @@ from beacon.ember import (
     EmberError,
     LedgerReplacedError,
     Pacer,
+    SpendScope,
     Storage,
     fake_response,
 )
@@ -1371,6 +1372,25 @@ def test_real_radio_is_not_handed_to_a_stand_in_for_ember(
     paced = EmberClient.live(storage, api_key="test-key", pacer=Pacer(3000))
     with pytest.raises(ValueError, match="makes each call once: no pacer"):
         OpenMhzRadio(SourceHttp(), paced, talkgroups=(FIRE,), known=KNOWN)
+
+
+def test_a_radio_poller_that_can_spend_pays_under_radios_own_budget(
+    storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+
+    def live(label: str | None) -> EmberClient:
+        scope = None if label is None else SpendScope(label, 250_000_000)
+        return EmberClient.live(storage, api_key="test-key", scope=scope)
+
+    # With no budget of its own, and with the one set aside for reading notices.
+    for label in (None, "ingest:notices"):
+        with pytest.raises(ValueError, match="needs the spending scope ingest:openmhz"):
+            OpenMhzRadio(SourceHttp(), live(label), talkgroups=(FIRE,), known=KNOWN)
+
+    with SourceHttp() as http:
+        poller = OpenMhzRadio(http, live("ingest:openmhz"), talkgroups=(FIRE,), known=KNOWN)
+        assert poller.origin == "live"
 
 
 def test_the_pollers_origin_is_its_clients_and_cannot_be_set(poller: OpenMhzRadio) -> None:

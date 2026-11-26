@@ -30,7 +30,7 @@ def test_sources_says_the_data_is_mock_and_how_each_pollers_last_poll_went(
         "mode": "mock",
         "sources": [
             {"name": name, "polled_at": None, "ok": None, "partial": False, "rows": 0}
-            for name in ("nws", "opensky", "511", "openmhz")
+            for name in ("nws", "opensky", "511", "openmhz", "notices")
         ],
     }
 
@@ -67,6 +67,13 @@ def test_sources_says_the_data_is_mock_and_how_each_pollers_last_poll_went(
                 "partial": False,
                 "rows": 10,
             },
+            {
+                "name": "notices",
+                "polled_at": "2026-11-27T20:00:00Z",
+                "ok": True,
+                "partial": False,
+                "rows": 1,
+            },
         ],
     }
 
@@ -84,7 +91,13 @@ def test_the_server_runs_the_pollers_on_the_mock_scenario_while_it_is_up() -> No
         ingest = client.app.state.ingest
 
     assert answer["mode"] == "mock"
-    assert [source["name"] for source in answer["sources"]] == ["nws", "opensky", "511", "openmhz"]
+    assert [source["name"] for source in answer["sources"]] == [
+        "nws",
+        "opensky",
+        "511",
+        "openmhz",
+        "notices",
+    ]
     # When the server has shut down, the pollers have stopped and can ask nothing more.
     assert ingest.http.closed
     assert ingest.store.closed

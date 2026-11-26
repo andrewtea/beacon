@@ -454,6 +454,12 @@ class EmberClient:
         return "replay" if self._responder is None else "fake"
 
     @property
+    def scope(self) -> SpendScope | None:
+        """The budget of their own that the client's calls are held to, when it was
+        given one."""
+        return self._scope
+
+    @property
     def retries(self) -> bool:
         """Whether the client makes a call again after the API answers 429, which a
         client with a pacer does. Each attempt is a paid request of its own."""
