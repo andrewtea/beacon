@@ -1,0 +1,39 @@
+:root {
+  /* Night navy is the brand, and amber is the beacon: the one accent. */
+  --bg: #0b1f33;
+  --surface: #12304d;
+  --line: #24476b;
+  --text: #c5d3e2;
+  --text-strong: #f4f8fc;
+  --text-soft: #8fa5bd;
+  --accent: #ffb020;
+  --ok: #4ade9a;
+  --error: #ff8a65;
+  --focus: #ffd27a;
+
+  font:
+    17px/1.5 system-ui,
+    'Segoe UI',
+    Roboto,
+    sans-serif;
+  color-scheme: dark;
+  color: var(--text);
+  background: var(--bg);
+  accent-color: var(--accent);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100dvh;
+}
+
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
