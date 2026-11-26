@@ -14,6 +14,15 @@ A source needs no code change to go live, only its name in that list and what it
     opensky   BEACON_OPENSKY_PERMITTED=1, which says OpenSky has given Beacon the
               written license its terms require, and optionally OPENSKY_CLIENT_ID
               and OPENSKY_CLIENT_SECRET for a larger quota
+    openmhz   BEACON_OPENMHZ_PERMITTED=1, which says OpenMHz has given Beacon
+              permission to use its audio; BEACON_OPENMHZ_TALKGROUPS, the channels
+              to hear; BEACON_OPENMHZ_BUDGET_USD, the most hearing them may cost;
+              a live Ember (REPLAY=0, MODEL_API_KEY, EMBER_SPENT_BEFORE_USD); and
+              ffmpeg, on Linux. BEACON_OPENMHZ_EMS_TALKGROUPS and
+              BEACON_OPENMHZ_MEDIA_HOSTS are optional.
+
+Radio is the one source that costs money: every call is heard by Ember. In mock mode
+the calls are tones and a stand-in for Ember "hears" them, which costs nothing.
 
 The mock scenario is played on a clock of its own. Its story begins twenty minutes
 before a mock store is first opened and runs in real time from there, in steps of ten
@@ -24,28 +33,44 @@ the pollers that failed in it poll again.
 """
 
 import logging
+import os
+import re
+import shutil
 import threading
 from collections.abc import Mapping
 from datetime import datetime, timedelta
 from typing import Any
 
+from beacon.ember import EmberClient, SpendScope, Storage
 from beacon.ember.client import default_data_dir
+from beacon.ember.pricing import parse_usd
 from beacon.evidence import EvidenceStore, Mode
 from beacon.ingest.http import SourceHttp
 from beacon.ingest.nws import NwsAlerts
+from beacon.ingest.openmhz import OpenMhzRadio
 from beacon.ingest.opensky import SIGNED_IN_INTERVAL_SECONDS, OpenSkyAircraft
 from beacon.ingest.runner import Clock, Poller, PollerStatus, Runner
 from beacon.ingest.traffic511 import Traffic511
-from beacon.scenario import DURATION, Scenario, scenario_transport
+from beacon.radio import Ffmpeg
+from beacon.scenario import DURATION, Scenario, scenario_transport, stand_in_ember
+from beacon.scenario import radio as scenario_radio
 
 # The sources that can be named in BEACON_LIVE_SOURCES.
-SOURCES = ("nws", "opensky", "511")
+SOURCES = ("nws", "opensky", "511", "openmhz")
 
 LIVE_SOURCES_VARIABLE = "BEACON_LIVE_SOURCES"
 KEY_511_VARIABLE = "BEACON_511_API_KEY"
 OPENSKY_PERMITTED_VARIABLE = "BEACON_OPENSKY_PERMITTED"
 OPENSKY_ID_VARIABLE = "OPENSKY_CLIENT_ID"
 OPENSKY_SECRET_VARIABLE = "OPENSKY_CLIENT_SECRET"
+OPENMHZ_PERMITTED_VARIABLE = "BEACON_OPENMHZ_PERMITTED"
+OPENMHZ_TALKGROUPS_VARIABLE = "BEACON_OPENMHZ_TALKGROUPS"
+OPENMHZ_EMS_TALKGROUPS_VARIABLE = "BEACON_OPENMHZ_EMS_TALKGROUPS"
+OPENMHZ_MEDIA_HOSTS_VARIABLE = "BEACON_OPENMHZ_MEDIA_HOSTS"
+OPENMHZ_BUDGET_VARIABLE = "BEACON_OPENMHZ_BUDGET_USD"
+
+# The label of the spending scope every live radio call is made under.
+RADIO_SCOPE = "ingest:openmhz"
 
 # A mock store that is begun starts its story this long ago, so the first thing a
 # developer sees is a fire in progress and not an empty city.
@@ -64,6 +89,8 @@ _AFTER_THE_STORY = timedelta(minutes=10)
 STOP_SECONDS = 5.0
 
 logger = logging.getLogger("beacon.ingest")
+
+_HOST = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?")
 
 
 class IngestConfigError(Exception):
@@ -233,10 +260,20 @@ def build(env: Mapping[str, str], clock: Clock | None = None) -> Ingest:
     store = open_store(env)
     scenario = _scenario(store, clock.now())
     http = SourceHttp(scenario_transport(scenario, clock.now))
+    # Stands in for Ember: it spends nothing, and what it "hears" in the story's
+    # tones is the story's own. Its rows say `model == "fake"`.
+    ember = EmberClient.fake(Storage.under(default_data_dir(env)), stand_in_ember)
     pollers = [
         NwsAlerts(http),
         OpenSkyAircraft(http, interval_seconds=SIGNED_IN_INTERVAL_SECONDS),
         Traffic511(http, api_key="mock"),
+        OpenMhzRadio(
+            http,
+            ember,
+            talkgroups=scenario_radio.TALKGROUPS,
+            ems_talkgroups=scenario_radio.EMS_TALKGROUPS,
+            system=scenario_radio.SYSTEM,
+        ),
     ]
     last = _saved_polls(store.state(_SCENARIO_STATE).get("polls"))
     return Ingest(store, Runner(pollers, store, clock, last=last), clock, http, scenario)
@@ -279,7 +316,84 @@ def source_pollers(
                 f"{LIVE_SOURCES_VARIABLE} names 511, which needs {KEY_511_VARIABLE}."
             )
         pollers.append(Traffic511(http, api_key=token))
+    if "openmhz" in sources:
+        pollers.append(_radio_poller(env, http))
     return pollers
+
+
+def _radio_poller(env: Mapping[str, str], http: SourceHttp) -> OpenMhzRadio:
+    """The poller for real radio, heard by a live Ember under a budget of its own.
+
+    Raises IngestConfigError when permission, the talkgroups, the budget, a live
+    Ember, or ffmpeg is missing."""
+    names = f"{LIVE_SOURCES_VARIABLE} names openmhz"
+    if env.get(OPENMHZ_PERMITTED_VARIABLE) != "1":
+        raise IngestConfigError(
+            f"{names}, and using OpenMHz's audio needs its permission. Ask the contact "
+            f"on its San Francisco page, and set {OPENMHZ_PERMITTED_VARIABLE}=1 once "
+            "permission is given."
+        )
+    talkgroups = _talkgroups(env, OPENMHZ_TALKGROUPS_VARIABLE)
+    if not talkgroups:
+        raise IngestConfigError(
+            f"{names}, which needs {OPENMHZ_TALKGROUPS_VARIABLE}: the numbers of the "
+            "fire and EMS talkgroups to hear. Every call on them is paid for."
+        )
+    ems_talkgroups = _talkgroups(env, OPENMHZ_EMS_TALKGROUPS_VARIABLE)
+    if not set(ems_talkgroups) <= set(talkgroups):
+        raise IngestConfigError(
+            f"{OPENMHZ_EMS_TALKGROUPS_VARIABLE} names a talkgroup that "
+            f"{OPENMHZ_TALKGROUPS_VARIABLE} does not."
+        )
+    hosts = [host.strip().lower() for host in env.get(OPENMHZ_MEDIA_HOSTS_VARIABLE, "").split(",")]
+    hosts = [host for host in hosts if host]
+    if not all(_HOST.fullmatch(host) for host in hosts):
+        raise IngestConfigError(
+            f"{OPENMHZ_MEDIA_HOSTS_VARIABLE} is a list of host names, such as media.example.org."
+        )
+    scope = _radio_scope(env)
+    if scope is None:
+        raise IngestConfigError(
+            f"{names}, which needs {OPENMHZ_BUDGET_VARIABLE}: the most, in dollars, that "
+            "hearing radio may cost over every run. It has no default, because every "
+            "call is paid for."
+        )
+    if shutil.which("ffmpeg") is None or not hasattr(os, "memfd_create"):
+        raise IngestConfigError(
+            f"{names}, whose audio is converted by ffmpeg, in memory, which needs ffmpeg "
+            "installed and Linux."
+        )
+    ember = EmberClient.from_env(env, scope=scope)
+    if not ember.spends:
+        raise IngestConfigError(
+            f"{names}, and a radio call is heard by a live Ember and cannot be replayed: "
+            "set REPLAY=0, MODEL_API_KEY, and EMBER_SPENT_BEFORE_USD."
+        )
+    return OpenMhzRadio(
+        http,
+        ember,
+        talkgroups=talkgroups,
+        ems_talkgroups=ems_talkgroups,
+        media_hosts=hosts,
+        transcoder=Ffmpeg(),
+    )
+
+
+def _radio_scope(env: Mapping[str, str]) -> SpendScope | None:
+    """The spending scope live radio calls are made under, with the budget the
+    environment sets for it, or None when that is not a dollar amount a scope takes."""
+    try:
+        return SpendScope(RADIO_SCOPE, parse_usd(env.get(OPENMHZ_BUDGET_VARIABLE, "")))
+    except ValueError:
+        return None
+
+
+def _talkgroups(env: Mapping[str, str], variable: str) -> tuple[int, ...]:
+    numbers = [number.strip() for number in env.get(variable, "").split(",")]
+    numbers = [number for number in numbers if number]
+    if not all(number.isascii() and number.isdigit() and len(number) <= 7 for number in numbers):
+        raise IngestConfigError(f"{variable} is a list of talkgroup numbers, such as 1201,1203.")
+    return tuple(dict.fromkeys(int(number) for number in numbers))
 
 
 def _saved_polls(saved: Any) -> list[PollerStatus]:

@@ -6,7 +6,7 @@
     ingest.run(stop)             # polls until the threading.Event is set
 
 See `setup` for how a source goes live, `runner` for the loop, and a source's own
-module (`nws`, `opensky`, `traffic511`) for what its rows hold.
+module (`nws`, `opensky`, `traffic511`, `openmhz`) for what its rows hold.
 """
 
 from beacon.ingest.http import SourceError, SourceHttp

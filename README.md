@@ -4,7 +4,7 @@ Beacon is a "What's that?" button for your city. You hear a siren or see a helic
 
 Beacon is being built for the Meta Muse Ember Hackathon (Nov 23 to Dec 2, 2026). The rules, the $10 budget, and the submission checklist are in [HACKATHON.md](HACKATHON.md).
 
-**Status:** scaffold, Ember client, evidence store, and the first three pollers. The web app is an installable shell that shows whether the server is reachable. The server stores evidence rows and runs pollers for National Weather Service alerts, OpenSky aircraft positions, and 511 road closures. **By default the pollers are fed an invented scenario, not real sources:** a made-up three-alarm fire in Hayes Valley, told in each source's own format, and every row from it is stored as `mock`. An early version of the NWS poller was run once against the real API; nothing else has been. The 511 poller has run only against mocked HTTP, because there is no token. The OpenSky poller has too, and **may not be pointed at the real API yet:** OpenSky's terms require a written license for a running service, which nobody has asked for. **No real Ember call has been made:** there is no API key, so the client has run only against a mock of the Meta Model API in tests, and its request shapes come from Meta's documentation, not from an answer of Ember's. The audio token rate the budget rests on is [still a guess](#measure-the-audio-token-rate). Nothing listens to radio, and no incident exists.
+**Status:** scaffold, Ember client, evidence store, and four pollers. The web app is an installable shell that shows whether the server is reachable. The server stores evidence rows and runs pollers for National Weather Service alerts, OpenSky aircraft positions, 511 road closures, and OpenMHz dispatch radio, each call of which Ember hears and turns into a row. **By default the pollers are fed an invented scenario, not real sources:** a made-up three-alarm fire in Hayes Valley, told in each source's own format, and every row from it is stored as `mock`. Its radio calls are generated tones, and what was "said" in them is filled in by a stand-in for Ember, so its radio rows are a stand-in's twice over. An early version of the NWS poller was run once against the real API; nothing else has been. The 511 poller has run only against mocked HTTP, because there is no token. The OpenSky poller has too, and **may not be pointed at the real API yet:** OpenSky's terms require a written license for a running service, which nobody has asked for. **OpenMHz has never been asked anything:** using its audio needs its permission, which Beacon does not have, and the shapes of its API are read from its server's source and unverified. **No real Ember call has been made:** there is no API key, so the client has run only against a mock of the Meta Model API in tests, and its request shapes come from Meta's documentation, not from an answer of Ember's. Nobody knows yet how well Ember hears a radio call. The audio token rate the budget rests on is [still a guess](#measure-the-audio-token-rate). No incident exists.
 
 ## Layout
 
@@ -23,11 +23,12 @@ Inside `server/beacon/`, each package has one concern so pull requests stay apar
 | `ember/` | The Muse Ember client, the only code that calls the Meta Model API. |
 | `evidence/` | The evidence store: one SQLite row for each thing a source said. |
 | `ingest/` | One poller per source, the loop that runs them, and how they are built from the environment. |
+| `radio/` | What is kept of a dispatch radio call, the Ember call that hears one (`extract_transmission`), and the conversion of its audio. |
 | `scenario/` | The mock scenario: an invented San Francisco fire, served to the pollers in each source's format. |
 
 ## Run locally
 
-You need [uv](https://docs.astral.sh/uv/), Node.js 26, and pnpm 12. uv installs Python 3.12 itself.
+You need [uv](https://docs.astral.sh/uv/), Node.js 26, and pnpm 12. uv installs Python 3.12 itself. [ffmpeg](https://ffmpeg.org) is needed only to hear real radio, and for the tests of that conversion, which are skipped without it (CI installs it).
 
 ```sh
 # The server, on http://127.0.0.1:8000.
@@ -60,7 +61,7 @@ scripts/check web      # format, lint, tests, type check, build
 scripts/check server   # format, lint, tests
 ```
 
-Tests never call the Meta Model API or a live data source: the pollers' tests answer from hand-written replies and the mock scenario. Two entry points enforce the environment for that: `scripts/check`, which CI also runs, sets `REPLAY=1` and removes `MODEL_API_KEY` before it checks either side, and server pytest does the same however it is started, because `server/tests/conftest.py` does it. CI holds no key. A web test run directly with `pnpm test` keeps whatever environment the shell has; nothing in `web/` reads the key. As a backstop for the server tests, `server/tests/conftest.py` patches Python's `socket.connect` and `socket.connect_ex` in the test process to raise `NetworkBlockedError` for any address that is not this machine. It is a backstop and not a sandbox: a test that catches that error still passes, and the patch does not reach DNS lookups, subprocesses, or native code that opens sockets without Python's `socket` module.
+Tests never call the Meta Model API or a live data source: the pollers' tests answer from hand-written replies and the mock scenario, and the radio tests hand generated tones to a fake Ember. Two entry points enforce the environment for that: `scripts/check`, which CI also runs, sets `REPLAY=1` and removes `MODEL_API_KEY` before it checks either side, and server pytest does the same however it is started, because `server/tests/conftest.py` does it. CI holds no key. A web test run directly with `pnpm test` keeps whatever environment the shell has; nothing in `web/` reads the key. As a backstop for the server tests, `server/tests/conftest.py` patches Python's `socket.connect` and `socket.connect_ex` in the test process to raise `NetworkBlockedError` for any address that is not this machine. It is a backstop and not a sandbox: a test that catches that error still passes, and the patch does not reach DNS lookups, subprocesses, or native code that opens sockets without Python's `socket` module.
 
 ## Configuration
 
@@ -75,22 +76,27 @@ Settings come from the environment. The server does not load the repository-root
 | `EMBER_STOP_USD` | The most the Ember ledger may hold in live spend, in dollars. | `3.00` |
 | `EMBER_SPENT_BEFORE_USD` | The total spend against the $10 credit, for every model, that Meta's Usage page showed before Beacon's first call, in dollars. `0` is an answer; it has no default. | No live calls: a client that can spend is refused. |
 | `BEACON_DATA_DIR` | Where runtime data goes. An absolute path; a relative one is refused. | The repository's `data/`. |
-| `BEACON_LIVE_SOURCES` | The sources to poll for real, as a list: `nws`, `opensky`, `511`. Naming any source turns the mock scenario off for all of them. | Every poller runs on the mock scenario, and nothing asks a real source. |
+| `BEACON_LIVE_SOURCES` | The sources to poll for real, as a list: `nws`, `opensky`, `511`, `openmhz`. Naming any source turns the mock scenario off for all of them. | Every poller runs on the mock scenario, and nothing asks a real source. |
 | `BEACON_511_API_KEY` | The [511 SF Bay token](https://511.org/open-data/token). Needed when `BEACON_LIVE_SOURCES` names `511`. | 511 cannot be named. |
 | `BEACON_OPENSKY_PERMITTED` | `1` says OpenSky has given Beacon the written license its terms require. Needed when `BEACON_LIVE_SOURCES` names `opensky`. | OpenSky cannot be named. |
 | `OPENSKY_CLIENT_ID`, `OPENSKY_CLIENT_SECRET` | An OpenSky API client, for 4,000 requests a day in place of 400. Set both or neither. | OpenSky is asked without an account, every four minutes. |
+| `BEACON_OPENMHZ_PERMITTED` | `1` says OpenMHz has given Beacon permission to use its audio. Needed when `BEACON_LIVE_SOURCES` names `openmhz`, with the three settings below, `REPLAY=0`, `MODEL_API_KEY`, `EMBER_SPENT_BEFORE_USD`, and ffmpeg on Linux. | OpenMHz cannot be named. |
+| `BEACON_OPENMHZ_TALKGROUPS` | The talkgroups to hear, as a list of OpenMHz's numbers. Every call on them is paid for. | OpenMHz cannot be named. |
+| `BEACON_OPENMHZ_EMS_TALKGROUPS` | The ones among them that carry EMS traffic only. Every call on one is kept as a medical response. | No talkgroup is treated as EMS-only; a call is medical when Ember hears it as one. |
+| `BEACON_OPENMHZ_BUDGET_USD` | The most, in dollars, that hearing radio may cost over every run. It has no default. | OpenMHz cannot be named. |
+| `BEACON_OPENMHZ_MEDIA_HOSTS` | Hosts a call's audio may be fetched from besides `openmhz.com` and its subdomains, as a list. | Audio anywhere else is not fetched. |
 | `BEACON_INGEST` | `0` starts the server without its pollers. | `1`: the server runs the pollers. |
 
 The server's routes do not build an Ember client yet, so today the Ember settings are read by the two commands under [Ember client](#ember-client) and nothing else. The server reads the source settings when it starts, and `BEACON_DATA_DIR` with them. Three places set any of them. `scripts/check`, and so CI, sets `REPLAY=1` and removes `MODEL_API_KEY`. Server pytest does the same, removes the spending settings and every source setting, and points `BEACON_DATA_DIR` at a temporary directory for each test. The orb's API service in [`.amp/services.yaml`](.amp/services.yaml) sets `REPLAY=1`.
 
 ## Evidence and ingest
 
-Each source has a poller in [`server/beacon/ingest/`](server/beacon/ingest) that writes **evidence** rows to SQLite through [`server/beacon/evidence/`](server/beacon/evidence). A row is one thing one source said: a weather alert, one position of an aircraft, one version of a road closure. Later phases read the rows back by kind, time, and place to build incidents and answer taps.
+Each source has a poller in [`server/beacon/ingest/`](server/beacon/ingest) that writes **evidence** rows to SQLite through [`server/beacon/evidence/`](server/beacon/evidence). A row is one thing one source said: a weather alert, one position of an aircraft, one version of a road closure, one radio call. Later phases read the rows back by kind, time, and place to build incidents and answer taps.
 
 | Column | What it holds |
 | --- | --- |
-| `kind` | `radio`, `aircraft`, `alert`, `traffic`, `notice`, or `tap`. Only `aircraft`, `alert`, and `traffic` are written today. |
-| `source`, `ref` | The feed (`nws`, `opensky`, `511`) and the source's own name for the item. Together they name one row, so an item a source sends twice is stored once. |
+| `kind` | `radio`, `aircraft`, `alert`, `traffic`, `notice`, or `tap`. `notice` and `tap` are not written yet. |
+| `source`, `ref` | The feed (`nws`, `opensky`, `511`, `openmhz`) and the source's own name for the item. Together they name one row, so an item a source sends twice is stored once. |
 | `occurred_at`, `until` | When it happened according to the source, and when it stops applying, for an alert. |
 | `point`, `place` | A latitude and longitude, and the place in words. Either can be missing: a city-wide alert has no point. |
 | `confidence` | `official` for an authority speaking for itself, else `high`, `medium`, or `low`. |
@@ -108,10 +114,25 @@ Rows are never changed. A source that revises what it said gets a new row: an NW
 | [NWS](https://www.weather.gov/documentation/services-web-api) | Active alerts for San Francisco's forecast zone and county, every 2 minutes. No key. | Every `Actual` alert, including civil messages NWS relays, such as a shelter-in-place warning. | Open data, free to use for any purpose. |
 | [OpenSky](https://openskynetwork.github.io/opensky-api/rest.html) | Aircraft in a box around the city, every 4 minutes without an account or every 30 seconds with one. | Aircraft that are airborne below 3,000 m: what a person on the street could notice. | **Needs a written license first.** [OpenSky's terms](https://opensky-network.org/about/terms-of-use) allow the REST API for non-profit research and education, and require a written license for use "in any operational capacity", whoever asks. Beacon refuses to poll it until `BEACON_OPENSKY_PERMITTED=1` says the license was given. |
 | [511 SF Bay](https://511.org/open-data/traffic) | The traffic events in effect now, for the whole Bay Area: one request every 2 minutes, and a poll that needs several pages waits that long for each. Needs a token. | Events inside the city, each with its schedule. | [511's data agreement](https://511.org/sites/default/files/2026-04/511_Data_Agreement_Final_2026.pdf) licenses storing, displaying, and deriving from the data. Wherever the app shows it, it must say "data provided by 511.org" with a link to 511.org. |
+| [OpenMHz](https://openmhz.com) | The calls on the fire and EMS talkgroups of San Francisco's P25 system, every 30 seconds, and each call's audio. | One row for each call Ember heard, in the closed vocabulary described under [Radio](#radio). Never the audio or a transcript. | **Needs OpenMHz's permission first**, which has not been given; Beacon refuses to poll it until `BEACON_OPENMHZ_PERMITTED=1`. Beacon publishes summaries, never the audio. |
+
+### Radio
+
+A radio call is the one kind of evidence a model makes: the poller downloads a call's audio and Ember hears it (`extract_transmission` in [`server/beacon/radio/`](server/beacon/radio)). Dispatch radio names people, describes patients, and gives house numbers, so this is what ingest guarantees about a call, before any later redaction:
+
+- **Nothing a call said is stored as text.** There is no transcript. Ember fills in a form, and each field is checked against a closed vocabulary before anything is kept: a category, a status, and detail tags from fixed lists, unit ids such as `E36`, a street name of a strict shape, and the hundred block of an address (`1458` is kept as `1400`). What does not fit is dropped, whatever Ember wrote.
+- **A medical call is "medical response", its crews, and its block.** Its status, details, and alarm level are not kept. That holds for a call Ember hears as medical and for every call on a talkgroup named in `BEACON_OPENMHZ_EMS_TALKGROUPS`, whatever Ember made of it.
+- **The audio is never written to disk**, not even while ffmpeg converts it from M4A: it is handed over as a file that exists only in memory.
+- **The Ember call is a sensitive one**, so the Ember ledger and trace hold its tokens and cost and none of its audio or its answer, and it is never recorded for replay.
+- A radio row has a place in words and no point: nothing in ingest knows where on the map a block is.
+
+The limit of this: a street is checked by its shape, not against a list of the city's streets, so a name that Ember put in the street field with a street type after it (`Jane Doe St`) would be kept. And the form is only as good as Ember's hearing, which has not been measured: a row heard `clear` is `medium` confidence, and anything less is `low`.
+
+Every call is paid for, once. The poller hears only the talkgroups it is given, passes over a call shorter than a second or longer than two minutes, hears at most 20 calls every 30 seconds, never asks about the same call twice, and makes its calls under a budget of its own (`BEACON_OPENMHZ_BUDGET_USD`, the spending scope `ingest:openmhz`) inside the client's spending stop. When either refuses a call, or Ember fails on one, the poller waits ten minutes before it looks again, and calls that grew older than fifteen minutes meanwhile are passed over. A call Ember was asked about is never asked about again, whether or not an answer came.
 
 ### Mock and live
 
-**With `BEACON_LIVE_SOURCES` unset, which is the default, no real source is asked anything.** The pollers are the real ones, and where the network would be stands the mock scenario in [`server/beacon/scenario/`](server/beacon/scenario): an invented three-alarm fire on the 400 block of Hayes St, told as what NWS, OpenSky, and 511 would have answered minute by minute. A helicopter circles, 511 closes Hayes St and widens the closure, a shelter-in-place warning is issued, narrowed, and dropped, and the closure stops being listed. Nothing in it happened; its texts say "Invented for Beacon's mock scenario", and its rows have the origin `mock`. The story begins twenty minutes before a mock store is first opened and is played in real time for 105 minutes, after which nothing more is stored. A restart goes on from where the story had been played to, and a step in which a poller failed is played again ten seconds later, not passed over. To play it again, stop the server and delete `data/evidence/mock.sqlite3` with its `-wal` and `-shm` files.
+**With `BEACON_LIVE_SOURCES` unset, which is the default, no real source is asked anything.** The pollers are the real ones, and where the network would be stands the mock scenario in [`server/beacon/scenario/`](server/beacon/scenario): an invented three-alarm fire on the 400 block of Hayes St, told as what NWS, OpenSky, 511, and OpenMHz would have answered minute by minute. Twenty radio calls dispatch the first alarm, call a second and a third, order an evacuation, send a medic to a block nearby, and clear the units; a helicopter circles, 511 closes Hayes St and widens the closure, a shelter-in-place warning is issued, narrowed, and dropped, and the closure stops being listed. Nothing in it happened; its texts say "Invented for Beacon's mock scenario", and its rows have the origin `mock`. The radio calls are tones, and a stand-in for Ember (`beacon.scenario.stand_in_ember`) fills in what was "said" in each, so a radio row also has the model `fake`. The story begins twenty minutes before a mock store is first opened and is played in real time for 105 minutes, after which nothing more is stored. A restart goes on from where the story had been played to, and a step in which a poller failed is played again ten seconds later, not passed over. To play it again, stop the server and delete `data/evidence/mock.sqlite3` with its `-wal` and `-shm` files.
 
 There are two store files, `data/evidence/mock.sqlite3` and `data/evidence/live.sqlite3`, and **the live store refuses any row a stand-in had a part in**: one from the mock scenario, or one a fake Ember wrote. So a source that is not named in `BEACON_LIVE_SOURCES` does not run beside the live ones; it is off. Anything read from the mock store is a stand-in's, and has to be labeled as one wherever it is shown.
 
@@ -123,6 +144,17 @@ BEACON_LIVE_SOURCES=nws,511 BEACON_511_API_KEY=... \
 ```
 
 `opensky` can be added to that list only with `BEACON_OPENSKY_PERMITTED=1`, and only once OpenSky has given a written license (write to contact@opensky-network.org). Having an account or an API client is not that license.
+
+`openmhz` can be added only once OpenMHz has given permission to use its audio, and it is the one source that spends the Ember credit:
+
+```sh
+BEACON_LIVE_SOURCES=nws,openmhz BEACON_OPENMHZ_PERMITTED=1 \
+  BEACON_OPENMHZ_TALKGROUPS=... BEACON_OPENMHZ_EMS_TALKGROUPS=... BEACON_OPENMHZ_BUDGET_USD=0.25 \
+  REPLAY=0 MODEL_API_KEY=... EMBER_SPENT_BEFORE_USD=... \
+  uv run uvicorn beacon.main:app
+```
+
+The talkgroup numbers are OpenMHz's for the San Francisco fire and EMS channels; nobody has looked them up yet, because that means asking OpenMHz. If a call's audio turns out to be served from a host that is not under `openmhz.com`, the poller counts the call as unreadable until the host is named in `BEACON_OPENMHZ_MEDIA_HOSTS`. Run [the audio-rate measurement](#measure-the-audio-token-rate) before the first real poll: what a call costs is still a guess.
 
 The server runs the pollers on a thread of its own, so run one server process: two would ask every source twice as often. `GET /api/sources` says which mode the server is in and how each poller's last poll went, including whether it was `partial`: a 511 answer that ran past four pages, or whose pages did not say plainly where they stood, is stored as far as it was read, and events on the pages that were not read are missing until a later poll reads them. To poll without the server:
 

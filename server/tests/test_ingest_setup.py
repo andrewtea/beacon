@@ -14,6 +14,7 @@ from typing import Any
 import httpx2
 import pytest
 
+from beacon.ember import EmberClient, EmberConfigError, SpendScope
 from beacon.evidence import Evidence, EvidenceStore, EvidenceStoreError, NewEvidence
 from beacon.ingest import (
     Clock,
@@ -146,14 +147,82 @@ def test_with_no_live_source_the_pollers_play_the_whole_invented_fire(
     assert {row.confidence for row in by_address["beac02"]} == {"medium"}
 
     everything = store.search(limit=5000)
-    assert len(everything) == 4 + 4 + 98
-    assert {(row.origin, row.stand_in, row.model) for row in everything} == {("mock", True, None)}
-    # Every text a person could read says it was made up.
+    assert len(everything) == 4 + 4 + 98 + 19
+    # Everything is the invented scenario's, and the radio also a stand-in Ember's.
+    assert {(row.kind == "radio", row.origin, row.stand_in, row.model) for row in everything} == {
+        (False, "mock", True, None),
+        (True, "mock", True, "fake"),
+    }
+    # Every text a person could read says it was made up. A radio row has no text.
     for row in everything:
         if row.kind == "aircraft":
             assert row.data["callsign"].startswith("MOCK")
-        elif "change" not in row.data:
+        elif row.kind != "radio" and "change" not in row.data:
             assert INVENTED in (row.data.get("description") or row.data["headline"])
+
+
+def test_the_radio_of_the_mock_scenario_tells_the_fire_through_a_stand_in_for_ember(
+    env: dict[str, str], time: Time, tmp_path: Path
+) -> None:
+    ingest = build(env, Clock(time))
+    time.moment = NOON + timedelta(minutes=100)
+    ingest.catch_up()
+
+    calls = ingest.store.search(kinds=["radio"])
+    # Twenty calls were made. The click of a microphone was never heard.
+    assert [row.ref for row in calls] == [
+        f"mock-call-{number:04d}" for number in range(20) if number != 4
+    ]
+    assert {(row.source, row.origin, row.model, row.point) for row in calls} == {
+        ("openmhz", "mock", "fake", None)
+    }
+    # A call is stored when the poll after it hears it, at the time it was made.
+    assert [calls[0].occurred_at, calls[-1].occurred_at] == [story(0), story(90)]
+    fire = [row for row in calls if row.data["event"] == "fire"]
+    assert [
+        (row.data["status"], row.data["alarm"]) for row in fire if row.data["alarm"] is not None
+    ] == [("working", 2), ("working", 3), ("under_control", 3)]
+    assert [row.data["status"] for row in fire][:4] == [
+        "dispatched",
+        "en_route",
+        "on_scene",
+        "working",
+    ]
+    assert fire[-1].data["status"] == "cleared"
+    at_the_fire = [row for row in calls if row.place == "400 block of Hayes St"]
+    assert len(at_the_fire) == 10
+    # The call whose form had a house number where the block belongs.
+    assert calls[2].data["block"] == 400
+    assert "evacuation" in calls[7].data["details"]
+
+    # The two medical calls, one on the fire channel and one on the EMS channel
+    # that the stand-in took for something else: crews and a block, and no more.
+    medical = [row for row in calls if row.data["event"] == "medical response"]
+    assert [
+        (row.place, row.data["units"], row.data["status"], row.data["details"]) for row in medical
+    ] == [
+        ("400 block of Fell St", ["M52", "E21"], "unknown", []),
+        ("5200 block of Geary Blvd", ["M78"], "unknown", []),
+    ]
+    assert [row.data["talkgroup"] for row in medical] == [9101, 9103]
+    (unheard,) = [row for row in calls if row.data["clarity"] == "unintelligible"]
+    assert (unheard.confidence, unheard.data["units"], unheard.place) == ("low", [], None)
+    # Something that is not the fire: an alarm across town, sounded and cancelled.
+    assert [row.data["status"] for row in calls if row.data["event"] == "alarm"] == [
+        "dispatched",
+        "cancelled",
+    ]
+
+    # The stand-in spent nothing, and each call was "heard" once.
+    with sqlite3.connect(tmp_path / "ember" / "ledger.sqlite3") as db:
+        heard = db.execute(
+            "SELECT source, task, cost_nanousd, COUNT(*) FROM ember_calls GROUP BY 1, 2, 3"
+        ).fetchall()
+    assert heard == [("fake", "extract_transmission", 0, 19)]
+    # No audio is kept: the store, the ledger, and nothing else.
+    assert {path.suffix.split("-")[0] for path in tmp_path.rglob("*") if path.is_file()} == {
+        ".sqlite3"
+    }
 
 
 def test_a_mock_store_first_opened_shows_a_fire_already_under_way(
@@ -172,14 +241,14 @@ def test_a_mock_store_first_opened_shows_a_fire_already_under_way(
         "511.org/mock-1002@" + story(20).isoformat(),
     ]
     # The helicopter has been there since minute 5, seen every thirty seconds.
-    assert ingest.store.count_by_source() == {"nws": 2, "511": 3, "opensky": 31}
+    assert ingest.store.count_by_source() == {"nws": 2, "511": 3, "opensky": 31, "openmhz": 10}
     assert ingest.store.state("scenario") == {
         "start": START.isoformat(),
         "played_to": NOON.isoformat(),
         # How each poller's last poll went, for a process that goes on from here.
         "polls": {
             name: {"polled_at": NOON.isoformat(), "ok": True, "partial": False}
-            for name in ("nws", "opensky", "511")
+            for name in ("nws", "opensky", "511", "openmhz")
         },
     }
     # The clock is let go when the story has been played up to now.
@@ -333,6 +402,7 @@ def test_a_restart_after_the_story_has_ended_still_says_how_the_last_polls_went(
         PollerStatus("nws", story(104), True),
         PollerStatus("opensky", story(105), True),
         PollerStatus("511", story(104), True),
+        PollerStatus("openmhz", story(105), True),
     ]
 
 
@@ -405,13 +475,13 @@ def test_a_setting_that_names_no_source_is_mock_mode_through_and_through(
     assert ingest.scenario is not None
     assert (ingest.store.mode, ingest.store.path.name) == ("mock", "mock.sqlite3")
     assert open_store(env).path == ingest.store.path
-    assert ingest.store.count_by_source() == {"nws": 2, "511": 3, "opensky": 31}
+    assert ingest.store.count_by_source() == {"nws": 2, "511": 3, "opensky": 31, "openmhz": 10}
 
 
 def test_a_name_that_is_not_a_source_is_refused(env: dict[str, str]) -> None:
     for make in (build, open_store):
-        with pytest.raises(IngestConfigError, match="names openmhz, radio, which is not a source"):
-            make(env | {"BEACON_LIVE_SOURCES": "nws,radio,openmhz"})
+        with pytest.raises(IngestConfigError, match="names cnn, radio, which is not a source"):
+            make(env | {"BEACON_LIVE_SOURCES": "nws,radio,cnn"})
 
 
 OPENSKY = {"BEACON_LIVE_SOURCES": "opensky", "BEACON_OPENSKY_PERMITTED": "1"}
@@ -527,6 +597,104 @@ def test_each_source_is_asked_with_the_settings_the_environment_holds(
     # With an account OpenSky is asked every thirty seconds.
     time.moment = NOON + timedelta(seconds=30)
     assert list(runner.step()) == ["opensky"]
+
+
+RADIO = {
+    "BEACON_LIVE_SOURCES": "openmhz",
+    "BEACON_OPENMHZ_PERMITTED": "1",
+    "BEACON_OPENMHZ_TALKGROUPS": "1201, 1203,1301",
+    "BEACON_OPENMHZ_EMS_TALKGROUPS": "1301",
+    "BEACON_OPENMHZ_BUDGET_USD": "0.25",
+    "REPLAY": "0",
+    "MODEL_API_KEY": "key-from-the-env",
+}
+
+
+@pytest.mark.parametrize(
+    ("settings", "message"),
+    [
+        # Being able to ask is not permission to.
+        (RADIO | {"BEACON_OPENMHZ_PERMITTED": ""}, "needs its permission"),
+        (RADIO | {"BEACON_OPENMHZ_PERMITTED": "yes"}, "set BEACON_OPENMHZ_PERMITTED=1 once"),
+        (RADIO | {"BEACON_OPENMHZ_TALKGROUPS": ""}, "needs BEACON_OPENMHZ_TALKGROUPS"),
+        (RADIO | {"BEACON_OPENMHZ_TALKGROUPS": "fire,ems"}, "is a list of talkgroup numbers"),
+        (RADIO | {"BEACON_OPENMHZ_TALKGROUPS": "-1201"}, "is a list of talkgroup numbers"),
+        (
+            RADIO | {"BEACON_OPENMHZ_EMS_TALKGROUPS": "1301,1400"},
+            "names a talkgroup that BEACON_OPENMHZ_TALKGROUPS does not",
+        ),
+        (
+            RADIO | {"BEACON_OPENMHZ_MEDIA_HOSTS": "https://s3.example.org/calls"},
+            "is a list of host names",
+        ),
+        # Every call is paid for, so the most it may cost has no default.
+        (RADIO | {"BEACON_OPENMHZ_BUDGET_USD": ""}, "needs BEACON_OPENMHZ_BUDGET_USD"),
+        (RADIO | {"BEACON_OPENMHZ_BUDGET_USD": "a little"}, "needs BEACON_OPENMHZ_BUDGET_USD"),
+        (RADIO | {"BEACON_OPENMHZ_BUDGET_USD": "250"}, "needs BEACON_OPENMHZ_BUDGET_USD"),
+        # A call cannot be replayed, so a client that only replays cannot hear one.
+        (RADIO | {"REPLAY": "1"}, "heard by a live Ember and cannot be replayed"),
+    ],
+)
+def test_radio_is_not_polled_for_real_without_permission_a_budget_and_a_live_ember(
+    env: dict[str, str], monkeypatch: pytest.MonkeyPatch, settings: dict[str, str], message: str
+) -> None:
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+
+    with pytest.raises(IngestConfigError, match=message) as refused:
+        build(env | settings)
+
+    assert "key-from-the-env" not in str(refused.value)
+    assert not (Path(env["BEACON_DATA_DIR"]) / "evidence").exists()
+
+
+def test_radio_is_not_polled_for_real_until_the_spend_so_far_is_known(
+    env: dict[str, str],
+) -> None:
+    # The Ember client's own rule: a client that can spend needs EMBER_SPENT_BEFORE_USD.
+    with pytest.raises(EmberConfigError, match="EMBER_SPENT_BEFORE_USD"):
+        build(env | RADIO)
+
+    assert not (Path(env["BEACON_DATA_DIR"]) / "evidence").exists()
+
+
+def test_radio_is_not_polled_for_real_where_its_audio_cannot_be_converted(
+    env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+    monkeypatch.setattr("shutil.which", lambda name: None)
+
+    with pytest.raises(IngestConfigError, match="needs ffmpeg installed and Linux"):
+        build(env | RADIO)
+
+    # Refused before a client that can spend was built.
+    assert not (Path(env["BEACON_DATA_DIR"]) / "ember").exists()
+
+
+def test_naming_radio_builds_its_poller_with_a_live_ember_under_its_budget_and_asks_nothing(
+    env: dict[str, str], time: Time, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+    built: list[tuple[EmberClient, SpendScope | None]] = []
+    from_env = EmberClient.from_env
+
+    def remember(*args: Any, scope: SpendScope | None = None, **options: Any) -> EmberClient:
+        built.append((from_env(*args, scope=scope, **options), scope))
+        return built[-1][0]
+
+    monkeypatch.setattr(EmberClient, "from_env", remember)
+
+    ingest = build(env | RADIO | {"BEACON_OPENMHZ_MEDIA_HOSTS": "S3.Example.org"}, Clock(time))
+
+    assert (ingest.store.mode, ingest.http.origin, ingest.scenario) == ("live", "live", None)
+    assert [(status.name, status.ok) for status in ingest.runner.status()] == [("openmhz", None)]
+    # One client, which can spend, and every call it makes counts against the
+    # budget the operator set for radio over all runs: 25 cents.
+    ((ember, scope),) = built
+    assert ember.spends
+    assert scope == SpendScope("ingest:openmhz", 250_000_000)
+    assert ember.spent_usd() == 0
+    ingest.close()
 
 
 def test_what_a_stand_in_answered_cannot_be_stored_as_a_real_sources(
@@ -896,5 +1064,5 @@ def test_the_mock_and_live_stores_are_kept_apart_in_one_data_directory(
 
     assert (live.mode, live.path.name) == ("live", "live.sqlite3")
     assert live.count_by_source() == {}
-    assert open_store(env).count_by_source() == {"nws": 2, "511": 3, "opensky": 31}
+    assert open_store(env).count_by_source() == {"nws": 2, "511": 3, "opensky": 31, "openmhz": 10}
     assert (open_store(env).mode, open_store(env).path.name) == ("mock", "mock.sqlite3")
