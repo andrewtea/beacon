@@ -1,0 +1,7 @@
+# Applies to all Python in the repo: server/ and scripts/.
+line-length = 100
+target-version = "py312"
+src = ["server"]
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "PT", "RUF"]

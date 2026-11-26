@@ -1,0 +1,30 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data: downloaded datasets, SQLite files, captured images. Never committed.
+/data/
+
+# Web
+node_modules/
+dist/
+dev-dist/
+*.tsbuildinfo
+
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+
+# Amp
+.amp/in/
+.amp/out/
+.amp/portals/
+
+# OS and editors
+.DS_Store
+.idea/
+.vscode/
+*.log

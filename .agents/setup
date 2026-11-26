@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Prepares a fresh Amp orb: installs the web and server dependencies from their lockfiles.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+step() {
+  echo "==> $1"
+  local start=$SECONDS
+  shift
+  "$@"
+  echo "    done in $((SECONDS - start))s"
+}
+
+# uv downloads the Python pinned in server/.python-version when it is missing.
+step "server: uv sync" uv sync --locked --project "$root/server"
+step "web: pnpm install" pnpm --dir "$root/web" install --frozen-lockfile

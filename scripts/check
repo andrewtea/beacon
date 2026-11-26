@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Runs the same checks as CI. With no arguments it checks everything.
+# Usage: scripts/check [web] [server]
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Checks replay recorded Ember responses and must never call the Meta Model API,
+# so they run without the key even when the caller's shell has one.
+export REPLAY=1
+unset MODEL_API_KEY
+
+check_web() {
+  cd "$root/web"
+  pnpm install --frozen-lockfile
+  pnpm format:check
+  pnpm lint
+  pnpm test
+  pnpm build # includes the TypeScript check
+}
+
+check_server() {
+  cd "$root/server"
+  uv sync --locked
+  uv run --no-sync ruff format --check . ../scripts
+  uv run --no-sync ruff check . ../scripts
+  uv run --no-sync pytest
+}
+
+if [ "$#" -eq 0 ]; then
+  set -- web server
+fi
+
+for target in "$@"; do
+  case "$target" in
+    web | server)
+      echo "==> Checking $target"
+      (check_"$target")
+      ;;
+    *)
+      echo "Unknown target '$target'. Usage: scripts/check [web] [server]" >&2
+      exit 2
+      ;;
+  esac
+done
