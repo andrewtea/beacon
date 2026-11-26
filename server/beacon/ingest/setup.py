@@ -124,7 +124,11 @@ class Ingest:
                     "start": self.scenario.start.isoformat(),
                     "played_to": moment.isoformat(),
                     "polls": {
-                        status.name: {"polled_at": status.polled_at.isoformat(), "ok": status.ok}
+                        status.name: {
+                            "polled_at": status.polled_at.isoformat(),
+                            "ok": status.ok,
+                            "partial": status.partial,
+                        }
                         for status in self.runner.status()
                         if status.polled_at is not None
                     },
@@ -285,7 +289,8 @@ def _saved_polls(saved: Any) -> list[PollerStatus]:
         polled_at = poll.get("polled_at") if isinstance(poll, dict) else None
         ok = poll.get("ok") if isinstance(poll, dict) else None
         if isinstance(polled_at, str) and isinstance(ok, bool):
-            polls.append(PollerStatus(name, datetime.fromisoformat(polled_at), ok))
+            partial = poll.get("partial") is True
+            polls.append(PollerStatus(name, datetime.fromisoformat(polled_at), ok, partial))
     return polls
 
 

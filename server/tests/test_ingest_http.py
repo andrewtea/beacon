@@ -55,7 +55,11 @@ class Server:
 
 
 def send(handler: BaseHTTPRequestHandler, status: int, body: bytes = b"", **headers: str) -> None:
-    handler.send_response(status)
+    if "Date" in headers:
+        # Without the date the server would put in front of the one given.
+        handler.send_response_only(status)
+    else:
+        handler.send_response(status)
     for name, value in headers.items():
         handler.send_header(name.replace("_", "-"), value)
     handler.send_header("Content-Length", str(len(body)))
@@ -156,6 +160,27 @@ def test_a_reply_packed_another_way_is_refused(server: Server) -> None:
         ({"X_Rate_Limit_Retry_After_Seconds": "412"}, 412.0),
         ({"Retry_After": "soon", "X_Rate_Limit_Retry_After_Seconds": "30"}, 30.0),
         ({"Retry_After": "-5"}, None),
+        # A date, counted from when the source says it answered and not from this
+        # machine's clock, which may be set differently.
+        (
+            {
+                "Retry_After": "Fri, 27 Nov 2099 20:30:00 GMT",
+                "Date": "Fri, 27 Nov 2099 20:00:00 GMT",
+            },
+            1800.0,
+        ),
+        (
+            {
+                "Retry_After": "Fri, 27 Nov 2099 19:00:00 GMT",
+                "Date": "Fri, 27 Nov 2099 20:00:00 GMT",
+            },
+            0.0,
+        ),
+        # A date that has passed by this machine's clock, with no date to count from.
+        ({"Retry_After": "Fri, 27 Nov 2020 20:30:00 GMT"}, 0.0),
+        ({"Retry_After": "27 Nov 2099 20:30:00"}, None),
+        # OpenSky's own header is a number and nothing else.
+        ({"X_Rate_Limit_Retry_After_Seconds": "Fri, 27 Nov 2099 20:30:00 GMT"}, None),
         ({"Retry_After": "inf"}, None),
         ({"Retry_After": "nan"}, None),
     ],
@@ -294,6 +319,39 @@ def test_an_exchange_that_takes_too_long_as_a_whole_is_given_up_on(
     assert _everything_under(failure.value) == [failure.value]
     # At the deadline, and not when the source would have finished, three seconds in.
     assert 0.5 <= time.monotonic() - began < 2.5
+
+
+def test_lookups_that_hang_do_not_leave_a_thread_behind_for_each_exchange(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    answered = threading.Event()
+    asked: list[str] = []
+
+    def hang(host: str, *args: object, **kwargs: object) -> list:
+        # A resolver that does not answer. Nothing can call a lookup off.
+        asked.append(host)
+        answered.wait(30)
+        return []
+
+    monkeypatch.setattr("socket.getaddrinfo", hang)
+    monkeypatch.setattr(source_http, "MAX_SECONDS", 0.2)
+    http = SourceHttp()
+
+    for _exchange in range(5):
+        with pytest.raises(SourceError, match=r"^nws took too long to answer\.$"):
+            fetch(http, "GET", "http://source.invalid/alerts", source="nws", max_bytes=10)
+
+    # Five exchanges timed out, and no more lookups are waiting than the client has
+    # threads for. The others never began.
+    waiting = [
+        thread for thread in threading.enumerate() if thread.name.startswith("beacon-lookup")
+    ]
+    assert len(waiting) == len(asked) == 2
+    http.close()
+    answered.set()
+    for thread in waiting:
+        thread.join(5)
+    assert not any(thread.is_alive() for thread in waiting)
 
 
 def test_closing_the_client_ends_an_exchange_that_is_out_and_refuses_the_next(

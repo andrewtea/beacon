@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS poller_state (
 CREATE TABLE IF NOT EXISTS store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
+_SCHEMA_STATEMENTS = tuple(part.strip() for part in _SCHEMA.split(";") if part.strip())
+
 _MODE = "SELECT value FROM store_meta WHERE key = 'mode'"
 
 _COLUMNS = (
@@ -189,6 +191,8 @@ class EvidenceStore:
         # Held to close the store, and by a write from its last look at whether the
         # store is closed to its commit, so that no write lands after `close` returns.
         self._closing = threading.Lock()
+        # Whether this store has seen its file in write-ahead mode yet.
+        self._write_ahead = False
         path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()):
             pass
@@ -368,22 +372,29 @@ class EvidenceStore:
             try:
                 db.execute("BEGIN IMMEDIATE")
             except sqlite3.OperationalError as error:
-                busy = error.sqlite_errorcode & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
-                if not busy or time.monotonic() >= give_up:
+                if not _is_busy(error) or time.monotonic() >= give_up:
                     raise
             else:
                 return True
             self._closed.wait(_WRITE_LOOK_SECONDS)
         return False
 
-    def _row(self, item: NewEvidence, recorded_ms: int) -> tuple[Any, ...]:
-        if self._mode == "live" and item.stand_in:
+    def refuse_stand_in(self, origin: Origin, model: ModelSource | None = None) -> None:
+        """Raise EvidenceStoreError when this is the live store and `origin` and
+        `model` are a stand-in's. `add` does it for every row. A poller does it
+        before it reads anything, because not everything a poller concludes is a row
+        of its source's: that an item is no longer listed is concluded from what the
+        source did *not* say, and a stand-in's silence is not a real source's."""
+        if self._mode == "live" and (origin == "mock" or model == "fake"):
             raise_bare(
                 EvidenceStoreError(
-                    "The live evidence store holds nothing a stand-in produced: this row "
+                    "The live evidence store holds nothing a stand-in produced: this "
                     "comes from the mock scenario or a fake Ember, and belongs in the mock store."
                 )
             )
+
+    def _row(self, item: NewEvidence, recorded_ms: int) -> tuple[Any, ...]:
+        self.refuse_stand_in(item.origin, item.model)
         return (
             item.kind,
             item.source,
@@ -404,37 +415,95 @@ class EvidenceStore:
     def _connect(self) -> sqlite3.Connection:
         # A connection for each operation, as the Ember ledger does, so one store is
         # safe to share between threads and between the server and the pollers.
-        db = sqlite3.connect(self._path, timeout=30, isolation_level=None)
+        db = sqlite3.connect(self._path, timeout=_WRITE_WAIT_SECONDS, isolation_level=None)
         try:
             db.create_function("distance_m", 4, _distance_m, deterministic=True)
             # Read before anything is written, so a connection to a store that is
             # already begun takes no write lock to open.
-            try:
-                begun = db.execute(_MODE).fetchone()
-            except sqlite3.OperationalError:
-                begun = None
+            begun = _begun(db)
             if begun is None:
-                # Kept in the file, so it is set once, when the file is begun.
-                db.execute("PRAGMA journal_mode = WAL")
-                db.executescript(_SCHEMA)
-                # Of two connections that begin a file at once, one mode is kept.
-                db.execute(
-                    "INSERT OR IGNORE INTO store_meta (key, value) VALUES ('mode', ?)",
-                    (self._mode,),
-                )
-                begun = db.execute(_MODE).fetchone()
+                _begin_file(db, self._mode)
+                begun = _begun(db)
+            elif not self._write_ahead:
+                # A file from before the store used write-ahead mode is put in it.
+                _write_ahead(db)
+            self._write_ahead = True
         except BaseException:
             db.close()
             raise
-        if begun[0] != self._mode:
+        if begun != self._mode:
             db.close()
             raise_bare(
                 EvidenceStoreError(
-                    f"{self._path} is the {begun[0]} evidence store, and was opened as the "
+                    f"{self._path} is the {begun} evidence store, and was opened as the "
                     f"{self._mode} one. A store is one or the other for life."
                 )
             )
         return db
+
+
+def _begun(db: sqlite3.Connection) -> str | None:
+    """The mode a store file was begun as, or None for a file that holds no store
+    yet. An error from the file, such as its being locked, is not "no store": it is
+    raised, and nothing is begun over what may be there."""
+    table = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_meta'"
+    ).fetchone()
+    if table is None:
+        return None
+    mode = db.execute(_MODE).fetchone()
+    return None if mode is None else mode[0]
+
+
+def _begin_file(db: sqlite3.Connection, mode: Mode) -> None:
+    """Make the tables and write down the mode, in one transaction. Of two
+    connections that begin a file at once, the second waits for the first, makes
+    nothing again, and the first one's mode is kept."""
+    _write_ahead(db)
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        for statement in _SCHEMA_STATEMENTS:
+            db.execute(statement)
+        db.execute("INSERT OR IGNORE INTO store_meta (key, value) VALUES ('mode', ?)", (mode,))
+        db.execute("COMMIT")
+    except BaseException:
+        if db.in_transaction:
+            db.execute("ROLLBACK")
+        raise
+
+
+def _write_ahead(db: sqlite3.Connection) -> None:
+    """Put the file in SQLite's write-ahead mode, which is kept in the file. SQLite
+    changes the mode only while nothing else is using the file, and says so by
+    leaving the mode as it was, so this asks until it is done or
+    `_WRITE_WAIT_SECONDS` have passed.
+
+    Raises EvidenceStoreError when the file stayed in use that long."""
+    give_up = time.monotonic() + _WRITE_WAIT_SECONDS
+    while True:
+        try:
+            if db.execute("PRAGMA journal_mode").fetchone()[0] == "wal":
+                return
+            if db.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal":
+                return
+        except sqlite3.OperationalError as error:
+            if not _is_busy(error):
+                raise
+        if time.monotonic() >= give_up:
+            break
+        time.sleep(_WRITE_LOOK_SECONDS)
+    raise_bare(
+        EvidenceStoreError(
+            "The evidence store's file could not be put in write-ahead mode, because "
+            "something else kept it in use. Stop whatever has it open, and start again."
+        )
+    )
+
+
+def _is_busy(error: sqlite3.OperationalError) -> bool:
+    """Whether SQLite refused because another connection has the file, which
+    passes, and not because something is wrong."""
+    return error.sqlite_errorcode & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
 
 
 def _distance_m(lat_a: float, lon_a: float, lat_b: float, lon_b: float) -> float:

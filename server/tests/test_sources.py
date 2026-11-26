@@ -28,7 +28,7 @@ def test_sources_says_the_data_is_mock_and_how_each_pollers_last_poll_went(
     assert before.json() == {
         "mode": "mock",
         "sources": [
-            {"name": name, "polled_at": None, "ok": None, "rows": 0}
+            {"name": name, "polled_at": None, "ok": None, "partial": False, "rows": 0}
             for name in ("nws", "opensky", "511")
         ],
     }
@@ -38,9 +38,27 @@ def test_sources_says_the_data_is_mock_and_how_each_pollers_last_poll_went(
     assert client.get("/api/sources").json() == {
         "mode": "mock",
         "sources": [
-            {"name": "nws", "polled_at": "2026-11-27T20:00:00Z", "ok": True, "rows": 2},
-            {"name": "opensky", "polled_at": "2026-11-27T20:00:00Z", "ok": True, "rows": 31},
-            {"name": "511", "polled_at": "2026-11-27T20:00:00Z", "ok": True, "rows": 3},
+            {
+                "name": "nws",
+                "polled_at": "2026-11-27T20:00:00Z",
+                "ok": True,
+                "partial": False,
+                "rows": 2,
+            },
+            {
+                "name": "opensky",
+                "polled_at": "2026-11-27T20:00:00Z",
+                "ok": True,
+                "partial": False,
+                "rows": 31,
+            },
+            {
+                "name": "511",
+                "polled_at": "2026-11-27T20:00:00Z",
+                "ok": True,
+                "partial": False,
+                "rows": 3,
+            },
         ],
     }
 

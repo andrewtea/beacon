@@ -13,6 +13,9 @@ class Source(BaseModel):
     # for a source that has not been asked yet.
     polled_at: datetime | None
     ok: bool | None
+    # Whether that poll read only part of what the source lists, so that items can
+    # be missing from the store that the source has.
+    partial: bool
     # How many evidence rows the source has in the store.
     rows: int
 
@@ -37,6 +40,7 @@ def sources(request: Request) -> Sources:
                 name=status.name,
                 polled_at=status.polled_at,
                 ok=status.ok,
+                partial=status.partial,
                 rows=rows.get(status.name, 0),
             )
             for status in ingest.runner.status()

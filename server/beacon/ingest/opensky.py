@@ -81,7 +81,7 @@ class OpenSkyAircraft:
             raise ValueError("An OpenSky client id and secret are given together.")
         self._http = http
         # What a stand-in for the network answered is a stand-in's, whoever asks.
-        self._origin: Origin = http.origin
+        self.origin: Origin = http.origin
         self._credentials = None if client_id is None else (client_id, client_secret)
         self._bounds = bounds
         self._monotonic = monotonic
@@ -93,6 +93,7 @@ class OpenSkyAircraft:
         )
 
     def poll(self, store: EvidenceStore, now: datetime) -> PollReport:
+        store.refuse_stand_in(self.origin)
         try:
             body = self._states()
         except SourceError as error:
@@ -103,7 +104,7 @@ class OpenSkyAircraft:
             # The token ran out early. One new token, one more try.
             self._token = None
             body = self._states()
-        aircraft, unreadable = parse_states(read_json(body, SOURCE), self._origin)
+        aircraft, unreadable = parse_states(read_json(body, SOURCE), self.origin)
         added = store.add(aircraft, now=now)
         return PollReport(added=len(added), unreadable=unreadable)
 

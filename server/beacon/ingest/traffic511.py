@@ -21,10 +21,12 @@ night work is every night (`beacon.ingest.listing`).
 An answer comes in pages, and an event counts as no longer listed only when every
 page was read and each said plainly where it stood: its `pagination` object repeats
 the offset that was asked for, and either names a next page or does not. A page that
-says anything else is read for its events, and the list is not taken as whole. That
-shape is the specification's and Open511's. No real answer has been read yet, there
-being no token, so if 511 sends something else the events are still stored and only
-"no longer listed" waits on a look at a real answer.
+says anything else is read for its events, and no further page is asked for. The
+poll is then a *partial* one, and so is one that stopped at `_MAX_PAGES`: events on
+the pages that were not read are missing from it until a later poll reads them,
+nothing counts as no longer listed, and the poll's report says so, which is logged
+and shown by `GET /api/sources`. That shape is the specification's and its example's.
+No real answer has been read yet, there being no token.
 
 The token goes in the query string, which is where 511 reads it, so the address of a
 request is never logged or put in an error (`beacon.ingest.http`).
@@ -84,13 +86,14 @@ class Traffic511:
         self._http = http
         self._api_key = api_key
         # What a stand-in for the network answered is a stand-in's, whoever asks.
-        self._origin: Origin = http.origin
+        self.origin: Origin = http.origin
         self._bounds = bounds
         # How long to wait before the next poll. It is set after each poll from the
         # number of requests the poll made, so the quota is kept by requests.
         self.interval_seconds = SECONDS_PER_REQUEST
 
     def poll(self, store: EvidenceStore, now: datetime) -> PollReport:
+        store.refuse_stand_in(self.origin)
         events: list[NewEvidence] = []
         unreadable = 0
         offset = 0
@@ -115,7 +118,7 @@ class Traffic511:
                     },
                 )
                 page = parse_events(
-                    read_json(body, SOURCE), self._origin, self._bounds, offset=offset
+                    read_json(body, SOURCE), self.origin, self._bounds, offset=offset
                 )
                 events += page.events
                 unreadable += page.unreadable
@@ -138,10 +141,10 @@ class Traffic511:
             complete=complete and unreadable == 0,
             now=now,
         )
-        changes = [_change(row, now, "not_listed") for row in listing.gone]
-        changes += [_change(row, now, "listed_again") for row in listing.back]
+        changes = [_change(row, now, "not_listed", self.origin) for row in listing.gone]
+        changes += [_change(row, now, "listed_again", self.origin) for row in listing.back]
         added = store.add([*events, *changes], state=(self.name, listing.state), now=now)
-        return PollReport(added=len(added), unreadable=unreadable)
+        return PollReport(added=len(added), unreadable=unreadable, partial=not complete)
 
 
 @dataclass(frozen=True)
@@ -303,10 +306,10 @@ def _place(roads: list[dict[str, Any]]) -> str | None:
     return None
 
 
-def _change(event: Evidence, now: datetime, change: str) -> NewEvidence:
+def _change(event: Evidence, now: datetime, change: str, origin: Origin) -> NewEvidence:
     """The row that says an event is no longer listed, or is listed again after
     that. Beacon saw it; 511 did not announce it."""
-    fields = (not_listed_row if change == "not_listed" else listed_again_row)(event, now)
+    fields = (not_listed_row if change == "not_listed" else listed_again_row)(event, now, origin)
     return NewEvidence(
         **fields,
         data={

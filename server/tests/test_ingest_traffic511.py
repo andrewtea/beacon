@@ -399,7 +399,7 @@ def test_every_page_is_read_before_anything_counts_as_missing(
 
     report = poller.poll(store, NOON)
 
-    assert report.added == 5
+    assert (report.added, report.partial) == (5, False)
     assert [request.url.params["offset"] for request in feed.requests] == ["0", "2", "4"]
     # A token allows 60 requests an hour, and the poll made three: the next poll
     # waits long enough that the hour's requests stay at half of that.
@@ -455,9 +455,11 @@ def test_a_page_that_does_not_say_where_it_stands_keeps_its_events_and_clears_no
     # is the whole list.
     feed.listed = [event(2), event(3)]
     feed.pagination = {"offset": 0, "next_url": 7}
-    added = [poller.poll(store, minutes(count)).added for count in (2, 4, 6)]
+    reports = [poller.poll(store, minutes(count)) for count in (2, 4, 6)]
 
-    assert added == [1, 0, 0]
+    assert [report.added for report in reports] == [1, 0, 0]
+    # Each poll worked, and says that it may not have seen everything 511 lists.
+    assert [(report.unreadable, report.partial) for report in reports] == [(0, True)] * 3
     assert len(feed.requests) == 4
     assert [row.data["event_id"] for row in store.search()] == [
         "511.org/1",
@@ -467,7 +469,7 @@ def test_a_page_that_does_not_say_where_it_stands_keeps_its_events_and_clears_no
 
     # Once the answers say it plainly, two of them without the event are enough.
     feed.pagination = MISSING
-    poller.poll(store, minutes(8))
+    assert poller.poll(store, minutes(8)).partial is False
     assert len(store.search()) == 3
     poller.poll(store, minutes(10))
     assert [row.data.get("change") for row in store.search()] == [None, None, None, "not_listed"]
@@ -483,16 +485,19 @@ def test_an_answer_with_more_pages_than_beacon_reads_clears_nothing(
     # not in the answer, and it may be on the page that was not read.
     feed.page = 2
     feed.listed = [event(number) for number in range(2, 11)]
-    for count in (2, 4, 6):
-        poller.poll(store, minutes(count))
+    reports = [poller.poll(store, minutes(count)) for count in (2, 4, 6)]
 
     assert len(feed.requests) == 1 + 3 * 4
+    # The ninth event is on the fifth page, and is not stored: the polls say that
+    # they read only part of what 511 lists.
+    assert [(report.unreadable, report.partial) for report in reports] == [(0, True)] * 3
+    assert len(refs(store)) == 1 + 8
     assert poller.interval_seconds == 480
     assert not [ref for ref in refs(store) if "#not-listed" in ref]
 
     # Read in full again without it, twice, and it is recorded as gone.
     feed.page = 500
-    poller.poll(store, minutes(8))
+    assert poller.poll(store, minutes(8)).partial is False
     assert poller.interval_seconds == 120
     poller.poll(store, minutes(10))
     assert at("511.org/1@2026-11-27T19:55:00+00:00", "not-listed", 10) in refs(store)
@@ -508,7 +513,7 @@ def test_an_empty_page_that_says_another_follows_is_not_the_whole_list(
     feed.listed = []
     feed.always_more = True
     for count in (2, 4, 6):
-        poller.poll(store, minutes(count))
+        assert poller.poll(store, minutes(count)).partial is True
 
     # One request a poll: the poller does not ask for the same empty page again.
     assert len(feed.requests) == 4

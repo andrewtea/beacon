@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from beacon.evidence import Evidence, EvidenceStore
+from beacon.evidence import Evidence, EvidenceStore, Origin
 
 MISSES_BEFORE_GONE = 2
 
@@ -88,9 +88,11 @@ def compare_listing(
     return Listing(gone, back, {"at": moment, "listed": state})
 
 
-def not_listed_row(row: Evidence, now: datetime) -> dict[str, Any]:
+def not_listed_row(row: Evidence, now: datetime, origin: Origin) -> dict[str, Any]:
     """The fields every "no longer listed" row shares. Its reference holds the
-    moment, so an item that goes, comes back, and goes again has a row for each."""
+    moment, so an item that goes, comes back, and goes again has a row for each.
+    `origin` is the origin of the poller that saw it, not of the row it is about:
+    what is recorded is this poll's observation."""
     return {
         "kind": row.kind,
         "source": row.source,
@@ -101,13 +103,13 @@ def not_listed_row(row: Evidence, now: datetime) -> dict[str, Any]:
         # The source is an authority, and it did not say this: Beacon saw the item
         # missing from two of its answers.
         "confidence": "medium",
-        "origin": row.origin,
+        "origin": origin,
     }
 
 
-def listed_again_row(row: Evidence, now: datetime) -> dict[str, Any]:
+def listed_again_row(row: Evidence, now: datetime, origin: Origin) -> dict[str, Any]:
     """The fields every "listed again" row shares."""
-    return not_listed_row(row, now) | {
+    return not_listed_row(row, now, origin) | {
         "ref": f"{row.ref}#listed-again@{now.isoformat()}",
         "until": row.until,
         # The source lists it, which is the source speaking.

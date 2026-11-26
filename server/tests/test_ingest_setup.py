@@ -176,7 +176,8 @@ def test_a_mock_store_first_opened_shows_a_fire_already_under_way(
         "played_to": NOON.isoformat(),
         # How each poller's last poll went, for a process that goes on from here.
         "polls": {
-            name: {"polled_at": NOON.isoformat(), "ok": True} for name in ("nws", "opensky", "511")
+            name: {"polled_at": NOON.isoformat(), "ok": True, "partial": False}
+            for name in ("nws", "opensky", "511")
         },
     }
     # The clock is let go when the story has been played up to now.
@@ -527,7 +528,7 @@ def test_each_source_is_asked_with_the_settings_the_environment_holds(
 
 
 def test_what_a_stand_in_answered_cannot_be_stored_as_a_real_sources(
-    tmp_path: Path, time: Time, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, time: Time
 ) -> None:
     # The pollers a live deployment would build, from the same settings, but handed
     # the invented scenario where the network would be.
@@ -537,18 +538,124 @@ def test_what_a_stand_in_answered_cannot_be_stored_as_a_real_sources(
     )
     live = EvidenceStore(tmp_path / "live.sqlite3", "live")
 
-    results = Runner(pollers, live, Clock(time)).step()
-
-    # Their rows are `mock` ones, because the client says so and nothing else can,
-    # and the live store refuses every one of them.
-    assert stand_in.origin == "mock"
-    assert {name: type(result).__name__ for name, result in results.items()} == {
-        "nws": "EvidenceStoreError",
-        "opensky": "EvidenceStoreError",
-        "511": "EvidenceStoreError",
-    }
+    # Their rows are `mock` ones, because the client says so and nothing else can.
+    assert (stand_in.origin, {poller.origin for poller in pollers}) == ("mock", {"mock"})
+    # The live store's runner does not take them, and each refuses the store itself.
+    with pytest.raises(EvidenceStoreError, match="holds nothing a stand-in produced"):
+        Runner(pollers, live, Clock(time))
+    for poller in pollers:
+        with pytest.raises(EvidenceStoreError, match="holds nothing a stand-in produced"):
+            poller.poll(live, NOON)
     assert live.count_by_source() == {}
-    assert "poller failed (EvidenceStoreError)" in caplog.text
+    assert [live.state(poller.name) for poller in pollers] == [{}, {}, {}]
+
+
+def test_a_stand_ins_silence_is_not_recorded_in_the_live_store_as_an_item_going_missing(
+    tmp_path: Path, time: Time
+) -> None:
+    # The live store holds what the real sources listed: an alert and a closure,
+    # each with the state its real poller saved.
+    live = EvidenceStore(tmp_path / "live.sqlite3", "live")
+    alert = NewEvidence(
+        kind="alert",
+        source="nws",
+        ref="urn:oid:real.1",
+        occurred_at=NOON - timedelta(hours=1),
+        until=NOON + timedelta(hours=5),
+        confidence="official",
+        origin="live",
+        data={"event": "Wind Advisory", "message_type": "Alert", "replaces": []},
+    )
+    closure = NewEvidence(
+        kind="traffic",
+        source="511",
+        ref="511.org/9@2026-11-27T19:00:00+00:00",
+        occurred_at=NOON - timedelta(hours=1),
+        confidence="official",
+        origin="live",
+        data={"event_id": "511.org/9", "headline": "Road closed"},
+    )
+    listed = {
+        "nws": {"at": "earlier", "listed": {alert.ref: {"ref": alert.ref, "missed": 0}}},
+        "511": {"at": "earlier", "listed": {"511.org/9": {"ref": closure.ref, "missed": 0}}},
+    }
+    live.add([alert], state=("nws", listed["nws"]), now=NOON)
+    live.add([closure], state=("511", listed["511"]), now=NOON)
+    before = live.search()
+
+    # A stand-in that lists nothing is polled against that store, over and over.
+    silent = SourceHttp(
+        httpx2.MockTransport(
+            lambda request: httpx2.Response(
+                200,
+                json={"type": "FeatureCollection", "features": []}
+                if request.url.host == "api.weather.gov"
+                else {"events": [], "pagination": {"offset": 0}},
+            )
+        )
+    )
+    for poller in (NwsAlerts(silent), Traffic511(silent, api_key="token")):
+        for count in (2, 4, 6):
+            with pytest.raises(EvidenceStoreError, match="holds nothing a stand-in produced"):
+                poller.poll(live, NOON + timedelta(minutes=count))
+
+    # Nothing is stored, and no answer of the stand-in's counts as one without the item.
+    assert live.search() == before
+    assert (live.state("nws"), live.state("511")) == (listed["nws"], listed["511"])
+
+
+def test_a_change_row_has_the_origin_of_the_poller_that_saw_the_change(
+    tmp_path: Path,
+) -> None:
+    # A mock store can hold a row from a real source. That a stand-in then stopped
+    # listing it is the stand-in's doing, and is recorded as such.
+    store = EvidenceStore(tmp_path / "mock.sqlite3", "mock")
+    listed = [
+        {
+            "id": "https://api.weather.gov/alerts/urn:oid:real.1",
+            "geometry": None,
+            "properties": {
+                "id": "urn:oid:real.1",
+                "status": "Actual",
+                "messageType": "Alert",
+                "event": "Wind Advisory",
+                "sent": "2026-11-27T11:00:00-08:00",
+                "ends": "2026-11-27T22:00:00-08:00",
+            },
+        }
+    ]
+    answers = SourceHttp(
+        httpx2.MockTransport(
+            lambda request: httpx2.Response(
+                200, json={"type": "FeatureCollection", "features": listed}
+            )
+        )
+    )
+    real = NewEvidence(
+        kind="alert",
+        source="nws",
+        ref="urn:oid:real.1",
+        occurred_at=NOON - timedelta(hours=1),
+        until=NOON + timedelta(hours=10),
+        confidence="official",
+        origin="live",
+        data={"event": "Wind Advisory", "message_type": "Alert", "replaces": []},
+    )
+    store.add([real], now=NOON)
+    poller = NwsAlerts(answers)
+    poller.poll(store, NOON)
+
+    listed.clear()
+    poller.poll(store, NOON + timedelta(minutes=2))
+    poller.poll(store, NOON + timedelta(minutes=4))
+
+    # The stand-in listed the alert once, which is "listed again" for a stored row
+    # no poll had listed, and then did not.
+    assert [(row.data.get("change"), row.origin) for row in store.search()] == [
+        (None, "live"),
+        ("listed_again", "mock"),
+        ("not_listed", "mock"),
+    ]
 
 
 class Silent:
@@ -583,6 +690,7 @@ def test_stopping_calls_off_a_request_that_is_out_and_leaves_no_thread(
 
     class Asking:
         name = "slow"
+        origin = "live"
         interval_seconds = 30.0
 
         def poll(self, store: EvidenceStore, now: datetime) -> PollReport:

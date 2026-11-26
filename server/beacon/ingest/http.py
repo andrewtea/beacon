@@ -14,6 +14,13 @@ An exchange runs on an event loop of its own for as long as it lasts. That is wh
 lets it be cancelled from outside wherever it is waiting: by its deadline, which
 covers the lookup, the connection, the headers, and the body together, and by
 `SourceHttp.close` when Beacon stops.
+
+One thing cannot be called off: the lookup of a source's name, which the system does
+on a thread and gives no way to stop. A cancelled exchange stops waiting for it, and
+the lookup itself goes on until the system's resolver gives up. A client has
+`_LOOKUP_THREADS` threads for lookups and no more, so however many exchanges time
+out on a resolver that does not answer, that many threads are waiting on it at most,
+and Python waits for them, for as long as the resolver takes, when the process ends.
 """
 
 import asyncio
@@ -23,7 +30,10 @@ import logging
 import ssl
 import threading
 import zlib
-from collections.abc import Coroutine, Mapping
+from collections.abc import Callable, Coroutine, Mapping
+from concurrent.futures import Executor, ThreadPoolExecutor
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx2
@@ -35,6 +45,10 @@ from beacon.evidence import Origin
 # lookup of the source's name to the last byte of its reply.
 TIMEOUT_SECONDS = 20.0
 MAX_SECONDS = 60.0
+
+# The threads a client has for looking names up. A lookup that hangs keeps one until
+# the resolver gives up, and the exchanges that follow share what is left.
+_LOOKUP_THREADS = 2
 
 # The header OpenSky sends beside 429, and the standard one.
 _RETRY_HEADERS = ("retry-after", "x-rate-limit-retry-after-seconds")
@@ -115,6 +129,21 @@ class _AsFromTheNetwork(httpx2.AsyncBaseTransport):
         )
 
 
+class _Loop(asyncio.SelectorEventLoop):
+    """An event loop that looks names up on the client's few threads. A loop of the
+    usual kind has threads of its own for that, and with a loop for each exchange,
+    every lookup that hung would leave a thread behind."""
+
+    def __init__(self, lookups: Executor) -> None:
+        super().__init__()
+        self._lookups = lookups
+
+    def run_in_executor(
+        self, executor: Executor | None, func: Callable[..., Any], *args: Any
+    ) -> "asyncio.Future[Any]":
+        return super().run_in_executor(self._lookups if executor is None else executor, func, *args)
+
+
 class _Gunzip:
     """Unpacks a gzip reply a piece at a time, and knows whether it ended where a
     gzip stream ends. A reply can be several gzip members one after another, and
@@ -164,6 +193,9 @@ class SourceHttp:
         self._closed = False
         # The exchanges that are out, each with the loop it runs on.
         self._out: set[tuple[asyncio.AbstractEventLoop, asyncio.Task[Any]]] = set()
+        # Its threads are begun when a name is first looked up, so a client that is
+        # answered by a stand-in never has any.
+        self._lookups = ThreadPoolExecutor(_LOOKUP_THREADS, thread_name_prefix="beacon-lookup")
 
     @property
     def origin(self) -> Origin:
@@ -183,6 +215,8 @@ class SourceHttp:
             # An exchange that ended meanwhile has closed its loop, which is fine.
             with contextlib.suppress(RuntimeError):
                 loop.call_soon_threadsafe(task.cancel)
+        # A lookup that is out cannot be called off. Its thread ends when it returns.
+        self._lookups.shutdown(wait=False, cancel_futures=True)
 
     def __enter__(self) -> "SourceHttp":
         return self
@@ -193,7 +227,7 @@ class SourceHttp:
     def _run[T](self, exchange: Coroutine[Any, Any, T]) -> T | None:
         """Run an exchange to its end on a loop of its own, and return what it
         returned, or None when `close` cancelled it."""
-        loop = asyncio.new_event_loop()
+        loop = _Loop(self._lookups)
         try:
             task = loop.create_task(exchange)
             with self._lock:
@@ -204,6 +238,12 @@ class SourceHttp:
                 return loop.run_until_complete(task)
             except asyncio.CancelledError:
                 return None
+            except RuntimeError:
+                # `close` shut the lookup threads down just as the exchange went to
+                # look a name up, before the cancellation reached it.
+                if self._closed:
+                    return None
+                raise
             finally:
                 with self._lock:
                     self._out.discard((loop, task))
@@ -216,7 +256,7 @@ class SourceHttp:
                 loop.run_until_complete(loop.shutdown_asyncgens())
         finally:
             # Closing the loop does not wait for a name lookup that is still out on
-            # a thread, as `asyncio.run` would for minutes.
+            # one of the client's threads, as `asyncio.run` would for minutes.
             loop.close()
 
     async def _exchange(
@@ -342,11 +382,36 @@ def read_json(body: bytes, source: str) -> Any:
 
 
 def _retry_after(headers: httpx2.Headers) -> float | None:
+    """The seconds a reply asks the caller to wait, counted from the reply. The
+    standard header says it as a number of seconds or as a date, and OpenSky's own
+    as a number."""
     for name in _RETRY_HEADERS:
+        value = headers.get(name, "").strip()
         try:
-            seconds = float(headers.get(name, ""))
+            seconds: float | None = float(value)
         except ValueError:
-            continue
-        if 0 <= seconds < float("inf"):
+            seconds = _seconds_until(value, headers.get("date")) if name == "retry-after" else None
+        if seconds is not None and 0 <= seconds < float("inf"):
             return seconds
     return None
+
+
+def _seconds_until(when: str, sent: str | None) -> float | None:
+    """The seconds from when a reply was sent to the HTTP date `when`, or None when
+    it is not one. A reply says when it was sent in its `Date` header, which is the
+    source's clock, as `when` is. Without one, this machine's clock is used. A date
+    that has passed is no wait."""
+    until = _http_date(when)
+    if until is None:
+        return None
+    since = _http_date(sent or "") or datetime.now(UTC)
+    return max(0.0, (until - since).total_seconds())
+
+
+def _http_date(value: str) -> datetime | None:
+    try:
+        moment = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    # A date with no zone is not an HTTP date, which is always in GMT.
+    return moment if moment.utcoffset() is not None else None

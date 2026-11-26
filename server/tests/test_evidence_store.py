@@ -381,3 +381,86 @@ def test_a_write_does_not_wait_for_a_reader(store: EvidenceStore) -> None:
     # The reader still sees the store as it was when it began to read.
     assert reader.execute("SELECT COUNT(*) FROM evidence").fetchone() == (1,)
     reader.close()
+
+
+def test_two_openings_of_a_new_file_at_once_begin_one_store(tmp_path: Path) -> None:
+    for trial in range(30):
+        path = tmp_path / f"evidence-{trial}.sqlite3"
+        outcomes: list[object] = []
+        together = threading.Barrier(4)
+
+        def open_and_write(
+            ref: str,
+            path: Path = path,
+            together: threading.Barrier = together,
+            outcomes: list[object] = outcomes,
+        ) -> None:
+            together.wait()
+            try:
+                outcomes.append(EvidenceStore(path, "live").add([row(ref)]))
+            except Exception as failure:
+                outcomes.append(failure)
+
+        openers = [threading.Thread(target=open_and_write, args=(f"row-{n}",)) for n in range(4)]
+        for opener in openers:
+            opener.start()
+        for opener in openers:
+            opener.join()
+
+        assert [type(outcome) for outcome in outcomes] == [list] * 4
+        assert len(EvidenceStore(path, "live").search()) == 4
+
+
+def _old_store(path: Path) -> None:
+    """A store file as it was before the store used write-ahead mode."""
+    EvidenceStore(path, "live").add([row("old")])
+    db = sqlite3.connect(path, isolation_level=None)
+    assert db.execute("PRAGMA journal_mode = DELETE").fetchone() == ("delete",)
+    db.close()
+
+
+def test_a_file_from_before_write_ahead_mode_is_put_in_it_when_it_is_opened(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "evidence.sqlite3"
+    _old_store(path)
+
+    store = EvidenceStore(path, "live")
+
+    reader = sqlite3.connect(path, isolation_level=None)
+    assert reader.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+    # So a write to it does not wait for a reader, or fail on one, either.
+    reader.execute("BEGIN")
+    assert reader.execute("SELECT COUNT(*) FROM evidence").fetchone() == (1,)
+    store.add([row("new")])
+    assert refs(store.search()) == ["old", "new"]
+    reader.close()
+
+
+def test_a_file_that_cannot_be_put_in_write_ahead_mode_is_not_opened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "evidence.sqlite3"
+    _old_store(path)
+    # Something else is reading the file, and goes on reading it.
+    reader = sqlite3.connect(path, isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM evidence").fetchone()
+    monkeypatch.setattr("beacon.evidence.store._WRITE_WAIT_SECONDS", 0.3)
+
+    with pytest.raises(EvidenceStoreError, match="could not be put in write-ahead mode"):
+        EvidenceStore(path, "live")
+
+    reader.close()
+    assert refs(EvidenceStore(path, "live").search()) == ["old"]
+
+
+def test_a_file_that_is_not_a_store_is_an_error_and_is_left_as_it_is(tmp_path: Path) -> None:
+    path = tmp_path / "evidence.sqlite3"
+    path.write_bytes(b"This is somebody's notes, not a database. " * 100)
+
+    # Not being able to read the file is not the same as there being no store in it.
+    with pytest.raises(sqlite3.DatabaseError):
+        EvidenceStore(path, "live")
+
+    assert path.read_bytes().startswith(b"This is somebody's notes")

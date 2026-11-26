@@ -54,10 +54,11 @@ class NwsAlerts:
     ) -> None:
         self._http = http
         # What a stand-in for the network answered is a stand-in's, whoever asks.
-        self._origin: Origin = http.origin
+        self.origin: Origin = http.origin
         self._zones = zones
 
     def poll(self, store: EvidenceStore, now: datetime) -> PollReport:
+        store.refuse_stand_in(self.origin)
         body = fetch(
             self._http,
             "GET",
@@ -68,7 +69,7 @@ class NwsAlerts:
             params={"zone": ",".join(self._zones), "status": "actual"},
             headers={"User-Agent": USER_AGENT, "Accept": "application/geo+json"},
         )
-        alerts, unreadable = parse_alerts(read_json(body, SOURCE), self._origin)
+        alerts, unreadable = parse_alerts(read_json(body, SOURCE), self.origin)
         replaced = {ref for alert in alerts for ref in alert.data["replaces"]}
         listing = compare_listing(
             store,
@@ -83,8 +84,8 @@ class NwsAlerts:
             complete=unreadable == 0,
             now=now,
         )
-        changes = [_change(row, now, "not_listed") for row in listing.gone]
-        changes += [_change(row, now, "listed_again") for row in listing.back]
+        changes = [_change(row, now, "not_listed", self.origin) for row in listing.gone]
+        changes += [_change(row, now, "listed_again", self.origin) for row in listing.back]
         added = store.add([*alerts, *changes], state=(self.name, listing.state), now=now)
         return PollReport(added=len(added), unreadable=unreadable)
 
@@ -171,10 +172,10 @@ def _alert(
     )
 
 
-def _change(alert: Evidence, now: datetime, change: str) -> NewEvidence:
+def _change(alert: Evidence, now: datetime, change: str, origin: Origin) -> NewEvidence:
     """The row that says an alert stopped being listed before it was due to end, or
     is listed again after that. Beacon saw it; NWS did not announce it."""
-    fields = (not_listed_row if change == "not_listed" else listed_again_row)(alert, now)
+    fields = (not_listed_row if change == "not_listed" else listed_again_row)(alert, now, origin)
     return NewEvidence(
         **fields,
         url=alert.url,

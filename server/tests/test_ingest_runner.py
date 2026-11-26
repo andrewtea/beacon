@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from beacon.evidence import EvidenceStore
+from beacon.evidence import EvidenceStore, EvidenceStoreError
 from beacon.ingest import Clock, PollerStatus, PollReport, Runner, SourceError
 
 NOON = datetime(2026, 11, 27, 20, 0, tzinfo=UTC)
@@ -19,6 +19,8 @@ def seconds(count: float) -> datetime:
 
 class FakePoller:
     """Records when it was polled, and fails when the next of `failures` is an error."""
+
+    origin = "mock"
 
     def __init__(self, name: str, interval_seconds: float) -> None:
         self.name = name
@@ -244,6 +246,37 @@ def test_a_runner_can_be_told_how_the_last_polls_of_an_earlier_process_went(
     # It is what is shown until the poller polls again, which it does at once.
     assert sorted(runner.step()) == ["511", "nws"]
     assert runner.status()[0] == PollerStatus("nws", NOON, True)
+
+
+def test_a_poll_that_read_only_part_of_an_answer_is_logged_and_shown_as_partial(
+    store: EvidenceStore, time: Time, caplog: pytest.LogCaptureFixture
+) -> None:
+    paged = FakePoller("511", 120)
+    reports = [PollReport(added=3, partial=True), PollReport(added=0)]
+    paged.poll = lambda store, now: reports.pop(0)  # type: ignore[method-assign]
+    runner = Runner([paged], store, Clock(time))
+
+    assert runner.step() == {"511": PollReport(added=3, partial=True)}
+
+    # It is a poll that worked, and it may have missed what the source lists.
+    assert runner.status() == [PollerStatus("511", NOON, True, partial=True)]
+    assert "511's answer was not read to its end, so items it lists may be missing." in caplog.text
+    time.moment = seconds(120)
+    runner.step()
+    assert runner.status() == [PollerStatus("511", seconds(120), True, partial=False)]
+
+
+def test_a_runner_on_the_live_store_takes_no_poller_that_a_stand_in_feeds(
+    tmp_path: Path, time: Time
+) -> None:
+    live = EvidenceStore(tmp_path / "live.sqlite3", "live")
+    real = FakePoller("nws", 30)
+    real.origin = "live"  # type: ignore[misc]
+
+    with pytest.raises(EvidenceStoreError, match="holds nothing a stand-in produced"):
+        Runner([real, FakePoller("511", 30)], live, Clock(time))
+
+    assert sorted(Runner([real], live, Clock(time)).step()) == ["nws"]
 
 
 def test_a_poll_cut_short_by_stopping_is_not_reported_as_the_sources_failure(

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
-from beacon.evidence import EvidenceStore
+from beacon.evidence import EvidenceStore, Origin
 from beacon.ingest.http import SourceError
 
 logger = logging.getLogger("beacon.ingest")
@@ -30,6 +30,9 @@ class PollReport:
     added: int
     # Items the source sent that Beacon could not read, and left out.
     unreadable: int = 0
+    # Whether the source's answer was not read to its end, so that items it lists
+    # can be missing from this poll.
+    partial: bool = False
 
 
 @dataclass(frozen=True)
@@ -39,11 +42,15 @@ class PollerStatus:
     # Both are None for a poller that has not polled yet.
     polled_at: datetime | None
     ok: bool | None
+    # Whether that poll read only part of what the source lists.
+    partial: bool = False
 
 
 class Poller(Protocol):
     # Names the poller in the log and in the state it saves.
     name: str
+    # Where its rows come from: `live` only for a poller that asks the real source.
+    origin: Origin
     # How long to wait after a poll before the next. It is read after each poll, so
     # a poller can ask for longer after a poll that cost more.
     interval_seconds: float
@@ -80,10 +87,15 @@ class Runner:
         last: Iterable[PollerStatus] = (),
     ) -> None:
         """`last` is how the pollers' last polls went in an earlier process, for a
-        runner that goes on where that one stopped and may have nothing left to poll."""
+        runner that goes on where that one stopped and may have nothing left to poll.
+
+        Raises EvidenceStoreError when `store` is the live one and a poller is fed
+        by a stand-in."""
         names = [poller.name for poller in pollers]
         if len(set(names)) != len(names):
             raise ValueError("Two pollers have the same name.")
+        for poller in pollers:
+            store.refuse_stand_in(poller.origin)
         self._pollers = list(pollers)
         self._store = store
         self._clock = clock
@@ -143,15 +155,23 @@ class Runner:
                     logger.warning(
                         "%s sent %d items Beacon could not read.", poller.name, report.unreadable
                     )
+                if report.partial:
+                    logger.warning(
+                        "%s's answer was not read to its end, so items it lists may be missing.",
+                        poller.name,
+                    )
                 results[poller.name] = report
-            ok = isinstance(results[poller.name], PollReport)
+            outcome = results[poller.name]
+            ok = isinstance(outcome, PollReport)
             if ok or not failed_stay_due:
                 self._due[poller.name] = max(
                     now + timedelta(seconds=_seconds(poller.interval_seconds) or 1.0),
                     # The clock, read again: the source asked when it answered.
                     self._clock.now() + timedelta(seconds=_seconds(asked)),
                 )
-            self._last[poller.name] = PollerStatus(poller.name, now, ok)
+            self._last[poller.name] = PollerStatus(
+                poller.name, now, ok, isinstance(outcome, PollReport) and outcome.partial
+            )
         return results
 
     def run(self, stop: threading.Event, *, sleep: Callable[[float], object] | None = None) -> None:
