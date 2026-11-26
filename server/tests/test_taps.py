@@ -4,7 +4,10 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import sqlite3
+import subprocess
+import sys
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -15,15 +18,18 @@ import pytest
 from fastapi.testclient import TestClient
 
 from beacon import main as beacon_main
+from beacon import taps as beacon_taps
 from beacon.api import taps as api_taps
 from beacon.api.taps import MAX_BODY_BYTES
 from beacon.evidence import EvidenceStore, EvidenceStoreError, Point
+from beacon.ingest import build
 from beacon.main import create_app
-from beacon.radio import ConversionStopped
+from beacon.radio import ConversionStopped, ConversionUnavailable
 from beacon.taps import (
     KEPT,
     MAX_TAPS_AT_ONCE,
     MAX_TAPS_PER_MINUTE,
+    MediaLockedError,
     Swept,
     TapError,
     TapMedia,
@@ -33,7 +39,7 @@ from beacon.taps import (
 from beacon.taps import desk as tap_desk
 from beacon.taps import media as tap_media
 from beacon.taps.media import ORPHANED
-from tests.test_taps_media import SECRETS, Same, jpeg, needs_ffmpeg, real_jpeg, wav
+from tests.test_taps_media import SECRETS, Same, jpeg, kept, needs_ffmpeg, real_jpeg, wav
 
 NOON = datetime(2026, 11, 27, 20, 0, tzinfo=UTC)
 # Somebody at a window on Hayes Street. The position is invented.
@@ -44,6 +50,13 @@ PRECISE = ("37.7763549", "122.4244123", "776354", "424412")
 
 def b64(file: bytes) -> str:
     return base64.b64encode(file).decode()
+
+
+@pytest.fixture(autouse=True)
+def a_host_that_hands_no_core_to_a_collector(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Photos are taken only on such a host, and where these tests run is not
+    what they test. A test of a host with a collector says so itself."""
+    monkeypatch.setattr(beacon_taps, "core_dump_problem", lambda: None)
 
 
 @pytest.fixture
@@ -241,7 +254,7 @@ def test_what_is_not_a_tap_is_refused_in_a_fixed_sentence_that_repeats_nothing(
     assert response.status_code == 422
     assert response.json() == {"detail": detail}
     assert store.search() == []
-    assert not (tmp_path / "taps").exists()
+    assert kept(tmp_path / "taps") == []
 
 
 @pytest.mark.parametrize(
@@ -541,6 +554,7 @@ def test_a_server_takes_taps_into_the_store_its_environment_picks_and_sweeps_old
     # ran on the other store.
     old = TapMedia(tmp_path / "taps", "live")
     old.keep("tap-AAAAAAAAAAAA", "clip", wav(), datetime.now(UTC) - KEPT - timedelta(minutes=1))
+    old.close()
 
     with TestClient(create_app()) as client:
         response = client.post("/api/taps", json={"location": PHONE, "clip": b64(wav())})
@@ -594,27 +608,46 @@ def test_the_servers_access_log_leaves_out_the_tap_route_and_the_address_with_it
     ]
 
 
+def put(path: Path, content: bytes, when: datetime) -> None:
+    """A file as it lies on the disk, written at `when`."""
+    path.write_bytes(content)
+    os.utime(path, (when.timestamp(), when.timestamp()))
+
+
 def test_a_file_with_no_row_is_handed_to_nobody_and_is_swept(
     taps: Taps, now: list[datetime], tmp_path: Path
 ) -> None:
+    taken = taps.take({"location": PHONE, "clip": b64(wav())})
+    directory = tmp_path / "taps" / "mock"
     # Beacon died after a tap's photo was written and before its row was stored.
     orphan = "tap-AAAAAAAAAAAA"
-    TapMedia(tmp_path / "taps", "mock").keep(orphan, "photo", jpeg(extras=False), NOON)
-    taken = taps.take({"location": PHONE, "clip": b64(wav())})
+    put(directory / f"{orphan}.photo.jpg", jpeg(extras=False), NOON)
 
     assert taps.media(orphan, "photo") is None
     # Nor is a tap handed a kind of media its row does not say it sent.
-    TapMedia(tmp_path / "taps", "mock").keep(taken.id, "photo", jpeg(extras=False), NOON)
+    put(directory / f"{taken.id}.photo.jpg", jpeg(extras=False), NOON)
     assert taps.media(taken.id, "photo") is None
     assert taps.media(taken.id, "clip") == wav()
 
     now[0] = NOON + ORPHANED
     assert taps.sweep() == Swept(deleted=1)
 
-    assert sorted(file.name for file in (tmp_path / "taps" / "mock").iterdir()) == [
-        f"{taken.id}.clip.wav",
-        f"{taken.id}.photo.jpg",
-    ]
+    assert kept(directory) == [f"{taken.id}.clip.wav", f"{taken.id}.photo.jpg"]
+
+
+def test_a_file_is_not_handed_out_after_the_moment_its_tap_was_told(
+    taps: Taps, now: list[datetime], tmp_path: Path
+) -> None:
+    taken = taps.take({"location": PHONE, "clip": b64(wav())})
+    # The directory was restored from a copy, and the file is new again.
+    later = NOON + KEPT
+    put(tmp_path / "taps" / "mock" / f"{taken.id}.clip.wav", wav(), later)
+
+    now[0] = later
+
+    assert taken.media_kept_until == later
+    assert taps.media(taken.id, "clip") is None
+    assert kept(tmp_path / "taps") == []
 
 
 def test_media_that_cannot_be_deleted_after_a_failure_does_not_change_the_answer(
@@ -715,10 +748,10 @@ def test_a_server_that_cannot_draw_a_photo_again_takes_taps_without_one(
     # A photo is not kept as it was sent, so it is not kept at all.
     assert refused.status_code == 503
     assert refused.json() == {
-        "detail": "This server cannot take a photo. Send the tap without one."
+        "detail": "This server cannot take a photo just now. Send the tap without one."
     }
     assert store.search() == []
-    assert not (tmp_path / "taps").exists()
+    assert kept(tmp_path / "taps") == []
     assert client.post("/api/taps", json={"location": PHONE, "clip": b64(wav())}).status_code == 201
 
 
@@ -881,3 +914,152 @@ def test_a_server_whose_taps_cannot_be_opened_stops_the_pollers_it_built(
         pass
 
     assert ingest.stopped == 1
+
+
+def test_a_host_that_could_not_run_the_converter_is_not_told_its_photo_is_bad(
+    store: EvidenceStore, tmp_path: Path
+) -> None:
+    class Unavailable:
+        def to_jpeg(self, photo: bytes, *, max_side: int, max_bytes: int) -> bytes | None:
+            raise ConversionUnavailable("The converter could not be run on this host just now.")
+
+    app = create_app()
+    app.state.taps = Taps(store, TapMedia(tmp_path / "taps", "mock"), photos=Unavailable())
+
+    response = TestClient(app).post("/api/taps", json={"location": PHONE, "photo": b64(jpeg())})
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "This server cannot take a photo just now. Send the tap without one."
+    }
+    assert response.headers["Retry-After"] == "30"
+    assert store.search() == []
+
+
+def test_a_server_on_a_host_that_collects_core_dumps_takes_no_photos(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("BEACON_INGEST", "0")
+    monkeypatch.setenv("BEACON_DATA_DIR", str(tmp_path))
+    # ffmpeg holds the photo while it draws it, and nothing keeps a collector on
+    # the host from being handed ffmpeg's memory when it crashes.
+    monkeypatch.setattr(beacon_taps, "core_dump_problem", lambda: "This host hands core dumps on.")
+
+    with TestClient(create_app()) as client:
+        photo = client.post("/api/taps", json={"location": PHONE, "photo": b64(jpeg())})
+        without = client.post("/api/taps", json={"location": PHONE, "clip": b64(wav())})
+
+    assert (photo.status_code, without.status_code) == (503, 201)
+    assert "Taps are taken without photos." in caplog.text
+
+
+def test_a_server_that_cannot_be_kept_from_dumping_its_memory_takes_no_taps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("BEACON_INGEST", "0")
+    monkeypatch.setenv("BEACON_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(beacon_main, "forbid_core_dumps", lambda: False)
+
+    with TestClient(create_app()) as client:
+        response = client.post("/api/taps", json={"location": PHONE})
+        assert client.get("/api/health").status_code == 200
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "This server is not taking taps."}
+    assert "This server takes no taps" in caplog.text
+    assert not (tmp_path / "taps").exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="The mark is Linux's.")
+def test_a_server_that_takes_taps_is_a_process_the_kernel_makes_no_core_of(
+    tmp_path: Path,
+) -> None:
+    # In a process of its own, because the mark stays on the process that sets it.
+    script = (
+        "import ctypes, os, resource\n"
+        "from fastapi.testclient import TestClient\n"
+        "from beacon.main import create_app\n"
+        "libc = ctypes.CDLL(None)\n"
+        "before = libc.prctl(3, 0, 0, 0, 0)\n"
+        "with TestClient(create_app()) as client:\n"
+        "    place = {'location': {'lat': 37.7763, 'lon': -122.4244}}\n"
+        "    status = client.post('/api/taps', json=place).status_code\n"
+        "    core = resource.getrlimit(resource.RLIMIT_CORE)[0]\n"
+        "    print(before, libc.prctl(3, 0, 0, 0, 0), core, status)\n"
+    )
+    env = os.environ | {"BEACON_INGEST": "0", "BEACON_DATA_DIR": str(tmp_path)}
+
+    ran = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True)
+
+    # Dumpable before, not dumpable while it takes taps, with no core file either.
+    assert ran.stdout.split() == ["1", "0", "0", "201"], ran.stderr
+
+
+def test_a_tap_is_left_out_of_telemetry_wherever_the_app_is_served_from(
+    taps: Taps, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from opentelemetry import trace
+
+    spans: list[tuple[str, dict[str, Any]]] = []
+
+    class Tracer(trace.NoOpTracer):
+        def start_span(self, name: str, *args: Any, **kwargs: Any) -> trace.Span:
+            spans.append((name, dict(kwargs.get("attributes") or {})))
+            return super().start_span(name, *args, **kwargs)
+
+    class Provider(trace.TracerProvider):
+        def get_tracer(self, *args: Any, **kwargs: Any) -> trace.Tracer:
+            return Tracer()
+
+    monkeypatch.setattr(trace, "get_tracer_provider", lambda: Provider())
+    app = create_app()
+    app.state.taps = taps
+    # Behind a proxy that serves the app under /beacon, as uvicorn's --root-path does.
+    client = TestClient(app, root_path="/beacon")
+
+    assert client.get("/beacon/api/health").status_code == 200
+    traced = len(spans)
+    tapped = client.post("/beacon/api/taps?lat=37.7763549", json={"location": PHONE})
+
+    assert tapped.status_code == 201
+    assert traced > 0
+    assert len(spans) == traced
+    assert "37.7763549" not in str(spans)
+
+
+def test_pollers_whose_thread_could_not_be_started_can_still_be_stopped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    ingest = build({"BEACON_DATA_DIR": str(tmp_path)})
+
+    def fail(self: threading.Thread) -> None:
+        raise RuntimeError("can't start new thread")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(threading.Thread, "start", fail)
+        with pytest.raises(RuntimeError, match="can't start new thread"):
+            ingest.start()
+
+    # Stopping joins no thread that never ran, and closes what was open.
+    assert ingest.stop() is True
+    assert ingest.store.closed
+
+
+def test_a_second_server_in_the_same_data_directory_does_not_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("BEACON_INGEST", "0")
+    monkeypatch.setenv("BEACON_DATA_DIR", str(tmp_path))
+
+    with TestClient(create_app()) as first:
+        # The megabytes kept and the sweep are one process's to count.
+        with (
+            pytest.raises(MediaLockedError, match="Another Beacon process is taking taps"),
+            TestClient(create_app()),
+        ):
+            pass
+        assert first.post("/api/taps", json={"location": PHONE}).status_code == 201
+
+    # The first has stopped and given the directory up.
+    with TestClient(create_app()) as second:
+        assert second.post("/api/taps", json={"location": PHONE}).status_code == 201

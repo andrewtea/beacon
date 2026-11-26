@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 from beacon import __version__
 from beacon.api import health, sources, taps
 from beacon.ingest import IngestConfigError, build
-from beacon.radio import core_dump_problem, forbid_core_dumps
+from beacon.radio import forbid_core_dumps
 from beacon.taps import Taps, open_taps
 
 _REQUEST_PARTS = frozenset({"body", "query", "path", "header", "cookie"})
@@ -31,9 +31,13 @@ logger = logging.getLogger("beacon")
 
 
 def _is_private(path: object) -> bool:
-    """Whether a request's path is one of `PRIVATE_PATHS` or under one."""
+    """Whether a request's path is one of `PRIVATE_PATHS` or under one, wherever
+    the app is mounted: the path a server hands over begins with whatever the app
+    is served under (`root_path`), so it is the end of the path that is compared.
+    A path that only ends like a private one is taken for one, which costs a log
+    line and nothing else."""
     return isinstance(path, str) and any(
-        path == private or path.startswith(private + "/") for private in PRIVATE_PATHS
+        path.endswith(private) or private + "/" in path for private in PRIVATE_PATHS
     )
 
 
@@ -101,6 +105,12 @@ async def _sweep_tap_media(taps: Taps, stop: asyncio.Event) -> None:
                     "deleted. They are handed to nobody. Look at the taps directory.",
                     swept.failed,
                 )
+            if swept.unchecked:
+                logger.error(
+                    "The evidence store could not say whether %d files of taps' media "
+                    "have their rows. They are left until it can, or their hour is over.",
+                    swept.unchecked,
+                )
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), SWEEP_SECONDS)
 
@@ -114,13 +124,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     if setting not in ("0", "1"):
         raise IngestConfigError(f"{INGEST_VARIABLE} must be 1 or 0, not {setting!r}.")
     # This process holds what people send with a tap in memory, the place as the
-    # phone gave it included. It writes no core file. A host that hands cores to a
-    # collector writes one all the same (`beacon.radio.audio`), and the log says so.
-    forbid_core_dumps()
-    if core_dump_problem() is not None:
-        logger.warning(
-            "This host hands core dumps to a collector, so a crash of the server can "
-            "write what a tap held to the disk: its place, its photo, its clip."
+    # phone gave it included. Before it takes one, it is made a process of which
+    # no core is written, to a file or to a collector. Where that cannot be done,
+    # it takes no taps.
+    private = forbid_core_dumps()
+    if not private:
+        logger.error(
+            "This server takes no taps: it could not be kept from leaving a core dump, "
+            "which would hold what a tap sent, the place as the phone gave it included."
         )
     # The pollers first: a setting of theirs that is refused leaves no store behind.
     ingest = build(os.environ) if setting == "1" else None
@@ -129,9 +140,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     stop = asyncio.Event()
     # Whatever of this is begun is ended below, however far the beginning got.
     try:
-        taps = open_taps(os.environ)
-        app.state.taps = taps
-        sweeping = asyncio.create_task(_sweep_tap_media(taps, stop))
+        if private:
+            taps = open_taps(os.environ)
+            app.state.taps = taps
+            sweeping = asyncio.create_task(_sweep_tap_media(taps, stop))
         if ingest is not None:
             app.state.ingest = ingest
             ingest.start()

@@ -107,7 +107,14 @@ from beacon.errors import raise_bare
 from beacon.evidence import Confidence, EvidenceStore, EvidenceStoreError, NewEvidence, Origin
 from beacon.ingest.http import SourceError, SourceHttp, fetch, read_json
 from beacon.ingest.runner import MAX_WAIT_SECONDS, PollerHeldError, PollReport
-from beacon.radio import AudioError, ExtractionError, Transcoder, Transmission, extract_transmission
+from beacon.radio import (
+    AudioError,
+    ConversionUnavailable,
+    ExtractionError,
+    Transcoder,
+    Transmission,
+    extract_transmission,
+)
 from beacon.radio.audio import MAX_SECONDS as MAX_AUDIO_SECONDS
 from beacon.radio.audio import container, plain_wav, wav_seconds
 from beacon.radio.vocabulary import Known
@@ -454,8 +461,9 @@ class OpenMhzRadio:
         passed over for good: its audio is not there, is not audio Beacon can
         decode, or does not play for as long as a call that is worth hearing.
 
-        Raises SourceError when the audio could not be fetched for a reason that
-        may pass, and ConversionStopped when the poller was closed meanwhile."""
+        Raises SourceError when the audio could not be fetched, or converted on
+        this host, for a reason that may pass, and ConversionStopped when the
+        poller was closed meanwhile."""
         try:
             audio = fetch(self._http, "GET", call.url, source=SOURCE, max_bytes=_MAX_AUDIO_BYTES)
         except SourceError as error:
@@ -464,6 +472,7 @@ class OpenMhzRadio:
                 raise
             return None
         kind = container(audio)
+        unavailable = False
         try:
             if kind == "wav":
                 wav = plain_wav(audio)
@@ -473,6 +482,12 @@ class OpenMhzRadio:
                 return None
         except AudioError:
             return None
+        except ConversionUnavailable:
+            unavailable = True
+        if unavailable:
+            # The host could not run the converter. That is nothing about the
+            # call, which is not passed over: the poll ends, and is made again.
+            raise_bare(SourceError(SOURCE, "calls could not be converted on this host just now"))
         # How long it really plays, whatever the listing said: that is what is paid for.
         played = wav_seconds(wav)
         longest = MAX_CALL_SECONDS + _LENGTH_SLACK_SECONDS

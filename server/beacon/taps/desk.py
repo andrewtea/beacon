@@ -48,7 +48,7 @@ from typing import Any
 from beacon.errors import raise_bare
 from beacon.evidence import EvidenceStore, EvidenceStoreError, Mode, NewEvidence, Point
 from beacon.ingest.area import SAN_FRANCISCO, Bounds
-from beacon.radio.audio import ConversionStopped
+from beacon.radio.audio import ConversionStopped, ConversionUnavailable
 from beacon.taps.media import (
     MAX_CLIP_BYTES,
     MAX_PHOTO_BYTES,
@@ -95,6 +95,7 @@ _SHAPE = (
 _NOT_JSON = "A tap is a JSON object."
 _MEDIA = "A tap's photo and clip are files in base64, of a size Beacon takes."
 _NOT_TAKING = "This server is not taking taps."
+_NO_PHOTOS = "This server cannot take a photo just now. Send the tap without one."
 
 
 class TapError(Exception):
@@ -200,10 +201,10 @@ class Taps:
             )
         photos = self._photos
         if photo_sent is not None and photos is None:
-            raise_bare(TapError(503, "This server cannot take a photo. Send the tap without one."))
+            raise_bare(TapError(503, _NO_PHOTOS))
         # Its place in the minute, before anything of it is decoded.
         self._count()
-        stopped = False
+        stopped = unavailable = False
         photo: Photo | None = None
         clip: Clip | None = None
         try:
@@ -213,9 +214,14 @@ class Taps:
                 clip = _media(clip_sent, clean_clip)
         except ConversionStopped:
             stopped = True
+        except ConversionUnavailable:
+            unavailable = True
         if stopped:
             # The server is shutting down.
             raise_bare(TapError(503, _NOT_TAKING))
+        if unavailable:
+            # The host could not run the converter, which says nothing of the photo.
+            raise_bare(TapError(503, _NO_PHOTOS, retry_after=30))
         now = self._clock()
         tap_id = secrets.token_urlsafe(12)
         kept_until = None
@@ -252,28 +258,40 @@ class Taps:
     def media(self, tap_id: str, kind: MediaKind) -> bytes | None:
         """A tap's photo (a JPEG file) or clip (a WAV file), as it was cleaned, or
         None when the tap sent none, its hour is over, or there is no such tap. A
-        file is handed out only for a tap whose row is stored and says it sent one."""
+        file is handed out only for a tap whose row is stored and says it sent one,
+        and not after the moment the row says it is kept until, which is the one
+        the tap's sender was told."""
         if not is_tap_id(tap_id) or kind not in ("photo", "clip"):
             return None
         row = self._store.find(SOURCE, tap_id)
         if row is None or row.kind != "tap" or row.data.get(kind) is None:
             return None
-        return self._media.read(tap_id, kind, self._clock())
+        kept_until = None
+        said = row.data.get("media_kept_until")
+        if isinstance(said, str):
+            with contextlib.suppress(ValueError):
+                kept_until = datetime.fromisoformat(said)
+        if kept_until is None or kept_until.utcoffset() is None:
+            return None
+        return self._media.read(tap_id, kind, self._clock(), kept_until)
 
     def sweep(self) -> Swept:
         """Delete the media whose hour is over, of this store's taps and the other
         store's, and the files of this store's that have had no row for too long.
 
-        Raises OSError when the media cannot be listed."""
+        Raises OSError when the media cannot be listed, or the taps are closed."""
         return self._media.sweep(self._clock(), lambda ids: self._store.taken(SOURCE, ids))
 
     def close(self) -> None:
-        """Take no more taps: the store is closed, and a photo that is being drawn
-        again is given up."""
-        self._store.close()
-        close = getattr(self._photos, "close", None)
-        if callable(close):
-            close()
+        """Take no more taps: the store is closed, a photo that is being drawn
+        again is given up, and the media directory is free for another to take."""
+        try:
+            self._store.close()
+            close = getattr(self._photos, "close", None)
+            if callable(close):
+                close()
+        finally:
+            self._media.close()
 
     def _count(self) -> None:
         """Count this tap against the limit for a minute, or refuse it."""

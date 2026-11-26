@@ -201,10 +201,13 @@ class Ingest:
         """Run the pollers on a thread of their own until `stop` is called."""
         if self._thread is not None:
             raise RuntimeError("The pollers were already started.")
-        self._thread = threading.Thread(
+        thread = threading.Thread(
             target=self.run, args=(self._stop,), name="beacon-ingest", daemon=True
         )
-        self._thread.start()
+        thread.start()
+        # Kept only once it runs: `stop` joins it, and a thread that never started
+        # cannot be joined.
+        self._thread = thread
 
     def stop(self, timeout: float = STOP_SECONDS, paid_timeout: float = PAID_SECONDS) -> bool:
         """Stop the pollers, and say whether they have stopped: no paid work is

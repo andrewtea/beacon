@@ -23,10 +23,14 @@ the first. So:
   the live store's, is at most `MAX_STORED_BYTES`; past that a tap with media is
   refused until some has expired. When what is stored cannot be counted, nothing
   more is kept.
-- **A file belongs to a row.** A file is written, and synced to the disk, before its
-  tap's row is stored. If Beacon dies in between, the file is there with no row:
-  `beacon.taps.desk` hands out no file without its row, and the sweep deletes one
-  that has had no row for `ORPHANED`.
+- **A file belongs to a row.** A file is written, and synced to the disk with the
+  directories that hold it, before its tap's row is stored. If Beacon dies in
+  between, the file is there with no row: `beacon.taps.desk` hands out no file
+  without its row, nor past the time its row says it is kept until, and the sweep
+  deletes one that has had no row for `ORPHANED`.
+- **One process keeps them.** `TapMedia` holds a lock on the directory for as long as
+  it is open, and a second one, in this process or another, is refused: the limit
+  is counted and the files are swept by whoever writes them, and by nobody else.
 
 What the new picture loses besides: the note of which way up it is, so the app sends
 a picture it has already turned upright, and the colour profile, without the colours
@@ -38,6 +42,8 @@ Nothing here reads a picture or hears a clip. That is the investigator's to do, 
 Ember, and only as evidence for the tap it came with.
 """
 
+import contextlib
+import fcntl
 import io
 import os
 import re
@@ -98,6 +104,10 @@ class MediaFullError(Exception):
     """No more media can be kept until some has expired. The text is fixed."""
 
 
+class MediaLockedError(Exception):
+    """Another `TapMedia` has the directory, in this process or another."""
+
+
 class PhotoConverter(Protocol):
     """Decodes a JPEG and draws it again as a new one. `beacon.radio.audio.Ffmpeg`
     is the one there is."""
@@ -105,7 +115,8 @@ class PhotoConverter(Protocol):
     def to_jpeg(self, photo: bytes, *, max_side: int, max_bytes: int) -> bytes | None:
         """A new JPEG of the picture, or None when it cannot be decoded.
 
-        Raises `beacon.radio.ConversionStopped` when the converter is closed."""
+        Raises `beacon.radio.ConversionUnavailable` when the converter could not be
+        run just now, and `beacon.radio.ConversionStopped` when it is closed."""
         ...
 
 
@@ -117,6 +128,9 @@ class Swept:
     # Files that should have been deleted and could not be. They are still not
     # handed out, and the next sweep tries again.
     failed: int = 0
+    # Files that may have no row, of which the store could not say. They are left
+    # until it can, or until their hour is over, which needs no store.
+    unchecked: int = 0
 
 
 @dataclass(frozen=True)
@@ -146,7 +160,7 @@ def clean_photo(photo: bytes, converter: PhotoConverter) -> Photo:
     decoded if it says it has no more than `MAX_PHOTO_PIXELS`.
 
     Raises MediaError when it is not a JPEG that can be decoded, or is larger than
-    a photo may be, and what `converter` raises when it is closed."""
+    a photo may be, and what `converter` raises when it cannot be run or is closed."""
     drawn = None
     sent = None if len(photo) > MAX_PHOTO_BYTES else _clean_jpeg(photo)
     if sent is not None and sent.width * sent.height <= MAX_PHOTO_PIXELS:
@@ -283,6 +297,11 @@ class TapMedia:
     allowance of its own."""
 
     def __init__(self, root: Path, mode: Mode) -> None:
+        """Take the directory `root`, making it if it is not there, for as long as
+        this is open (`close`).
+
+        Raises MediaLockedError when another `TapMedia` has it, and OSError when it
+        cannot be made or locked."""
         if mode not in get_args(Mode):
             raise ValueError(f"mode must be one of {get_args(Mode)}.")
         self._directory = root / mode
@@ -290,10 +309,39 @@ class TapMedia:
         # One file is checked against the limit and written at a time, and no
         # sweep runs meanwhile.
         self._writing = threading.Lock()
+        _make_directories(root)
+        self._lock = os.open(root / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        locked = False
+        with contextlib.suppress(BlockingIOError):
+            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+        if not locked:
+            os.close(self._lock)
+            self._lock = -1
+            raise_bare(
+                MediaLockedError(
+                    "Another Beacon process is taking taps in this data directory. One "
+                    "server process takes them: stop the other, or give this one a data "
+                    "directory of its own."
+                )
+            )
 
     @property
     def directory(self) -> Path:
         return self._directory
+
+    def close(self) -> None:
+        """Give the directory up. Nothing is kept or swept through this again."""
+        with self._writing:
+            if self._lock >= 0:
+                # Closing the file is what releases its lock.
+                os.close(self._lock)
+                self._lock = -1
+
+    def _held(self) -> None:
+        """Raises OSError when the directory has been given up."""
+        if self._lock < 0:
+            raise OSError("The taps' media is closed.")
 
     def keep(self, tap_id: str, kind: MediaKind, content: bytes, now: datetime) -> datetime:
         """Keep a tap's photo or clip, already cleaned, and return when it will be
@@ -305,7 +353,8 @@ class TapMedia:
         file cannot be written or what is stored cannot be counted."""
         path = self._path(tap_id, kind)
         with self._writing:
-            self._directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self._held()
+            _make_directories(self._directory)
             if self._stored_bytes() + len(content) > MAX_STORED_BYTES:
                 self._sweep(now, None)
                 if self._stored_bytes() + len(content) > MAX_STORED_BYTES:
@@ -316,10 +365,10 @@ class TapMedia:
                 with os.fdopen(descriptor, "wb") as file:
                     file.write(content)
                     file.flush()
-                    # On the disk before the row that names it is.
+                    # Its age is counted from the tap, by the clock the caller keeps.
+                    os.utime(file.fileno(), (now.timestamp(), now.timestamp()))
+                    # On the disk, with its age, before the row that names it is.
                     os.fsync(file.fileno())
-                # Its age is counted from the tap, by the clock the caller keeps.
-                os.utime(part, (now.timestamp(), now.timestamp()))
                 os.replace(part, path)
                 _sync_directory(self._directory)
             except BaseException:
@@ -327,13 +376,18 @@ class TapMedia:
                 raise
         return now + KEPT
 
-    def read(self, tap_id: str, kind: MediaKind, now: datetime) -> bytes | None:
-        """A tap's photo or clip, or None when it sent none or its hour is over. A
-        file whose hour is over is deleted here, if the sweep has not got to it."""
+    def read(
+        self, tap_id: str, kind: MediaKind, now: datetime, kept_until: datetime | None = None
+    ) -> bytes | None:
+        """A tap's photo or clip, or None when it sent none or its hour is over. The
+        hour is counted from the file's own time, and is over at `kept_until` at
+        the latest, whatever the file's time says: a file that was restored from a
+        copy is as old as its tap. A file whose hour is over is deleted here, if
+        the sweep has not got to it."""
         path = self._path(tap_id, kind)
         try:
             written = datetime.fromtimestamp(path.stat().st_mtime, UTC)
-            if now - written >= KEPT:
+            if now - written >= KEPT or (kept_until is not None and now >= kept_until):
                 path.unlink(missing_ok=True)
                 return None
             return path.read_bytes()
@@ -368,6 +422,7 @@ class TapMedia:
             return self._sweep(now, with_rows)
 
     def _sweep(self, now: datetime, with_rows: Callable[[list[str]], set[str]] | None) -> Swept:
+        self._held()
         failed = 0
         over: list[Path] = []
         # The files that are old enough to be missed, by the tap each says it is of.
@@ -385,19 +440,21 @@ class TapMedia:
                 over.append(path)
             elif with_rows is not None and path.parent == self._directory and age >= ORPHANED:
                 unsure[path] = path.name.split(".", 1)[0]
+        # What is over is deleted first, and needs nothing but the clock: a store
+        # that cannot be read keeps no photo past its hour.
+        deleted, undeleted = _delete(over)
+        unchecked = 0
         if unsure and with_rows is not None:
-            stored = with_rows(sorted(set(unsure.values())))
-            over += [path for path, tap_id in unsure.items() if tap_id not in stored]
-        deleted = 0
-        for path in over:
             try:
-                path.unlink()
-                deleted += 1
-            except FileNotFoundError:
-                continue
-            except OSError:
-                failed += 1
-        return Swept(deleted, failed)
+                stored = with_rows(sorted(set(unsure.values())))
+            except Exception:
+                # Nothing says these have no row, so they are left for now.
+                unchecked = len(unsure)
+            else:
+                orphaned = [path for path, tap_id in unsure.items() if tap_id not in stored]
+                more, more_undeleted = _delete(orphaned)
+                deleted, undeleted = deleted + more, undeleted + more_undeleted
+        return Swept(deleted, failed + undeleted, unchecked)
 
     def _stored_bytes(self) -> int:
         """What all the media takes, in both stores' directories. Raises OSError
@@ -428,6 +485,36 @@ class TapMedia:
             # is never made into a path.
             raise ValueError("That is not a tap's id and a kind of media.")
         return self._directory / f"{tap_id}.{_SUFFIX[kind]}"
+
+
+def _delete(paths: list[Path]) -> tuple[int, int]:
+    """Delete these files. Returns how many were deleted, and how many are still
+    there because they could not be."""
+    deleted = failed = 0
+    for path in paths:
+        try:
+            path.unlink()
+            deleted += 1
+        except FileNotFoundError:
+            continue
+        except OSError:
+            failed += 1
+    return deleted, failed
+
+
+def _make_directories(directory: Path) -> None:
+    """Make a directory and the ones above it that are missing, for Beacon's own
+    user only, and have the disk hold each new one's entry in the directory above
+    it: a file is not durable in a directory that is not."""
+    missing = []
+    at = directory
+    while not at.is_dir() and at != at.parent:
+        missing.append(at)
+        at = at.parent
+    for made in reversed(missing):
+        with contextlib.suppress(FileExistsError):
+            made.mkdir(mode=0o700)
+        _sync_directory(made.parent)
 
 
 def _sync_directory(directory: Path) -> None:

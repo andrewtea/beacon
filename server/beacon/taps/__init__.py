@@ -15,7 +15,7 @@ from collections.abc import Mapping
 
 from beacon.ember.client import default_data_dir
 from beacon.ingest.setup import open_store
-from beacon.radio.audio import Ffmpeg
+from beacon.radio.audio import Ffmpeg, core_dump_problem
 from beacon.taps.desk import (
     MAX_TAPS_AT_ONCE,
     MAX_TAPS_PER_MINUTE,
@@ -34,6 +34,7 @@ from beacon.taps.media import (
     Clip,
     MediaError,
     MediaKind,
+    MediaLockedError,
     Photo,
     PhotoConverter,
     Swept,
@@ -55,6 +56,7 @@ __all__ = [
     "Clip",
     "MediaError",
     "MediaKind",
+    "MediaLockedError",
     "Photo",
     "PhotoConverter",
     "Swept",
@@ -75,19 +77,31 @@ def open_taps(env: Mapping[str, str]) -> Taps:
     environment picks (`beacon.ingest.open_store`), and their media is kept beside
     it under the data directory, apart for the mock store and the live one.
 
-    A photo is drawn again by ffmpeg, confined by bubblewrap, which needs Linux.
-    Where that cannot be run, the log says so, and a tap that sends a photo is
+    A photo is drawn again by ffmpeg, confined by bubblewrap, which needs Linux,
+    on a host that does not hand a crashed program's memory to a collector
+    (`beacon.radio.core_dump_problem`): ffmpeg holds the photo while it draws it.
+    Where either is not so, the log says so, and a tap that sends a photo is
     refused: a photo is not kept as it was sent.
 
-    Raises what `open_store` raises."""
+    Raises what `open_store` raises, MediaLockedError when another process is
+    taking taps in the same data directory, and OSError when the media directory
+    cannot be made."""
     data = default_data_dir(env)
     # ffmpeg is shown the system's programs and nothing of Beacon's.
     photos: Ffmpeg | None = Ffmpeg(hidden=[data])
-    if photos is not None and photos.problem() is not None:
+    if photos.problem() is not None or core_dump_problem() is not None:
         logger.warning(
-            "Taps are taken without photos: a photo is drawn again by ffmpeg, confined "
-            "by bubblewrap (bwrap), on Linux, and that cannot be run here."
+            "Taps are taken without photos. A photo is drawn again by ffmpeg, confined "
+            "by bubblewrap (bwrap), on Linux, on a host that hands no core dump to a "
+            "collector (kernel.core_pattern beginning with | or @), and one of those "
+            "is not so here."
         )
         photos = None
     store = open_store(env)
-    return Taps(store, TapMedia(data / "taps", store.mode), photos=photos)
+    try:
+        media = TapMedia(data / "taps", store.mode)
+    except BaseException:
+        # Nothing is left open by taps that were not opened.
+        store.close()
+        raise
+    return Taps(store, media, photos=photos)

@@ -2,6 +2,7 @@
 
 import io
 import os
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -23,6 +24,7 @@ from beacon.taps.media import (
     ORPHANED,
     MediaError,
     MediaFullError,
+    MediaLockedError,
     Swept,
     TapMedia,
     clean_clip,
@@ -60,6 +62,15 @@ OTHER = "tap-BBBBBBBBBBBB"
 
 # What a phone's file says besides its picture. All of it is invented.
 SECRETS = (b"GPSLatitude 37.7763", b"Jane Doe's iPhone", b"taken at home", b"a second picture")
+
+
+def kept(directory: Path) -> list[str]:
+    """Every file under a directory but the lock a `TapMedia` holds on its own."""
+    return sorted(
+        str(path.relative_to(directory))
+        for path in directory.rglob("*")
+        if path.is_file() and path.name != ".lock"
+    )
 
 
 def segment(marker: int, payload: bytes) -> bytes:
@@ -438,7 +449,9 @@ def test_the_other_stores_media_is_swept_and_counted_and_never_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Kept while Beacon ran on the invented scenario, by real people all the same.
-    TapMedia(tmp_path, "mock").keep(TAP, "photo", b"0123456789", NOON)
+    mock = TapMedia(tmp_path, "mock")
+    mock.keep(TAP, "photo", b"0123456789", NOON)
+    mock.close()
     live = TapMedia(tmp_path, "live")
 
     # It is the other store's, so it is not this one's to hand out, and nothing
@@ -547,6 +560,108 @@ def test_a_name_that_is_not_shaped_as_a_taps_id_is_never_made_into_a_path(
     with pytest.raises(ValueError, match="not a tap's id"):
         media.read(TAP, "video", NOON)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="mode must be"):
-        TapMedia(tmp_path / "taps", "../elsewhere")  # type: ignore[arg-type]
+        TapMedia(tmp_path / "elsewhere", "../elsewhere")  # type: ignore[arg-type]
 
-    assert not (tmp_path / "taps").exists()
+    assert kept(tmp_path) == []
+
+
+def test_a_sweep_deletes_what_is_over_though_the_store_cannot_say_which_files_have_rows(
+    tmp_path: Path,
+) -> None:
+    media = TapMedia(tmp_path, "mock")
+    media.keep(TAP, "photo", b"a picture", NOON)
+    media.keep(OTHER, "photo", b"a picture", NOON + timedelta(minutes=50))
+
+    def broken(_tap_ids: list[str]) -> set[str]:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    # An hour after the first: it is over, which needs no store to know. The
+    # second may have no row, and nothing says so, so it is left and counted.
+    swept = media.sweep(NOON + KEPT, broken)
+
+    assert swept == Swept(deleted=1, failed=0, unchecked=1)
+    assert kept(tmp_path) == [f"mock/{OTHER}.photo.jpg"]
+
+
+def test_one_process_at_a_time_keeps_the_media_of_a_data_directory(tmp_path: Path) -> None:
+    media = TapMedia(tmp_path / "taps", "mock")
+
+    # Not a second one here, for either store, and not one in another process.
+    for mode in ("mock", "live"):
+        with pytest.raises(MediaLockedError, match="Another Beacon process is taking taps"):
+            TapMedia(tmp_path / "taps", mode)  # type: ignore[arg-type]
+    other = (
+        "import sys; from pathlib import Path; from beacon.taps.media import *\n"
+        "try: TapMedia(Path(sys.argv[1]), 'mock')\n"
+        "except MediaLockedError: print('locked')\n"
+        "else: print('taken')\n"
+    )
+    command = [sys.executable, "-c", other, str(tmp_path / "taps")]
+    assert subprocess.run(command, capture_output=True, text=True, check=True).stdout == "locked\n"
+
+    media.close()
+
+    # Given up, it keeps and sweeps nothing more, and another may take it.
+    with pytest.raises(OSError, match="closed"):
+        media.keep(TAP, "photo", b"a picture", NOON)
+    with pytest.raises(OSError, match="closed"):
+        media.sweep(NOON)
+    assert subprocess.run(command, capture_output=True, text=True, check=True).stdout == "taken\n"
+    TapMedia(tmp_path / "taps", "live").close()
+
+
+def test_a_file_is_on_the_disk_with_its_age_and_its_directories_before_it_is_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    done: list[tuple[str, str]] = []
+    real_fsync, real_utime, real_replace = os.fsync, os.utime, os.replace
+
+    def fsync(descriptor: int) -> None:
+        done.append(("sync", os.path.relpath(os.readlink(f"/proc/self/fd/{descriptor}"), tmp_path)))
+        real_fsync(descriptor)
+
+    def utime(target: object, times: tuple[float, float]) -> None:
+        done.append(("age", ""))
+        real_utime(target, times)  # type: ignore[arg-type]
+
+    def replace(source: Path, target: Path) -> None:
+        done.append(("name", target.name))
+        real_replace(source, target)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "utime", utime)
+    monkeypatch.setattr(os, "replace", replace)
+
+    media = TapMedia(tmp_path / "data" / "taps", "mock")
+    media.keep(TAP, "photo", b"a picture", NOON)
+
+    assert done == [
+        # Each directory that was made is held by the one above it.
+        ("sync", "."),
+        ("sync", "data"),
+        ("sync", "data/taps"),
+        # The file's age is set before the file is synced, and both before it has
+        # the name it is read by. Then the directory holds the name.
+        ("age", ""),
+        ("sync", f"data/taps/mock/.{TAP}.photo.jpg.part"),
+        ("name", f"{TAP}.photo.jpg"),
+        ("sync", "data/taps/mock"),
+    ]
+    # Each of them is Beacon's alone.
+    for directory in ("data", "data/taps", "data/taps/mock"):
+        assert stat.S_IMODE((tmp_path / directory).stat().st_mode) == 0o700
+
+
+def test_a_file_is_not_read_after_the_moment_its_tap_was_told_whatever_its_own_age(
+    tmp_path: Path,
+) -> None:
+    media = TapMedia(tmp_path, "mock")
+    kept_until = media.keep(TAP, "photo", b"a picture", NOON)
+    # Restored from a copy an hour later, which made the file new again.
+    path = tmp_path / "mock" / f"{TAP}.photo.jpg"
+    os.utime(path, ((NOON + KEPT).timestamp(), (NOON + KEPT).timestamp()))
+
+    assert media.read(TAP, "photo", NOON + KEPT) == b"a picture"
+    assert media.read(TAP, "photo", NOON + KEPT, kept_until) is None
+
+    assert not path.exists()
