@@ -99,6 +99,8 @@ export function MapView({
               />
               {tiles !== null && (
                 <p className="meta">
+                  {answer.mode === 'mock' &&
+                    'The streets are real. What is drawn on them is invented. '}
                   The street map is loaded from the servers named on it, which
                   are asked for the streets around this incident. Beacon sends
                   them nothing of your taps or your places.

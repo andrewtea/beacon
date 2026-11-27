@@ -3,6 +3,7 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import App from './App.tsx'
 import type { Feature, MapAnswer, Source } from './api/incidents.ts'
 import { MapCanvas } from './components/MapCanvas.tsx'
+import { DISC, SIZE } from './lib/marks.ts'
 import { parseRoute } from './lib/router.ts'
 import { frameOf, gridOf, OSM_TILES, tilesFrom } from './lib/tiles.ts'
 import { fireIncident } from './test/fixtures.ts'
@@ -29,7 +30,8 @@ const source = (from: Partial<Source>): Source => ({
 const CREDIT = { text: 'data provided by 511.org', url: 'https://511.org' }
 
 // Sentences of the server's, which the view shows as they are given.
-const PLACE = 'The point Beacon has for the block named on the radio.'
+const PLACE =
+  'The point Beacon’s list of blocks has for the block named on the radio. It marks the block, not an address.'
 const EVENT = '511 lists: Hayes St closed between Gough St and Octavia St.'
 const AIRCRAFT = 'A helicopter (MOCKH1) circled nearby for about 6 min.'
 const ALERT = 'The Department issued an alert, Shelter In Place Warning.'
@@ -139,6 +141,40 @@ test('the map is a view of one incident, named in the fragment', () => {
   expect(parseRoute(`#/incident/${ID}/map`)).toEqual({ view: 'map', id: ID })
   expect(parseRoute(`#/incident/${ID}/map/more`)).toEqual({ view: 'unknown' })
   expect(parseRoute('#/map')).toEqual({ view: 'unknown' })
+})
+
+test('only an incident’s id names an incident’s page or its map, so a tap’s id is never asked of the incident routes', async () => {
+  // What a tap's id looks like, and other things that are no incident's id.
+  const TAP = 'q3J9xT-4bWm_Zk2A'
+  for (const id of [
+    TAP,
+    'inc-0942f7593037801',
+    'inc-0942f75930378016a',
+    'inc-0942F75930378016',
+    'INC-0942f75930378016',
+    '0942f75930378016',
+  ]) {
+    expect(parseRoute(`#/incident/${id}`)).toEqual({ view: 'unknown' })
+    expect(parseRoute(`#/incident/${id}/map`)).toEqual({ view: 'unknown' })
+  }
+  // A tap's own views take it as before.
+  expect(parseRoute(`#/tap/${TAP}`)).toEqual({ view: 'tap', id: TAP })
+  expect(parseRoute(`#/tap/${TAP}/trace`)).toEqual({ view: 'trace', id: TAP })
+
+  for (const fragment of [`#/incident/${TAP}/map`, `#/incident/${TAP}`]) {
+    window.location.hash = fragment
+    const asked = serve({ 'GET /api/health': MOCK_HEALTH })
+    const view = render(<App />)
+    // The app is up, and has asked nothing that holds the id.
+    await waitFor(() =>
+      expect(asked.map((request) => request.key)).toContain('GET /api/health'),
+    )
+    expect(asked.filter((request) => request.key.includes(TAP))).toEqual([])
+    expect(
+      asked.filter((request) => request.key.includes('/api/incidents')),
+    ).toEqual([])
+    view.unmount()
+  }
 })
 
 test('a position falls among the tiles where the tile grid has it', () => {
@@ -320,6 +356,13 @@ test('the street map is OpenStreetMap’s tiles around the incident, with their 
     'https://www.openstreetmap.org/copyright',
   )
   expect(credit.closest('.map-canvas')).not.toBeNull()
+  // 511's credit is on the picture too, beside the tiles': something of 511's
+  // is drawn.
+  expect(
+    within(credit.closest('.map-canvas') as HTMLElement).getByRole('link', {
+      name: CREDIT.text,
+    }),
+  ).toHaveAttribute('href', CREDIT.url)
   // Sixteen tiles at most, all around the incident.
   expect(tiles()).toHaveLength(16)
   expect(tiles()).toContain('https://tile.openstreetmap.org/15/5240/12665.png')
@@ -334,10 +377,16 @@ test('the street map is OpenStreetMap’s tiles around the incident, with their 
       tile.getAttribute('referrerpolicy'),
     ),
   ).toEqual(Array(16).fill('strict-origin-when-cross-origin'))
-  // The streets are real and what is drawn is not: the picture says so itself.
+  // The streets are real and what is drawn is not: the picture says so itself,
+  // and the words under it say which is which.
   expect(
     within(credit.closest('.map-canvas') as HTMLElement).getByText(
-      'Invented scenario on a real street map',
+      'Invented scenario',
+    ),
+  ).toBeInTheDocument()
+  expect(
+    screen.getByText(
+      /^The streets are real\. What is drawn on them is invented\./,
     ),
   ).toBeInTheDocument()
 
@@ -362,50 +411,104 @@ test('a real incident’s map does not say it is invented', async () => {
 
   expect(await screen.findByText(PLACE)).toBeInTheDocument()
   expect(screen.queryByText(/Invented scenario/)).toBeNull()
+  expect(screen.queryByText(/What is drawn on them is invented/)).toBeNull()
 })
 
-test('with no street map, what Beacon places is drawn on a plain ground and no tile is asked for', () => {
+const canvas = (drawn: Feature[], invented = false) =>
   render(
     <MapCanvas
       centre={HAYES}
-      features={features}
+      features={drawn}
       tiles={null}
-      invented={false}
+      invented={invented}
     />,
   )
-
-  expect(tiles()).toEqual([])
-  expect(screen.queryByRole('link')).toBeNull()
-  expect(document.querySelectorAll('.map-mark')).toHaveLength(4)
-})
-
-test('things at one point stand side by side, and the incident is in the middle of the picture', () => {
-  render(
-    <MapCanvas
-      centre={HAYES}
-      features={features}
-      tiles={null}
-      invented={false}
-    />,
-  )
-
-  const spots = [...document.querySelectorAll('.map-mark')].map((mark) => {
+const numbers = () =>
+  [...document.querySelectorAll('.map-mark')].map((mark) => {
     const [x, y] = /translate\(([\d.]+) ([\d.]+)\)/
       .exec(mark.getAttribute('transform') ?? '')!
       .slice(1)
       .map(Number)
     return { x, y }
   })
-  // The picture is 300 across: the incident's own point is its middle.
-  expect(spots[0]).toEqual({ x: 150, y: 150 })
-  // The 511 event is on the same point, and its number does not cover the
-  // incident's.
-  expect(spots[1].y).toBe(150)
-  expect(spots[1].x - spots[0].x).toBeGreaterThanOrEqual(17)
-  // No two numbers cover one another.
-  for (const [index, spot] of spots.entries())
+const spotsOf = (selector: string, x: string, y: string) =>
+  [...document.querySelectorAll(selector)].map((found) => ({
+    x: Number(found.getAttribute(x)),
+    y: Number(found.getAttribute(y)),
+  }))
+// Where the frame puts a position, in the picture's own units.
+const projected = (place: { lat: number; lon: number }) => {
+  const { x, y } = frameOf(HAYES, 15, null).project(place)
+  return { x: Number((x * SIZE).toFixed(2)), y: Number((y * SIZE).toFixed(2)) }
+}
+
+test('with no street map, what Beacon places is drawn on a plain ground, no tile is asked for, and 511’s credit is still on the picture', () => {
+  canvas(features, true)
+
+  expect(tiles()).toEqual([])
+  expect(document.querySelectorAll('.map-mark')).toHaveLength(4)
+  // No tiles, so no tiles' credit; and 511's, because its event is drawn.
+  const picture = document.querySelector('.map-canvas') as HTMLElement
+  const links = within(picture).getAllByRole('link')
+  expect(links.map((link) => link.textContent)).toEqual([CREDIT.text])
+  expect(links[0]).toHaveAttribute('href', CREDIT.url)
+  // The invented scenario is called that whatever it is drawn on, and is not
+  // said to be on a street map that is not there.
+  expect(within(picture).getByText('Invented scenario')).toBeInTheDocument()
+  expect(within(picture).queryByText(/street map/)).toBeNull()
+})
+
+test('a picture with nothing of a credited source on it shows no credit', () => {
+  canvas([features[0], features[2], features[3]])
+
+  expect(screen.queryByRole('link')).toBeNull()
+  expect(document.querySelector('.map-credits')).toBeNull()
+})
+
+test('a place whose point is 511’s puts 511’s credit on the picture', () => {
+  canvas([
+    feature({
+      point: HAYES,
+      confidence: 'official',
+      sources: [
+        source({ kind: 'traffic', source: '511', model: null, credit: CREDIT }),
+      ],
+    }),
+  ])
+
+  expect(screen.getByRole('link', { name: CREDIT.text })).toHaveAttribute(
+    'href',
+    CREDIT.url,
+  )
+})
+
+test('a thing’s dot is at its own point and only its number is moved, joined to the dot by a line', () => {
+  canvas(features)
+
+  const spots = numbers()
+  const dots = spotsOf('.map-dot', 'cx', 'cy')
+  // The picture is 300 across, and the incident's own point is its middle.
+  // The 511 event is on the same point: both dots are there, and neither moved.
+  expect(dots.slice(0, 2)).toEqual([
+    { x: 150, y: 150 },
+    { x: 150, y: 150 },
+  ])
+  // The aircraft's dot is the newest position it was seen at. An area has no
+  // dot: its number names an outline and no point.
+  expect(dots[2]).toEqual(projected(features[2].path[1]))
+  expect(dots).toHaveLength(3)
+  // No number is on a dot, and no two numbers cover one another.
+  for (const [index, spot] of spots.entries()) {
+    for (const dot of dots)
+      expect(Math.hypot(spot.x - dot.x, spot.y - dot.y)).toBeGreaterThan(DISC)
     for (const other of spots.slice(index + 1))
-      expect(Math.hypot(spot.x - other.x, spot.y - other.y)).toBeGreaterThan(17)
+      expect(Math.hypot(spot.x - other.x, spot.y - other.y)).toBeGreaterThan(
+        2 * DISC,
+      )
+  }
+  // Each number of a thing with a point is joined to that thing's dot.
+  expect(spotsOf('.map-leader', 'x1', 'y1')).toEqual(dots)
+  expect(spotsOf('.map-leader', 'x2', 'y2')).toEqual(spots.slice(0, 3))
   // An area is drawn with its outline closed, and an aircraft as a line
   // through where it was seen.
   expect(document.querySelector('.map-area')?.getAttribute('d')).toMatch(
@@ -414,6 +517,37 @@ test('things at one point stand side by side, and the incident is in the middle 
   expect(
     document.querySelector('.map-path')?.getAttribute('points')?.split(' '),
   ).toHaveLength(2)
+})
+
+test('things at one point near the edge keep their dots there, and their numbers stay whole inside the picture', () => {
+  // Three 511 events at one point, in the north-east corner of the view, each
+  // about two units from the edges.
+  const corner = { lat: HAYES.lat + 0.01289, lon: HAYES.lon + 0.01626 }
+  const event = feature({ ...features[1], point: corner })
+  canvas([features[0], event, event, event])
+
+  const there = projected(corner)
+  expect(there.x).toBeGreaterThan(SIZE - 4)
+  expect(there.x).toBeLessThan(SIZE)
+  expect(there.y).toBeGreaterThan(0)
+  expect(there.y).toBeLessThan(4)
+  const dots = spotsOf('.map-dot', 'cx', 'cy')
+  expect(dots).toEqual([{ x: 150, y: 150 }, there, there, there])
+  const spots = numbers()
+  expect(spots).toHaveLength(4)
+  for (const [index, spot] of spots.entries()) {
+    // Whole inside the picture: the disc, not only its middle.
+    for (const value of [spot.x, spot.y]) {
+      expect(value).toBeGreaterThanOrEqual(DISC)
+      expect(value).toBeLessThanOrEqual(SIZE - DISC)
+    }
+    for (const other of spots.slice(index + 1))
+      expect(Math.hypot(spot.x - other.x, spot.y - other.y)).toBeGreaterThan(
+        2 * DISC,
+      )
+  }
+  expect(spotsOf('.map-leader', 'x1', 'y1')).toEqual(dots)
+  expect(spotsOf('.map-leader', 'x2', 'y2')).toEqual(spots)
 })
 
 test('a medical response has no map: the server’s sentence is shown and nothing else', async () => {

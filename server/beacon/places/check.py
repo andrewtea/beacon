@@ -1,8 +1,8 @@
 """Does this affect me? What Beacon has near a place a person saved.
 
 The answer is a distance and no more. Code measures how far the point Beacon has
-for each open incident (its block's, or a 511 closure's) is from the saved place,
-and says that, with how roughly both are known. It does not say that a place is
+for each open incident (its block's, or one taken from a 511 event) is from the
+saved place, and says that, with how roughly both are known. It does not say that a place is
 inside or outside the area of an order or an alert: a notice's row keeps streets and
 no area, and the saved place is known only to about a block. So every answer carries
 `NOT_AN_AREA`, and what an authority published is shown as published, with its link,
@@ -44,17 +44,21 @@ NOTHING_NEAR = (
 )
 NOT_AN_AREA = (
     "A distance here is between the point Beacon has for an incident, which is its "
-    "block's or a road closure's, and this place as it was saved, rounded to about a "
-    "block. It is rough. A distance does not tell you whether this place is inside or "
-    "outside the area of an official order or alert. What an authority published says "
-    "which area it covers."
+    "block's or an approximate one taken from a 511 event that listed a road closure, "
+    "and this place as it was saved, rounded to about a block. It is rough. A distance "
+    "does not tell you whether this place is inside or outside the area of an official "
+    "order or alert. What an authority published says which area it covers."
 )
 # Said with a distance that is measured from a point of 511's. "Listed", not
 # "lists": the point is from the version of a 511 event that had a road of the
 # incident's closed, and a later version can have it open again. The point is
 # still where the incident is taken to be; whether 511 lists a closure now is the
-# timeline's to say.
-_FROM_511 = ", going by where 511 listed a road closure on its street"
+# timeline's to say. And not "where 511 listed it": the point is the middle of
+# what 511 drew for the event, which Beacon worked out.
+_FROM_511 = (
+    ", measured from an approximate point Beacon took from a 511 event that listed a "
+    "road closure on its street"
+)
 
 
 @dataclass(frozen=True)

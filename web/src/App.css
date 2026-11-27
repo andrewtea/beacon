@@ -1195,6 +1195,29 @@ button.quiet:hover {
   stroke-width: 1.6;
 }
 
+/* A thing's own point, which is never moved, and the line that joins it to
+   its number. */
+.map-dot {
+  fill: #0b1f33;
+  stroke: #fff;
+  stroke-width: 1.2;
+}
+
+.map-leader-casing,
+.map-leader {
+  stroke-linecap: round;
+}
+
+.map-leader-casing {
+  stroke: #fff;
+  stroke-width: 3;
+}
+
+.map-leader {
+  stroke: #0b1f33;
+  stroke-width: 1.2;
+}
+
 .map-mark circle {
   stroke: #0b1f33;
   stroke-width: 1.4;
@@ -1237,15 +1260,25 @@ button.quiet:hover {
   background: var(--bg);
 }
 
-.map-credit {
+.map-credits {
   position: absolute;
   right: 0;
   bottom: 0;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0 0.75rem;
+  max-width: 100%;
+  margin: 0;
   padding: 0.15rem 0.45rem;
   border-top-left-radius: 0.4rem;
   background: rgb(255 255 255 / 88%);
-  color: #12304d;
   font-size: 0.78rem;
+}
+
+.map-credits .credit {
+  color: #12304d;
+  font-size: inherit;
 }
 
 .map-zoom {

@@ -1,5 +1,6 @@
 import { useState } from 'react'
-import type { Feature, Point } from '../api/incidents.ts'
+import type { Credit, Feature, Point } from '../api/incidents.ts'
+import { at, DISC, DOT, marksOf, SIZE } from '../lib/marks.ts'
 import {
   DEFAULT_ZOOM,
   frameOf,
@@ -7,69 +8,27 @@ import {
   type Tiles,
   ZOOMS,
 } from '../lib/tiles.ts'
+import { CreditLine } from './Provenance.tsx'
 
 // The picture of one incident's map: the street map's tiles, and over them what
 // Beacon places, each thing under the number it has in the list below the map.
 // The picture says nothing by itself: every word about a thing, its confidence,
-// and its sources are in that list.
+// and its sources are in that list. Where a thing's dot and its number go is
+// `marksOf` (`lib/marks.ts`): the dot is the thing's own point and is not moved.
 
-// The overlay is drawn in these units across and down.
-const SIZE = 300
-
-const at = (frame: MapFrame, place: Point): { x: number; y: number } => {
-  const { x, y } = frame.project(place)
-  return { x: x * SIZE, y: y * SIZE }
-}
-
-const inView = (spot: { x: number; y: number }): boolean =>
-  spot.x >= 0 && spot.x <= SIZE && spot.y >= 0 && spot.y <= SIZE
-
-// How far apart two numbers are kept, so that neither covers the other.
-const APART = 19
-
-/** Where a thing's number goes: on its point, on the newest position of an
- * aircraft that is in view, or at the north-west corner of the part of an area that is in view
- * (its middle is where the incident is). Null when there is nowhere to put it. */
-function anchorOf(
-  frame: MapFrame,
-  feature: Feature,
-): { x: number; y: number } | null {
-  if (feature.point !== null) return at(frame, feature.point)
-  if (feature.path.length > 0) {
-    // The newest position that is in view, or failing one, the newest.
-    const seen = feature.path.map((position) => at(frame, position))
-    return seen.findLast(inView) ?? seen[seen.length - 1]
-  }
-  const corners = feature.rings.flat().map((point) => at(frame, point))
-  if (corners.length === 0) return null
-  const inside = (value: number) => Math.max(12, Math.min(SIZE - 12, value))
-  return {
-    x: inside(Math.min(...corners.map((corner) => corner.x))),
-    y: inside(Math.min(...corners.map((corner) => corner.y))),
-  }
-}
-
-/** Where each thing's number is drawn: its anchor, moved east while it would
- * cover a number that is already placed. Things at one point, as an incident
- * and a closure on its block are, then stand side by side. */
-function marksOf(
-  frame: MapFrame,
-  features: Feature[],
-): ({ x: number; y: number } | null)[] {
-  const placed: { x: number; y: number }[] = []
-  return features.map((feature) => {
-    const anchor = anchorOf(frame, feature)
-    if (anchor === null || !inView(anchor)) return null
-    const spot = { ...anchor }
-    while (
-      placed.some(
-        (other) => Math.hypot(other.x - spot.x, other.y - spot.y) < APART,
+/** The credits the sources of what is drawn ask for, each once. */
+function creditsOf(features: Feature[]): Credit[] {
+  const found: Credit[] = []
+  for (const feature of features)
+    for (const { credit } of feature.sources)
+      if (
+        credit !== null &&
+        !found.some(
+          (other) => other.text === credit.text && other.url === credit.url,
+        )
       )
-    )
-      spot.x += APART
-    placed.push(spot)
-    return spot
-  })
+        found.push(credit)
+  return found
 }
 
 function Shape({ frame, feature }: { frame: MapFrame; feature: Feature }) {
@@ -116,13 +75,14 @@ export function MapCanvas({
   // The street map's tiles, or null to draw on a plain ground.
   tiles: Tiles | null
   // Whether what is drawn is the invented scenario's: the picture then says so
-  // itself, because the streets under it are real.
+  // itself, whatever it is drawn on.
   invented: boolean
 }) {
   const [zoom, setZoom] = useState<number>(DEFAULT_ZOOM)
   const frame = frameOf(centre, zoom, tiles)
   const level = ZOOMS.indexOf(zoom as (typeof ZOOMS)[number])
   const marks = marksOf(frame, features)
+  const credits = creditsOf(features)
   return (
     <div className="map-wrap">
       <div className={tiles === null ? 'map-canvas plain' : 'map-canvas'}>
@@ -156,16 +116,51 @@ export function MapCanvas({
           {features.map((feature, index) => (
             <Shape key={index} frame={frame} feature={feature} />
           ))}
+          {marks.map(
+            (mark, index) =>
+              mark !== null &&
+              mark.dot !== null && (
+                <g key={index}>
+                  <line
+                    className="map-leader-casing"
+                    x1={mark.dot.x.toFixed(2)}
+                    y1={mark.dot.y.toFixed(2)}
+                    x2={mark.number.x.toFixed(2)}
+                    y2={mark.number.y.toFixed(2)}
+                  />
+                  <line
+                    className="map-leader"
+                    x1={mark.dot.x.toFixed(2)}
+                    y1={mark.dot.y.toFixed(2)}
+                    x2={mark.number.x.toFixed(2)}
+                    y2={mark.number.y.toFixed(2)}
+                  />
+                </g>
+              ),
+          )}
+          {marks.map(
+            (mark, index) =>
+              mark !== null &&
+              mark.dot !== null && (
+                <circle
+                  key={index}
+                  className="map-dot"
+                  cx={mark.dot.x.toFixed(2)}
+                  cy={mark.dot.y.toFixed(2)}
+                  r={DOT}
+                />
+              ),
+          )}
           {features.map((feature, index) => {
-            const anchor = marks[index]
-            if (anchor === null) return null
+            const mark = marks[index]
+            if (mark === null) return null
             return (
               <g
                 key={index}
                 className={`map-mark map-mark-${feature.kind}`}
-                transform={`translate(${anchor.x.toFixed(2)} ${anchor.y.toFixed(2)})`}
+                transform={`translate(${mark.number.x.toFixed(2)} ${mark.number.y.toFixed(2)})`}
               >
-                <circle r="8.5" />
+                <circle r={DISC} />
                 <text textAnchor="middle" dy="0.35em">
                   {index + 1}
                 </text>
@@ -174,19 +169,30 @@ export function MapCanvas({
           })}
         </svg>
         {invented && (
-          <span className="tag stand-in map-invented">
-            Invented scenario on a real street map
-          </span>
+          <span className="tag stand-in map-invented">Invented scenario</span>
         )}
-        {tiles !== null && (
-          <a
-            className="map-credit"
-            href={tiles.credit.url}
-            target="_blank"
-            rel="noreferrer"
-          >
-            {tiles.credit.text}
-          </a>
+        {/* The words the tiles' terms and each source's terms ask for, on the
+            picture itself: 511's are here whenever something of 511's is
+            drawn, with a street map under it or not. */}
+        {(tiles !== null || credits.length > 0) && (
+          <p className="map-credits">
+            {tiles !== null && (
+              <a
+                className="credit"
+                href={tiles.credit.url}
+                target="_blank"
+                rel="noreferrer"
+              >
+                {tiles.credit.text}
+              </a>
+            )}
+            {credits.map((credit) => (
+              <CreditLine
+                key={`${credit.text} ${credit.url}`}
+                credit={credit}
+              />
+            ))}
+          </p>
         )}
       </div>
       <div

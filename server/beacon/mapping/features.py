@@ -4,29 +4,36 @@ Four kinds of thing, each of which the incident already has as a line of its
 timeline or as its place. The map adds where each is, and no claim of its own:
 
 - `place`: the point Beacon has for the incident. It is the point of the hundred
-  block named on the radio, from the list of blocks, or else where 511 listed a
-  closure on the incident's street. The sentence says which, and that it marks a
-  block and no address.
+  block named on the radio, from the list of blocks, or else a point Beacon took
+  from a 511 event that listed a street of the incident's as closed. The sentence
+  says which. The second is approximate, and says so: the radio need have named no
+  block, and the point is the middle of the box around what 511 drew for the event,
+  which Beacon worked out and which need not lie on the road.
 - `traffic_event`: a 511 event of the incident's, as its version in force has it,
   in 511's own headline. Only the version in force is drawn: an earlier one can be
-  about a road that is open again.
+  about a road that is open again. It is drawn at the same kind of middle, and its
+  note says so.
 - `aircraft`: an aircraft the incident's timeline has, with the positions it was
-  seen at near the place.
+  seen at near the place. Its sources are the rows of every position that is drawn,
+  with the rows its sentence rests on.
 - `alert_area`: the area an authority drew for an alert that is in force for the
   place. An alert that is not known to be in force is not drawn, and neither is one
-  that was issued for a whole zone, which has no drawn area.
+  that was issued for a whole zone, which has no drawn area. **An area is drawn
+  whole or not at all**: with one ring that cannot be read, a hole included, none
+  of it is drawn and the note says so, because an area without one of its holes
+  shows a place as inside it that the alert leaves out.
 
 Nothing of a tap is drawn: a tap's point is its sender's. A notice has no place and
 is not drawn. A medical response has no map (`NO_MAP_OF_MEDICAL`).
 """
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
 from beacon.evidence import Confidence, Evidence, Point
-from beacon.incident import Entry, Incident, Source, weakest
+from beacon.incident import Entry, Incident, Source, source_of, weakest
 from beacon.radio.vocabulary import MEDICAL_EVENT
 
 # The most positions of one aircraft that are drawn: the newest ones.
@@ -42,21 +49,36 @@ NO_MAP_OF_MEDICAL = "Beacon draws no map of a medical response."
 # at all is not looked at here.
 NO_POINT = (
     "Beacon has no point for this incident, so it draws no map of it. A point is "
-    "that of the block named on the radio, when the block is on Beacon's list, or "
-    "else where 511 listed a road closure on the incident's street."
+    "that of the block named on the radio, when one was named and is on Beacon's "
+    "list of blocks, or else one Beacon takes from a 511 event that listed a street "
+    "of the incident's as closed."
 )
 _PLACE_FROM_BLOCKS = (
-    "The point Beacon has for the block named on the radio. It marks the block, not an address."
+    "The point Beacon's list of blocks has for the block named on the radio. It marks "
+    "the block, not an address."
 )
+# Not "where 511 listed the closure": 511 gave the event a shape, and the point is
+# the middle of the box around it, which Beacon worked out. And not "the block":
+# the radio need have named none.
 _PLACE_FROM_511 = (
-    "Where 511 listed a road closure on this incident's street. Beacon has no point "
-    "for the block named on the radio, so this is where the incident is drawn. It "
+    "An approximate point, which Beacon took from a 511 event that listed a street of "
+    "this incident's as closed: the middle of what 511 drew for the event. Beacon has "
+    "no point of its own for this incident. The point need not lie on the road, and it "
     "marks no address."
+)
+_EVENT_POINT = (
+    "Drawn at the middle of what 511 drew for the event, which Beacon worked out. It "
+    "need not lie on the road."
 )
 _PATH_CUT = f"Only its newest {MAX_PATH} positions are drawn."
 _AREA_TOO_LARGE = (
     "Its area has more points than Beacon draws, so it is not drawn. The alert says "
     "which area it covers."
+)
+_AREA_UNREADABLE = (
+    "Beacon could not read every part of this alert's area, so none of it is drawn: "
+    "an area drawn in part can show a place as inside it that the alert leaves out. "
+    "The alert says which area it covers."
 )
 
 
@@ -87,7 +109,7 @@ class Feature:
     # An `alert_area` is rings of points: each ring is closed, and a ring inside
     # another is a hole in it.
     rings: tuple[tuple[Point, ...], ...] = ()
-    # What is not drawn of it, in a sentence, or None.
+    # What is not drawn of it, or how roughly it is placed, in a sentence, or None.
     note: str | None = None
 
 
@@ -114,17 +136,33 @@ def drawn(incident: Incident, row: Callable[[int], Evidence | None]) -> tuple[Fe
             continue
         found = _row_of(entry, row, "traffic")
         if found is not None and found.point is not None:
-            features.append(_of_line("traffic_event", entry, point=found.point))
+            features.append(_of_line("traffic_event", entry, point=found.point, note=_EVENT_POINT))
     for track in incident.aircraft:
         line = lines.get(("aircraft", track.rows[0].id))
         if line is None:
             continue
-        seen = [Position(found.point, found.occurred_at) for found in track.rows if found.point]
+        seen = [found for found in track.rows if found.point is not None]
+        plotted = seen[-MAX_PATH:]
+        # The rows the sentence rests on, and the row of every position that is
+        # drawn: a bend in the path is some row's, and that row is named.
+        named = {source.evidence_id for source in line.sources}
+        sources = (
+            *line.sources,
+            *(source_of(found) for found in plotted if found.id not in named),
+        )
         features.append(
-            _of_line(
-                "aircraft",
-                line,
-                path=tuple(seen[-MAX_PATH:]),
+            Feature(
+                kind="aircraft",
+                text=line.text,
+                at=line.at,
+                # The line's is already the least among every row of the track.
+                confidence=line.confidence,
+                sources=sources,
+                path=tuple(
+                    Position(found.point, found.occurred_at)
+                    for found in plotted
+                    if found.point is not None
+                ),
                 note=_PATH_CUT if len(seen) > MAX_PATH else None,
             )
         )
@@ -138,18 +176,21 @@ def drawn(incident: Incident, row: Callable[[int], Evidence | None]) -> tuple[Fe
         found = None if row_id is None else row(row_id)
         if line is None or found is None or found.kind != "alert":
             continue
-        rings = tuple(_rings(found.data.get("geometry")))
-        if not rings:
-            # Issued for a whole zone: there is no area of its own to draw.
+        geometry = found.data.get("geometry")
+        if geometry is None:
+            # Issued for a whole zone: there is no area of its own to draw. The
+            # engine has no such alert as applying to a place; this is for one
+            # that came to be listed some other way.
             continue
-        too_large = sum(len(ring) for ring in rings) > MAX_RING_POINTS
+        rings = _rings(geometry)
+        if rings is None:
+            note: str | None = _AREA_UNREADABLE
+        elif sum(len(ring) for ring in rings) > MAX_RING_POINTS:
+            note = _AREA_TOO_LARGE
+        else:
+            note = None
         features.append(
-            _of_line(
-                "alert_area",
-                line,
-                rings=() if too_large else rings,
-                note=_AREA_TOO_LARGE if too_large else None,
-            )
+            _of_line("alert_area", line, rings=rings if note is None and rings else (), note=note)
         )
     return tuple(features)
 
@@ -204,30 +245,31 @@ def _row_of(entry: Entry, row: Callable[[int], Evidence | None], kind: str) -> E
     return None
 
 
-def _rings(geometry: Any) -> Iterator[tuple[Point, ...]]:
-    """The rings of a GeoJSON polygon, multi-polygon, or collection of them, each
-    as it is given. A ring with a position that is not one is left out whole, and
-    so is anything that is not a polygon."""
+def _rings(geometry: Any) -> tuple[tuple[Point, ...], ...] | None:
+    """The rings of a GeoJSON polygon or multi-polygon, every one of them, or None
+    when any part of it cannot be read: a polygon that is not a list of rings, a
+    ring that is not closed or has fewer than four positions, a position that is
+    not one. Nothing is left out to make the rest fit. Only the two kinds the
+    engine reads an area from (`build._inside`) are read here."""
     if not isinstance(geometry, dict):
-        return
+        return None
     kind, coordinates = geometry.get("type"), geometry.get("coordinates")
-    if kind == "GeometryCollection":
-        for inner in geometry.get("geometries") or ():
-            yield from _rings(inner)
-        return
     if kind == "Polygon":
         polygons = [coordinates]
-    elif kind == "MultiPolygon":
-        polygons = coordinates if isinstance(coordinates, list) else []
+    elif kind == "MultiPolygon" and isinstance(coordinates, list) and coordinates:
+        polygons = coordinates
     else:
-        return
+        return None
+    rings: list[tuple[Point, ...]] = []
     for polygon in polygons:
-        if not isinstance(polygon, list):
-            continue
+        if not isinstance(polygon, list) or not polygon:
+            return None
         for ring in polygon:
             points = _ring(ring)
-            if points is not None:
-                yield points
+            if points is None:
+                return None
+            rings.append(points)
+    return tuple(rings)
 
 
 def _ring(ring: Any) -> tuple[Point, ...] | None:
@@ -242,4 +284,5 @@ def _ring(ring: Any) -> tuple[Point, ...] | None:
             points.append(Point(lat=position[1], lon=position[0]))
         except ValueError:
             return None
-    return tuple(points)
+    # A ring ends where it began.
+    return tuple(points) if points[0] == points[-1] else None

@@ -304,8 +304,9 @@ def test_a_distance_measured_from_a_point_of_511s_says_so_and_carries_511s_credi
     (fire,) = answer["places"][0]["near"]
     assert fire["incident"]["point_from"] == "closure"
     assert fire["text"] == (
-        f"Beacon has this incident about {fire['distance_m']} m from this place, going by "
-        "where 511 listed a road closure on its street."
+        f"Beacon has this incident about {fire['distance_m']} m from this place, measured "
+        "from an approximate point Beacon took from a 511 event that listed a road closure "
+        "on its street."
     )
     # The row the point is from, with how far it is trusted and 511's credit.
     source = fire["incident"]["point_source"]
@@ -321,7 +322,7 @@ def test_a_distance_measured_from_a_point_of_511s_says_so_and_carries_511s_credi
     (fire,) = later["places"][0]["near"]
     assert "closure" not in {signal["kind"] for signal in fire["incident"]["signals"]}
     assert fire["incident"]["point_source"]["evidence_id"] == closed
-    assert fire["text"].endswith(", going by where 511 listed a road closure on its street.")
+    assert fire["text"].endswith("a 511 event that listed a road closure on its street.")
     said = json.dumps(later)
     assert "511 lists a road closure" not in said
     assert "lists a road closed" not in said

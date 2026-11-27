@@ -61,7 +61,8 @@ def test_the_place_is_the_block_named_on_the_radio_and_rests_on_the_calls(rows: 
     assert place.kind == "place"
     assert place.point == BLOCKS.points[("Hayes St", 400)]
     assert place.text == (
-        "The point Beacon has for the block named on the radio. It marks the block, not an address."
+        "The point Beacon's list of blocks has for the block named on the radio. It marks "
+        "the block, not an address."
     )
     # Trusted as the radio calls are, and no more.
     assert place.confidence == "medium"
@@ -76,10 +77,29 @@ def test_a_place_taken_from_511_says_so_and_carries_511s_credit(rows: Rows) -> N
 
     place = features[0]
     assert (place.kind, place.point) == ("place", HAYES)
-    assert place.text.startswith("Where 511 listed a road closure on this incident's street.")
+    assert place.text == (
+        "An approximate point, which Beacon took from a 511 event that listed a street of "
+        "this incident's as closed: the middle of what 511 drew for the event. Beacon has "
+        "no point of its own for this incident. The point need not lie on the road, and it "
+        "marks no address."
+    )
     assert place.confidence == "official"
     (source,) = place.sources
     assert (source.source, source.credit) == ("511", CREDIT_511)
+
+
+def test_a_place_taken_from_511_does_not_say_the_radio_named_a_block(rows: Rows) -> None:
+    # A call that names a street and no block, and a 511 event that closes the street.
+    rows.radio(3, "alarm", "on_scene", units=("E5",), street="Oak St")
+    oak = offset(HAYES, -400, 0)
+    rows.traffic(3.5, "511.org/2", road="Oak St", headline="Oak St closed", point=oak)
+    (alarm,) = [i for i in engine_of(rows).incidents() if i.category == "alarm"]
+    assert (alarm.point, alarm.point_from) == (oak, "closure")
+
+    place = drawn(alarm, rows.store.get)[0]
+
+    assert "block" not in place.text
+    assert place.text.startswith("An approximate point, which Beacon took from a 511 event")
 
 
 def test_an_incident_with_no_point_and_a_medical_response_have_nothing_drawn(rows: Rows) -> None:
@@ -109,6 +129,11 @@ def test_a_511_event_is_drawn_as_its_version_in_force_in_the_timelines_words(row
     assert event.text == line_of(fire, "closure", source.evidence_id)
     assert event.text == "511 lists: Activity on Hayes St"
     assert (event.confidence, source.credit) == ("official", CREDIT_511)
+    # 511 said what the line says. Where the mark stands is Beacon's working out.
+    assert event.note == (
+        "Drawn at the middle of what 511 drew for the event, which Beacon worked out. It "
+        "need not lie on the road."
+    )
 
 
 def test_only_the_version_of_a_511_event_that_is_in_force_is_drawn(rows: Rows) -> None:
@@ -148,6 +173,26 @@ def test_an_aircraft_of_the_timeline_is_drawn_where_it_was_seen_oldest_first(row
     assert (aircraft.confidence, aircraft.note) == ("high", None)
 
 
+def test_an_aircrafts_sources_are_the_rows_of_every_position_that_is_drawn(rows: Rows) -> None:
+    circle(rows, HAYES, 300, minutes=4, icao24="a1b2c3")
+    fire = fire_of(engine_of(rows))
+    (track,) = fire.aircraft
+    (line,) = [entry for entry in fire.timeline if entry.kind == "aircraft"]
+    # The timeline's line names fewer rows than the path has positions: a sighting
+    # in the middle of the path is not one of them.
+    middle = track.rows[4]
+    assert middle.id not in {source.evidence_id for source in line.sources}
+
+    (aircraft,) = of_kind(drawn(fire, rows.store.get), "aircraft")
+
+    named = [source.evidence_id for source in aircraft.sources]
+    assert middle.id in named
+    assert set(named) == {row.id for row in track.rows}
+    # Each row once, the line's own first.
+    assert len(named) == len(set(named)) == len(aircraft.path)
+    assert named[: len(line.sources)] == [source.evidence_id for source in line.sources]
+
+
 def test_an_aircraft_seen_more_often_than_is_drawn_says_so(
     rows: Rows, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -163,6 +208,13 @@ def test_an_aircraft_seen_more_often_than_is_drawn_says_so(
     ]
     assert aircraft.note is not None
     assert aircraft.note.startswith("Only its newest")
+    # The rows of the positions that are drawn, and the rows the sentence rests
+    # on, which can be older than any of them.
+    (line,) = [entry for entry in fire.timeline if entry.kind == "aircraft"]
+    assert {source.evidence_id for source in aircraft.sources} == {
+        *(row.id for row in fire.aircraft[0].rows[-4:]),
+        *(source.evidence_id for source in line.sources),
+    }
 
 
 # Alerts.
@@ -232,24 +284,88 @@ def test_an_area_with_more_points_than_are_drawn_is_left_out_whole_and_says_so(
     )
 
 
-def test_rings_are_read_from_polygons_with_their_holes_and_a_broken_ring_is_left_out() -> None:
-    def ring(*positions: tuple[float, float]) -> list[list[float]]:
-        return [[lon, lat] for lat, lon in positions]
+def ring(*positions: tuple[float, float]) -> list[list[float]]:
+    return [[lon, lat] for lat, lon in positions]
 
-    square = ring((37.77, -122.43), (37.77, -122.42), (37.78, -122.42), (37.77, -122.43))
-    hole = ring((37.774, -122.426), (37.774, -122.425), (37.775, -122.425), (37.774, -122.426))
+
+# A square around the fire, and a hole in it that the fire is not in.
+SQUARE = ring(
+    (37.77, -122.43), (37.77, -122.42), (37.78, -122.42), (37.78, -122.43), (37.77, -122.43)
+)
+HOLE = ring((37.771, -122.429), (37.771, -122.428), (37.772, -122.428), (37.771, -122.429))
+
+
+def test_an_area_is_drawn_with_its_holes(tmp_path: Path) -> None:
+    made = Rows(mock_store(tmp_path))
+    made.radio(0, "fire", "working", units=("E36",), street="Hayes St", block=400)
+    made.alert(4, "shelter", geometry={"type": "Polygon", "coordinates": [SQUARE, HOLE]})
+
+    (alert,) = of_kind(map_of(made), "alert_area")
+
+    assert [len(found) for found in alert.rings] == [5, 4]
+    assert alert.rings[1][0] == Point(37.771, -122.429)
+    assert alert.note is None
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        # A position that is nowhere.
+        [[-122.429, 37.771], [-122.428, 370.0], [-122.428, 37.772], [-122.429, 37.771]],
+        # A ring that does not end where it began.
+        [*HOLE[:-1], [-122.4285, 37.7715]],
+        # Too few positions to be a ring.
+        HOLE[:2] + HOLE[-1:],
+        "a hole",
+    ],
+)
+def test_an_area_with_a_hole_that_cannot_be_read_is_not_drawn_at_all_and_says_so(
+    tmp_path: Path, broken: Any
+) -> None:
+    made = Rows(mock_store(tmp_path))
+    made.radio(0, "fire", "working", units=("E36",), street="Hayes St", block=400)
+    made.alert(4, "shelter", geometry={"type": "Polygon", "coordinates": [SQUARE, broken]})
+    fire = fire_of(engine_of(made))
+    # The engine has the alert as in force for the place: the fire is in the square.
+    assert [official.state for official in fire.official] == ["in_force"]
+
+    (alert,) = of_kind(drawn(fire, made.store.get), "alert_area")
+
+    # Not the square without its hole: that would show the hole as inside the area.
+    assert alert.rings == ()
+    assert alert.note == (
+        "Beacon could not read every part of this alert's area, so none of it is drawn: "
+        "an area drawn in part can show a place as inside it that the alert leaves out. "
+        "The alert says which area it covers."
+    )
+    # The alert is still listed, in the authority's words and under its row.
+    assert alert.text.startswith("Department of Emergency Management issued an alert")
+    assert [source.source for source in alert.sources] == ["nws"]
+
+
+def test_rings_are_read_whole_or_not_at_all() -> None:
+    polygon = {"type": "Polygon", "coordinates": [SQUARE, HOLE]}
+    assert [len(found) for found in mapping._rings(polygon) or ()] == [5, 4]
+
     broken = [[-122.43, 37.77], [-122.42, 370.0], [-122.42, 37.78], [-122.43, 37.77]]
-    polygon = {"type": "Polygon", "coordinates": [square, hole]}
-
-    assert [len(found) for found in mapping._rings(polygon)] == [4, 4]
-    assert next(mapping._rings(polygon))[0] == Point(37.77, -122.43)
-    several = {"type": "MultiPolygon", "coordinates": [[square], [broken], [hole]]}
-    assert len(list(mapping._rings(several))) == 2
-    collection = {"type": "GeometryCollection", "geometries": [polygon, several]}
-    assert len(list(mapping._rings(collection))) == 4
-    for nothing in (None, "x", {"type": "Point", "coordinates": [-122.43, 37.77]}, {}):
-        assert list(mapping._rings(nothing)) == []
-    assert list(mapping._rings({"type": "Polygon", "coordinates": [square[:3]]})) == []
+    two = {"type": "MultiPolygon", "coordinates": [[SQUARE], [HOLE]]}
+    assert [len(found) for found in mapping._rings(two) or ()] == [5, 4]
+    # One polygon of several that cannot be read, and none is.
+    assert mapping._rings({"type": "MultiPolygon", "coordinates": [[SQUARE], [broken]]}) is None
+    assert mapping._rings({"type": "MultiPolygon", "coordinates": [[SQUARE], "x"]}) is None
+    assert mapping._rings({"type": "MultiPolygon", "coordinates": [[SQUARE], []]}) is None
+    for nothing in (
+        None,
+        "x",
+        {},
+        {"type": "Point", "coordinates": [-122.43, 37.77]},
+        {"type": "GeometryCollection", "geometries": [polygon]},
+        {"type": "Polygon", "coordinates": []},
+        {"type": "Polygon", "coordinates": [SQUARE[:3]]},
+        {"type": "Polygon", "coordinates": [[[True, 37.77]] * 4]},
+        {"type": "MultiPolygon", "coordinates": []},
+    ):
+        assert mapping._rings(nothing) is None, nothing
 
 
 # Taps and notices.
@@ -330,6 +446,9 @@ def test_the_map_of_an_incident_has_each_thing_with_its_words_its_confidence_and
     assert set(aircraft["path"][0]) == {"lat", "lon", "at"}
     assert len(alert["rings"][0]) == 5
     assert (place["path"], place["rings"], alert["point"], aircraft["note"]) == ([], [], None, None)
+    assert len(aircraft["sources"]) == 9
+    assert (place["note"], alert["note"]) == (None, None)
+    assert event["note"].startswith("Drawn at the middle of what 511 drew for the event")
 
 
 def test_a_medical_response_has_no_map_and_neither_has_an_incident_nobody_has(
