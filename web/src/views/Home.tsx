@@ -282,8 +282,8 @@ export function Home({
       <p className="meta privacy">
         A tap sends where you are, rounded to about a block, and whatever you
         add. A clip or a photo goes only with the tap, as evidence for it, and
-        Beacon keeps it for an hour. Beacon keeps nothing that says who sent a
-        tap.
+        Beacon keeps it for an hour at most. Beacon keeps nothing that says who
+        sent a tap.
       </p>
 
       {mode === 'mock' && (

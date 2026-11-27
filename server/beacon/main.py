@@ -591,6 +591,11 @@ def create_app() -> FastAPI:
         # No OAuth flows, and the default callback route would sit outside /api.
         swagger_ui_oauth2_redirect_url=None,
         lifespan=_lifespan,
+        # A path with a slash too many is not sent on to the route's own address.
+        # The redirect would be made with the scheme this server sees, which behind
+        # a host that ends TLS is http, and a client that followed it would send
+        # the path, which for a tap's routes holds its id, in the clear.
+        redirect_slashes=False,
         # FastAPI traces requests by itself once OpenTelemetry is set up in the
         # process. The private routes are left out of it.
         telemetry={"exclude": _not_traced},

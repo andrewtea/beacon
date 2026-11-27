@@ -40,9 +40,9 @@ def test_the_api_answers_as_it_does_with_no_app_beside_it(
     built: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A mount at the root matches every path, and would answer a request the API
-    # has no whole route for as a file that is not there: no redirect to a route's
-    # own address, and no "method not allowed". And a file named api/... in the
-    # directory would be served. Under /api nothing is the mount's.
+    # has no whole route for as a file that is not there: no "method not allowed".
+    # And a file named api/... in the directory would be served. Under /api nothing
+    # is the mount's.
     (built / "api").mkdir()
     (built / "api" / "health").write_text("a file's, not the server's")
     (built / "api" / "left.json").write_text("left in the directory")
@@ -68,7 +68,10 @@ def test_the_api_answers_as_it_does_with_no_app_beside_it(
     alone = answers()
 
     assert beside == alone
-    assert [status for status, _ in beside] == [307, 405, 405, 307, 404, 404, 404]
+    assert [status for status, _ in beside] == [404, 405, 405, 404, 404, 404, 404]
+    # No answer sends a client on to another address: a redirect would be made with
+    # the scheme this server sees, which behind a host that ends TLS is http.
+    assert [location for _, location in beside] == [None] * len(asked)
     # And what is not under /api is the app's still, a path that only begins alike
     # included.
     monkeypatch.setenv("BEACON_WEB_DIR", str(built))
