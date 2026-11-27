@@ -6,14 +6,7 @@ import {
   waitFor,
   within,
 } from '@testing-library/react'
-import {
-  afterEach,
-  beforeEach,
-  expect,
-  onTestFinished,
-  test,
-  vi,
-} from 'vitest'
+import { afterEach, beforeEach, expect, onTestFinished, test, vi } from 'vitest'
 import App from './App.tsx'
 import { CrisisPanel } from './components/IncidentBody.tsx'
 import { IncidentCard } from './components/IncidentCard.tsx'
