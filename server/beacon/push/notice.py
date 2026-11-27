@@ -11,6 +11,7 @@ says first that the incident is invented and that a stand-in decided.
 from dataclasses import dataclass
 
 from beacon.files import Mode
+from beacon.push.store import KEPT, SENT_KEPT
 
 
 @dataclass(frozen=True)
@@ -39,19 +40,30 @@ _MOCK = Notice(
     ),
 )
 
-# What Beacon keeps to send a notification, when it sends one, and who learns what.
-# Shown before a person turns notifications on.
+# Everything Beacon keeps to send a notification and for how long, when it sends
+# one, and what the push service is and is not sent. Shown before a person turns
+# notifications on, so it has to name every column of `store`'s two tables. Its
+# paragraphs are parted by a blank line, which the app shows as paragraphs.
 ABOUT = (
-    "To notify this device, Beacon keeps the address your browser's push service "
-    "made for it and the places you have saved, each rounded to about a block and "
-    "without its name. It keeps nothing else about you or this device. It sends one "
-    "notification for an incident, when its investigator turns crisis mode on for "
-    "one it has within about a kilometre of one of those places. A notification "
-    "carries no words: your device shows a sentence it already has, so the push "
-    "service, which is your browser maker's, learns only that Beacon sent this "
-    "device a message and when. Beacon deletes the address and the places when you "
-    "turn notifications off, when the push service says the address is no longer "
-    "good, and 30 days after you last opened Beacon with them on."
+    "To notify this device, Beacon's server keeps the address your browser's push "
+    "service made for it; where the places you have saved are, each rounded to "
+    "about a block and without its name, with when you added it; and when you "
+    "last opened Beacon with notifications on. For each incident it tries to "
+    "notify this device about, it also keeps, beside that address, the incident's "
+    "id, when it last tried, how many times it tried, and whether the push service "
+    f"took the notification, for {SENT_KEPT.days} days at most. It keeps no name, no "
+    "browser, and no address a request came from.\n\n"
+    "It sends a notification when its investigator turns crisis mode on for an "
+    "incident it has within about a kilometre of one of those places, as you had "
+    "saved it by then: once for an incident as a rule, though a notification can "
+    "fail to arrive, and one can arrive twice.\n\n"
+    "A notification carries no words: your device shows a sentence it already "
+    "has. The push service, which is your browser maker's, is sent no incident, no "
+    "place, and no text; it does learn that Beacon sent this device a message, and "
+    "when.\n\n"
+    "Beacon deletes all of this when you turn notifications off, when the push "
+    f"service says the address is no longer good, and {KEPT.days} days after you last "
+    "opened Beacon with them on."
 )
 OFF = "This server sends no notifications."
 

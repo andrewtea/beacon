@@ -7,6 +7,9 @@ services:
     health: /api/health
     env:
       REPLAY: "1"
+      # Whom a push service may write to about this development server: the
+      # repository's page. Without a contact the server sends no notifications.
+      BEACON_VAPID_SUBJECT: https://github.com/andrewtea/beacon
   web:
     command: pnpm dev --host 0.0.0.0 --port "$PORT" --strictPort
     cwd: web

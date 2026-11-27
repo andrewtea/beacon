@@ -3,8 +3,8 @@ import type { Mode } from '../api/incidents.ts'
 import { fetchPushInfo } from '../api/push.ts'
 import { usePolled } from '../lib/poll.ts'
 import {
-  keptNotice,
   onPushChange,
+  previewNotice,
   pushSnapshot,
   pushSupported,
   turnOff,
@@ -15,8 +15,14 @@ import { Icon } from './Icon.tsx'
 // Notifications for the saved places. What Beacon keeps to send one, when it
 // sends one, and what a notification says are the server's words (`about_text`,
 // and the notice the service worker shows). The sentences written here are about
-// this device and this browser: whether notifications are on, and why they
-// cannot be.
+// this device and this browser, and about what the server has answered to it:
+// whether notifications are on, why they cannot be, and whether the server has
+// said that it deleted this device's address.
+//
+// **Notifications can be turned off whatever the server is doing**: the control
+// is there whenever they are on, with the server unreachable, in another mode,
+// or sending none. And nothing here says that a deletion happened before the
+// server answered that it did.
 
 const INFO_MS = 10 * 60_000
 
@@ -25,7 +31,7 @@ const UNSUPPORTED =
 const BLOCKED =
   'Notifications from this site are blocked in this browser. Allow them in the browser’s settings for this site, then turn them on here.'
 const NO_WORKER =
-  'This copy of Beacon has no service worker, which is what receives a notification. The built app, served over HTTPS, has one.'
+  'This copy of Beacon could not start the service worker that receives a notification. It needs HTTPS, or localhost.'
 const NOT_KEPT =
   'This browser would not keep the change. Notifications are as they were.'
 const SAID = { blocked: BLOCKED, 'no-worker': NO_WORKER, failed: NOT_KEPT }
@@ -33,45 +39,25 @@ const NO_WORDS =
   'This device has no words for a notification yet. They are kept once Beacon’s server has been told.'
 const NOT_SHOWN =
   'This browser would not show a notification just now. Whether one from Beacon would be shown is the browser’s to say: look at its settings for this site.'
+const HELD =
+  'This browser would not let go of its subscription. A notification can reach this device through it only while Beacon’s server has this device’s address. Beacon tries again while it is open.'
+// What a server of each mode is called.
+const SERVER = { mock: 'the invented scenario', live: 'real sources' }
 
 function permission(): NotificationPermission | null {
   return typeof Notification === 'undefined' ? null : Notification.permission
 }
 
-/** Shows, on this device, the notification a push from this server would show.
- * It is marked as a preview: no push was sent, and nothing was decided.
- * Answers with the sentence to show when it could not, else null. */
-async function preview(): Promise<string | null> {
-  const notice = await keptNotice()
-  const registration = await navigator.serviceWorker.getRegistration()
-  if (notice === null || registration === undefined) return NO_WORDS
-  try {
-    await registration.showNotification(notice.title, {
-      body: `A preview, not a notification. What one would say: ${notice.text}`,
-      tag: 'beacon-preview',
-      icon: '/pwa-192x192.png',
-    })
-  } catch {
-    // The browser refuses when its leave was taken back since the page was
-    // drawn, and where it shows none at all.
-    return NOT_SHOWN
-  }
-  return null
-}
-
 export function Notifications({
   mode,
-  places,
 }: {
   // The mode the server said it is in, or null when that is not known.
   mode: Mode | null
-  // How many places are saved on this device.
-  places: number
 }) {
   const status = useSyncExternalStore(onPushChange, pushSnapshot)
   // What a press met, with whether notifications were on when it did: it is
   // about that press, and is not shown once they are turned on or off.
-  const [met, setMet] = useState<{ wanted: boolean; text: string } | null>(null)
+  const [met, setMet] = useState<{ on: Mode | null; text: string } | null>(null)
   const [busy, setBusy] = useState(false)
   const supported = pushSupported()
   const info = usePolled(
@@ -82,7 +68,7 @@ export function Notifications({
       supported && mode !== null ? await fetchPushInfo(signal) : null,
     () => INFO_MS,
   ).data
-  const problem = met !== null && met.wanted === status.wanted ? met.text : null
+  const problem = met !== null && met.on === status.on ? met.text : null
 
   const press = async (work: () => Promise<string | null>) => {
     setBusy(true)
@@ -90,17 +76,37 @@ export function Notifications({
     // Whatever the browser does, the controls come back.
     const text = await work().catch(() => NOT_KEPT)
     setBusy(false)
-    setMet(text === null ? null : { wanted: pushSnapshot().wanted, text })
+    setMet(text === null ? null : { on: pushSnapshot().on, text })
   }
-  const on = () =>
+  const on = (shown: Mode) =>
     press(async () => {
-      const came = await turnOn()
+      const came = await turnOn(shown)
       return came === 'on' ? null : SAID[came]
     })
-  const off = () => press(async () => ((await turnOff()) ? null : NOT_KEPT))
-  const show = () => press(preview)
+  // A browser that would not let go is said by the status, for as long as it
+  // is so.
+  const off = () =>
+    press(async () => ((await turnOff()) === 'failed' ? NOT_KEPT : null))
+  const show = (shown: Mode) =>
+    press(async () => {
+      let came: 'shown' | 'no-words'
+      try {
+        came = await previewNotice(shown)
+      } catch {
+        // The browser refuses when its leave was taken back since the page was
+        // drawn, and where it shows none at all.
+        return NOT_SHOWN
+      }
+      return came === 'no-words' ? NO_WORDS : null
+    })
 
-  const blocked = status.wanted && permission() !== 'granted'
+  const blocked = status.on !== null && permission() !== 'granted'
+  // The addresses a server has yet to answer that it deleted: this server's,
+  // and the other mode's, which only that server can delete.
+  const here = status.forget.filter((owner) => owner === mode).length
+  const elsewhere = [
+    ...new Set(status.forget.filter((owner) => owner !== mode)),
+  ]
   return (
     <section className="panel notify" aria-labelledby="notify-heading">
       <h2 id="notify-heading">
@@ -117,70 +123,96 @@ export function Notifications({
       ) : !info.enabled ? (
         <p className="meta">{info.text}</p>
       ) : (
+        <p className="meta about">{info.about_text}</p>
+      )}
+      {status.on !== null ? (
         <>
-          <p className="meta">{info.about_text}</p>
-          {status.wanted ? (
-            <>
-              <p className="notify-state" role="status">
-                Notifications are on for this device.{' '}
-                {blocked
-                  ? BLOCKED
-                  : places === 0
-                    ? 'With no place saved, Beacon’s server keeps nothing of this device and sends it nothing.'
-                    : status.told === 'told'
-                      ? `Beacon’s server has this device’s address and where ${status.places === 1 ? 'your saved place is' : `your ${status.places} saved places are`}.`
-                      : status.told === 'failed'
-                        ? null
-                        : 'Beacon’s server is being told.'}
-              </p>
-              {status.told === 'failed' && (
-                <p className="note problem" role="status">
-                  {status.problem} Beacon tries again while it is open.
-                </p>
-              )}
-              <div className="notify-actions">
+          <p className="notify-state" role="status">
+            Notifications are on for this device.{' '}
+            {blocked
+              ? BLOCKED
+              : status.told === 'told'
+                ? status.places === 0
+                  ? 'With no place saved, Beacon’s server has no address for this device.'
+                  : `Beacon’s server has this device’s address and where ${status.places === 1 ? 'your saved place is' : `your ${status.places} saved places are`}.`
+                : status.told === 'not-yet'
+                  ? 'Beacon’s server is yet to be told.'
+                  : null}
+          </p>
+          {status.told === 'failed' && (
+            <p className="note problem" role="status">
+              {status.problem} Beacon tries again while it is open.
+            </p>
+          )}
+          <div className="notify-actions">
+            <button
+              type="button"
+              className="action"
+              disabled={busy}
+              onClick={() => void off()}
+            >
+              Turn notifications off
+            </button>
+            {!blocked &&
+              mode !== null &&
+              status.on === mode &&
+              status.told === 'told' &&
+              status.places > 0 && (
                 <button
                   type="button"
                   className="action"
                   disabled={busy}
-                  onClick={() => void off()}
+                  onClick={() => void show(mode)}
                 >
-                  Turn notifications off
+                  Show a preview of one
                 </button>
-                {!blocked && status.told === 'told' && places > 0 && (
-                  <button
-                    type="button"
-                    className="action"
-                    disabled={busy}
-                    onClick={() => void show()}
-                  >
-                    Show a preview of one
-                  </button>
-                )}
-              </div>
-            </>
-          ) : (
+              )}
+          </div>
+        </>
+      ) : (
+        <>
+          {supported && mode !== null && info !== null && info.enabled && (
             <div className="notify-actions">
               <button
                 type="button"
                 className="action"
                 disabled={busy}
-                onClick={() => void on()}
+                onClick={() => void on(mode)}
               >
                 <Icon name="bell" />
                 Turn notifications on
               </button>
             </div>
           )}
+          {here > 0 ? (
+            <p className="note problem" role="status">
+              Notifications are off on this device. Beacon’s server has not yet
+              answered that it deleted this device’s address.{' '}
+              {status.told === 'failed' ? `${status.problem} ` : ''}
+              Beacon asks again while it is open.
+            </p>
+          ) : (
+            status.deleted && (
+              <p className="note" role="status">
+                Notifications are off on this device. Beacon’s server has
+                answered that it deleted this device’s address.
+              </p>
+            )
+          )}
         </>
       )}
-      {status.told === 'failed' && !status.wanted && (
+      {status.held && (
         <p className="note problem" role="status">
-          Notifications are off on this device, and nothing can arrive.{' '}
-          {status.problem} Beacon tries again while it is open, and the server
-          deletes what it kept of this device when it hears.
+          {HELD}
         </p>
       )}
+      {elsewhere.map((owner) => (
+        <p className="note problem" role="status" key={owner}>
+          Beacon’s server for {SERVER[owner]} has not yet answered that it
+          deleted an address of this device. Only that server can, so Beacon
+          asks when it is next shown it.
+        </p>
+      ))}
       {problem !== null && (
         <p className="note problem" role="alert">
           {problem}

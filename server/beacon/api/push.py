@@ -34,13 +34,14 @@ _TOO_LARGE = "A request about notifications is at most four kilobytes."
 _TOO_SLOW = "A request about notifications has to arrive within five seconds. Send it again."
 _BUSY = "Beacon is busy with other requests about notifications. Try again in a moment."
 _NO_MODE = (
-    "A request to be notified says which mode its sender was shown, in the "
+    "A request about notifications says which mode its sender was shown, in the "
     "Beacon-Mode header: live or mock. This one does not, and nothing of it was read."
 )
 _OTHER_MODE = (
     "This server is not in the mode the sender was shown: it runs on real sources and "
     "the sender was shown the invented scenario, or the other way round. Nothing of "
-    "the request was read. Look at what Beacon shows now, and ask again."
+    "the request was read, and nothing was kept or deleted. Look at what Beacon shows "
+    "now, and ask again."
 )
 SUBSCRIBE_SHAPE = (
     "A request to be notified is a JSON object with endpoint, the address your "
@@ -80,7 +81,8 @@ class PushInfo(BaseModel):
     # base64. The mock store and the live store have a key each.
     public_key: str | None
     # What Beacon keeps to notify a device, when it notifies, and who learns
-    # what. Show it before a person turns notifications on.
+    # what. Show it before a person turns notifications on. Its paragraphs are
+    # parted by a blank line.
     about_text: str | None
     # The words to show when a push arrives from this server: a push carries
     # none, so the app keeps these on the device before it subscribes. On the
@@ -104,17 +106,16 @@ class Subscribed(BaseModel):
 async def info(request: Request) -> PushInfo:
     """Whether this server sends notifications, and what a person is told before
     they turn them on. It reads nothing and keeps nothing."""
-    engine: Engine | None = getattr(request.app.state, "incidents", None)
-    if engine is None:
-        raise HTTPException(503, "This server is not reading incidents.")
+    engine = _engine(request)
     push: Push | None = getattr(request.app.state, "push", None)
-    notice = None if push is None else notice_of(push.mode)
+    vapid = None if push is None or not push.sends else push.vapid
+    notice = None if vapid is None else notice_of(engine.mode)
     return PushInfo(
         mode=engine.mode,
-        enabled=push is not None,
-        text=None if push is not None else OFF,
-        public_key=None if push is None else push.vapid.public_key,
-        about_text=None if push is None else ABOUT,
+        enabled=vapid is not None,
+        text=None if vapid is not None else OFF,
+        public_key=None if vapid is None else vapid.public_key,
+        about_text=None if vapid is None else ABOUT,
         notice=None if notice is None else NoticeOut(title=notice.title, text=notice.text),
         reach_m=int(REACH_M),
         max_places=MAX_PLACES,
@@ -134,29 +135,47 @@ async def subscribe(request: Request) -> Subscribed:
     log line is written about the request. Like a tap, it names the mode its
     sender was shown (`Beacon-Mode`), and a server in the other mode refuses it
     unread."""
-    push = _push(request)
-    shown = request.headers.get(MODE_HEADER)
-    if shown not in ("live", "mock"):
-        raise HTTPException(400, _NO_MODE)
-    if shown != push.mode:
-        raise HTTPException(409, _OTHER_MODE)
-    return await _admitted(request, lambda body: _subscribe(push, body))
+    _shown(request)
+    push: Push | None = getattr(request.app.state, "push", None)
+    if push is None or not push.sends:
+        raise HTTPException(503, OFF)
+    sending = push
+    return await _admitted(request, lambda body: _subscribe(sending, body))
 
 
 @router.post("/push/unsubscribe", status_code=204)
 async def unsubscribe(request: Request) -> Response:
-    """Delete the subscription kept under an address, and what was sent to it. The
-    answer is the same whether or not there was one."""
-    push = _push(request)
-    await _admitted(request, lambda body: _unsubscribe(push, body))
+    """Delete the subscription kept under an address, and what was sent to it.
+
+    **`204` means that this mode's file does not hold the address**: it was
+    deleted, or was never there. Any other answer means nothing was deleted, and
+    the app asks again: `409` from a server in the other mode than the request
+    names (`Beacon-Mode`), whose file is another one, and `503` from a server
+    that is busy or stopping. The answer is the same whether or not there was a
+    subscription, so it tells nobody whether an address is kept. A server that
+    sends no notifications deletes as any other does."""
+    _shown(request)
+    push: Push | None = getattr(request.app.state, "push", None)
+    kept = push
+    await _admitted(request, lambda body: _unsubscribe(kept, body))
     return Response(status_code=204)
 
 
-def _push(request: Request) -> Push:
-    push: Push | None = getattr(request.app.state, "push", None)
-    if push is None:
-        raise HTTPException(503, OFF)
-    return push
+def _engine(request: Request) -> Engine:
+    engine: Engine | None = getattr(request.app.state, "incidents", None)
+    if engine is None:
+        raise HTTPException(503, "This server is not reading incidents.")
+    return engine
+
+
+def _shown(request: Request) -> None:
+    """Refuse a request that does not name the mode this server is in, before any
+    of it is read."""
+    shown = request.headers.get(MODE_HEADER)
+    if shown not in ("live", "mock"):
+        raise HTTPException(400, _NO_MODE)
+    if shown != _engine(request).mode:
+        raise HTTPException(409, _OTHER_MODE)
 
 
 async def _admitted[T](request: Request, work: Callable[[bytes], T]) -> T:
@@ -243,9 +262,10 @@ def _subscribe(push: Push, body: bytes) -> Subscribed:
     return Subscribed(mode=push.mode, kept_until=kept_until)
 
 
-def _unsubscribe(push: Push, body: bytes) -> None:
+def _unsubscribe(push: Push | None, body: bytes) -> None:
     sent = _parse(body, frozenset({"endpoint"}), UNSUBSCRIBE_SHAPE)
-    # An address Beacon would not have kept is not looked for.
+    # An address Beacon would not have kept is not looked for, and a server with
+    # no subscriptions file of this mode keeps none.
     endpoint = checked(sent["endpoint"])
-    if endpoint is not None:
+    if endpoint is not None and push is not None:
         push.subscriptions.remove(endpoint)

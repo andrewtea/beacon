@@ -1,4 +1,4 @@
-import { fetchJson, MODE_HEADER } from './http.ts'
+import { ApiError, fetchJson, MODE_HEADER } from './http.ts'
 import type { Mode } from './incidents.ts'
 import { roundToBlock } from '../lib/geo.ts'
 
@@ -19,7 +19,8 @@ export type PushInfo = {
   // real one have a key each.
   public_key: string | null
   // What Beacon keeps to notify a device, when it notifies, and who learns
-  // what, in the server's words. Shown before notifications are turned on.
+  // what, in the server's words. Shown before notifications are turned on. Its
+  // paragraphs are parted by a blank line.
   about_text: string | null
   notice: PushNotice | null
   reach_m: number
@@ -56,20 +57,40 @@ export function subscribePush(
   })
 }
 
-/** Has the server delete the subscription kept under an address. The address
- * goes in the body, never in the request's own address. */
-export async function unsubscribePush(endpoint: string): Promise<void> {
+/**
+ * Has the server delete the subscription kept under an address. The address
+ * goes in the body, never in the request's own address.
+ *
+ * **Only `204` is the server saying that it does not keep the address**, and
+ * only the server of the mode the address was given to can say so: `owner` is
+ * that mode, and a server in the other mode refuses with `409`. Anything else
+ * (a server that is busy, stopping, or not reached) deleted nothing and is an
+ * `ApiError`: the caller keeps the address and asks again.
+ */
+export async function unsubscribePush(
+  endpoint: string,
+  owner: Mode,
+): Promise<void> {
   let response: Response
   try {
     response = await fetch('/api/push/unsubscribe', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', [MODE_HEADER]: owner },
       body: JSON.stringify({ endpoint }),
     })
   } catch {
-    throw new Error('The server could not be reached.')
+    throw new ApiError('The server could not be reached.', null)
   }
-  // 503 from a server that sends no notifications: it keeps none to delete.
-  if (!response.ok && response.status !== 503)
-    throw new Error(`The server answered with HTTP ${response.status}.`)
+  if (response.status === 204) return
+  const body: unknown = await response.json().catch(() => null)
+  const detail =
+    typeof body === 'object' && body !== null && 'detail' in body
+      ? body.detail
+      : null
+  throw new ApiError(
+    typeof detail === 'string'
+      ? detail
+      : `The server answered with HTTP ${response.status}.`,
+    response.status,
+  )
 }

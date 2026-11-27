@@ -7,6 +7,7 @@ import json
 import logging
 import sqlite3
 import stat
+import threading
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -23,6 +24,7 @@ import beacon.api.push as api_push
 import beacon.main as main_module
 import beacon.push.desk as desk_module
 import beacon.push.store as store_module
+import beacon.push.vapid as vapid_module
 from beacon import taps as beacon_taps
 from beacon.ember import EmberClient, Storage
 from beacon.incident import Engine
@@ -42,12 +44,16 @@ from beacon.push import (
     ABOUT,
     KEPT,
     MAX_ENDPOINT,
+    NO_CONTACT,
     OFF,
     PUSH_VARIABLE,
+    TURNED_OFF,
     Notifier,
     Pass,
+    Place,
     Push,
     PushConfigError,
+    Subscription,
     Subscriptions,
     SubscriptionsError,
     Vapid,
@@ -56,7 +62,9 @@ from beacon.push import (
     checked,
     notice_of,
     open_push,
+    subject_of,
 )
+from beacon.push.store import SENT_KEPT
 from beacon.push.vapid import SUBJECT_VARIABLE, TOKEN_LIFE, key_file, open_vapid
 from beacon.taps import TapMedia, Taps
 from tests.incident_rows import HAYES, Rows, at, mock_store
@@ -73,6 +81,13 @@ EDGE = "https://wns2-by3p.notify.windows.com/w/?token=BQYAAACsecret%2fSecret%3d"
 NEAR = offset(HAYES, 300, 0)
 FAR = offset(HAYES, 3000, 0)
 SHOWN = {"Beacon-Mode": "mock"}
+# Whom a push service may write to about the server under test.
+CONTACT = "mailto:ops@example.org"
+
+
+def near(minute: float = 5) -> Place:
+    """The place three hundred metres from the fire, as one added at `minute`."""
+    return Place(NEAR, at(minute))
 
 
 @pytest.fixture(autouse=True)
@@ -88,17 +103,29 @@ class Services:
         self.requests: list[httpx2.Request] = []
         self.status: dict[str, int] = {}
         self.unreachable: set[str] = set()
+        # Addresses whose push is taken (201) with a body that then fails to come.
+        self.body_fails: set[str] = set()
 
     def __call__(self, request: httpx2.Request) -> httpx2.Response:
         self.requests.append(request)
         address = str(request.url)
         if address in self.unreachable:
             raise httpx2.ConnectError(f"Could not connect to {address}")
+        if address in self.body_fails:
+            return httpx2.Response(201, stream=_BrokenBody())
         return httpx2.Response(self.status.get(address, 201))
 
     @property
     def sent_to(self) -> list[str]:
         return [str(request.url) for request in self.requests]
+
+
+class _BrokenBody(httpx2.AsyncByteStream):
+    """A reply's body that breaks off as it is read."""
+
+    async def __aiter__(self) -> Any:
+        raise httpx2.ReadError("The connection was lost.")
+        yield b""  # pragma: no cover
 
 
 @dataclass
@@ -159,9 +186,33 @@ class World:
         (found,) = [i.id for i in self.engine.incidents() if i.category == category]
         return found
 
+    @property
+    def notifier(self) -> Notifier:
+        assert self.push.notifier is not None
+        return self.push.notifier
+
+    @property
+    def vapid(self) -> Vapid:
+        assert self.push.vapid is not None
+        return self.push.vapid
+
     def notify(self, minute: float = 7) -> Pass:
         self.now[0] = at(minute)
-        return self.push.notifier.notify(self.engine.snapshot(), at(minute))
+        return self.push.work(self.engine.snapshot, at(minute))
+
+    def places_added(self, minute: float) -> None:
+        """Make every place in the file one that was added at `minute`: the
+        routes add a place at the time it really is, which is after the story's."""
+        with sqlite3.connect(self.path / "push" / "mock.sqlite3") as db:
+            for endpoint, places in db.execute("SELECT endpoint, places FROM subscription"):
+                moved = [
+                    [lat, lon, store_module._stamp(at(minute))]
+                    for lat, lon, _ in json.loads(places)
+                ]
+                db.execute(
+                    "UPDATE subscription SET places = ? WHERE endpoint = ?",
+                    (json.dumps(moved), endpoint),
+                )
 
     def app(self, *, push: bool = True) -> TestClient:
         """A server over this world, with push or with none."""
@@ -186,12 +237,13 @@ def world(tmp_path: Path) -> Any:
     runs = Runs(tmp_path / "investigate" / "mock.sqlite3", "mock")
     services = Services()
     push = open_push(
-        {"BEACON_DATA_DIR": str(tmp_path)},
+        {"BEACON_DATA_DIR": str(tmp_path), SUBJECT_VARIABLE: CONTACT},
         engine,
         runs,
         transport=httpx2.MockTransport(services),
     )
     assert push is not None
+    assert push.sends
     taps = Taps(rows.store, TapMedia(tmp_path / "taps", "mock"), clock=lambda: now[0])
     yield World(tmp_path, rows, now, engine, runs, services, push, taps)
     push.close()
@@ -286,36 +338,90 @@ def verified(vapid: Vapid, header: str) -> dict[str, Any]:
     return claims
 
 
-def test_a_push_is_signed_for_one_push_service_for_half_a_day(tmp_path: Path) -> None:
-    vapid = open_vapid({SUBJECT_VARIABLE: "mailto:ops@example.org"}, tmp_path, "mock")
+def test_a_push_is_signed_for_one_push_service_for_half_a_day_and_names_a_contact(
+    tmp_path: Path,
+) -> None:
+    vapid = open_vapid(tmp_path, "mock", CONTACT)
 
     claims = verified(vapid, vapid.authorization("https://fcm.googleapis.com", at(0)))
 
     assert claims == {
         "aud": "https://fcm.googleapis.com",
         "exp": int((at(0) + TOKEN_LIFE).timestamp()),
-        "sub": "mailto:ops@example.org",
+        "sub": CONTACT,
     }
     assert timedelta(0) < TOKEN_LIFE <= timedelta(hours=24)
-    # With nobody named, the token names nobody.
-    unnamed = Vapid.generate()
-    assert "sub" not in verified(unnamed, unnamed.authorization("https://x.example", at(0)))
+
+
+def test_the_contact_is_a_mail_address_or_a_page_and_none_is_none() -> None:
+    assert subject_of({}) is None
+    assert subject_of({SUBJECT_VARIABLE: "  "}) is None
+    for contact in (CONTACT, "https://example.org/contact"):
+        assert subject_of({SUBJECT_VARIABLE: f" {contact} "}) == contact
+    for contact in (
+        "ops@example.org",
+        "mailto:ops",
+        "http://example.org/contact",
+        "https://example.org/a b",
+        "mailto:ops@example.org, secret@example.org",
+        "https://" + "a" * 300 + ".org",
+    ):
+        with pytest.raises(VapidError, match="mailto: address or an https:// one") as refused:
+            subject_of({SUBJECT_VARIABLE: contact})
+        assert "secret" not in str(refused.value)
 
 
 def test_the_key_is_made_once_for_the_servers_user_only_and_read_again(tmp_path: Path) -> None:
-    first = open_vapid({}, tmp_path, "mock")
+    first = open_vapid(tmp_path, "mock", CONTACT)
     path = tmp_path / "mock.vapid.key"
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     kept = path.read_bytes()
 
-    again = open_vapid({}, tmp_path, "mock")
+    again = open_vapid(tmp_path, "mock", CONTACT)
 
     assert again.public_key == first.public_key
     assert path.read_bytes() == kept
+    # Nothing is left of how it was written.
+    assert [found.name for found in tmp_path.iterdir()] == ["mock.vapid.key"]
     # The invented scenario's server and a real one never sign with one key.
-    live = open_vapid({}, tmp_path, "live")
+    live = open_vapid(tmp_path, "live", CONTACT)
     assert live.public_key != first.public_key
     assert (key_file("mock"), key_file("live")) == ("mock.vapid.key", "live.vapid.key")
+
+
+def test_two_servers_that_start_at_once_sign_with_one_key(tmp_path: Path) -> None:
+    together = threading.Barrier(8)
+    found: list[str] = []
+
+    def start() -> None:
+        together.wait()
+        found.append(open_vapid(tmp_path, "mock", CONTACT).public_key)
+
+    threads = [threading.Thread(target=start) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(found) == 8
+    assert len(set(found)) == 1
+    assert [path.name for path in tmp_path.iterdir()] == ["mock.vapid.key"]
+
+
+def test_a_key_that_could_not_be_kept_is_not_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def full(_descriptor: int) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(vapid_module.os, "fsync", full)
+
+    with pytest.raises(VapidError, match="could not be read or made") as refused:
+        open_vapid(tmp_path, "mock", CONTACT)
+
+    assert refused.value.__context__ is None
+    # No key file, whole or in part, is left under any name.
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_a_key_file_that_holds_no_key_is_refused_and_left_as_it_is(tmp_path: Path) -> None:
@@ -323,13 +429,11 @@ def test_a_key_file_that_holds_no_key_is_refused_and_left_as_it_is(tmp_path: Pat
     for held in ("not a key", "", "AAAA", base64.urlsafe_b64encode(bytes(32)).decode()):
         path.write_text(held)
         with pytest.raises(VapidError) as refused:
-            open_vapid({}, tmp_path, "mock")
+            open_vapid(tmp_path, "mock", CONTACT)
         assert path.read_text() == held
         assert "not a key" not in str(refused.value)
         assert refused.value.__cause__ is None
         assert refused.value.__context__ is None
-    with pytest.raises(VapidError, match="mailto: address or an https:// one"):
-        open_vapid({SUBJECT_VARIABLE: "ops@example.org"}, tmp_path, "live")
 
 
 # The subscriptions file.
@@ -339,28 +443,35 @@ def subscriptions(tmp_path: Path) -> Subscriptions:
     return Subscriptions(tmp_path / "mock.sqlite3", "mock")
 
 
-def test_a_subscription_is_an_address_and_places_and_renewing_it_replaces_the_places(
+def test_a_subscription_is_an_address_and_places_and_a_place_keeps_when_it_was_added(
     tmp_path: Path,
 ) -> None:
     kept = subscriptions(tmp_path)
 
     assert kept.put(FCM, [NEAR, FAR], at(0)) == at(0) + KEPT
+    # Renewed without the first place, and then with it again.
     assert kept.put(FCM, [FAR], at(10)) == at(10) + KEPT
+    assert kept.put(FCM, [NEAR, FAR, FAR], at(20)) == at(20) + KEPT
 
     (found,) = kept.all()
-    # When it was first made is kept: a renewal is not a new subscription.
-    assert (found.endpoint, found.points, found.created_at) == (FCM, (FAR,), at(0))
+    # A place that was named all along keeps the time it was added. One that was
+    # removed and named again was added when it was named again.
+    assert found == Subscription(FCM, (Place(NEAR, at(20)), Place(FAR, at(0))))
     with sqlite3.connect(tmp_path / "mock.sqlite3") as db:
         columns = [column[1] for column in db.execute("PRAGMA table_info(subscription)")]
-    assert columns == ["endpoint", "places", "created_at", "renewed_at"]
+        sent = [column[1] for column in db.execute("PRAGMA table_info(sent)")]
+    # Every column is one the app's person is told of before they turn
+    # notifications on (`ABOUT`).
+    assert columns == ["endpoint", "places", "renewed_at"]
+    assert sent == ["endpoint", "incident_id", "claimed_at", "tries", "state"]
 
 
 def test_a_subscription_is_deleted_when_asked_and_when_its_time_is_over(tmp_path: Path) -> None:
     kept = subscriptions(tmp_path)
     kept.put(FCM, [NEAR], at(0))
     kept.put(MOZ, [NEAR], at(0))
-    assert kept.claim(FCM, "inc-1", at(1))
-    assert kept.claim(MOZ, "inc-1", at(1))
+    assert kept.claim(FCM, "inc-1", near(0), at(1))
+    assert kept.claim(MOZ, "inc-1", near(0), at(1))
 
     assert kept.remove(FCM) is True
     assert kept.remove(FCM) is False
@@ -370,6 +481,13 @@ def test_a_subscription_is_deleted_when_asked_and_when_its_time_is_over(tmp_path
     # Renewed on the twentieth day, it is kept thirty more.
     day = timedelta(days=1)
     kept.put(MOZ, [NEAR], at(0) + 20 * day)
+    # What was sent is kept two days and no longer, whatever the subscription.
+    assert kept.claim(MOZ, "inc-2", near(0), at(0) + 20 * day)
+    kept.sweep(at(0) + 20 * day + SENT_KEPT - timedelta(minutes=1))
+    assert set(kept.tries()) == {(MOZ, "inc-2")}
+    kept.sweep(at(0) + 20 * day + SENT_KEPT + timedelta(minutes=1))
+    assert kept.tries() == {}
+    assert kept.claim(MOZ, "inc-3", near(0), at(0) + 48 * day)
     assert kept.sweep(at(0) + 49 * day) == 0
     assert kept.sweep(at(0) + 50 * day + timedelta(minutes=1)) == 1
     assert kept.all() == ()
@@ -400,32 +518,67 @@ def test_a_send_is_claimed_once_and_again_only_as_often_and_as_soon_as_it_may_be
 ) -> None:
     kept = subscriptions(tmp_path)
     kept.put(FCM, [NEAR], at(0))
+    place = near(0)
 
-    assert kept.claim(FCM, "inc-1", at(1)) is True
-    assert kept.claim(FCM, "inc-1", at(1)) is False
+    assert kept.claim(FCM, "inc-1", place, at(1)) is True
+    assert kept.claim(FCM, "inc-1", place, at(1)) is False
     # Another incident is another send.
-    assert kept.claim(FCM, "inc-2", at(1)) is True
+    assert kept.claim(FCM, "inc-2", place, at(1)) is True
     # An address that is not kept is sent nothing.
-    assert kept.claim(MOZ, "inc-1", at(1)) is False
+    assert kept.claim(MOZ, "inc-1", place, at(1)) is False
 
     kept.settle(FCM, "inc-1", "again")
     wait = store_module.RETRY_AFTER
-    assert kept.claim(FCM, "inc-1", at(1) + wait - timedelta(seconds=1)) is False
-    assert kept.claim(FCM, "inc-1", at(1) + wait) is True
+    assert kept.claim(FCM, "inc-1", place, at(1) + wait - timedelta(seconds=1)) is False
+    assert kept.claim(FCM, "inc-1", place, at(1) + wait) is True
     kept.settle(FCM, "inc-1", "again")
     # Twice as long after the second try.
-    assert kept.claim(FCM, "inc-1", at(1) + wait * 2) is False
-    assert kept.claim(FCM, "inc-1", at(1) + wait * 3) is True
+    assert kept.claim(FCM, "inc-1", place, at(1) + wait * 2) is False
+    assert kept.claim(FCM, "inc-1", place, at(1) + wait * 3) is True
     kept.settle(FCM, "inc-1", "again")
     # Three tries in all.
     assert store_module.MAX_TRIES == 3
-    assert kept.claim(FCM, "inc-1", at(600)) is False
+    assert kept.claim(FCM, "inc-1", place, at(600)) is False
     # What was sent, and what was refused for good, is not sent again.
     for outcome in ("sent", "failed"):
         kept.settle(FCM, "inc-2", outcome)  # type: ignore[arg-type]
-        assert kept.claim(FCM, "inc-2", at(600)) is False
+        assert kept.claim(FCM, "inc-2", place, at(600)) is False
         with sqlite3.connect(tmp_path / "mock.sqlite3") as db:
             db.execute("UPDATE sent SET state = 'claimed' WHERE incident_id = 'inc-2'")
+
+
+def test_a_claim_whose_server_was_stopped_before_it_heard_is_tried_again_later(
+    tmp_path: Path,
+) -> None:
+    kept = subscriptions(tmp_path)
+    kept.put(FCM, [NEAR], at(0))
+    assert kept.claim(FCM, "inc-1", near(0), at(1)) is True
+    # The server is stopped here: the claim is never settled. Another is started.
+    again = Subscriptions(tmp_path / "mock.sqlite3", "mock")
+    stale = store_module.CLAIM_STALE
+
+    # Not while the first server's pass could still be under way.
+    assert again.claim(FCM, "inc-1", near(0), at(1) + stale - timedelta(seconds=1)) is False
+    assert again.claim(FCM, "inc-1", near(0), at(1) + stale) is True
+    # It counts as a try: three in all, however they ended.
+    assert again.tries()[(FCM, "inc-1")].tries == 2
+    assert again.claim(FCM, "inc-1", near(0), at(1) + stale * 2) is True
+    assert again.claim(FCM, "inc-1", near(0), at(1) + stale * 9) is False
+    assert stale > timedelta(seconds=desk_module.PASS_SECONDS) * 4
+
+
+def test_a_send_is_claimed_only_for_a_place_the_subscription_still_names(tmp_path: Path) -> None:
+    kept = subscriptions(tmp_path)
+    kept.put(FCM, [NEAR, FAR], at(0))
+    # A pass reads the subscription, and the person then removes the place.
+    kept.put(FCM, [FAR], at(1))
+
+    assert kept.claim(FCM, "inc-1", near(0), at(2)) is False
+    # Named again, it is a place added then, and not the one the pass read.
+    kept.put(FCM, [FAR, NEAR], at(3))
+    assert kept.claim(FCM, "inc-1", near(0), at(4)) is False
+    assert kept.claim(FCM, "inc-1", near(3), at(4)) is True
+    assert kept.tries()[(FCM, "inc-1")].tries == 1
 
 
 def test_a_subscriptions_file_is_one_modes_and_takes_nothing_once_closed(tmp_path: Path) -> None:
@@ -442,7 +595,7 @@ def test_a_subscriptions_file_is_one_modes_and_takes_nothing_once_closed(tmp_pat
         lambda: kept.put(MOZ, [NEAR], at(1)),
         lambda: kept.remove(FCM),
         lambda: kept.sweep(at(1)),
-        lambda: kept.claim(FCM, "inc-1", at(1)),
+        lambda: kept.claim(FCM, "inc-1", near(0), at(1)),
         lambda: kept.settle(FCM, "inc-1", "sent"),
     ):
         with pytest.raises(SubscriptionsError):
@@ -471,8 +624,8 @@ def test_a_device_is_sent_one_push_with_no_content_when_crisis_mode_is_turned_on
     assert request.content == b""
     assert request.headers.get("content-encoding") is None
     assert (request.headers["ttl"], request.headers["urgency"]) == ("3600", "high")
-    claims = verified(world.push.vapid, request.headers["authorization"])
-    assert claims["aud"] == "https://fcm.googleapis.com"
+    claims = verified(world.vapid, request.headers["authorization"])
+    assert (claims["aud"], claims["sub"]) == ("https://fcm.googleapis.com", CONTACT)
     # One for the incident, however often the incidents are looked over.
     assert world.notify(7.5) == Pass()
     assert world.notify(30) == Pass()
@@ -489,12 +642,71 @@ def test_how_near_is_the_saved_place_checks_reach(world: World) -> None:
     assert world.services.sent_to == [FCM]
 
 
-def test_no_push_is_sent_for_a_decision_made_before_the_device_subscribed(world: World) -> None:
+def test_a_push_is_for_crisis_mode_turned_on_near_a_place_the_device_had_named_by_then(
+    world: World,
+) -> None:
+    # One device names the place before the decision, one after it, and one had
+    # a far place before and adds the near one after.
+    world.push.subscriptions.put(FCM, [NEAR], at(6))
+    world.push.subscriptions.put(APPLE, [FAR], at(6))
     world.decide(6.5)
-    world.push.subscriptions.put(FCM, [NEAR], at(6.6))
+    world.push.subscriptions.put(MOZ, [NEAR], at(6.6))
+    world.push.subscriptions.put(APPLE, [FAR, NEAR], at(6.6))
+
+    assert world.notify(7) == Pass(sent=1)
+    assert world.services.sent_to == [FCM]
+    # A renewal changes nothing of that: the place keeps when it was added.
+    world.push.subscriptions.put(MOZ, [NEAR], at(7.1))
+    assert world.notify(7.5) == Pass()
+
+    # A place named at the very moment of the decision was not named before it.
+    decided = world.runs.crisis(world.id_of("fire"))
+    assert decided is not None
+    world.push.subscriptions.put(EDGE, [NEAR], decided.decided_at)
+    assert world.notify(8) == Pass()
+    world.push.subscriptions.remove(EDGE)
+    world.push.subscriptions.put(EDGE, [NEAR], decided.decided_at - timedelta(microseconds=1))
+    assert world.notify(8.5) == Pass(sent=1)
+
+
+def test_a_place_removed_after_a_pass_read_it_brings_no_push(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world.push.subscriptions.put(FCM, [NEAR, FAR], at(5))
+    world.decide()
+    read = world.push.subscriptions.all
+
+    def read_and_then_the_place_is_removed() -> Any:
+        found = read()
+        world.push.subscriptions.put(FCM, [FAR], at(6.9))
+        return found
+
+    monkeypatch.setattr(world.push.subscriptions, "all", read_and_then_the_place_is_removed)
 
     assert world.notify(7) == Pass()
     assert world.services.requests == []
+    assert world.push.subscriptions.tries() == {}
+
+
+def test_no_push_is_sent_from_a_point_beacon_took_from_a_511_event(world: World) -> None:
+    world.push.subscriptions.put(FCM, [NEAR], at(5))
+    world.decide()
+    snapshot = world.engine.snapshot()
+    (fire,) = [incident for incident in snapshot.incidents if incident.category == "fire"]
+    assert fire.point_from == "blocks"
+    # The same incident, had Beacon no point for its block and only a closure's:
+    # a notification says it is near a place, and could not carry 511's credit.
+    from_511 = replace(
+        snapshot,
+        incidents=tuple(
+            replace(incident, point_from="closure") if incident.id == fire.id else incident
+            for incident in snapshot.incidents
+        ),
+    )
+
+    assert world.notifier.notify(from_511, at(7)) == Pass()
+    assert world.services.requests == []
+    assert world.notifier.notify(snapshot, at(7)) == Pass(sent=1)
 
 
 def test_no_push_is_sent_for_a_medical_response_a_closed_incident_or_signals_that_are_gone(
@@ -528,7 +740,7 @@ def test_no_push_is_sent_for_a_medical_response_a_closed_incident_or_signals_tha
             for incident in snapshot.incidents
         ),
     )
-    assert world.push.notifier.notify(doctored, at(7)) == Pass()
+    assert world.notifier.notify(doctored, at(7)) == Pass()
     assert world.services.requests == []
 
 
@@ -581,6 +793,36 @@ def test_a_push_the_service_did_not_take_is_tried_again_three_times_in_all(world
     assert len(world.push.subscriptions.all()) == 3
 
 
+def test_a_push_the_service_took_is_sent_whatever_becomes_of_the_reply_after_its_status(
+    world: World,
+) -> None:
+    world.push.subscriptions.put(FCM, [NEAR], at(5))
+    world.services.body_fails = {FCM}
+    world.decide()
+
+    # The status said the push was taken. Asking again would notify twice.
+    assert world.notify(7) == Pass(sent=1)
+    assert world.notify(30) == Pass()
+    assert len(world.services.requests) == 1
+
+
+def test_a_send_whose_server_was_stopped_before_it_heard_is_made_again(world: World) -> None:
+    world.push.subscriptions.put(FCM, [NEAR], at(5))
+    world.decide()
+    # A pass claims the send, and the server is stopped before the push service
+    # answers: the claim is never settled.
+    fire = world.id_of("fire")
+    assert world.push.subscriptions.claim(FCM, fire, near(5), at(7))
+
+    assert world.notify(8) == Pass()
+    stale = store_module.CLAIM_STALE.total_seconds() / 60
+    # Best effort: whether the push service took the first is not known, so the
+    # device may be notified twice.
+    assert world.notify(7 + stale) == Pass(sent=1)
+    assert world.notify(8 + stale) == Pass()
+    assert world.services.sent_to == [FCM]
+
+
 def test_one_token_is_signed_for_a_push_service_and_used_for_an_hour(world: World) -> None:
     other = FCM + "-2"
     for address in (FCM, other, MOZ):
@@ -593,15 +835,32 @@ def test_one_token_is_signed_for_a_push_service_and_used_for_an_hour(world: Worl
     # One for each push service, whoever of its devices is sent to.
     assert tokens[FCM] == tokens[other]
     assert tokens[FCM] != tokens[MOZ]
-    assert verified(world.push.vapid, tokens[MOZ])["aud"] == audience(MOZ)
+    assert verified(world.vapid, tokens[MOZ])["aud"] == audience(MOZ)
     # Within the hour the same token is used, and after it another is signed.
-    send = world.push.notifier._send
-    assert send(FCM, at(7) + desk_module.TOKEN_REUSED - timedelta(seconds=1)) == "sent"
+    send = world.notifier._send
+    assert send(FCM, at(7) + desk_module.TOKEN_REUSED - timedelta(seconds=1), 5.0) == "sent"
     assert world.services.requests[-1].headers["authorization"] == tokens[FCM]
-    assert send(FCM, at(7) + desk_module.TOKEN_REUSED) == "sent"
+    assert send(FCM, at(7) + desk_module.TOKEN_REUSED, 5.0) == "sent"
     later = world.services.requests[-1].headers["authorization"]
     assert later != tokens[FCM]
-    assert verified(world.push.vapid, later)["exp"] > verified(world.push.vapid, tokens[FCM])["exp"]
+    assert verified(world.vapid, later)["exp"] > verified(world.vapid, tokens[FCM])["exp"]
+
+
+def test_only_so_many_tokens_are_kept_and_none_past_its_hour(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(desk_module, "MAX_TOKENS", 2)
+    notifier = world.notifier
+    hosts = [f"https://wns{number}.notify.windows.com/w/abc" for number in range(4)]
+
+    for minute, host in enumerate(hosts):
+        assert notifier._send(host, at(minute), 5.0) == "sent"
+
+    # The two signed last are kept, however many push services there were.
+    assert set(notifier._tokens) == {audience(hosts[2]), audience(hosts[3])}
+    # A pass an hour on keeps none of them: no push went to their services since.
+    world.notify(3 + desk_module.TOKEN_REUSED.total_seconds() / 60)
+    assert notifier._tokens == {}
 
 
 def test_a_push_the_service_refuses_is_not_tried_again_and_the_subscription_stays(
@@ -617,7 +876,7 @@ def test_a_push_the_service_refuses_is_not_tried_again_and_the_subscription_stay
     assert len(world.push.subscriptions.all()) == 1
 
 
-def test_a_pass_sends_only_so_many_and_only_so_long_and_the_next_sends_the_rest(
+def test_a_pass_sends_only_so_many_and_the_next_sends_the_rest(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     for address in (FCM, MOZ, APPLE):
@@ -629,21 +888,102 @@ def test_a_pass_sends_only_so_many_and_only_so_long_and_the_next_sends_the_rest(
     assert world.notify(7.2) == Pass(sent=1)
     assert sorted(world.services.sent_to) == sorted([FCM, MOZ, APPLE])
 
-    # And by the clock: a pass whose time is up claims nothing more.
-    world.push.subscriptions.put(EDGE, [NEAR], at(5))
-    ticks = iter([0.0, 0.0, desk_module.PASS_SECONDS, desk_module.PASS_SECONDS])
+
+def test_what_was_sent_before_takes_none_of_a_pass_so_the_last_devices_are_reached(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    addresses = [f"{FCM}-{number}" for number in range(7)]
+    for address in addresses:
+        world.push.subscriptions.put(address, [NEAR], at(5))
+    world.decide()
+    monkeypatch.setattr(desk_module, "MAX_SENDS", 3)
+    writes: list[str] = []
+    claim = world.push.subscriptions.claim
+
+    def counted(endpoint: str, *rest: Any) -> bool:
+        writes.append(endpoint)
+        return claim(endpoint, *rest)
+
+    monkeypatch.setattr(world.push.subscriptions, "claim", counted)
+
+    assert world.notify(7) == Pass(sent=3, more=True)
+    assert world.notify(7.2) == Pass(sent=3, more=True)
+    assert world.notify(7.4) == Pass(sent=1)
+    # Every device once, in the order they subscribed, and a pass asked the file
+    # about no send it had already made.
+    assert world.services.sent_to == addresses
+    assert writes == addresses
+
+
+class _Clock:
+    """A clock a test moves by hand, in seconds."""
+
+    def __init__(self) -> None:
+        self.seconds = 0.0
+
+    def __call__(self) -> float:
+        return self.seconds
+
+
+def test_a_pass_lasts_only_so_long_from_before_it_reads_anything(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for address in (FCM, MOZ, APPLE):
+        world.push.subscriptions.put(address, [NEAR], at(5))
+    world.decide()
+    clock = _Clock()
+    waited: list[float] = []
+    fetch = desk_module.fetch
+
+    def slow(*args: Any, **named: Any) -> bytes:
+        # A push service that takes all the time it is given.
+        waited.append(named["max_seconds"])
+        clock.seconds += named["max_seconds"]
+        return fetch(*args, **named)
+
+    monkeypatch.setattr(desk_module, "fetch", slow)
     timed = Notifier(
         world.push.subscriptions,
         world.runs,
-        world.push.vapid,
+        world.vapid,
         SourceHttp(httpx2.MockTransport(world.services)),
-        monotonic=lambda: next(ticks),
+        monotonic=clock,
     )
-    with sqlite3.connect(world.path / "push" / "mock.sqlite3") as db:
-        db.execute("DELETE FROM sent")
-    world.push.subscriptions.put(FCM, [NEAR], at(5))
-    assert timed.notify(world.engine.snapshot(), at(8)) == Pass(sent=1, more=True)
+    # Reading what is kept takes most of the pass's time, which counts.
+    sweep = world.push.subscriptions.sweep
+
+    def slow_sweep(now: datetime) -> int:
+        clock.seconds += desk_module.PASS_SECONDS - 12.0
+        return sweep(now)
+
+    monkeypatch.setattr(world.push.subscriptions, "sweep", slow_sweep)
+
+    assert timed.notify(world.engine.snapshot(), at(7)) == Pass(sent=2, more=True)
+
+    # No push service is waited for longer than a send may take, or than the
+    # pass has left, and the pass ends by its time.
+    assert waited == [desk_module.SEND_SECONDS, 2.0]
+    assert clock.seconds == desk_module.PASS_SECONDS
+    assert desk_module.SEND_SECONDS < desk_module.PASS_SECONDS
     timed.close()
+
+
+def test_a_push_service_that_does_not_answer_in_time_is_asked_again_later(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world.push.subscriptions.put(FCM, [NEAR], at(5))
+    world.decide()
+
+    class Silent(httpx2.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+            await asyncio.sleep(30)
+            return httpx2.Response(201)
+
+    monkeypatch.setattr(desk_module, "SEND_SECONDS", 0.05)
+    waiting = Notifier(world.push.subscriptions, world.runs, world.vapid, SourceHttp(Silent()))
+
+    assert waiting.notify(world.engine.snapshot(), at(7)) == Pass(again=1)
+    waiting.close()
 
 
 def test_nothing_of_an_address_a_place_or_an_incident_is_logged_or_raised(
@@ -682,7 +1022,7 @@ def test_nothing_of_an_address_a_place_or_an_incident_is_logged_or_raised(
 def test_a_closed_notifier_sends_nothing_and_claims_nothing(world: World) -> None:
     world.push.subscriptions.put(FCM, [NEAR], at(5))
     world.decide()
-    world.push.notifier.close()
+    world.notifier.close()
 
     assert world.notify(7) == Pass()
     assert world.services.requests == []
@@ -690,7 +1030,7 @@ def test_a_closed_notifier_sends_nothing_and_claims_nothing(world: World) -> Non
     again = Notifier(
         world.push.subscriptions,
         world.runs,
-        world.push.vapid,
+        world.vapid,
         SourceHttp(httpx2.MockTransport(world.services)),
     )
     assert again.notify(world.engine.snapshot(), at(7.1)) == Pass(sent=1)
@@ -717,6 +1057,16 @@ def test_the_words_of_a_notification_say_whose_decision_it_is_and_tell_nobody_wh
     assert "model" not in mock.text
     assert "30 days" in ABOUT
     assert timedelta(days=30) == KEPT
+    assert "2 days at most" in ABOUT
+    assert timedelta(days=2) == SENT_KEPT
+    # It names everything the file holds beside an address, and does not say the
+    # push service learns nothing.
+    for kept in ("when you added it", "the incident's id", "how many times it tried"):
+        assert kept in ABOUT
+    assert "it does learn that Beacon sent this device a message, and when" in ABOUT
+    assert "nothing else" not in ABOUT
+    # Sending is best effort, and the words do not promise more.
+    assert "can fail to arrive, and one can arrive twice" in ABOUT
 
 
 # The routes.
@@ -734,7 +1084,7 @@ def test_the_app_is_told_the_key_and_what_is_kept_before_anyone_subscribes(world
         "mode": "mock",
         "enabled": True,
         "text": None,
-        "public_key": world.push.vapid.public_key,
+        "public_key": world.vapid.public_key,
         "about_text": ABOUT,
         # The invented scenario's words, for a device that subscribes to it.
         "notice": {"title": notice_of("mock").title, "text": notice_of("mock").text},
@@ -760,10 +1110,13 @@ def test_subscribing_keeps_the_address_and_the_places_rounded_to_a_block_and_not
     answer = response.json()
     assert set(answer) == {"mode", "kept_until"}
     assert answer["mode"] == "mock"
-    ((endpoint, kept_places, created_at, renewed_at),) = world.kept()
+    ((endpoint, kept_places, renewed_at),) = world.kept()
     assert endpoint == FCM
-    assert json.loads(kept_places) == [[37.777, -122.424], [37.78, -122.42]]
-    assert created_at == renewed_at
+    # Each place rounded, with when it was added, which is when it was first sent.
+    assert json.loads(kept_places) == [
+        [37.777, -122.424, renewed_at],
+        [37.78, -122.42, renewed_at],
+    ]
     until = datetime.fromisoformat(answer["kept_until"])
     assert KEPT - timedelta(minutes=1) < until - datetime.now(until.tzinfo) <= KEPT
     # Nothing of who asked is anywhere in the file.
@@ -773,25 +1126,22 @@ def test_subscribing_keeps_the_address_and_the_places_rounded_to_a_block_and_not
 
     # Asked again with other places, it is the same subscription with those.
     assert client.post("/api/push/subscribe", json=body_of(), headers=SHOWN).status_code == 200
-    ((_, kept_places, created_again, _),) = world.kept()
-    assert json.loads(kept_places) == [[round(NEAR.lat, 3), round(NEAR.lon, 3)]]
-    assert created_again == created_at
+    ((_, kept_places, renewed_again),) = world.kept()
+    assert json.loads(kept_places) == [[round(NEAR.lat, 3), round(NEAR.lon, 3), renewed_again]]
+    assert renewed_again > renewed_at
 
 
 def test_a_subscription_the_routes_made_is_sent_its_push(world: World) -> None:
     client = world.app()
     assert client.post("/api/push/subscribe", json=body_of(), headers=SHOWN).status_code == 200
+    world.places_added(5)
     world.decide(6.5)
-    # The route stamps a subscription with the time it is now, which is after the
-    # story's. The decision is moved to after that.
-    with sqlite3.connect(world.path / "push" / "mock.sqlite3") as db:
-        db.execute("UPDATE subscription SET created_at = '2026-01-01T00:00:00.000000'")
 
     assert world.notify(7) == Pass(sent=1)
     assert world.services.sent_to == [FCM]
 
     # Turned off, the address and what was sent to it are deleted.
-    gone = client.post("/api/push/unsubscribe", json={"endpoint": FCM})
+    gone = client.post("/api/push/unsubscribe", json={"endpoint": FCM}, headers=SHOWN)
     assert (gone.status_code, gone.content) == (204, b"")
     assert world.kept() == []
     with sqlite3.connect(world.path / "push" / "mock.sqlite3") as db:
@@ -799,8 +1149,37 @@ def test_a_subscription_the_routes_made_is_sent_its_push(world: World) -> None:
     # The answer is the same when there was none, and for an address Beacon
     # would never have kept.
     for endpoint in (FCM, "https://example.org/x"):
-        again = client.post("/api/push/unsubscribe", json={"endpoint": endpoint})
+        again = client.post("/api/push/unsubscribe", json={"endpoint": endpoint}, headers=SHOWN)
         assert (again.status_code, again.content) == (204, b"")
+
+
+def test_an_address_is_said_to_be_deleted_only_by_the_server_whose_file_it_is_in(
+    world: World,
+) -> None:
+    client = world.app()
+    world.push.subscriptions.put(FCM, [NEAR], at(5))
+    gone = {"endpoint": FCM}
+
+    # 204 says this mode's file does not hold the address. A request that names
+    # no mode, or the other mode's, is refused unread, and nothing is deleted.
+    unnamed = client.post("/api/push/unsubscribe", json=gone)
+    other = client.post("/api/push/unsubscribe", json=gone, headers={"Beacon-Mode": "live"})
+    assert (unnamed.status_code, other.status_code) == (400, 409)
+    assert "nothing was kept or deleted" in other.json()["detail"]
+    assert len(world.kept()) == 1
+    # Nor by a server that is too busy, or stopping.
+    admission = client.app.state.push_requests  # type: ignore[attr-defined]
+    held = [admission.admit() for _ in range(8)]
+    busy = client.post("/api/push/unsubscribe", json=gone, headers=SHOWN)
+    for give_back in held:
+        give_back()
+    assert busy.status_code == 503
+    assert len(world.kept()) == 1
+    assert client.post("/api/push/unsubscribe", json=gone, headers=SHOWN).status_code == 204
+    assert world.kept() == []
+    world.push.subscriptions.close()
+    stopping = client.post("/api/push/unsubscribe", json=gone, headers=SHOWN)
+    assert stopping.status_code == 503
 
 
 @pytest.mark.parametrize(
@@ -882,19 +1261,125 @@ def test_a_request_about_notifications_is_bounded_before_it_is_read(
     assert admission.held == 0
 
 
-def test_a_server_that_sends_no_notifications_says_so_and_keeps_nothing(world: World) -> None:
+def test_a_server_with_nothing_kept_and_notifications_off_says_so_and_keeps_nothing(
+    world: World,
+) -> None:
     client = world.app(push=False)
 
     answer = client.get("/api/push").json()
     assert (answer["enabled"], answer["text"]) == (False, OFF)
     assert (answer["public_key"], answer["about_text"], answer["notice"]) == (None, None, None)
-    for path, body in (
-        ("/api/push/subscribe", body_of()),
-        ("/api/push/unsubscribe", {"endpoint": FCM}),
-    ):
-        refused = client.post(path, json=body, headers=SHOWN)
-        assert (refused.status_code, refused.json()) == (503, {"detail": OFF})
+    refused = client.post("/api/push/subscribe", json=body_of(), headers=SHOWN)
+    assert (refused.status_code, refused.json()) == (503, {"detail": OFF})
+    # It keeps no address, which is what 204 says.
+    gone = client.post("/api/push/unsubscribe", json={"endpoint": FCM}, headers=SHOWN)
+    assert gone.status_code == 204
     assert world.kept() == []
+
+
+@pytest.mark.parametrize(
+    ("env", "why"),
+    [({PUSH_VARIABLE: "0", SUBJECT_VARIABLE: CONTACT}, TURNED_OFF), ({}, NO_CONTACT)],
+)
+def test_a_server_that_sends_none_still_deletes_what_an_earlier_one_kept(
+    world: World, env: dict[str, str], why: str
+) -> None:
+    # A server that sent notifications kept two subscriptions, and is stopped.
+    world.push.subscriptions.put(FCM, [NEAR], at(5))
+    world.push.subscriptions.put(MOZ, [NEAR], at(5) + timedelta(days=20))
+    world.decide()
+    world.push.close()
+    key = world.path / "push" / "mock.vapid.key"
+    key.unlink()
+
+    # The next one is told to send none, or is given nobody to name to a push service.
+    quiet = open_push(
+        {"BEACON_DATA_DIR": str(world.path), **env},
+        world.engine,
+        world.runs,
+        transport=httpx2.MockTransport(world.services),
+    )
+    assert quiet is not None
+    assert (quiet.sends, quiet.off, quiet.vapid, quiet.notifier) == (False, why, None, None)
+    # It makes no key, takes no subscription, and sends nothing, though one is due.
+    world.push = quiet
+    client = world.app()
+    assert client.get("/api/push").json()["enabled"] is False
+    refused = client.post("/api/push/subscribe", json=body_of(endpoint=APPLE), headers=SHOWN)
+    assert (refused.status_code, refused.json()) == (503, {"detail": OFF})
+    assert world.notify(7) == Pass()
+    assert world.services.requests == []
+    assert not key.exists()
+    assert len(world.kept()) == 2
+
+    # A device that turns notifications off is deleted, and one whose time is
+    # over is deleted by the pass, which the server goes on making.
+    gone = client.post("/api/push/unsubscribe", json={"endpoint": MOZ}, headers=SHOWN)
+    assert gone.status_code == 204
+    assert [row[0] for row in world.kept()] == [FCM]
+    day = 24 * 60
+    assert world.notify(5 + 29 * day) == Pass()
+    assert len(world.kept()) == 1
+    assert world.notify(5 + 30 * day + 1) == Pass()
+    assert world.kept() == []
+    quiet.close()
+
+
+def test_the_other_modes_subscriptions_are_deleted_when_their_time_is_over(
+    world: World, tmp_path: Path
+) -> None:
+    # A live server kept a subscription here before this one, which is the
+    # invented scenario's, was started on the same data directory.
+    live = Subscriptions(world.path / "push" / "live.sqlite3", "live")
+    live.put(FCM, [NEAR], at(5))
+    live.put(MOZ, [NEAR], at(5) + timedelta(days=10))
+    live.close()
+    world.push.close()
+    both = open_push(
+        {"BEACON_DATA_DIR": str(world.path), SUBJECT_VARIABLE: CONTACT},
+        world.engine,
+        world.runs,
+        transport=httpx2.MockTransport(world.services),
+    )
+    assert both is not None
+    world.push = both
+    (other,) = both.others
+    assert (other.mode, both.unswept) == ("live", False)
+    world.decide()
+
+    day = 24 * 60
+    world.notify(5 + 30 * day + 1)
+
+    # Only time empties the other mode's file: nothing in it is sent to, by a
+    # server that is not its mode's.
+    assert [found.endpoint for found in other.all()] == [MOZ]
+    assert world.services.requests == []
+    world.notify(5 + 41 * day)
+    assert other.all() == ()
+    both.close()
+    with pytest.raises(SubscriptionsError):
+        other.sweep(at(0))
+
+
+def test_another_modes_file_this_beacon_cannot_open_is_left_and_said(world: World) -> None:
+    world.push.close()
+    path = world.path / "push" / "live.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.execute("PRAGMA user_version = 99")
+        db.execute("CREATE TABLE newer (x)")
+    before = path.read_bytes()
+
+    opened = open_push(
+        {"BEACON_DATA_DIR": str(world.path), SUBJECT_VARIABLE: CONTACT},
+        world.engine,
+        world.runs,
+        transport=httpx2.MockTransport(world.services),
+    )
+
+    assert opened is not None
+    assert (opened.others, opened.unswept) == ((), True)
+    assert path.read_bytes() == before
+    opened.close()
 
 
 def test_a_server_that_is_stopping_refuses_in_a_sentence(world: World) -> None:
@@ -921,6 +1406,7 @@ def test_the_server_opens_push_with_a_key_that_lasts_and_closes_it(
 ) -> None:
     monkeypatch.setenv("BEACON_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("BEACON_INGEST", "0")
+    monkeypatch.setenv(SUBJECT_VARIABLE, CONTACT)
 
     with TestClient(create_app()) as client:
         first = client.get("/api/push").json()
@@ -930,6 +1416,7 @@ def test_the_server_opens_push_with_a_key_that_lasts_and_closes_it(
     # Closed with the server: nothing more is kept, and nothing more is sent.
     with pytest.raises(SubscriptionsError):
         push.subscriptions.put(MOZ, [NEAR], at(0))
+    assert push.notifier is not None
     assert push.notifier._http.closed
     # For the server's user only.
     directory = tmp_path / "push"
@@ -961,3 +1448,25 @@ def test_push_is_turned_off_by_a_setting_and_a_wrong_setting_is_refused(
 
     with pytest.raises(PushConfigError, match="must be 1 or 0"):
         open_push({PUSH_VARIABLE: "yes"}, world.engine, world.runs)
+
+
+def test_a_server_given_no_contact_starts_sends_none_and_says_why(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("BEACON_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("BEACON_INGEST", "0")
+    caplog.set_level(logging.WARNING)
+
+    with TestClient(create_app()) as client:
+        answer = client.get("/api/push").json()
+        push: Push = client.app.state.push  # type: ignore[attr-defined]
+
+    assert (answer["enabled"], answer["text"], answer["public_key"]) == (False, OFF, None)
+    assert (push.sends, push.off) == (False, NO_CONTACT)
+    assert f"This server sends no notifications ({NO_CONTACT})" in caplog.text
+    # No key is made for a server that signs nothing.
+    assert not (tmp_path / "push" / "mock.vapid.key").exists()
+
+    monkeypatch.setenv(SUBJECT_VARIABLE, "ops@example.org")
+    with pytest.raises(VapidError), TestClient(create_app()):
+        pass

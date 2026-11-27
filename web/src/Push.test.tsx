@@ -2,6 +2,7 @@ import { act, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import worker from '../public/push-sw.js?raw'
 import App from './App.tsx'
+import type { Mode } from './api/incidents.ts'
 import type { PushInfo } from './api/push.ts'
 import { removePlace, savePlace } from './lib/placeStore.ts'
 import {
@@ -11,11 +12,14 @@ import {
   pushSnapshot,
   resetPush,
   RETRY_MS,
+  scopeOf,
   syncPush,
+  turnOff,
+  WORKER,
 } from './lib/push.ts'
 import { type Asked, MOCK_HEALTH, serve } from './test/server.ts'
 
-const KEY = 'beacon.push.v1'
+const KEY = 'beacon.push.v2'
 const INFO = 'GET /api/push'
 const SUBSCRIBE = 'POST /api/push/subscribe'
 const UNSUBSCRIBE = 'POST /api/push/unsubscribe'
@@ -66,107 +70,162 @@ const NOTHING_NEAR = {
 type FakeSubscription = {
   endpoint: string
   options: { applicationServerKey: ArrayBuffer | null }
-  unsubscribe: ReturnType<typeof vi.fn>
+  unsubscribe: ReturnType<typeof vi.fn<() => Promise<boolean>>>
 }
 
-/** The browser's side of web push, which jsdom has none of: a service worker's
- * registration with its push manager, the permission to notify, and the cache
- * the notification's words are kept in. `events` is what was done, in order. */
+const MOCK_SERVER = { on: 'mock', told: { endpoint: ADDRESS, mode: 'mock' } }
+/** What a device keeps once notifications are on for the invented scenario and
+ * its server was given `endpoint`. */
+const turnedOn = (endpoint: string | null = ADDRESS) =>
+  JSON.stringify({
+    on: 'mock',
+    told: endpoint === null ? null : { endpoint, mode: 'mock' },
+    forget: [],
+  })
+const modeOfScope = (scope: string): Mode =>
+  scope.endsWith('/push/live/') ? 'live' : 'mock'
+
+/** The browser's side of web push, which jsdom has none of: service worker
+ * registrations, each with its push manager, the permission to notify, and the
+ * cache the notifications' words are kept in. `events` is what was done, in
+ * order. The app's other service worker, at the site's root, is there too, and
+ * fails the test if a push is ever asked of it. */
 function browser({
   permission = 'default' as NotificationPermission,
   grants = 'granted' as NotificationPermission,
-  registered = true,
-  subscribedFor = null as Uint8Array | null,
+  worker: hasWorker = true,
+  subscribed = null as { mode: Mode; key: Uint8Array } | null,
 } = {}) {
   const events: string[] = []
+  const registered: string[] = []
   const kept = new Map<string, string>()
-  let subscription: FakeSubscription | null = null
+  const shown: { mode: Mode; title: string; options: NotificationOptions }[] =
+    []
+  const subscriptions = new Map<Mode, FakeSubscription>()
+  const registrations = new Map<string, unknown>()
+  const device = {
+    events,
+    registered,
+    kept,
+    shown,
+    // Whether the browser lets go of a subscription when it is asked to.
+    letsGo: true,
+    // Done while the browser makes a subscription.
+    whileSubscribing: async () => {},
+    showing: vi.fn(async () => {}),
+    subscribe: vi.fn(),
+    notification: {
+      permission,
+      requestPermission: vi.fn(async () => {
+        events.push('ask permission')
+        device.notification.permission = grants
+        return grants
+      }),
+    },
+    subscription: (mode: Mode) => subscriptions.get(mode) ?? null,
+    words: (mode: Mode): unknown => {
+      const words = kept.get(`${NOTICE_CACHE} ${NOTICE_URL}${mode}`)
+      return words === undefined ? null : JSON.parse(words)
+    },
+  }
   let made = 0
-  const subscriptionFor = (key: Uint8Array, endpoint: string) => {
+  const subscriptionFor = (mode: Mode, key: Uint8Array, endpoint: string) => {
     const mine: FakeSubscription = {
       endpoint,
       options: { applicationServerKey: key.slice().buffer },
       unsubscribe: vi.fn(async () => {
         events.push(`unsubscribe ${endpoint}`)
-        if (subscription === mine) subscription = null
+        if (!device.letsGo) return false
+        if (subscriptions.get(mode) === mine) subscriptions.delete(mode)
         return true
       }),
     }
+    subscriptions.set(mode, mine)
     return mine
   }
-  if (subscribedFor !== null)
-    subscription = subscriptionFor(subscribedFor, `${ADDRESS}-old`)
-  const shown: { title: string; options: NotificationOptions }[] = []
-  const registration = {
-    pushManager: {
-      getSubscription: vi.fn(async () => subscription),
-      subscribe: vi.fn(
-        async (options: {
+  const registrationAt = (scope: string) => {
+    const mode = modeOfScope(scope)
+    const found = registrations.get(scope)
+    if (found !== undefined) return found
+    const registration = {
+      scope: new URL(scope, window.location.href).href,
+      active: {},
+      installing: null,
+      waiting: null,
+      pushManager: {
+        getSubscription: async () => subscriptions.get(mode) ?? null,
+        subscribe: async (options: {
           userVisibleOnly: boolean
           applicationServerKey: Uint8Array
         }) => {
+          device.subscribe(options)
+          await device.whileSubscribing()
           made += 1
-          events.push('subscribe')
-          subscription = subscriptionFor(
+          events.push(`subscribe ${mode}`)
+          return subscriptionFor(
+            mode,
             options.applicationServerKey,
             made === 1 ? ADDRESS : `${ADDRESS}-${made}`,
           )
-          return subscription
         },
-      ),
-    },
-    showNotification: vi.fn(
-      async (title: string, options: NotificationOptions) => {
-        shown.push({ title, options })
       },
-    ),
+      showNotification: async (title: string, options: NotificationOptions) => {
+        await device.showing()
+        shown.push({ mode, title, options })
+      },
+    }
+    registrations.set(scope, registration)
+    return registration
   }
-  const notification = {
-    permission,
-    requestPermission: vi.fn(async () => {
-      events.push('ask permission')
-      notification.permission = grants
-      return grants
-    }),
+  if (subscribed !== null) {
+    registrationAt(scopeOf(subscribed.mode))
+    subscriptionFor(subscribed.mode, subscribed.key, `${ADDRESS}-old`)
   }
-  vi.stubGlobal('Notification', notification)
+  // The registration of the app's own service worker. No push is its to take.
+  const notThisOne = () => {
+    throw new Error('The app’s own service worker receives no push.')
+  }
+  const root = {
+    scope: new URL('/', window.location.href).href,
+    active: {},
+    pushManager: { getSubscription: notThisOne, subscribe: notThisOne },
+    showNotification: notThisOne,
+  }
+  vi.stubGlobal('Notification', device.notification)
   vi.stubGlobal('PushManager', class {})
   vi.stubGlobal('caches', {
     open: vi.fn(async (name: string) => ({
       put: async (url: string, response: Response) => {
         kept.set(`${name} ${url}`, await response.text())
-        events.push('keep the words')
+        events.push(`keep the words ${url.slice(NOTICE_URL.length)}`)
       },
       match: async (url: string) => {
         const body = kept.get(`${name} ${url}`)
         return body === undefined ? undefined : new Response(body)
       },
+      delete: async (url: string) => {
+        events.push(`delete the words ${url.slice(NOTICE_URL.length)}`)
+        return kept.delete(`${name} ${url}`)
+      },
     })),
-    delete: vi.fn(async (name: string) => {
-      events.push('delete the words')
-      for (const key of [...kept.keys()])
-        if (key.startsWith(`${name} `)) kept.delete(key)
-      return true
-    }),
   })
   Object.defineProperty(window.navigator, 'serviceWorker', {
     value: {
-      getRegistration: vi.fn(async () =>
-        registered ? registration : undefined,
+      register: vi.fn(async (url: string, options: { scope: string }) => {
+        if (!hasWorker) throw new TypeError('No service worker here.')
+        registered.push(`${url} ${options.scope}`)
+        return registrationAt(options.scope)
+      }),
+      // As a browser answers: the registration whose scope holds the address
+      // asked about, which is the app's own when no other does.
+      getRegistration: vi.fn(
+        async (scope?: string) =>
+          (scope === undefined ? undefined : registrations.get(scope)) ?? root,
       ),
     },
     configurable: true,
   })
-  return {
-    events,
-    kept,
-    shown,
-    registration,
-    notification,
-    get subscription() {
-      return subscription
-    },
-  }
+  return device
 }
 
 const routes = (more: Record<string, unknown> = {}) => ({
@@ -182,6 +241,9 @@ const of = (asked: Asked[], key: string) =>
 const click = (element: HTMLElement) => act(async () => element.click())
 const wanted = (): unknown =>
   JSON.parse(window.localStorage.getItem(KEY) ?? 'null')
+const OFF = { on: null, told: null, forget: [] }
+const busy = () =>
+  Response.json({ detail: 'Beacon is busy. Try again.' }, { status: 503 })
 
 beforeEach(() => {
   window.localStorage.clear()
@@ -221,9 +283,11 @@ test('before notifications are turned on, the server’s words say what is kept,
   expect(
     screen.getByRole('button', { name: 'Turn notifications on' }),
   ).toBeEnabled()
-  // The browser is not asked for its leave until the person presses, and the
-  // server is given nothing of this device.
+  // The browser is not asked for its leave until the person presses, no
+  // service worker is registered, and the server is given nothing of this
+  // device.
   expect(device.events).toEqual([])
+  expect(device.registered).toEqual([])
   expect(of(asked, SUBSCRIBE)).toEqual([])
   expect(of(asked, UNSUBSCRIBE)).toEqual([])
   expect(wanted()).toBeNull()
@@ -233,7 +297,16 @@ test('turning notifications on keeps the server’s words, then sends the addres
   await savePlace('Home', { lat: 37.77612345, lon: -122.42398765 })
   await savePlace('Work', FAR)
   const device = browser()
-  const asked = serve(routes())
+  // What the device had noted down when the server was given the address.
+  let notedWhenSent: unknown = null
+  const asked = serve(
+    routes({
+      [SUBSCRIBE]: () => {
+        notedWhenSent = wanted()
+        return Response.json(SUBSCRIBED)
+      },
+    }),
+  )
   render(<App />)
 
   await click(
@@ -249,25 +322,31 @@ test('turning notifications on keeps the server’s words, then sends the addres
   // are on the device before the server has the address.
   expect(device.events).toEqual([
     'ask permission',
-    'keep the words',
-    'subscribe',
+    'keep the words mock',
+    'subscribe mock',
   ])
-  const [subscribed] = device.registration.pushManager.subscribe.mock.calls
-  expect(subscribed[0].userVisibleOnly).toBe(true)
-  expect([...subscribed[0].applicationServerKey]).toEqual([...KEY_BYTES])
-  expect(JSON.parse(device.kept.get(`${NOTICE_CACHE} ${NOTICE_URL}`)!)).toEqual(
-    NOTICE,
+  // A service worker of its own for the mode that is shown, and for no other.
+  expect(new Set(device.registered)).toEqual(
+    new Set([`${WORKER} ${scopeOf('mock')}`]),
   )
+  const [[subscribed]] = device.subscribe.mock.calls
+  expect(subscribed.userVisibleOnly).toBe(true)
+  expect([...subscribed.applicationServerKey]).toEqual([...KEY_BYTES])
+  expect(device.words('mock')).toEqual(NOTICE)
+  expect(device.words('live')).toBeNull()
   const sent = of(asked, SUBSCRIBE)
   expect(sent).toHaveLength(1)
   // No name, no id, and each place rounded to about a block.
   expect(sent[0].body).toEqual({ endpoint: ADDRESS, places: [FIRE, FAR] })
   expect(sent[0].headers['beacon-mode']).toBe('mock')
-  expect(wanted()).toEqual({ on: true, forget: [] })
+  // The address was noted on the device before the server had it: were the tab
+  // closed before the server answered, the device could still have it deleted.
+  expect(notedWhenSent).toEqual({ ...MOCK_SERVER, forget: [] })
+  expect(wanted()).toEqual({ ...MOCK_SERVER, forget: [] })
   expect(JSON.stringify(asked)).not.toContain('Home')
 })
 
-test('the server is told again when a place is saved or removed, and keeps nothing once none is saved', async () => {
+test('the server is told again when a place is saved or removed, and deletes the address once none is saved', async () => {
   await savePlace('Home', FIRE)
   const device = browser()
   const asked = serve(routes())
@@ -277,37 +356,46 @@ test('the server is told again when a place is saved or removed, and keeps nothi
   )
   await waitFor(() => expect(of(asked, SUBSCRIBE)).toHaveLength(1))
 
-  await act(async () => void (await savePlace('Work', FAR)))
+  await act(() => savePlace('Work', FAR))
+
   await waitFor(() => expect(of(asked, SUBSCRIBE)).toHaveLength(2))
   expect(of(asked, SUBSCRIBE)[1].body).toEqual({
     endpoint: ADDRESS,
     places: [FIRE, FAR],
   })
+  const ids = (
+    JSON.parse(window.localStorage.getItem('beacon.places.v1')!) as {
+      id: string
+    }[]
+  ).map((place) => place.id)
+  for (const id of ids) await act(() => removePlace(id))
 
-  // Removed in another tab: storage says so, and the server is told.
-  await act(async () => {
-    window.localStorage.setItem('beacon.places.v1', '[]')
-    window.dispatchEvent(
-      new StorageEvent('storage', { key: 'beacon.places.v1' }),
-    )
-  })
+  // With no place, there is nothing to be notified about.
   await waitFor(() => expect(of(asked, UNSUBSCRIBE)).toHaveLength(1))
   expect(of(asked, UNSUBSCRIBE)[0].body).toEqual({ endpoint: ADDRESS })
-  expect(of(asked, SUBSCRIBE)).toHaveLength(2)
+  expect(of(asked, UNSUBSCRIBE)[0].headers['beacon-mode']).toBe('mock')
   expect(
     await screen.findByText(
-      /With no place saved, Beacon’s server keeps nothing of this device/,
+      /With no place saved, Beacon’s server has no address for this device\./,
     ),
   ).toBeInTheDocument()
+  expect(wanted()).toEqual({ on: 'mock', told: null, forget: [] })
+  expect(of(asked, SUBSCRIBE).at(-1)?.body).not.toEqual({
+    endpoint: ADDRESS,
+    places: [],
+  })
   // The browser's own subscription stays, for the next place.
-  expect(device.subscription?.endpoint).toBe(ADDRESS)
-  expect(pushSnapshot().wanted).toBe(true)
+  expect(device.subscription('mock')?.endpoint).toBe(ADDRESS)
+  expect(pushSnapshot().on).toBe('mock')
 })
 
-test('the app renews what the server keeps when it is opened, once', async () => {
+test('the app renews what the server keeps when it is opened, with the subscription the browser has', async () => {
   await savePlace('Home', FIRE)
-  window.localStorage.setItem(KEY, JSON.stringify({ on: true, forget: [] }))
-  const device = browser({ permission: 'granted', subscribedFor: KEY_BYTES })
+  window.localStorage.setItem(KEY, turnedOn(`${ADDRESS}-old`))
+  const device = browser({
+    permission: 'granted',
+    subscribed: { mode: 'mock', key: KEY_BYTES },
+  })
   const asked = serve(routes())
 
   render(<App />)
@@ -318,17 +406,234 @@ test('the app renews what the server keeps when it is opened, once', async () =>
     places: [FIRE],
   })
   // The subscription the browser has is the one renewed: no other is made.
-  expect(device.registration.pushManager.subscribe).not.toHaveBeenCalled()
+  expect(device.subscribe).not.toHaveBeenCalled()
   expect(device.notification.requestPermission).not.toHaveBeenCalled()
-  // Nothing changes, so nothing more is sent.
+  // What a telling notes down is no reason to tell again, in this tab or
+  // another: the server is told once.
   await act(async () => {
     window.dispatchEvent(new StorageEvent('storage', { key: KEY }))
   })
   await screen.findByText(/where your saved place is\./)
   expect(of(asked, SUBSCRIBE)).toHaveLength(1)
+  expect(of(asked, UNSUBSCRIBE)).toEqual([])
 })
 
-test('turning notifications off lets go of the address at once and has the server delete it', async () => {
+test('a telling tells the server whatever this tab told it before, because another tab may have told it otherwise', async () => {
+  await savePlace('Home', FIRE)
+  window.localStorage.setItem(KEY, turnedOn(null))
+  browser({ permission: 'granted' })
+  const asked = serve(routes())
+
+  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock')).toBe(true)
+
+  expect(of(asked, SUBSCRIBE).map((request) => request.body)).toEqual([
+    { endpoint: ADDRESS, places: [FIRE] },
+    { endpoint: ADDRESS, places: [FIRE] },
+  ])
+})
+
+test('turning notifications off notes the address, lets go of it, and says it is deleted once the server has answered so', async () => {
+  await savePlace('Home', FIRE)
+  const device = browser()
+  let answer = () => new Response(null, { status: 204 })
+  const asked = serve(routes({ [UNSUBSCRIBE]: () => answer() }))
+  render(<App />)
+  await click(
+    await screen.findByRole('button', { name: 'Turn notifications on' }),
+  )
+  await waitFor(() => expect(of(asked, SUBSCRIBE)).toHaveLength(1))
+  device.events.length = 0
+  // What the device had noted down when the browser was asked to let go.
+  let notedWhenLetGo: unknown = null
+  const letGo = device.subscription('mock')!.unsubscribe
+  const inner = letGo.getMockImplementation()!
+  letGo.mockImplementation(async () => {
+    notedWhenLetGo = wanted()
+    return inner()
+  })
+  // The server cannot be reached just now.
+  answer = () => {
+    throw new TypeError('Failed to fetch')
+  }
+
+  await click(screen.getByRole('button', { name: 'Turn notifications off' }))
+
+  // Off on the device, with the address noted for the server before the
+  // browser let go of it.
+  const pending = { on: null, told: null, forget: [MOCK_SERVER.told] }
+  expect(notedWhenLetGo).toEqual(pending)
+  expect(device.events).toEqual([
+    `unsubscribe ${ADDRESS}`,
+    'delete the words mock',
+  ])
+  expect(device.subscription('mock')).toBeNull()
+  expect(device.words('mock')).toBeNull()
+  // The server has not answered, and the app does not say it has.
+  expect(
+    await screen.findByText(
+      /Beacon’s server has not yet answered that it deleted this device’s address\./,
+    ),
+  ).toBeInTheDocument()
+  expect(screen.queryByText(/has answered that it deleted/)).toBeNull()
+  expect(wanted()).toEqual(pending)
+
+  answer = () => new Response(null, { status: 204 })
+  expect(await syncPush('mock')).toBe(true)
+
+  await waitFor(() => expect(wanted()).toEqual(OFF))
+  expect(
+    await screen.findByText(
+      /Beacon’s server has answered that it deleted this device’s address\./,
+    ),
+  ).toBeInTheDocument()
+  const sent = of(asked, UNSUBSCRIBE).at(-1)!
+  expect(sent.body).toEqual({ endpoint: ADDRESS })
+  expect(sent.headers['beacon-mode']).toBe('mock')
+  expect(
+    await screen.findByRole('button', { name: 'Turn notifications on' }),
+  ).toBeEnabled()
+  // The places stay on the device: they are the person's, not the server's.
+  expect(screen.getByRole('heading', { name: 'Home' })).toBeInTheDocument()
+})
+
+test.each([
+  ['is busy', busy],
+  [
+    'cannot be reached',
+    () => {
+      throw new TypeError('Failed to fetch')
+    },
+  ],
+  ['errs', () => new Response('oops', { status: 500 })],
+])(
+  'a server that %s has deleted nothing: the address is kept and it is asked again until it answers',
+  async (_what, refusal) => {
+    await savePlace('Home', FIRE)
+    browser()
+    let answers: () => Response = () => new Response(null, { status: 204 })
+    const asked = serve(routes({ [UNSUBSCRIBE]: () => answers() }))
+    render(<App />)
+    await click(
+      await screen.findByRole('button', { name: 'Turn notifications on' }),
+    )
+    await waitFor(() => expect(of(asked, SUBSCRIBE)).toHaveLength(1))
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    answers = refusal
+
+    await click(screen.getByRole('button', { name: 'Turn notifications off' }))
+
+    expect(
+      await screen.findByText(/has not yet answered that it deleted/),
+    ).toBeInTheDocument()
+    await waitFor(() =>
+      expect(of(asked, UNSUBSCRIBE).length).toBeGreaterThanOrEqual(1),
+    )
+    expect(wanted()).toEqual({
+      on: null,
+      told: null,
+      forget: [MOCK_SERVER.told],
+    })
+    expect(screen.queryByText(/has answered that it deleted/)).toBeNull()
+    const tried = of(asked, UNSUBSCRIBE).length
+
+    answers = () => new Response(null, { status: 204 })
+    await act(() => vi.advanceTimersByTimeAsync(RETRY_MS + 100))
+
+    await waitFor(() => expect(wanted()).toEqual(OFF))
+    expect(of(asked, UNSUBSCRIBE).length).toBe(tried + 1)
+    expect(
+      await screen.findByText(/has answered that it deleted/),
+    ).toBeInTheDocument()
+  },
+)
+
+test('notifications can be turned off while the server cannot be reached, and nothing is said to be deleted', async () => {
+  await savePlace('Home', FIRE)
+  window.localStorage.setItem(KEY, turnedOn(`${ADDRESS}-old`))
+  const device = browser({
+    permission: 'granted',
+    subscribed: { mode: 'mock', key: KEY_BYTES },
+  })
+  const asked = serve({
+    'GET /api/health': () => {
+      throw new TypeError('Failed to fetch')
+    },
+  })
+  render(<App />)
+
+  await click(
+    await screen.findByRole('button', { name: 'Turn notifications off' }),
+  )
+
+  expect(device.subscription('mock')).toBeNull()
+  const old = { endpoint: `${ADDRESS}-old`, mode: 'mock' }
+  expect(wanted()).toEqual({ on: null, told: null, forget: [old] })
+  // Only the server that has the address can delete it, and it was not asked.
+  expect(
+    await screen.findByText(
+      /Beacon’s server for the invented scenario has not yet answered that it deleted an address of this device\./,
+    ),
+  ).toBeInTheDocument()
+  expect(screen.queryByText(/has answered that it deleted/)).toBeNull()
+  expect(asked.filter((request) => request.key.includes('/api/push'))).toEqual(
+    [],
+  )
+})
+
+test('notifications can be turned off on a server that sends none', async () => {
+  await savePlace('Home', FIRE)
+  window.localStorage.setItem(KEY, turnedOn(`${ADDRESS}-old`))
+  const device = browser({
+    permission: 'granted',
+    subscribed: { mode: 'mock', key: KEY_BYTES },
+  })
+  const off = 'This server sends no notifications.'
+  const asked = serve(
+    routes({
+      [INFO]: info({
+        enabled: false,
+        text: off,
+        public_key: null,
+        about_text: null,
+        notice: null,
+      }),
+    }),
+  )
+  render(<App />)
+  expect(await screen.findByText(off)).toBeInTheDocument()
+
+  await click(
+    await screen.findByRole('button', { name: 'Turn notifications off' }),
+  )
+
+  // A server that sends none still deletes what an earlier one kept.
+  await waitFor(() => expect(wanted()).toEqual(OFF))
+  expect(of(asked, UNSUBSCRIBE).at(-1)?.body).toEqual({
+    endpoint: `${ADDRESS}-old`,
+  })
+  expect(device.subscription('mock')).toBeNull()
+  expect(of(asked, SUBSCRIBE)).toEqual([])
+  expect(screen.queryByRole('button', { name: /notifications on/i })).toBeNull()
+})
+
+test('turning off has the server delete the address it was told, when the browser no longer has it too', async () => {
+  window.localStorage.setItem(KEY, turnedOn())
+  // The browser dropped its subscription since. The server still has the address.
+  browser({ permission: 'granted' })
+  const asked = serve(routes())
+
+  expect(await turnOff()).toBe('off')
+
+  expect(wanted()).toEqual({ on: null, told: null, forget: [MOCK_SERVER.told] })
+  expect(await syncPush('mock')).toBe(true)
+  expect(of(asked, UNSUBSCRIBE).map((request) => request.body)).toEqual([
+    { endpoint: ADDRESS },
+  ])
+  expect(wanted()).toEqual(OFF)
+})
+
+test('a browser that will not let go of its subscription is said to hold it, and the server is still asked to delete', async () => {
   await savePlace('Home', FIRE)
   const device = browser()
   const asked = serve(routes())
@@ -337,62 +642,43 @@ test('turning notifications off lets go of the address at once and has the serve
     await screen.findByRole('button', { name: 'Turn notifications on' }),
   )
   await waitFor(() => expect(of(asked, SUBSCRIBE)).toHaveLength(1))
-  device.events.length = 0
+  device.letsGo = false
 
   await click(screen.getByRole('button', { name: 'Turn notifications off' }))
 
-  await waitFor(() => expect(of(asked, UNSUBSCRIBE)).toHaveLength(1))
-  expect(of(asked, UNSUBSCRIBE)[0].body).toEqual({ endpoint: ADDRESS })
-  expect(device.events).toEqual([`unsubscribe ${ADDRESS}`, 'delete the words'])
-  expect(device.subscription).toBeNull()
-  expect(device.kept.size).toBe(0)
-  await waitFor(() => expect(wanted()).toEqual({ on: false, forget: [] }))
-  expect(
-    await screen.findByRole('button', { name: 'Turn notifications on' }),
-  ).toBeEnabled()
-  // The places stay on the device: they are the person's, not the server's.
-  expect(screen.getByRole('heading', { name: 'Home' })).toBeInTheDocument()
-})
-
-test('a server that could not be told to delete an address is told again until it hears', async () => {
-  await savePlace('Home', FIRE)
-  const device = browser()
-  let reachable = true
-  const asked = serve(
-    routes({
-      [UNSUBSCRIBE]: () => {
-        if (!reachable) throw new TypeError('Failed to fetch')
-        return new Response(null, { status: 204 })
-      },
-    }),
-  )
-  render(<App />)
-  await click(
-    await screen.findByRole('button', { name: 'Turn notifications on' }),
-  )
-  await waitFor(() => expect(of(asked, SUBSCRIBE)).toHaveLength(1))
-  vi.useFakeTimers({ shouldAdvanceTime: true })
-  reachable = false
-
-  await click(screen.getByRole('button', { name: 'Turn notifications off' }))
-
-  // Off on this device whatever the server heard.
-  expect(device.subscription).toBeNull()
   expect(
     await screen.findByText(
-      /Notifications are off on this device, and nothing can arrive\./,
+      /This browser would not let go of its subscription\./,
     ),
   ).toBeInTheDocument()
-  expect(wanted()).toEqual({ on: false, forget: [ADDRESS] })
-  const tried = of(asked, UNSUBSCRIBE).length
-  expect(tried).toBeGreaterThanOrEqual(1)
-
-  reachable = true
-  await act(() => vi.advanceTimersByTimeAsync(RETRY_MS + 100))
-
-  await waitFor(() => expect(wanted()).toEqual({ on: false, forget: [] }))
-  expect(of(asked, UNSUBSCRIBE).length).toBe(tried + 1)
+  expect(screen.queryByText(/nothing can arrive/)).toBeNull()
+  expect(device.subscription('mock')).not.toBeNull()
+  await waitFor(() => expect(wanted()).toEqual(OFF))
   expect(of(asked, UNSUBSCRIBE).at(-1)?.body).toEqual({ endpoint: ADDRESS })
+  expect(pushSnapshot().held).toBe(true)
+  // Worth trying again: the browser may let go the next time.
+  expect(await syncPush('mock')).toBe(false)
+  device.letsGo = true
+  expect(await syncPush('mock')).toBe(true)
+  expect(device.subscription('mock')).toBeNull()
+  await waitFor(() => expect(screen.queryByText(/would not let go/)).toBeNull())
+})
+
+test('a subscription the browser holds that this device has no note of is let go of, and its server asked to delete it', async () => {
+  // Storage was emptied, and the browser's subscription was not.
+  const device = browser({
+    permission: 'granted',
+    subscribed: { mode: 'mock', key: KEY_BYTES },
+  })
+  const asked = serve(routes())
+
+  expect(await syncPush('mock')).toBe(true)
+
+  expect(device.subscription('mock')).toBeNull()
+  expect(of(asked, UNSUBSCRIBE).map((request) => request.body)).toEqual([
+    { endpoint: `${ADDRESS}-old` },
+  ])
+  expect(wanted()).toEqual(OFF)
 })
 
 test('a browser that does not allow notifications is not subscribed, and the server is sent nothing', async () => {
@@ -405,38 +691,48 @@ test('a browser that does not allow notifications is not subscribed, and the ser
     await screen.findByRole('button', { name: 'Turn notifications on' }),
   )
 
-  expect(
-    await screen.findByText(/Notifications from this site are blocked/),
-  ).toBeInTheDocument()
-  expect(device.registration.pushManager.subscribe).not.toHaveBeenCalled()
+  expect((await screen.findByRole('alert')).textContent).toContain(
+    'Notifications from this site are blocked in this browser.',
+  )
+  expect(device.events).toEqual(['ask permission'])
+  expect(device.registered).toEqual([])
   expect(of(asked, SUBSCRIBE)).toEqual([])
   expect(wanted()).toBeNull()
+  expect(
+    screen.getByRole('button', { name: 'Turn notifications on' }),
+  ).toBeEnabled()
 })
 
-test('notifications that were on and are blocked in the browser since are said to be blocked, and the server is sent nothing', async () => {
+test('notifications that were on and are blocked in the browser since are said to be blocked, and the server is asked to delete the address', async () => {
   await savePlace('Home', FIRE)
-  window.localStorage.setItem(KEY, JSON.stringify({ on: true, forget: [] }))
+  window.localStorage.setItem(KEY, turnedOn())
+  // The browser took its leave back, and its subscription with it.
   const device = browser({ permission: 'denied' })
   const asked = serve(routes())
 
   render(<App />)
 
   expect(
-    await screen.findByText(/Notifications from this site are blocked/),
+    await screen.findByText(
+      /Notifications are on for this device\. Notifications from this site are blocked/,
+    ),
   ).toBeInTheDocument()
-  await waitFor(() => expect(of(asked, CHECK)).toHaveLength(1))
+  await waitFor(() => expect(of(asked, UNSUBSCRIBE)).toHaveLength(1))
+  expect(of(asked, UNSUBSCRIBE)[0].body).toEqual({ endpoint: ADDRESS })
+  await waitFor(() =>
+    expect(wanted()).toEqual({ on: 'mock', told: null, forget: [] }),
+  )
   expect(of(asked, SUBSCRIBE)).toEqual([])
-  expect(device.events).toEqual([])
-  // They can still be turned off.
+  expect(device.subscribe).not.toHaveBeenCalled()
+  expect(screen.queryByRole('button', { name: /preview/ })).toBeNull()
   expect(
     screen.getByRole('button', { name: 'Turn notifications off' }),
   ).toBeEnabled()
-  expect(screen.queryByRole('button', { name: /preview/ })).toBeNull()
 })
 
-test('a copy of the app with no service worker says so and subscribes nothing', async () => {
+test('a copy of the app that cannot start the service worker says so and subscribes nothing', async () => {
   await savePlace('Home', FIRE)
-  browser({ registered: false })
+  const device = browser({ worker: false })
   const asked = serve(routes())
   render(<App />)
 
@@ -444,46 +740,124 @@ test('a copy of the app with no service worker says so and subscribes nothing', 
     await screen.findByRole('button', { name: 'Turn notifications on' }),
   )
 
-  expect(
-    await screen.findByText(/This copy of Beacon has no service worker/),
-  ).toBeInTheDocument()
+  expect((await screen.findByRole('alert')).textContent).toContain(
+    'could not start the service worker',
+  )
+  expect(device.subscribe).not.toHaveBeenCalled()
   expect(of(asked, SUBSCRIBE)).toEqual([])
   expect(wanted()).toBeNull()
 })
 
-test('a subscription made for another server’s key is let go of, and one is made for this server with its words', async () => {
+test('a subscription made for another key is let go of once its address is noted for deletion, and one is made for this server with its words', async () => {
   await savePlace('Home', FIRE)
-  window.localStorage.setItem(KEY, JSON.stringify({ on: true, forget: [] }))
-  // Subscribed to a real server before; this one is the invented scenario's.
-  const other = KEY_BYTES.map((byte) => byte ^ 1)
-  const device = browser({ permission: 'granted', subscribedFor: other })
-  device.kept.set(
-    `${NOTICE_CACHE} ${NOTICE_URL}`,
-    JSON.stringify({ title: 'A real one', text: 'A real server’s words.' }),
+  window.localStorage.setItem(KEY, turnedOn(`${ADDRESS}-old`))
+  const device = browser({
+    permission: 'granted',
+    subscribed: { mode: 'mock', key: Uint8Array.from(KEY_BYTES, (b) => b ^ 1) },
+  })
+  let answers: () => Response = busy
+  const asked = serve(routes({ [UNSUBSCRIBE]: () => answers() }))
+
+  // The server is too busy to delete the old address: nothing is dropped.
+  expect(await syncPush('mock')).toBe(false)
+
+  const old = { endpoint: `${ADDRESS}-old`, mode: 'mock' }
+  expect(wanted()).toEqual({ on: 'mock', told: null, forget: [old] })
+  expect(of(asked, SUBSCRIBE)).toEqual([])
+  expect(pushSnapshot().problem).toBe('Beacon is busy. Try again.')
+
+  answers = () => new Response(null, { status: 204 })
+  expect(await syncPush('mock')).toBe(true)
+
+  expect(of(asked, UNSUBSCRIBE).at(-1)?.body).toEqual({
+    endpoint: `${ADDRESS}-old`,
+  })
+  expect(device.events.filter((event) => !event.startsWith('delete'))).toEqual([
+    `unsubscribe ${ADDRESS}-old`,
+    'keep the words mock',
+    'subscribe mock',
+  ])
+  expect(of(asked, SUBSCRIBE).map((request) => request.body)).toEqual([
+    { endpoint: ADDRESS, places: [FIRE] },
+  ])
+  expect(wanted()).toEqual({ ...MOCK_SERVER, forget: [] })
+  expect(device.words('mock')).toEqual(NOTICE)
+})
+
+test('turning notifications on for the invented scenario is not carried to real sources, and each server deletes only its own', async () => {
+  await savePlace('Home', FIRE)
+  window.localStorage.setItem(KEY, turnedOn(`${ADDRESS}-old`))
+  const device = browser({
+    permission: 'granted',
+    subscribed: { mode: 'mock', key: KEY_BYTES },
+  })
+  // The server the app is shown now runs on real sources.
+  const live = { ...MOCK_HEALTH, mode: 'live' }
+  const asked = serve(
+    routes({ 'GET /api/health': live, [INFO]: info({ mode: 'live' }) }),
   )
-  const asked = serve(routes())
 
   render(<App />)
 
-  await waitFor(() => expect(of(asked, SUBSCRIBE)).toHaveLength(1))
-  expect(device.events).toEqual([
-    `unsubscribe ${ADDRESS}-old`,
-    'keep the words',
-    'subscribe',
-  ])
-  expect(of(asked, SUBSCRIBE)[0].body).toEqual({
-    endpoint: ADDRESS,
-    places: [FIRE],
-  })
-  // The words kept are this server's now.
-  expect(JSON.parse(device.kept.get(`${NOTICE_CACHE} ${NOTICE_URL}`)!)).toEqual(
-    NOTICE,
+  // The person is asked again: nothing is on for real sources.
+  expect(
+    await screen.findByRole('button', { name: 'Turn notifications on' }),
+  ).toBeEnabled()
+  const old = { endpoint: `${ADDRESS}-old`, mode: 'mock' }
+  await waitFor(() =>
+    expect(wanted()).toEqual({ on: null, told: null, forget: [old] }),
   )
+  // The invented scenario's subscription is let go of, with its words.
+  expect(device.subscription('mock')).toBeNull()
+  expect(device.words('mock')).toBeNull()
+  // The live server is given nothing, and is not asked to delete an address
+  // that is in the other server's file: its 204 would say nothing of it.
+  expect(of(asked, SUBSCRIBE)).toEqual([])
+  expect(of(asked, UNSUBSCRIBE)).toEqual([])
+  expect(
+    await screen.findByText(
+      /Beacon’s server for the invented scenario has not yet answered that it deleted an address of this device\. Only that server can/,
+    ),
+  ).toBeInTheDocument()
+  expect(screen.queryByText(/has answered that it deleted/)).toBeNull()
+
+  // Shown the invented scenario's server again, the app has it delete.
+  expect(await syncPush('mock')).toBe(true)
+  const [sent] = of(asked, UNSUBSCRIBE)
+  expect(sent.body).toEqual({ endpoint: `${ADDRESS}-old` })
+  expect(sent.headers['beacon-mode']).toBe('mock')
+  expect(wanted()).toEqual(OFF)
+})
+
+test('each mode has a service worker, a subscription, and words of its own', async () => {
+  await savePlace('Home', FIRE)
+  const device = browser({ permission: 'granted' })
+  const liveNotice = { title: 'Beacon: crisis mode', text: 'Real words.' }
+  window.localStorage.setItem(
+    KEY,
+    JSON.stringify({ on: 'live', told: null, forget: [] }),
+  )
+  const asked = serve(
+    routes({ [INFO]: info({ mode: 'live', notice: liveNotice }) }),
+  )
+
+  expect(await syncPush('live')).toBe(true)
+
+  expect(device.registered).toEqual([`${WORKER} ${scopeOf('live')}`])
+  expect(device.events).toEqual(['keep the words live', 'subscribe live'])
+  expect(device.words('live')).toEqual(liveNotice)
+  expect(device.words('mock')).toBeNull()
+  expect(device.subscription('mock')).toBeNull()
+  expect(of(asked, SUBSCRIBE)[0].headers['beacon-mode']).toBe('live')
+  expect((wanted() as { told: unknown }).told).toEqual({
+    endpoint: ADDRESS,
+    mode: 'live',
+  })
 })
 
 test('a server in another mode than is shown is sent nothing, and the app asks what the server is', async () => {
   await savePlace('Home', FIRE)
-  window.localStorage.setItem(KEY, JSON.stringify({ on: true, forget: [] }))
+  window.localStorage.setItem(KEY, turnedOn(null))
   const device = browser({ permission: 'granted' })
   const asked = serve(routes({ [INFO]: info({ mode: 'live' }) }))
 
@@ -496,6 +870,29 @@ test('a server in another mode than is shown is sent nothing, and the app asks w
   expect(of(asked, SUBSCRIBE)).toEqual([])
   expect(device.events).toEqual([])
   await expect(syncPush('mock')).rejects.toBeInstanceOf(OtherModeError)
+})
+
+test('a server that says it is in another mode when asked to delete has deleted nothing', async () => {
+  window.localStorage.setItem(
+    KEY,
+    JSON.stringify({ on: null, told: null, forget: [MOCK_SERVER.told] }),
+  )
+  browser({ permission: 'granted' })
+  serve(
+    routes({
+      [UNSUBSCRIBE]: () =>
+        Response.json({ detail: 'Another mode.' }, { status: 409 }),
+    }),
+  )
+
+  await expect(syncPush('mock')).rejects.toBeInstanceOf(OtherModeError)
+
+  expect(wanted()).toEqual({
+    on: null,
+    told: null,
+    forget: [MOCK_SERVER.told],
+  })
+  expect(pushSnapshot().deleted).toBe(false)
 })
 
 test('a refusal by the server is shown in its own sentence and tried again', async () => {
@@ -553,7 +950,7 @@ test('a server that sends no notifications says so in its own words, and there i
   expect(screen.queryByRole('button', { name: /notifications/i })).toBeNull()
 })
 
-test('a preview shows the words a notification would have, marked as a preview', async () => {
+test('a preview shows the words a notification would have, marked as a preview in its title and its text', async () => {
   await savePlace('Home', FIRE)
   const device = browser()
   serve(routes())
@@ -566,9 +963,11 @@ test('a preview shows the words a notification would have, marked as a preview',
     await screen.findByRole('button', { name: 'Show a preview of one' }),
   )
 
+  // Collapsed to its title, it still cannot be taken for the real thing.
   expect(device.shown).toEqual([
     {
-      title: NOTICE.title,
+      mode: 'mock',
+      title: `Preview: ${NOTICE.title}`,
       options: {
         body: `A preview, not a notification. What one would say: ${NOTICE.text}`,
         tag: 'beacon-preview',
@@ -586,7 +985,7 @@ test('a preview the browser will not show says so, and the controls come back', 
   await click(
     await screen.findByRole('button', { name: 'Turn notifications on' }),
   )
-  device.registration.showNotification.mockRejectedValue(
+  device.showing.mockRejectedValue(
     new TypeError('No notification permission has been granted.'),
   )
 
@@ -606,7 +1005,7 @@ test('a preview the browser will not show says so, and the controls come back', 
 
 test('a telling reads the places when its turn comes, so a place removed meanwhile is not sent', async () => {
   await savePlace('Home', FIRE)
-  window.localStorage.setItem(KEY, JSON.stringify({ on: true, forget: [] }))
+  window.localStorage.setItem(KEY, turnedOn(null))
   browser({ permission: 'granted' })
   const asked = serve(routes())
   // Another tab holds the lock, as it does while it tells the server.
@@ -630,26 +1029,84 @@ test('a telling reads the places when its turn comes, so a place removed meanwhi
   expect(JSON.stringify(asked)).not.toContain(String(FIRE.lat))
 })
 
-// The service worker's part, which is plain JavaScript the browser loads: it is
-// run here against a worker's globals as they are used.
+test('a place removed while the browser makes the subscription is not sent', async () => {
+  await savePlace('Home', FIRE)
+  await savePlace('Work', FAR)
+  window.localStorage.setItem(KEY, turnedOn(null))
+  const device = browser({ permission: 'granted' })
+  const asked = serve(routes())
+  const places = () =>
+    JSON.parse(window.localStorage.getItem('beacon.places.v1')!) as {
+      id: string
+    }[]
+  // The telling has read that there are places, and is waiting for the browser.
+  device.whileSubscribing = async () => {
+    await removePlace(places()[0].id)
+  }
 
-function workerScope(keptWords: string | null) {
+  expect(await syncPush('mock')).toBe(true)
+
+  expect(of(asked, SUBSCRIBE).map((request) => request.body)).toEqual([
+    { endpoint: ADDRESS, places: [FAR] },
+  ])
+  expect(JSON.stringify(asked)).not.toContain(String(FIRE.lat))
+
+  // And when the last place goes that way, the server is given none, and is
+  // asked to delete the address it had.
+  device.whileSubscribing = async () => {}
+  await device.subscription('mock')!.unsubscribe()
+  device.whileSubscribing = async () => {
+    await removePlace(places()[0].id)
+  }
+  expect(await syncPush('mock')).toBe(true)
+  expect(of(asked, SUBSCRIBE)).toHaveLength(1)
+  expect(of(asked, UNSUBSCRIBE).map((request) => request.body)).toEqual([
+    { endpoint: ADDRESS },
+    { endpoint: `${ADDRESS}-2` },
+  ])
+  expect(wanted()).toEqual({ on: 'mock', told: null, forget: [] })
+})
+
+// The service worker, which is plain JavaScript the browser loads: it is run
+// here against a worker's globals as they are used.
+
+function workerScope(
+  mode: Mode | 'elsewhere',
+  keptWords: Partial<Record<Mode, string>> = {},
+) {
   const handlers: Record<string, (event: unknown) => void> = {}
   const shown: { title: string; options: NotificationOptions }[] = []
   const opened: string[] = []
+  const fetched: { url: string; init: RequestInit }[] = []
   const scope = {
     addEventListener: (name: string, handler: (event: unknown) => void) => {
       handlers[name] = handler
     },
+    skipWaiting: vi.fn(),
+    fetch: async (url: string, init: RequestInit) => {
+      fetched.push({ url, init })
+      return new Response(null, { status: 204 })
+    },
     caches: {
       open: async (name: string) => ({
-        match: async (url: string) =>
-          keptWords !== null && name === NOTICE_CACHE && url === NOTICE_URL
-            ? new Response(keptWords)
-            : undefined,
+        match: async (url: string) => {
+          const words = MODES.find(
+            (each) =>
+              name === NOTICE_CACHE &&
+              url === NOTICE_URL + each &&
+              keptWords[each] !== undefined,
+          )
+          return words === undefined
+            ? undefined
+            : new Response(keptWords[words])
+        },
       }),
     },
     registration: {
+      scope:
+        mode === 'elsewhere'
+          ? 'https://beacon.example/'
+          : `https://beacon.example${scopeOf(mode)}`,
       showNotification: async (title: string, options: NotificationOptions) => {
         shown.push({ title, options })
       },
@@ -671,56 +1128,113 @@ function workerScope(keptWords: string | null) {
     })
     await Promise.all(waited)
   }
-  return { scope, shown, opened, fire }
+  return { scope, shown, opened, fetched, fire }
+}
+const MODES: Mode[] = ['mock', 'live']
+const LIVE_NOTICE = { title: 'Beacon: crisis mode', text: 'Real words.' }
+const BOTH = {
+  mock: JSON.stringify(NOTICE),
+  live: JSON.stringify(LIVE_NOTICE),
 }
 
-test('a push shows the words that were kept for it, and reads nothing the push holds', async () => {
-  const { shown, fire } = workerScope(JSON.stringify(NOTICE))
+test('a push shows the words kept for the mode of the worker it woke, and reads nothing the push holds', async () => {
   const data = {
     text: () => {
       throw new Error('A push from Beacon holds nothing, and is not read.')
     },
   }
+  // Both modes' words are on the device. Which are shown is the worker's scope's
+  // to say, and nothing that is kept can make it the other's.
+  for (const [mode, words] of [
+    ['mock', NOTICE],
+    ['live', LIVE_NOTICE],
+  ] as const) {
+    const { shown, fire } = workerScope(mode, BOTH)
 
-  await fire('push', { data })
+    await fire('push', { data })
 
-  expect(shown).toEqual([
-    {
-      title: NOTICE.title,
-      options: {
-        body: NOTICE.text,
-        tag: 'beacon-crisis',
-        renotify: true,
-        icon: '/pwa-192x192.png',
-        badge: '/pwa-192x192.png',
+    expect(shown).toEqual([
+      {
+        title: words.title,
+        options: {
+          body: words.text,
+          tag: `beacon-crisis-${mode}`,
+          renotify: true,
+          icon: '/pwa-192x192.png',
+          badge: '/pwa-192x192.png',
+        },
       },
-    },
-  ])
+    ])
+  }
 })
 
-test('a push with no words kept says only that Beacon sent one, and nothing of an incident', async () => {
-  for (const kept of [null, 'not json', JSON.stringify({ title: 7 })]) {
-    const { shown, fire } = workerScope(kept)
+test('the invented scenario’s worker never shows the words of real sources, and says “invented” with no words at all', async () => {
+  const lost =
+    'Beacon sent this device a notification, and the words for it are no longer kept here. Open Beacon to see what it has.'
+  // Only the other mode's words are kept, or none, or words that cannot be read.
+  for (const kept of [
+    { live: JSON.stringify(LIVE_NOTICE) },
+    {},
+    { mock: 'not json' },
+    { mock: JSON.stringify({ title: 7 }) },
+  ]) {
+    const { shown, fire } = workerScope('mock', kept)
 
     await fire('push')
 
     expect(shown).toHaveLength(1)
-    expect(shown[0].title).toBe('Beacon')
+    expect(shown[0].title).toBe('Beacon: invented scenario')
     expect(shown[0].options.body).toBe(
-      'Beacon sent this device a notification, and the words for it are no longer kept here. Open Beacon to see what it has.',
+      `Invented scenario, not a real event. ${lost}`,
     )
-    expect(shown[0].options.body).not.toMatch(/crisis|incident|fire/i)
   }
+
+  // A real server's worker with no words says only that Beacon sent one, and
+  // never shows the invented scenario's.
+  for (const mode of ['live', 'elsewhere'] as const) {
+    const { shown, fire } = workerScope(mode, { mock: JSON.stringify(NOTICE) })
+    await fire('push')
+    expect(shown).toHaveLength(1)
+    expect(shown[0].title).toBe('Beacon')
+    expect(shown[0].options.body).toBe(lost)
+    expect(shown[0].options.body).not.toMatch(/crisis|incident|fire|invented/i)
+  }
+})
+
+test('an address the browser replaced while the app was closed is given to its own server to delete', async () => {
+  const { fetched, fire } = workerScope('mock')
+
+  await fire('pushsubscriptionchange', {
+    oldSubscription: { endpoint: ADDRESS },
+    newSubscription: { endpoint: `${ADDRESS}-new` },
+  })
+
+  // The old address in the body, for the server of the worker's mode. The new
+  // one is the app's to give, with where the places are.
+  expect(fetched).toHaveLength(1)
+  expect(fetched[0].url).toBe('/api/push/unsubscribe')
+  expect(fetched[0].init.method).toBe('POST')
+  expect(fetched[0].init.headers).toEqual({
+    'Content-Type': 'application/json',
+    'Beacon-Mode': 'mock',
+  })
+  expect(JSON.parse(fetched[0].init.body as string)).toEqual({
+    endpoint: ADDRESS,
+  })
+  // With no old address there is nothing to ask.
+  const none = workerScope('live')
+  await none.fire('pushsubscriptionchange', { oldSubscription: null })
+  expect(none.fetched).toEqual([])
 })
 
 test('pressing a notification opens the saved places, in the app’s window when there is one', async () => {
   const closed = { notification: { close: vi.fn() } }
-  const none = workerScope(null)
+  const none = workerScope('mock')
   await none.fire('notificationclick', closed)
   expect(none.opened).toEqual(['/#/places'])
   expect(closed.notification.close).toHaveBeenCalledOnce()
 
-  const open = workerScope(null)
+  const open = workerScope('mock')
   const window_ = {
     navigate: vi.fn(async () => undefined),
     focus: vi.fn(async () => undefined),
@@ -732,7 +1246,9 @@ test('pressing a notification opens the saved places, in the app’s window when
   expect(open.opened).toEqual([])
 })
 
-test('the service worker reads the words from where the app keeps them', () => {
+test('the service worker reads the words from where the app keeps them, at the scopes the app registers it at', () => {
   expect(worker).toContain(`const NOTICE_CACHE = '${NOTICE_CACHE}'`)
   expect(worker).toContain(`const NOTICE_URL = '${NOTICE_URL}'`)
+  for (const mode of MODES)
+    expect(worker).toContain(`SCOPE.endsWith('${scopeOf(mode)}')`)
 })

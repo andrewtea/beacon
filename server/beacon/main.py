@@ -165,14 +165,13 @@ async def _tell_stories(desk: StoryDesk, engine: Engine, stop: asyncio.Event) ->
 
 
 async def _send_pushes(sending: Push, engine: Engine, stop: asyncio.Event) -> None:
-    """Until `stop` is set, send the pushes that are due, every `PUSH_SECONDS`. A
+    """Until `stop` is set, every `PUSH_SECONDS`: delete the subscriptions whose
+    time is over, and send the pushes that are due when this server sends any. A
     pass is logged in counts and by the kind of its error, never with an address,
     a place, or an incident."""
     while not stop.is_set():
         try:
-            done = await asyncio.to_thread(
-                lambda: sending.notifier.notify(engine.snapshot(), datetime.now(UTC))
-            )
+            done = await asyncio.to_thread(lambda: sending.work(engine.snapshot, datetime.now(UTC)))
         except SubscriptionsError:
             # The file was closed: the server is shutting down.
             return
@@ -268,6 +267,19 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         sending = open_push(os.environ, engine, runs)
         if sending is not None:
             app.state.push = sending
+            if sending.off is not None:
+                logger.warning(
+                    "This server sends no notifications (%s). The subscriptions an "
+                    "earlier one kept are deleted when their devices ask and when "
+                    "their time is over.",
+                    sending.off,
+                )
+            if sending.unswept:
+                logger.warning(
+                    "The other mode's push subscriptions file could not be opened by "
+                    "this Beacon, so what it holds is not deleted when its time is over."
+                )
+            # Run on a server that sends nothing too: it deletes what ran out.
             pushing = asyncio.create_task(_send_pushes(sending, engine, stop))
         if ingest is not None:
             app.state.ingest = ingest
@@ -384,8 +396,9 @@ async def _stop_investigations(
 async def _stop_pushes(sending: Push | None, pushing: asyncio.Task[None] | None) -> None:
     """Stop sending pushes: end the one that is out, keep no more subscriptions,
     and give the pass that was under way `STOP_SECONDS` to end. A push that was
-    out is tried again by the next server, when the push service had not said it
-    took it."""
+    out when its answer was cut off is tried again by a later server, once its
+    claim is old enough (`push.store.CLAIM_STALE`), whether or not the push
+    service had taken it: sending is best effort."""
     if sending is None:
         return
     sending.close()

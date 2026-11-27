@@ -1079,6 +1079,11 @@ button.quiet:hover {
   margin: 0.75rem 0 0;
 }
 
+/* The server's words come as paragraphs parted by a blank line. */
+.notify .about {
+  white-space: pre-line;
+}
+
 .notify-actions {
   display: flex;
   flex-wrap: wrap;
