@@ -221,8 +221,11 @@ test.each(['tap', 'trace'])(
         }),
       ).toBeInTheDocument()
       expect(screen.getByRole('status')).toHaveTextContent(
-        'Beacon has not asked the server for it, so its id was not sent.',
+        'Beacon does not ask this server for it.',
       )
+      // Nothing is said of what was sent before: a view of this tap can have
+      // been open when the server changed what it takes.
+      expect(screen.getByRole('status')).not.toHaveTextContent(/was not sent/)
       unmount()
     }
     expect(tapRequests(asked)).toEqual([])
@@ -250,6 +253,51 @@ test('a server that takes only the invented places is asked for a tap this devic
     `GET /api/taps/${FIRE_TAP}`,
   )
 })
+
+test.each(['tap', 'trace'])(
+  'a %s the invented-only server no longer has stays said to be gone, and is not asked for again',
+  async (view) => {
+    // The story was told again: the server answers that it has no such tap,
+    // and the app forgets it. That the device no longer knows the tap does
+    // not take the answer away, or what the server says of why.
+    const repeats =
+      'On this server the invented scenario is told again from its beginning when it is over.'
+    keepTap({
+      id: FIRE_TAP,
+      at: new Date().toISOString(),
+      photo: false,
+      clip: false,
+      invented: true,
+    })
+    const gone = () =>
+      Response.json({ detail: 'There is no such tap.' }, { status: 404 })
+    const asked = serve({
+      'GET /api/health': { ...INVENTED_ONLY, repeats_text: repeats },
+      [`GET /api/taps/${FIRE_TAP}`]: gone,
+      [`GET /api/taps/${FIRE_TAP}/run`]: gone,
+    })
+    window.location.hash = hashOf(view, FIRE_TAP)
+    render(<App />)
+
+    await waitFor(() => expect(keptTaps()).toEqual([]))
+    expect(
+      await screen.findByRole('heading', { name: 'This tap is gone' }),
+    ).toBeInTheDocument()
+    await act(async () => undefined)
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Beacon does not have this tap. An answer is kept for 23 hours at most.',
+    )
+    expect(
+      screen.getByText(repeats, { selector: 'p.meta' }),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByRole('heading', { name: 'This tap is not asked for here' }),
+    ).not.toBeInTheDocument()
+    expect(document.body).not.toHaveTextContent(/was not sent/)
+    // Asked once, answered that it is gone, and not asked again.
+    expect(tapRequests(asked)).toHaveLength(1)
+  },
+)
 
 test('a server that takes a visitor’s own is asked for any tap, once it has said so', async () => {
   const asked = serve(fireRoutes)

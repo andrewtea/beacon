@@ -268,10 +268,13 @@ function Finished({ run }: { run: TapRun }) {
 export function TraceView({
   id,
   repeatsText = null,
+  onGone,
 }: {
   id: string
-  // As in `TapView`: why a run can be gone sooner than on another server.
+  // As in `TapView`: why a run can be gone sooner than on another server, and
+  // who is told that it is.
   repeatsText?: string | null
+  onGone?: () => void
 }) {
   const polled = usePolled(
     `run:${id}`,
@@ -280,8 +283,10 @@ export function TraceView({
   )
   const gone = polled.error?.status === 404
   useEffect(() => {
-    if (gone) forgetTap(id)
-  }, [gone, id])
+    if (!gone) return
+    onGone?.()
+    forgetTap(id)
+  }, [gone, id, onGone])
   const run = polled.data
   return (
     <div className="view trace-view">

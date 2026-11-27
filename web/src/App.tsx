@@ -17,7 +17,7 @@ import { IncidentView } from './views/IncidentView.tsx'
 import { MapView } from './views/MapView.tsx'
 import { PlacesView } from './views/PlacesView.tsx'
 import { ResultsView } from './views/ResultsView.tsx'
-import { TapView } from './views/TapView.tsx'
+import { TapGone, TapView } from './views/TapView.tsx'
 import { TraceView } from './views/TraceView.tsx'
 
 const HEALTH_MS = 30_000
@@ -31,18 +31,33 @@ const HEALTH_MS = 30_000
  * knows it took under that rule: never for one sent from where somebody was,
  * by this device at another time or by whoever a link came from. The server
  * would answer that it has no such tap, after the id was sent.
+ *
+ * A tap the server answered that it does not have stays said to be gone, for
+ * as long as this tap's views are open: the views forget such a tap, and the
+ * device then no longer knows it, which is no reason to stop saying what the
+ * server answered. It is not asked for again.
+ *
+ * What is said of a tap that is not asked for is about now and from now on.
+ * It can have been asked for before, by a view that was open when the server
+ * changed what it takes.
  */
 function AskedFor({
   id,
   input,
+  repeatsText,
   children,
 }: {
   id: string
   input: Input | null
-  children: ReactNode
+  repeatsText: string | null
+  children: (onGone: () => void) => ReactNode
 }) {
   const invented = useSyncExternalStore(subscribeTaps, () => isInventedTap(id))
-  if (input === 'own' || (input === 'invented' && invented)) return children
+  const [gone, setGone] = useState(false)
+  const onGone = useCallback(() => setGone(true), [])
+  if (input === 'own' || (input === 'invented' && invented))
+    return children(onGone)
+  if (gone) return <TapGone repeatsText={repeatsText} />
   return (
     <div className="view tap-view">
       {input === null ? (
@@ -54,8 +69,8 @@ function AskedFor({
           <h1>This tap is not asked for here</h1>
           <p role="status">
             This server answers only for taps sent from its two invented places,
-            and this device does not know this tap to be one of them. Beacon has
-            not asked the server for it, so its id was not sent.
+            and this device does not know this tap to be one of them. Beacon
+            does not ask this server for it.
           </p>
         </>
       )}
@@ -85,14 +100,32 @@ function View({
       return <Home mode={mode} input={input} onOtherMode={onOtherMode} />
     case 'tap':
       return (
-        <AskedFor key={route.id} id={route.id} input={input}>
-          <TapView id={route.id} repeatsText={repeatsText} />
+        <AskedFor
+          key={route.id}
+          id={route.id}
+          input={input}
+          repeatsText={repeatsText}
+        >
+          {(onGone) => (
+            <TapView id={route.id} repeatsText={repeatsText} onGone={onGone} />
+          )}
         </AskedFor>
       )
     case 'trace':
       return (
-        <AskedFor key={route.id} id={route.id} input={input}>
-          <TraceView id={route.id} repeatsText={repeatsText} />
+        <AskedFor
+          key={route.id}
+          id={route.id}
+          input={input}
+          repeatsText={repeatsText}
+        >
+          {(onGone) => (
+            <TraceView
+              id={route.id}
+              repeatsText={repeatsText}
+              onGone={onGone}
+            />
+          )}
         </AskedFor>
       )
     case 'incident':
