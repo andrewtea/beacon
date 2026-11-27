@@ -361,6 +361,21 @@ README "Scale run" says what a run is, the three kinds, and the commands for a p
 - **Errors are fixed sentences** (`ScaleError`): nothing of a call, a recording's path, or a source's reply. DataSF is asked through `beacon.ingest.http.fetch`.
 - **In tests**, `tests/scale_day.py` has `call(...)`, which makes DataSF rows of an invented day, and `DataSf`, which stands where data.sf.gov is; `main(argv, env, out, http, paid)` runs the command over it, with `paid` making the live client over `MetaApi` for a paid run. No test asks DataSF or Meta.
 
+## Working on the deployment
+
+README "Deploy" says what is deployed, where, and what was looked at on the Box. `amp boxes deploy` from a pushed `main` is a deploy; `scripts/check` does not build or deploy anything. The rules:
+
+- **A deployment is one process on one data directory**: `deploy/python -m beacon.serve`, which serves `/api` and the built app (`BEACON_WEB_DIR`) from one origin. Do not add a second service to `.amp/box.yaml` that opens the data directory (a second server, a poller of its own): the stores, the taps' lock, and the spending stop are one process's. A command run beside it (`scripts/scale_run.py`) keeps to its own files and the one ledger.
+- **`deploy/python` is where a deployment's settings are, each as a default the environment overrides** (`${NAME:-default}`). Do not set one in `.amp/box.yaml`, where the deployment's own environment could not override it, and never put a key in either. A new setting a deployment needs is a line there and a sentence in README "Deploy". It turns `BEACON_MOCK_REPEAT` on only when no live source is named.
+- **`beacon.serve` writes no access log and reads no forwarded address** (`access_log=False`, `proxy_headers=False`). Do not turn either on, and do not log a request anywhere else: a tap's id is in the path of its routes.
+- **`begin_again` deletes `MOCK_FILES` and nothing else, and only while it holds the taps' lock** (`TapMedia`), which a running server holds. Never add a live store's file, the ledger, anything under `scale/`, or `push/` to that list, and never let `BEACON_MOCK_REPEAT=1` through with a live source named (`repeats`). The evidence store goes last, because it is what says the story is over. A new file the mock store's story fills (one a later phase adds) is added to `MOCK_FILES`, before the evidence store, or a new telling shows the last one's.
+- **A server that tells the story again says so** (`REPEATS`, `repeats_text` of `GET /api/health`, shown in the app's mock banner), because it deletes a tap's answer sooner than the 23 hours the app otherwise counts on. Keep the sentence true of what `begin_again` deletes.
+- **The built app is mounted after every route** (`_Web` in `main.py`), so nothing under `/api` is ever a file's. Only `assets/` is cached for good; the page, the manifest, and both service workers are `no-cache`, so that a deploy reaches a browser.
+- **The release is read-only to the server.** Whatever is written is written under `BEACON_DATA_DIR`. `deploy/build` makes everything a release holds (`box/`, `web/dist`); the Box builds nothing and a service installs nothing.
+- **What the server needs of its host is `deploy/box-setup`'s**, run by hand once on a Box: ffmpeg, bubblewrap, no core collector, and an AppArmor profile for `bwrap` alone. Do not turn the restriction on user namespaces off for the whole machine, and do not ship an ffmpeg in the release: the confinement shows ffmpeg only the system's own directories (`_SYSTEM_DIRS`).
+- **Say of the front end only what was read.** The Box's router was read and writes nothing; what Amp's and Google's front ends keep of a request is not known, and README says so. Do not write that no log holds a tap's id.
+- **In tests**, `server/tests/test_serve.py` runs `serve.run` with a server of its own making and a clock, and `server/tests/test_web_dir.py` mounts a directory of its own. No test deploys.
+
 ## Conventions
 
 - Match the code that is there: a new route copies the shape of `server/beacon/api/health.py` and its test; a new web API module copies `web/src/api/health.ts` and uses `fetchJson`.

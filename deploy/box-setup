@@ -1,0 +1,47 @@
+#!/bin/sh
+# Sets a Box up, once, so that Beacon takes a photo with a tap. Run it on the Box as
+# its `user`, who has sudo; README, "Deploy", says how. It can be run again.
+#
+# A photo is drawn again by ffmpeg, confined by bubblewrap, on a host that hands no
+# core dump to a collector (beacon/radio/audio.py says why). A new Box has neither
+# program, hands core dumps to Ubuntu's apport, and lets no unprivileged program
+# make the user namespace bubblewrap confines with. Without this the server runs
+# and refuses a tap's photo; nothing else needs it. Hearing recorded radio needs
+# the same three things.
+set -eu
+
+sudo apt-get update -q
+sudo env DEBIAN_FRONTEND=noninteractive \
+  apt-get install -y -q --no-install-recommends ffmpeg bubblewrap
+
+# Core dumps go to no collector. apport sets the pattern to a pipe whenever it
+# starts, so it is turned off for good; the setting below is what holds at boot.
+sudo systemctl disable --now apport.service
+sudo sed -i 's/^enabled=1$/enabled=0/' /etc/default/apport
+printf '# Beacon: a core dump is handed to no collector (deploy/box-setup).\nkernel.core_pattern = core\n' |
+  sudo tee /etc/sysctl.d/60-beacon-core-pattern.conf >/dev/null
+sudo /usr/sbin/sysctl -q -p /etc/sysctl.d/60-beacon-core-pattern.conf
+
+# bubblewrap, and no other program, may make a user namespace. Ubuntu's AppArmor
+# refuses that to an unprivileged program with no profile; this is the profile,
+# which leaves the restriction on for everything else on the Box.
+sudo tee /etc/apparmor.d/bwrap >/dev/null <<'EOF'
+# Beacon: lets bubblewrap make the user namespace it confines ffmpeg in
+# (deploy/box-setup). Nothing else is changed for it.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+
+  include if exists <local/bwrap>
+}
+EOF
+sudo apparmor_parser -r /etc/apparmor.d/bwrap
+
+echo "core_pattern: $(cat /proc/sys/kernel/core_pattern)"
+# The one thing of these that fails quietly: whether bubblewrap may confine.
+bwrap --unshare-all --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib \
+  --symlink usr/lib64 /lib64 /bin/true
+echo "Set up. Restart Beacon's service, or deploy again: a server that still takes"
+echo "no photos says so in its log when it starts."
