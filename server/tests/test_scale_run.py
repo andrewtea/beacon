@@ -35,6 +35,7 @@ from tests.scale_day import (
     HAYES_OCTAVIA,
     DataSf,
     call,
+    unit_row,
 )
 from tests.test_ember_client import MetaApi
 
@@ -1038,6 +1039,51 @@ def test_two_controls_that_ask_the_same_thing_are_one_tap() -> None:
         (later + taps.AFTER_DISPATCH, Point(37.75, -122.45))
     ]
     assert len(planned) == len({tap.id for tap in planned}) == 9
+
+
+def test_a_control_is_not_put_at_a_call_while_a_later_unit_of_it_is_recorded_there() -> None:
+    here = ("GEARY BLVD/17TH AVE", -122.4760, 37.7800)
+    beside = ("GEARY BLVD/18TH AVE", -122.4760, 37.7804)
+    far = ("FELL ST/GOUGH ST", -122.4229, 37.7759)
+    farther = ("3RD ST/20TH ST", -122.3880, 37.7600)
+    rows = [
+        # One call, two units: the first is on scene at 08:10 and available at
+        # 11:15, and the second arrives at 11:03 and its row never says it is available.
+        unit_row("1", "E31", "Alarms", "08:00:00", here, on_scene="08:10:00",
+                 available="11:15:00"),
+        unit_row("1", "T12", "Alarms", "08:00:00", here, on_scene="11:03:00"),
+        *call("2", "Alarms", "08:30:00", far, ("E36",), available="08:50:00"),
+        *call("3", "Alarms", "09:00:00", far, ("E05",), available="09:10:00"),
+        # A call 44 m from the first, over long before, whose corner is the first
+        # place looked at for the control.
+        *call("4", "Alarms", "09:30:00", beside, ("T06",), available="09:40:00"),
+        # The fifth call, at whose moment the control is put: 11:03.
+        *call("5", "Alarms", "11:00:00", farther, ("B02",), available="11:20:00"),
+    ]  # fmt: skip
+    records, unread = datasf.read_records(rows)
+    assert unread == datasf.Unread()
+    first = records[0]
+    assert first.point is not None
+    # The first arrival, no time at which every unit was available, and the last
+    # time any row gives, which is the first unit's being available.
+    assert first.on_scene_at == datetime(2026, 3, 3, 16, 10, tzinfo=UTC)
+    assert first.cleared_at is None
+    assert first.last_recorded_at == datetime(2026, 3, 3, 19, 15, tzinfo=UTC)
+    # It is kept with the record, and read back.
+    assert datasf.records_from_data([r.as_data() for r in records]) == records
+
+    planned = taps.plan(records, 300)
+
+    (control,) = [tap for tap in planned if tap.near is None]
+    assert control.at == datetime(2026, 3, 3, 19, 3, tzinfo=UTC)
+    # Not at the first call's corner, where a unit of it arrives at that moment:
+    # at the corner of the calls that were over two hours before.
+    assert control.point.distance_m(first.point) > taps.CLEAR_M
+    assert control.point == Point(37.776, -122.423)
+    # A record a run kept without that time is not read as one.
+    without = [{k: v for k, v in r.as_data().items() if k != "last_recorded_at"} for r in records]
+    with pytest.raises(ValueError, match="not all records"):
+        datasf.records_from_data(without)
 
 
 def test_a_tap_is_not_away_from_a_call_whose_unit_datasf_says_is_on_scene_then() -> None:

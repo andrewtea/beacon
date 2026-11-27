@@ -17,10 +17,10 @@ it, so the same records give the same taps:
 - **away from every call DataSF records there then**: at a call's point, at a
   moment that, for every call DataSF lists within `CLEAR_M` of it, is more than
   `CLEAR_FOR` before the call was received or more than `CLEAR_FOR` after the last
-  time DataSF records for it: its dispatch, a unit on scene, or its last unit
-  available (`_last_recorded`). That is what the record says and no more: a call
-  whose record ends at its dispatch can have gone on long after, and a call DataSF
-  does not list is not known of at all.
+  time DataSF records for it: the latest, over all its units, of a dispatch, a unit
+  on scene, and a unit available again (`_last_recorded`). That is what the record
+  says and no more: a call whose record ends at its dispatch can have gone on long
+  after, and a call DataSF does not list is not known of at all.
 
 **A replayed tap is investigated once, over every invocation.** It is claimed in the
 run's own investigations file before Ember is asked and the claim is never given up,
@@ -333,13 +333,14 @@ def _away_from_all(
 
 
 def _last_recorded(record: Record) -> datetime:
-    """The last time DataSF records for a call: the latest of its dispatch, a unit
-    on scene, and its last unit available, of those the record has. It is not when
+    """The last time DataSF records for a call: the latest, over all its units, of
+    a dispatch, a unit on scene, and a unit available again
+    (`Record.last_recorded_at`). The first arrival and the time every unit was
+    available are not it: a second unit can arrive hours after the first, and one
+    unit can be available while another's row gives no such time. It is not when
     the call ended, which a record that lacks the later times does not say."""
-    later = (record.on_scene_at, record.cleared_at)
-    return max(
-        [record.dispatched_at, *(at for at in later if at is not None)],
-    )
+    later = (record.on_scene_at, record.cleared_at, record.last_recorded_at)
+    return max([record.dispatched_at, *(at for at in later if at is not None)])
 
 
 def _rounded(point: Point) -> Point:

@@ -110,6 +110,13 @@ class Record:
     units: tuple[str, ...]
     # None for a medical call, whose alarm level is not kept.
     alarms: int | None
+    # The latest time any row of the call gives for a unit's dispatch, its being on
+    # scene, or its being available again: the last thing DataSF records of the
+    # call. `on_scene_at` is the first arrival and `cleared_at` is there only when
+    # every unit is available again, so neither says this. It is not when the call
+    # ended, which the rows need not say. None only for a record that was not read
+    # from DataSF's rows.
+    last_recorded_at: datetime | None = None
 
     @property
     def medical(self) -> bool:
@@ -127,6 +134,9 @@ class Record:
             "point": None if self.point is None else [self.point.lat, self.point.lon],
             "units": list(self.units),
             "alarms": self.alarms,
+            "last_recorded_at": (
+                None if self.last_recorded_at is None else self.last_recorded_at.isoformat()
+            ),
         }
 
 
@@ -219,6 +229,8 @@ def records_from_data(listed: object) -> list[Record]:
                     point=None if point is None else Point(float(point[0]), float(point[1])),
                     units=tuple(str(unit) for unit in kept["units"]),
                     alarms=None if kept["alarms"] is None else int(kept["alarms"]),
+                    # A record that was read from DataSF's rows has it.
+                    last_recorded_at=datetime.fromisoformat(kept["last_recorded_at"]),
                 )
             )
         except (KeyError, TypeError, ValueError, IndexError):
@@ -249,6 +261,12 @@ def _record(number: str, rows: list[Mapping[str, Any]]) -> Record | None:
         if unit is not None and unit not in units:
             units.append(unit)
     available = [_time(row.get("available_dttm")) for row in rows]
+    recorded = [
+        time
+        for row in rows
+        for column in ("dispatch_dttm", "on_scene_dttm", "available_dttm")
+        if (time := _time(row.get(column))) is not None
+    ]
     return Record(
         number=number,
         kind=kind,
@@ -261,6 +279,8 @@ def _record(number: str, rows: list[Mapping[str, Any]]) -> Record | None:
         point=_point(rows[0].get("case_location")),
         units=tuple(units),
         alarms=None if kind == "medical" else _alarms(rows),
+        # The first dispatch is among them, so there is always one.
+        last_recorded_at=max(recorded),
     )
 
 

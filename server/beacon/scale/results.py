@@ -755,8 +755,9 @@ def _tap_numbers(
             f"Of {len(away)} answered taps placed at a place and a moment such that, "
             "for every call DataSF lists within a kilometre, the moment is more than "
             "an hour before the call was received or more than an hour after the last "
-            "time DataSF records for it (its dispatch, a unit on scene, or its last "
-            'unit available): those answered "unconfirmed". A call can have gone on '
+            "time DataSF records for it (the latest, over all its units, of a "
+            "dispatch, a unit on scene, and a unit available again): those answered "
+            '"unconfirmed". A call can have gone on '
             "past the last time recorded for it, and a call DataSF does not list is "
             "not known of.",
         ),
