@@ -609,6 +609,129 @@ test('a tap that was waiting when the server’s mode changed is called off, and
   expect(posts()).toEqual([])
 })
 
+const MEDIA =
+  'A clip or a photo you add to a tap is sent to Meta’s Model API when the investigator asks what is in it.'
+
+test('a tap says its sender was told where a clip or a photo goes only when the server’s sentence was shown', async () => {
+  const taps = (asked: ReturnType<typeof serve>) =>
+    asked.filter((request) => request.key === 'POST /api/taps')
+  const routes = {
+    'POST /api/taps': () => Response.json(receipt(FIRE_TAP), { status: 201 }),
+    [`GET /api/taps/${FIRE_TAP}`]: fireAnswer,
+  }
+  // Shown: the tap says so, in the header the server reads.
+  let asked = serve({
+    ...routes,
+    'GET /api/health': { ...MOCK_HEALTH, media_text: MEDIA },
+  })
+  const { unmount } = render(<App />)
+  await screen.findByText(MEDIA)
+  click(
+    screen.getByRole('button', {
+      name: 'Near the invented fire, Hayes Valley',
+    }),
+  )
+  await waitFor(() => expect(taps(asked)).toHaveLength(1))
+  expect(taps(asked)[0].headers['beacon-media']).toBe('meta')
+  unmount()
+  window.location.hash = ''
+
+  // Not shown: the tap says nothing of it, and a server that sends a clip or a
+  // photo to Meta takes it only without either.
+  asked = serve({ ...routes, 'GET /api/health': MOCK_HEALTH })
+  render(<App />)
+  click(
+    await screen.findByRole('button', {
+      name: 'Near the invented fire, Hayes Valley',
+    }),
+  )
+  await waitFor(() => expect(taps(asked)).toHaveLength(1))
+  expect(taps(asked)[0].headers).not.toHaveProperty('beacon-media')
+})
+
+test('a tap with a clip that was waiting when the server began to send clips to Meta is called off, and sends nothing', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true })
+  let health: () => Response = () => Response.json(MOCK_HEALTH)
+  const asked = serve({
+    'GET /api/health': () => health(),
+    'POST /api/taps': () => Response.json(receipt(FIRE_TAP), { status: 201 }),
+  })
+  // The phone says where it is only when it is let.
+  let found: PositionCallback = () => undefined
+  vi.stubGlobal('navigator', {
+    ...navigator,
+    geolocation: {
+      getCurrentPosition: (callback: PositionCallback) => (found = callback),
+    },
+  })
+  const here = {
+    coords: { latitude: 37.776412, longitude: -122.424391, accuracy: 8 },
+  } as GeolocationPosition
+  const posts = () =>
+    asked.filter((request) => request.key === 'POST /api/taps')
+  render(<App />)
+  const button = screen.getByRole('button', { name: ASK })
+  await waitFor(() => expect(button).toBeEnabled())
+
+  // Pressed with a clip, by somebody who was told nothing of Meta.
+  click(screen.getByRole('checkbox', { name: '5 seconds of sound' }))
+  click(button)
+  await waitFor(() => expect(button).toBeDisabled())
+
+  // Before the phone answers, the server is found to send a clip to Meta.
+  health = () => Response.json({ ...MOCK_HEALTH, media_text: MEDIA })
+  await vi.advanceTimersByTimeAsync(30_100)
+  expect(await screen.findByText(MEDIA)).toBeInTheDocument()
+  await waitFor(() => expect(button).toBeEnabled())
+
+  // The phone answers now. The clip goes nowhere its sender was not told of.
+  found(here)
+  await vi.advanceTimersByTimeAsync(1_000)
+  expect(posts()).toEqual([])
+  expect(keptTaps()).toEqual([])
+
+  // A tap with nothing added is not called off by the same change.
+  click(screen.getByRole('checkbox', { name: '5 seconds of sound' }))
+  health = () => Response.json(MOCK_HEALTH)
+  click(button)
+  await waitFor(() => expect(button).toBeDisabled())
+  await vi.advanceTimersByTimeAsync(30_100)
+  await waitFor(() => expect(screen.queryByText(MEDIA)).not.toBeInTheDocument())
+  found(here)
+  await waitFor(() => expect(posts()).toHaveLength(1))
+  expect(posts()[0].body).toEqual({
+    location: { lat: 37.776, lon: -122.424, accuracy_m: 70 },
+  })
+  vi.useRealTimers()
+  vi.unstubAllGlobals()
+})
+
+test('a tap refused because its sender was not told where a clip goes is said in the server’s sentence, and the server is asked again', async () => {
+  const refusal =
+    'This server can send a clip or a photo that comes with a tap to Meta’s Model API, and this tap did not say its sender was told so.'
+  let health: Record<string, unknown> = MOCK_HEALTH
+  const asked = serve({
+    'GET /api/health': () => Response.json(health),
+    'POST /api/taps': () => Response.json({ detail: refusal }, { status: 409 }),
+  })
+  render(<App />)
+  const spot = await screen.findByRole('button', {
+    name: 'Near the invented fire, Hayes Valley',
+  })
+  health = { ...MOCK_HEALTH, media_text: MEDIA }
+
+  click(spot)
+
+  expect(await screen.findByRole('alert')).toHaveTextContent(refusal)
+  expect(keptTaps()).toEqual([])
+  // Asked again at once, and what the server does now is shown beside the
+  // controls that add a clip or a photo.
+  expect(await screen.findByText(MEDIA)).toBeInTheDocument()
+  expect(
+    asked.filter((request) => request.key === 'GET /api/health'),
+  ).toHaveLength(2)
+})
+
 test('a tap the server refuses for being in another mode is said in its sentence, and the mode is asked for again at once', async () => {
   // The app was told the invented scenario. The server has since gone over to
   // real sources, and the app has not asked again yet.

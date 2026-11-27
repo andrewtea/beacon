@@ -58,15 +58,17 @@ Giving an address:
 - A file is the mock store's or the live store's for life, in one shape
   (`beacon.files.begin_file`). **Shape 1** kept a place without the time it was
   added, and is no shape this code can read or write; **shape 2** took an address
-  without a permit. Neither was ever written by a Beacon on `main`. **Shape 3**
-  has the rows of this one, from when the words a device was handed for the
-  invented scenario said that a stand-in decided, which a device that has not
-  opened the app since still shows. There is one rule for all three: a file in
-  an earlier shape has its subscriptions and what was sent to them deleted when
-  it is opened (`_EXPIRE`), which is the one thing that can be done with them on
-  time. A device whose subscription went that way
-  gives the server its address again when its app is next opened, with places
-  that are added then.
+  without a permit. Neither was ever written by a Beacon on `main`, and there is
+  one rule for both: a file in an earlier shape has its subscriptions and what
+  was sent to them deleted when it is opened (`_EXPIRE`), which is the one thing
+  that can be done with them on time. **Shape 3** has the rows of this one, from
+  before a device said which words it holds when it gave its address
+  (`Notice.id`): the live file's are kept and read as they are, because the
+  words for real sources did not change, and the mock file's go the same way as
+  the earlier shapes', with every permit that is out, because the words a device
+  was handed for the invented scenario said that a stand-in decided. A device
+  whose subscription went that way gives the server its address again when its
+  app is next opened, with places that are added then.
 """
 
 import json
@@ -116,13 +118,17 @@ Outcome = Literal["sent", "again", "failed"]
 _WAIT_SECONDS = 5.0
 _FORMAT = 4
 # 0 is a file that says no shape, which a new file is too. 1 kept places as pairs
-# and a time a subscription was made, and 2 took an address without a permit. 3
-# has the rows of this shape, from when the words a device was handed for the
-# invented scenario said a stand-in decided: a device that has not opened the app
-# since still shows those, and Muse Ember can now investigate there
-# (`beacon.telling`), so its subscription goes and it is told anew, with the words
-# of now, when it next opens the app.
-_EARLIER = frozenset({0, 1, 2, 3})
+# and a time a subscription was made, and 2 took an address without a permit.
+_EARLIER = frozenset({0, 1, 2})
+# 3 has the rows of this shape, from before a device said which words it holds
+# when it gave its address. **What becomes of them is the mode's.** The words for
+# real sources are what they were, so the live file's rows are read as they are.
+# The words for the invented scenario said that a stand-in decided, which a
+# device that has not opened the app since still shows, and Muse Ember can now
+# investigate there (`beacon.telling`): the mock file's subscriptions go, with
+# what was sent to them and every permit that is out, and a device is told anew,
+# with the words of now, when it next opens the app.
+_WORDS_KEPT = 3
 _SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS subscription (
@@ -150,6 +156,8 @@ _SCHEMA = (
 _EXPIRE = (
     "DROP TABLE IF EXISTS sent",
     "DROP TABLE IF EXISTS subscription",
+    # A permit that is out was given to a device of the earlier shape's.
+    "DELETE FROM permit",
     _SCHEMA[0],
     _SCHEMA[1],
 )
@@ -216,9 +224,10 @@ class Subscriptions:
             what="push subscriptions",
             schema=_SCHEMA,
             shape=_FORMAT,
-            earlier=_EARLIER,
+            earlier=_EARLIER | (frozenset({_WORDS_KEPT}) if mode == "mock" else frozenset()),
             drop=_EXPIRE,
             unknown=_UNKNOWN_SHAPE,
+            readable=frozenset({_WORDS_KEPT}) if mode == "live" else frozenset(),
         )
         if refusal is not None:
             raise SubscriptionsError(refusal)

@@ -9,6 +9,7 @@ says first that the incident is invented, and not who decided, a stand-in or a
 model (`beacon.telling`): the words on a device can be older than the telling.
 """
 
+import hashlib
 from dataclasses import dataclass
 
 from beacon.files import Mode
@@ -21,6 +22,14 @@ class Notice:
 
     title: str
     text: str
+
+    @property
+    def id(self) -> str:
+        """Names these words and no others. A device says which words it holds
+        when it gives its address (`POST /api/push/subscribe`), and the server
+        keeps an address only from a device that holds the words of now: a push
+        carries nothing, so what a device shows is what it was last handed."""
+        return hashlib.sha256(f"{self.title}\n{self.text}".encode()).hexdigest()[:16]
 
 
 _LIVE = Notice(

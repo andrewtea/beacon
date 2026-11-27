@@ -49,8 +49,9 @@ _OTHER_MODE = (
 SUBSCRIBE_SHAPE = (
     "A request to be notified is a JSON object with endpoint, the address your "
     "browser's push service gave this device; places, a list of one to five "
-    "places, each with lat and lon in degrees and nothing else; and permit, the "
-    "permit this server gave for the request."
+    "places, each with lat and lon in degrees and nothing else; permit, the "
+    "permit this server gave for the request; and notice, the id of the words this "
+    "server gave for a notification."
 )
 UNSUBSCRIBE_SHAPE = (
     "A request to stop notifications is a JSON object with endpoint, the address "
@@ -79,6 +80,17 @@ NOT_A_PUSH_SERVICE = (
     "Beacon sends notifications only through the push services of Chrome, Edge, "
     "Firefox, and Safari, and this address is not one of theirs."
 )
+# Said to a device that gives its address with the id of other words than the
+# ones this server hands out now, or with none: it was told them by an earlier
+# server, and what it would show for a push is not what this one would have it say.
+WORDS_CHANGED = (
+    "What a notification from this server says has changed since this device was "
+    "told, so this request to be notified kept nothing. The app reads the words "
+    "anew and asks again."
+)
+# Not 409, which is a request made for the other mode: the app takes that for a
+# server whose mode changed, and this one's did not.
+WORDS_CHANGED_STATUS = 412
 FULL = "Beacon keeps as many addresses to notify as it can, and can take no more just now."
 _CLOSED = "This server is stopping, and takes no more requests about notifications."
 _NOT_LOOKED = (
@@ -91,6 +103,9 @@ class NoticeOut(BaseModel):
     """What a device shows when a push arrives. A push carries no words, so the
     app keeps these for its service worker."""
 
+    # Names these words (`Notice.id`). The app sends it back with the device's
+    # address, and an address is kept only with the id of the words of now.
+    id: str
     title: str
     text: str
 
@@ -151,7 +166,9 @@ async def info(request: Request) -> PushInfo:
         text=None if vapid is not None else OFF if push is None else push.off_text,
         public_key=None if vapid is None else vapid.public_key,
         about_text=None if vapid is None else ABOUT,
-        notice=None if notice is None else NoticeOut(title=notice.title, text=notice.text),
+        notice=None
+        if notice is None
+        else NoticeOut(id=notice.id, title=notice.title, text=notice.text),
         reach_m=int(REACH_M),
         max_places=MAX_PLACES,
         kept_days=KEPT.days,
@@ -335,9 +352,13 @@ def _permit(push: Push, body: bytes) -> Permit:
 
 
 def _subscribe(push: Push, body: bytes) -> Subscribed:
-    sent = _parse(body, frozenset({"endpoint", "places", "permit"}), SUBSCRIBE_SHAPE)
-    if not isinstance(sent["endpoint"], str):
+    fields = frozenset({"endpoint", "places", "permit", "notice"})
+    sent = _parse(body, fields, SUBSCRIBE_SHAPE)
+    if not isinstance(sent["endpoint"], str) or not isinstance(sent["notice"], str):
         raise PlacesError(422, SUBSCRIBE_SHAPE)
+    if sent["notice"] != notice_of(push.mode).id:
+        # Before anything of the request is looked at or kept, its permit included.
+        raise PlacesError(WORDS_CHANGED_STATUS, WORDS_CHANGED)
     (permit,) = _permits([sent["permit"]], SUBSCRIBE_SHAPE)
     endpoint = checked(sent["endpoint"])
     if endpoint is None:

@@ -107,6 +107,15 @@ _NOT_JSON = "A tap is a JSON object."
 _MEDIA = "A tap's photo and clip are files in base64, of a size Beacon takes."
 _NOT_TAKING = "This server is not taking taps."
 _NO_PHOTOS = "This server cannot take a photo just now. Send the tap without one."
+# Said of a tap with a clip or a photo whose sender was not told that this server
+# can send either to Meta for a model to say what is in it. It names nothing the
+# tap held, and the app then asks the server what it does and shows it.
+MEDIA_NOT_TOLD = (
+    "This server can send a clip or a photo that comes with a tap to Meta's Model "
+    "API, for a model to say what is in it, and this tap did not say its sender was "
+    "told so. Nothing of the tap was kept. Look at what Beacon shows now beside the "
+    "clip and the photo, and tap again."
+)
 
 
 class TapError(Exception):
@@ -210,14 +219,14 @@ class Taps:
 
         return give_back
 
-    def take_body(self, body: bytes) -> Tap:
+    def take_body(self, body: bytes, *, media_told: bool = True) -> Tap:
         """Take one tap from the body of the request that sent it. It reads all of
         a body, so a server calls it off its event loop.
 
         Raises TapError as `take` does, and when the body is not a tap's JSON."""
-        return self.take(_parse(body))
+        return self.take(_parse(body), media_told=media_told)
 
-    def take(self, payload: Any) -> Tap:
+    def take(self, payload: Any, *, media_told: bool = True) -> Tap:
         """Take one tap, as the JSON a phone sent:
 
             {"location": {"lat": 37.7763, "lon": -122.4244, "accuracy_m": 12},
@@ -225,6 +234,11 @@ class Taps:
 
         `accuracy_m`, `photo`, and `clip` are optional. Its row is stored and its
         media kept, or neither is.
+
+        `media_told` is False for a tap whose sender was not told where a clip or
+        a photo goes from this server (`MEDIA_NOT_TOLD`): such a tap is refused
+        when it holds either, before anything of it is decoded, counted, or kept.
+        A tap that holds neither is taken as any other.
 
         Raises TapError when the tap cannot be used or cannot be taken just now."""
         point, accuracy_m, photo_sent, clip_sent = _read(payload)
@@ -238,6 +252,9 @@ class Taps:
         ):
             # Before anything of it is decoded, counted, or kept.
             raise_bare(TapError(403, front.TAP_REFUSED))
+        if not media_told and (photo_sent is not None or clip_sent is not None):
+            # Before anything of it is decoded, counted, or kept.
+            raise_bare(TapError(409, MEDIA_NOT_TOLD))
         if not self._bounds.holds(point):
             raise_bare(
                 TapError(422, "Beacon covers San Francisco, and this tap is from somewhere else.")

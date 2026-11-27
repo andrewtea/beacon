@@ -239,7 +239,7 @@ def test_a_story_is_told_by_one_or_the_other_from_its_beginning(
     told(env, 7, meta)
 
     # A stand-in does not go on with a story Ember began.
-    with pytest.raises(IngestConfigError, match="was begun with Muse Ember"):
+    with pytest.raises(IngestConfigError, match="is one Muse Ember worked on"):
         build(stand_in, Clock(lambda: NOON))
 
     # Nor Ember with a stand-in's, a store from before that was written down included.
@@ -249,7 +249,7 @@ def test_a_story_is_told_by_one_or_the_other_from_its_beginning(
     assert state.pop("teller") == "stand_in"
     began.store.add([], state=("scenario", state), now=NOON)
     began.close()
-    with pytest.raises(IngestConfigError, match="was begun with a stand-in"):
+    with pytest.raises(IngestConfigError, match="is one a stand-in for Muse Ember worked on"):
         build(env | {"BEACON_DATA_DIR": str(other)}, Clock(lambda: NOON), paid=Meta(other).client)
     # Asked nothing, and paid nothing.
     assert Meta(other).spend(telling.RADIO) == (0, 0)
@@ -423,40 +423,60 @@ def test_a_call_in_which_nothing_is_said_is_noise_and_is_the_same_every_time() -
     assert one != _clip("")
 
 
-def test_speech_is_synthesized_in_a_directory_of_its_own_that_is_gone_afterwards(
+def test_speech_is_synthesized_with_no_file_written_anywhere(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from beacon.radio import speech
 
-    seen: list[Path] = []
+    asked: list[tuple[list[str], dict[str, Any]]] = []
+    samples = b"\x01\x02" * 8_000
 
-    def ffmpeg(command: list[str], *, cwd: Path, **_: Any) -> Any:
-        # Stands where ffmpeg is: it reads the words and writes the speech, by the
-        # names it was given, in the directory it was started in.
-        seen.append(cwd)
-        assert cwd.stat().st_mode & 0o777 == 0o700
-        assert sorted(path.name for path in cwd.iterdir()) == ["words.txt"]
-        assert "-y" not in command
-        (cwd / command[-1]).write_bytes(_clip((cwd / "words.txt").read_text()))
+    def ffmpeg(command: list[str], **options: Any) -> Any:
+        # Stands where ffmpeg is: the words are in its arguments, and the speech
+        # is what it writes to its output.
+        asked.append((command, options))
 
         class Done:
             returncode = 0
+            stdout = samples
 
         return Done()
 
     monkeypatch.setattr(speech.subprocess, "run", ffmpeg)
-    monkeypatch.setattr(speech.tempfile, "tempdir", str(tmp_path))
-    # Something of somebody else's under the names an earlier Beacon used.
-    theirs = tmp_path / ".speech.wav"
-    theirs.write_bytes(b"theirs")
+    monkeypatch.chdir(tmp_path)
 
-    assert speech.synthesize("Engine 36 is on scene.") == plain_wav(_clip("Engine 36 is on scene."))
+    assert speech.synthesize("Engine 36 is on scene.") == pcm_to_wav(samples)
 
-    (work,) = seen
-    assert work.parent == tmp_path
-    assert work != tmp_path
-    assert not work.exists()
-    assert theirs.read_bytes() == b"theirs"
+    ((command, options),) = asked
+    # No file is named for the words or for the speech, and ffmpeg is started in
+    # no directory of its own to leave one in.
+    assert "flite=text=Engine 36 is on scene.:voice=slt" in command
+    assert command[-3:] == ["-f", "s16le", "pipe:1"]
+    assert "-y" not in command
+    assert "textfile" not in " ".join(command)
+    assert "cwd" not in options
+    assert list(tmp_path.iterdir()) == []
+    # Nothing that could not be synthesized is handed back as speech.
+    monkeypatch.setattr(
+        speech.subprocess, "run", lambda *_, **__: type("D", (), {"returncode": 1, "stdout": b""})()
+    )
+    with pytest.raises(OSError, match="could not synthesize"):
+        speech.synthesize("Engine 36 is on scene.")
+    with pytest.raises(ValueError, match="more than one synthesis takes"):
+        speech.synthesize("a" * (speech.MAX_WORDS + 1))
+
+
+def test_words_are_read_by_ffmpeg_as_words_whatever_characters_they_hold() -> None:
+    from beacon.radio.speech import _in_a_filtergraph
+
+    # Nothing in the words ends the option, the filter, or the graph: each of the
+    # characters ffmpeg reads as its own is escaped, once for each time ffmpeg
+    # takes escaping off.
+    assert _in_a_filtergraph("Engine 36 is on scene.") == "Engine 36 is on scene."
+    assert _in_a_filtergraph("a, b; [c]") == "a\\, b\\; \\[c\\]"
+    assert _in_a_filtergraph("one: two") == "one\\\\: two"
+    assert _in_a_filtergraph("O'Farrell") == "O\\\\\\'Farrell"
+    assert _in_a_filtergraph("a\\b") == "a" + "\\" * 4 + "b"
 
 
 # A generated notice.
@@ -560,7 +580,7 @@ def test_the_words_of_a_notification_are_the_same_whoever_tells_the_story(
     with serving(env, monkeypatch, Meta(tmp_path)) as client:
         by_ember = client.get("/api/push").json()["notice"]
     words = notice_of("mock")
-    assert by_ember == {"title": words.title, "text": words.text}
+    assert by_ember == {"id": words.id, "title": words.title, "text": words.text}
     assert words.text.startswith("Invented scenario, not a real event.")
     assert "which the app names as a model or a stand-in for one" in words.text
     for word in ("stay", "leave", "evacuate", " go "):
@@ -626,7 +646,7 @@ def test_a_server_without_its_pollers_does_not_put_a_stand_ins_work_into_embers_
     monkeypatch.setenv("BEACON_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("BEACON_INGEST", "0")
     with (
-        pytest.raises(IngestConfigError, match="was begun with Muse Ember"),
+        pytest.raises(IngestConfigError, match="is one Muse Ember worked on"),
         TestClient(create_app()),
     ):
         pass
@@ -651,7 +671,7 @@ def test_a_store_a_server_without_pollers_opened_first_is_a_stand_ins_and_ember_
     assert store.state("scenario") == {"teller": "stand_in"}
     store.close()
     meta = Meta(tmp_path)
-    with pytest.raises(IngestConfigError, match="was begun with a stand-in"):
+    with pytest.raises(IngestConfigError, match="is one a stand-in for Muse Ember worked on"):
         build(env, Clock(lambda: NOON), paid=meta.client)
     # Refused before a paying client was made for it.
     assert meta.scopes == []
@@ -662,6 +682,92 @@ def test_a_store_a_server_without_pollers_opened_first_is_a_stand_ins_and_ember_
     began.close()
 
 
+def test_a_store_from_before_tellers_were_kept_is_a_stand_ins_once_anything_was_put_into_it(
+    env: dict[str, str], tmp_path: Path
+) -> None:
+    from beacon.evidence import NewEvidence, Point
+
+    # As a server of an earlier Beacon without its pollers left one: a tap, which
+    # its stand-in investigated, and no story begun, so nothing under `scenario`.
+    path = tmp_path / "evidence" / "mock.sqlite3"
+    store = EvidenceStore(path, "mock")
+    assert ingest_setup.whose(store) is None
+    tap = NewEvidence(
+        kind="tap",
+        source="app",
+        ref="tap-1",
+        occurred_at=NOON,
+        confidence="low",
+        origin="live",
+        point=Point(37.776, -122.424),
+    )
+    store.add([tap])
+    assert store.state("scenario") == {}
+    assert ingest_setup.whose(store) == "stand_in"
+    store.close()
+
+    meta = Meta(tmp_path)
+    with pytest.raises(IngestConfigError, match="is one a stand-in for Muse Ember worked on"):
+        build(env, Clock(lambda: NOON), paid=meta.client)
+    assert meta.scopes == []
+    # A claim alone is enough, too: something was paid for, or was to be.
+    other = EvidenceStore(tmp_path / "other.sqlite3", "mock")
+    other.claim("recordings", "a-call", now=NOON)
+    assert ingest_setup.whose(other) == "stand_in"
+    other.close()
+
+
+def test_a_store_ember_works_on_says_so_in_the_word_an_earlier_beacon_reads_and_refuses(
+    env: dict[str, str], tmp_path: Path
+) -> None:
+    from beacon import files
+    from beacon.evidence.store import PAID_MOCK
+
+    path = tmp_path / "evidence" / "mock.sqlite3"
+    meta = Meta(tmp_path)
+    moment = [NOON]
+    ingest = build(env, Clock(lambda: moment[0]), paid=meta.client)
+    # Marked before the story is played, and so before anything is paid for.
+    assert meta.audio == []
+    assert files.look(path, meta="store_meta").mode == PAID_MOCK == "mock-paid"
+    ingest.close()
+
+    # A Beacon from before this took a file for the mock store only when its mode
+    # said `mock`: its `EvidenceStore` refused any other word as "the other store",
+    # and its `begin_again` refused to delete a file that did not say `mock`. So
+    # the word is neither `mock` nor `live`, and this Beacon reads it as the mock
+    # store, Muse Ember's, whatever its state says.
+    store = EvidenceStore(path, "mock")
+    assert (store.mode, store.paid) == ("mock", True)
+    state = dict(store.state("scenario"))
+    del state["teller"]
+    store.add([], state=("scenario", state), now=NOON)
+    assert ingest_setup.whose(store) == "ember"
+    with pytest.raises(IngestConfigError, match="is one Muse Ember worked on"):
+        ingest_setup.keep_teller(store, "stand_in", NOON)
+    store.close()
+    with pytest.raises(EvidenceStoreError, match="one or the other for life"):
+        EvidenceStore(path, "live").state("scenario")
+
+    # A stand-in's store says `mock`, as it always did.
+    theirs = tmp_path / "theirs"
+    began = build({"BEACON_DATA_DIR": str(theirs)}, Clock(lambda: NOON))
+    began.close()
+    assert files.look(theirs / "evidence" / "mock.sqlite3", meta="store_meta").mode == "mock"
+    live = EvidenceStore(tmp_path / "live.sqlite3", "live")
+    with pytest.raises(EvidenceStoreError, match="Only a mock store"):
+        live.mark_paid()
+    live.close()
+
+
+def test_what_is_said_of_a_store_the_other_worked_on_advises_no_deletion() -> None:
+    for began, now in (("ember", "stand_in"), ("stand_in", "ember")):
+        said = telling.other_teller(began, now)  # type: ignore[arg-type]
+        for word in ("again", "delete", "another data directory", "remove"):
+            assert word not in said
+    assert "BEACON_MOCK_EMBER=live and its budget" in telling.other_teller("ember", "stand_in")
+
+
 def test_two_that_open_a_new_store_together_begin_one_story(tmp_path: Path) -> None:
     # As a server without its pollers and `python -m beacon.ingest` do, sharing
     # the stores: whichever looks second goes on with what the first wrote.
@@ -670,7 +776,7 @@ def test_two_that_open_a_new_store_together_begin_one_story(tmp_path: Path) -> N
     first = ingest_setup.keep_teller(one, "stand_in", NOON, begin=True)
     second = ingest_setup.keep_teller(two, "stand_in", NOON + timedelta(minutes=7), begin=True)
     assert first == second == {"teller": "stand_in", "start": START.isoformat()}
-    with pytest.raises(IngestConfigError, match="was begun with a stand-in"):
+    with pytest.raises(IngestConfigError, match="is one a stand-in for Muse Ember worked on"):
         ingest_setup.keep_teller(two, "ember", NOON, begin=True)
     assert two.state("scenario") == first
     one.close()

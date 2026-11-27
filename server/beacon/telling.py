@@ -76,14 +76,22 @@ TOLD_BY_EMBER = (
     "investigates taps. The story is still made up, and what the model makes of it can "
     "be wrong."
 )
+# Said to whoever starts a server on a mock store the other worked on. It advises
+# no deletion and no second data directory: a store Muse Ember worked on holds the
+# claims on what was paid for, and the ledger is the data directory's.
 OTHER_TELLER = (
-    "The mock store's story was begun {began}, and this server is set to go on with it "
-    "{now} ({variable}). A story is told by one or the other from its beginning to its "
-    "end, so that nothing a stand-in made is shown beside what Muse Ember made as if "
-    "they were one telling. Start the server as the story was begun, or begin the "
-    "story again."
+    "The mock store under this data directory is one {began} worked on, and this "
+    "server is set to work on it {now} ({variable}). A mock store is one or the "
+    "other's for as long as it is kept, so that nothing a stand-in made is shown "
+    "beside what Muse Ember made as if they were one telling. Start the server as "
+    "the store was begun: {how}."
 )
-_AS = {"stand_in": "with a stand-in for Muse Ember", "ember": "with Muse Ember"}
+_AS = {"stand_in": "a stand-in for Muse Ember", "ember": "Muse Ember"}
+_WITH = {"stand_in": "with a stand-in for Muse Ember", "ember": "with Muse Ember"}
+_HOW = {
+    "stand_in": f"without {MOCK_EMBER_VARIABLE}, or with {MOCK_EMBER_VARIABLE}=stand-in",
+    "ember": f"with {MOCK_EMBER_VARIABLE}=live and its budget",
+}
 
 
 class TellingConfigError(Exception):
@@ -155,5 +163,7 @@ _NO_LIVE_EMBER = (
 
 
 def other_teller(began: Teller, now: Teller) -> str:
-    """What is said to whoever starts a server on a story the other teller began."""
-    return OTHER_TELLER.format(began=_AS[began], now=_AS[now], variable=MOCK_EMBER_VARIABLE)
+    """What is said to whoever starts a server on a mock store the other worked on."""
+    return OTHER_TELLER.format(
+        began=_AS[began], now=_WITH[now], variable=MOCK_EMBER_VARIABLE, how=_HOW[began]
+    )

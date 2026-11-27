@@ -751,16 +751,29 @@ def _scenario(store: EvidenceStore, now: datetime, teller: Teller) -> Scenario:
     return Scenario(start=datetime.fromisoformat(state["start"]))
 
 
-def teller_kept(state: Mapping[str, Any]) -> Teller | None:
+def teller_kept(state: Mapping[str, Any], used: bool = False) -> Teller | None:
     """Whose a mock store is, by what it keeps under `scenario`: who does the
-    model's work on its story, or None for a store nobody has worked on yet. A
-    store whose story was begun before that was written down was a stand-in's."""
+    model's work on its story, or None for a store that is nobody's yet.
+
+    **A store that does not say is a stand-in's unless nothing was ever put into
+    it** (`used`, `EvidenceStore.used`): a Beacon from before this was written down
+    had only stand-ins, and a server of it without its pollers took taps and had a
+    stand-in investigate them without beginning a story."""
     kept = state.get("teller")
     if kept == "ember":
         return "ember"
-    if kept == "stand_in" or isinstance(state.get("start"), str):
+    if kept == "stand_in" or isinstance(state.get("start"), str) or used:
         return "stand_in"
     return None
+
+
+def whose(store: EvidenceStore) -> Teller | None:
+    """Whose a mock store is, by everything it says: Muse Ember's when its file
+    is marked as paid for (`EvidenceStore.paid`), whatever its state holds, and
+    else as `teller_kept` reads it."""
+    if store.paid:
+        return "ember"
+    return teller_kept(store.state(_SCENARIO_STATE), store.used())
 
 
 def keep_teller(
@@ -777,11 +790,18 @@ def keep_teller(
     that open a new store together, one begins the story and the other goes on
     with that one.
 
+    **A store that is Muse Ember's has its file marked as paid for before this
+    returns** (`EvidenceStore.mark_paid`), and so before anything of it is paid
+    for: the mark is what a Beacon from before there was such a store reads, and
+    refuses. Only the server that has the stores alone makes a store Ember's.
+
     Raises IngestConfigError when the store is the other's: nothing a stand-in
     made is kept beside what Muse Ember made as if they were one telling."""
+    paid, used = store.paid, store.used()
 
     def change(saved: dict[str, Any]) -> dict[str, Any] | None:
-        if teller_kept(saved) not in (None, teller):
+        kept: Teller | None = "ember" if paid else teller_kept(saved, used)
+        if kept not in (None, teller):
             return None
         changed = dict(saved) | {"teller": teller}
         if begin and not isinstance(saved.get("start"), str):
@@ -789,9 +809,11 @@ def keep_teller(
         return None if changed == saved else changed
 
     state = store.amend(_SCENARIO_STATE, change, now=now)
-    kept = teller_kept(state)
+    kept: Teller | None = "ember" if paid else teller_kept(state, used)
     if kept != teller:
         raise IngestConfigError(telling.other_teller(kept or "stand_in", teller))
+    if teller == "ember":
+        store.mark_paid()
     return state
 
 
@@ -806,6 +828,6 @@ def begun_by(env: Mapping[str, str]) -> Teller | None:
         return None
     store = EvidenceStore(path, "mock")
     try:
-        return teller_kept(store.state(_SCENARIO_STATE))
+        return whose(store)
     finally:
         store.close()

@@ -483,7 +483,9 @@ async function dropNotice(mode: Mode, until: number): Promise<void> {
 
 /** The words a mode's notification shows on this device, or null when none
  * are kept. */
-export async function keptNotice(mode: Mode): Promise<PushNotice | null> {
+export async function keptNotice(
+  mode: Mode,
+): Promise<Pick<PushNotice, 'title' | 'text'> | null> {
   try {
     const kept = await (
       await window.caches.open(NOTICE_CACHE)
@@ -909,7 +911,14 @@ async function tell(mode: Mode, until: number, takes: Takes): Promise<void> {
       fence()
       try {
         await step((signal) =>
-          subscribePush(address.endpoint, places, mode, permit, signal),
+          subscribePush(
+            address.endpoint,
+            places,
+            mode,
+            permit,
+            notice.id,
+            signal,
+          ),
         )
       } catch (error) {
         // Refused because the permit is no longer good: the request kept

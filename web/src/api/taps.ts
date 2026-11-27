@@ -1,4 +1,4 @@
-import { fetchJson, MODE_HEADER } from './http.ts'
+import { fetchJson, MEDIA_HEADER, MEDIA_TOLD, MODE_HEADER } from './http.ts'
 import type { Confidence, Credit, IncidentSummary, Mode } from './incidents.ts'
 
 // The shapes of the tap routes, field for field as `server/beacon/api/taps.py`
@@ -158,15 +158,24 @@ export type TapRun = {
  * pressed: the server refuses the tap, before it reads it, when it is in the
  * other one. The app learns of a change of mode only by asking, so a tap made
  * between two askings is held to what its sender was told by the server itself.
+ *
+ * `mediaTold` says that the server's sentence about where a clip or a photo
+ * goes was on the screen when the button was pressed. A server that sends
+ * either to Meta refuses a tap that holds one and does not say so.
  */
 export function sendTap(
   body: TapBody,
   shown: Mode,
   signal?: AbortSignal,
+  mediaTold = false,
 ): Promise<TapReceipt> {
   return fetchJson<TapReceipt>('/api/taps', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', [MODE_HEADER]: shown },
+    headers: {
+      'Content-Type': 'application/json',
+      [MODE_HEADER]: shown,
+      ...(mediaTold ? { [MEDIA_HEADER]: MEDIA_TOLD } : {}),
+    },
     body: JSON.stringify(body),
     signal,
   })

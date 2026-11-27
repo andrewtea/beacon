@@ -84,7 +84,7 @@ from beacon.ingest.setup import (
     MOCK_HEAD_START,
     IngestConfigError,
     live_sources,
-    teller_kept,
+    whose,
 )
 from beacon.investigate import store as investigations
 from beacon.scenario import DURATION
@@ -116,6 +116,8 @@ class _Kind:
     shapes: frozenset[int]
     tables: frozenset[str]
     own: str
+    # What a file of the kind says its mode is, when it is the mock store's.
+    modes: frozenset[str] = frozenset({"mock"})
 
 
 # The evidence store says no shape.
@@ -124,8 +126,14 @@ _SAYS = {
         "meta", investigations.SHAPES, investigations.TABLES, investigations.OWN_TABLE
     ),
     "story": _Kind("meta", stories.SHAPES, stories.TABLES, stories.OWN_TABLE),
+    # A mock evidence store Muse Ember was set to work on says so in its mode
+    # (`PAID_MOCK`). It is the mock store's file, and is never deleted (`PAID_FOR`).
     "evidence": _Kind(
-        "store_meta", frozenset({0}), evidence_store.TABLES, evidence_store.OWN_TABLE
+        "store_meta",
+        frozenset({0}),
+        evidence_store.TABLES,
+        evidence_store.OWN_TABLE,
+        frozenset({"mock", evidence_store.PAID_MOCK}),
     ),
 }
 # How long a story is played for, from its start to the last moment anything of it
@@ -278,9 +286,10 @@ def begin_again(env: Mapping[str, str], now: datetime, lock: DataLock) -> bool:
         store = EvidenceStore(evidence, "mock")
         try:
             state = store.state(_SCENARIO_STATE)
+            teller = whose(store)
         finally:
             store.close()
-        if teller_kept(state) == "ember":
+        if teller == "ember":
             # Whatever this server is set to: what the store says, read under the
             # lock, before anything is changed.
             raise ServeError(PAID_FOR)
@@ -360,7 +369,7 @@ def _mock_stores(path: Path) -> None:
         if said.objects == 0 and said.shape == 0:
             return
         if (
-            said.mode == "mock"
+            said.mode in kind.modes
             and said.shape in kind.shapes
             and kind.own in said.tables
             # No table of another kind's, or of anybody else's.

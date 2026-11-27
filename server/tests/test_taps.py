@@ -23,6 +23,7 @@ from beacon.api import taps as api_taps
 from beacon.api.taps import MAX_BODY_BYTES
 from beacon.evidence import EvidenceStore, EvidenceStoreError, Point
 from beacon.ingest import build
+from beacon.investigate.setup import MEDIA_SENT
 from beacon.main import ServerSetupError, create_app
 from beacon.radio import ConversionStopped, ConversionUnavailable
 from beacon.taps import (
@@ -154,6 +155,46 @@ def test_a_tap_keeps_its_photo_and_clip_cleaned_and_for_an_hour(
     assert taps.media(receipt["id"], "clip") is None
     assert taps.sweep() == Swept(deleted=0)
     assert list((tmp_path / "taps" / "mock").iterdir()) == []
+
+
+@pytest.mark.parametrize("held", ["photo", "clip"])
+def test_where_media_can_go_to_meta_a_tap_that_holds_any_says_its_sender_was_told(
+    client: TestClient, store: EvidenceStore, tmp_path: Path, held: str
+) -> None:
+    # A server on which a clip or a photo can be sent to Meta says so in its
+    # health, and takes one only from a sender who was shown that sentence.
+    client.app.state.media_text = MEDIA_SENT  # type: ignore[attr-defined]
+    file = b64(jpeg()) if held == "photo" else b64(wav(2.0))
+    sent = {"location": PHONE, held: file}
+
+    for headers in (SHOWN, {**SHOWN, api_taps.MEDIA_HEADER: "yes"}):
+        untold = client.post("/api/taps", headers=headers, json=sent)
+        assert (untold.status_code, untold.json()) == (409, {"detail": tap_desk.MEDIA_NOT_TOLD})
+    # Nothing of it was kept: no row, and no file.
+    assert store.search() == []
+    assert not (tmp_path / "taps" / "mock").exists() or kept(tmp_path / "taps" / "mock") == []
+    for private in PRECISE:
+        assert private not in untold.text
+
+    # A tap that holds neither has nothing to be told about.
+    assert client.post("/api/taps", headers=SHOWN, json={"location": PHONE}).status_code == 201
+    told = {**SHOWN, api_taps.MEDIA_HEADER: api_taps.MEDIA_TOLD}
+    taken = client.post("/api/taps", headers=told, json=sent)
+    assert (taken.status_code, taken.json()[held]) == (201, True)
+    assert len(store.search()) == 2
+
+
+def test_where_no_media_goes_anywhere_a_tap_that_holds_some_names_nothing(
+    client: TestClient, store: EvidenceStore
+) -> None:
+    # The fixture's server sends a clip and a photo nowhere, and its health says
+    # nothing of it: an app that was shown nothing sends no header.
+    assert client.get("/api/health").json()["media_text"] is None
+    sent = {"location": PHONE, "photo": b64(jpeg()), "clip": b64(wav(2.0))}
+
+    taken = client.post("/api/taps", headers=SHOWN, json=sent)
+
+    assert (taken.status_code, len(store.search())) == (201, 1)
 
 
 def test_asking_for_the_media_of_no_tap_answers_nothing(taps: Taps) -> None:
