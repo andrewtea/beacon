@@ -10,6 +10,7 @@ import type { Mode } from '../api/incidents.ts'
 import { checkPlaces, type PlaceAnswer } from '../api/places.ts'
 import { Icon } from '../components/Icon.tsx'
 import { IncidentCard } from '../components/IncidentCard.tsx'
+import { Notifications } from '../components/Notifications.tsx'
 import { ConfidenceLabel, Sources } from '../components/Provenance.tsx'
 import { PLACES_MS } from '../lib/cadence.ts'
 import { locate, LocationError, MOCK_SPOTS } from '../lib/geo.ts'
@@ -334,6 +335,7 @@ export function PlacesView({
           <Checked places={places} mode={mode} onOtherMode={onOtherMode} />
         ))}
       <AddPlace mode={mode} full={places.length >= MOST_PLACES} />
+      <Notifications mode={mode} places={places.length} />
     </div>
   )
 }

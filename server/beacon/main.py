@@ -14,12 +14,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from beacon import __version__
-from beacon.api import health, incidents, places, sources, taps
+from beacon.api import health, incidents, places, push, sources, taps
 from beacon.incident import Engine, open_engine
 from beacon.ingest import IngestConfigError, build
 from beacon.ingest.setup import PAID_SECONDS, STOP_SECONDS, Ingest
 from beacon.investigate import InvestigationDesk, Runs, RunsError, open_investigations
 from beacon.places import Admission
+from beacon.push import Push, SubscriptionsError, open_push
 from beacon.radio import core_dump_problem, forbid_core_dumps
 from beacon.story import StoryDesk, open_stories
 from beacon.taps import Taps, open_taps
@@ -33,7 +34,9 @@ SWEEP_SECONDS = 60.0
 STORY_SECONDS = 15.0
 # The routes that take something private. No log line and no telemetry is written
 # about a request to one: add a route here when it takes what a person sends.
-PRIVATE_PATHS = ("/api/taps", "/api/places")
+PRIVATE_PATHS = ("/api/taps", "/api/places", "/api/push")
+# How often the incidents are looked over for a device that is due a push.
+PUSH_SECONDS = 15.0
 
 logger = logging.getLogger("beacon")
 
@@ -161,6 +164,39 @@ async def _tell_stories(desk: StoryDesk, engine: Engine, stop: asyncio.Event) ->
             await asyncio.wait_for(stop.wait(), STORY_SECONDS)
 
 
+async def _send_pushes(sending: Push, engine: Engine, stop: asyncio.Event) -> None:
+    """Until `stop` is set, send the pushes that are due, every `PUSH_SECONDS`. A
+    pass is logged in counts and by the kind of its error, never with an address,
+    a place, or an incident."""
+    while not stop.is_set():
+        try:
+            done = await asyncio.to_thread(
+                lambda: sending.notifier.notify(engine.snapshot(), datetime.now(UTC))
+            )
+        except SubscriptionsError:
+            # The file was closed: the server is shutting down.
+            return
+        except Exception as error:
+            logger.error("The pushes that are due could not be sent (%s).", type(error).__name__)
+        else:
+            if not done.quiet:
+                # A refusal is the operator's to look at (a contact a push
+                # service does not take, say), so it is a warning, which is
+                # printed where a pass that went well is not.
+                logger.log(
+                    logging.WARNING if done.failed else logging.INFO,
+                    "Pushes: %d sent, %d addresses gone and deleted, %d to try again, "
+                    "%d refused%s.",
+                    done.sent,
+                    done.gone,
+                    done.again,
+                    done.failed,
+                    ", and more are due" if done.more else "",
+                )
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), PUSH_SECONDS)
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Take taps for as long as the server runs, and run the pollers on a thread of
@@ -200,6 +236,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     investigations: InvestigationDesk | None = None
     runs: Runs | None = None
     sweeping_runs: asyncio.Task[None] | None = None
+    sending: Push | None = None
+    pushing: asyncio.Task[None] | None = None
     stop = asyncio.Event()
     # Whatever of this is begun is ended below, however far the beginning got.
     try:
@@ -224,6 +262,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.investigations = investigations
         sweeping_runs = asyncio.create_task(_sweep_runs(runs, stop))
         sweeping = asyncio.create_task(_sweep_tap_media(taps, stop))
+        # Notifications, for the devices that asked for them: sent when a decision
+        # that was made turned crisis mode on near a place a device named. It reads
+        # the decisions and asks Ember nothing.
+        sending = open_push(os.environ, engine, runs)
+        if sending is not None:
+            app.state.push = sending
+            pushing = asyncio.create_task(_send_pushes(sending, engine, stop))
         if ingest is not None:
             app.state.ingest = ingest
             ingest.start()
@@ -250,8 +295,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 await _stop_stories(stories, telling)
             finally:
                 try:
-                    # Before the taps are closed: a run reads a tap's photo and clip.
-                    await _stop_investigations(investigations, runs, sweeping_runs)
+                    try:
+                        # Before the investigations file is closed: a pass reads
+                        # the decisions in it.
+                        await _stop_pushes(sending, pushing)
+                    finally:
+                        # Before the taps are closed: a run reads a tap's photo
+                        # and clip.
+                        await _stop_investigations(investigations, runs, sweeping_runs)
                 finally:
                     try:
                         if taps is not None:
@@ -330,6 +381,24 @@ async def _stop_investigations(
         )
 
 
+async def _stop_pushes(sending: Push | None, pushing: asyncio.Task[None] | None) -> None:
+    """Stop sending pushes: end the one that is out, keep no more subscriptions,
+    and give the pass that was under way `STOP_SECONDS` to end. A push that was
+    out is tried again by the next server, when the push service had not said it
+    took it."""
+    if sending is None:
+        return
+    sending.close()
+    if pushing is None:
+        return
+    _done, pending = await asyncio.wait({pushing}, timeout=STOP_SECONDS)
+    if pending:
+        # It can send nothing and write nothing: its client and its file are closed.
+        pushing.cancel()
+        await asyncio.wait({pushing}, timeout=STOP_SECONDS)
+        logger.warning("The pass that sends pushes had not ended when the server shut down.")
+
+
 async def _stop_ingest(ingest: Ingest | None) -> None:
     """Stop the pollers. Off the event loop, and not returned from until they can
     ask no source and store no row: nothing of theirs outlives the server. It is
@@ -377,9 +446,12 @@ def create_app() -> FastAPI:
     logging.getLogger("uvicorn.error").addFilter(_NO_TRACE)
     # How many requests about saved places are worked on at once.
     app.state.place_checks = Admission()
+    # And how many about notifications.
+    app.state.push_requests = Admission()
     app.include_router(health.router, prefix="/api")
     app.include_router(incidents.router, prefix="/api")
     app.include_router(places.router, prefix="/api")
+    app.include_router(push.router, prefix="/api")
     app.include_router(sources.router, prefix="/api")
     app.include_router(taps.router, prefix="/api")
     return app

@@ -61,6 +61,9 @@ export default defineConfig({
         ],
       },
       workbox: {
+        // The part of the service worker that shows a notification when a push
+        // arrives (public/push-sw.js).
+        importScripts: ['push-sw.js'],
         // API requests must reach the server, never the cached app shell.
         // Workbox tests the path plus the query string, so this also covers
         // /api and /api?x.
