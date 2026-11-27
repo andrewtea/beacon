@@ -265,7 +265,14 @@ function Finished({ run }: { run: TapRun }) {
   )
 }
 
-export function TraceView({ id }: { id: string }) {
+export function TraceView({
+  id,
+  repeatsText = null,
+}: {
+  id: string
+  // As in `TapView`: why a run can be gone sooner than on another server.
+  repeatsText?: string | null
+}) {
   const polled = usePolled(
     `run:${id}`,
     (signal) => fetchTapRun(id, signal),
@@ -286,10 +293,11 @@ export function TraceView({ id }: { id: string }) {
       {polled.error !== null && (
         <p className="note problem" role="status">
           {gone
-            ? 'Beacon does not have this tap. A run is kept for 23 hours.'
+            ? 'Beacon does not have this tap. A run is kept for 23 hours at most.'
             : polled.error.message}
         </p>
       )}
+      {gone && repeatsText !== null && <p className="meta">{repeatsText}</p>}
       {run === null && polled.error === null && (
         <p className="meta" role="status">
           Reading the run…

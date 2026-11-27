@@ -19,19 +19,23 @@ const HEALTH_MS = 30_000
 function View({
   route,
   mode,
+  repeatsText,
   onOtherMode,
 }: {
   route: Route
   mode: 'live' | 'mock' | null
+  repeatsText: string | null
   onOtherMode: () => void
 }) {
   switch (route.view) {
     case 'home':
       return <Home mode={mode} onOtherMode={onOtherMode} />
     case 'tap':
-      return <TapView key={route.id} id={route.id} />
+      return <TapView key={route.id} id={route.id} repeatsText={repeatsText} />
     case 'trace':
-      return <TraceView key={route.id} id={route.id} />
+      return (
+        <TraceView key={route.id} id={route.id} repeatsText={repeatsText} />
+      )
     case 'incident':
       return <IncidentView key={route.id} id={route.id} />
     case 'map':
@@ -66,6 +70,7 @@ export default function App() {
   // the server that comes back can be another one, on other sources.
   const mode = unreachable ? null : (health.data?.mode ?? null)
   const repeatsText = unreachable ? null : (health.data?.repeats_text ?? null)
+  const frontText = unreachable ? null : (health.data?.front_text ?? null)
   // A tap the server no longer answers for is deleted from this device.
   useEffect(() => sweepTaps(), [])
   const askAgain = useCallback(() => setAsked((count) => count + 1), [])
@@ -94,13 +99,25 @@ export default function App() {
             {repeatsText !== null && <> {repeatsText}</>}
           </p>
         )}
+      {/* On a server behind a host nobody has checked: the server's sentence
+          about that, on the pages a person sends something from, whatever the
+          scenario. What is sent is theirs even when the incidents are made up. */}
+      {frontText !== null &&
+        (route.view === 'home' || route.view === 'places') && (
+          <p className="note front-note">{frontText}</p>
+        )}
       {unreachable && (
         <p className="note problem" role="status">
           {health.error?.message}
         </p>
       )}
       <main>
-        <View route={route} mode={mode} onOtherMode={askAgain} />
+        <View
+          route={route}
+          mode={mode}
+          repeatsText={repeatsText}
+          onOtherMode={askAgain}
+        />
       </main>
       <footer>
         <p>

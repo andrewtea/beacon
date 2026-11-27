@@ -52,9 +52,10 @@ function YourTaps() {
     <section className="panel your-taps" aria-labelledby="taps-heading">
       <h2 id="taps-heading">Your taps</h2>
       <p className="meta">
-        Kept on this device only. Beacon keeps an answer for 23 hours and lists
-        taps for nobody. A tap is deleted from this device when its answer runs
-        out, or the next time Beacon is opened after that.
+        Kept on this device only. Beacon keeps an answer for 23 hours at most
+        and lists taps for nobody. A tap is deleted from this device when the
+        server says it no longer has it, or 23 hours after it was sent, or the
+        next time Beacon is opened after that.
       </p>
       <ul className="tap-list">
         {taps.map((tap) => (

@@ -3,24 +3,35 @@
 # (`deploy/python -m beacon.serve --host 0.0.0.0`) and for a command given on the
 # Box (`deploy/python scripts/scale_run.py --name demo --day 2026-11-24`).
 #
-# A setting that is already in the environment is left as it is, so a key or a
-# source set on the deployment later needs no change here.
+# Each setting is a default for a variable that is not set at all (`${NAME-...}`).
+# One the deployment sets is left as it is, and so is one it sets to nothing, which
+# for several of these is how a thing is turned off: no contact, no run, no app.
+# So a key or a source set on the deployment later needs no change here.
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 
-# What Beacon keeps is kept where a deployment's data outlasts a deploy.
+# What Beacon keeps is kept where a deployment's data outlasts a deploy. An empty
+# name is no directory, so this one is a default for that too.
 export BEACON_DATA_DIR="${BEACON_DATA_DIR:-${AMP_DEPLOYMENT_DATA_DIRECTORY:?Set BEACON_DATA_DIR to where the data is kept.}}"
-export BEACON_WEB_DIR="${BEACON_WEB_DIR:-$here/web/dist}"
+export BEACON_WEB_DIR="${BEACON_WEB_DIR-$here/web/dist}"
 # No Ember is asked anything until a deployment is given a key and told to.
-export REPLAY="${REPLAY:-1}"
-# Whom a push service may write to about this server: the repository's page.
-export BEACON_VAPID_SUBJECT="${BEACON_VAPID_SUBJECT:-https://github.com/andrewtea/beacon}"
-# The scale run whose results the results page shows.
-export BEACON_SCALE_RUN="${BEACON_SCALE_RUN:-demo}"
-# The invented story is told again when it is over, for as long as no real source
-# is named: a visitor days after a deploy finds a story in progress.
-if [ -z "${BEACON_LIVE_SOURCES:-}" ]; then
-  export BEACON_MOCK_REPEAT="${BEACON_MOCK_REPEAT:-1}"
+export REPLAY="${REPLAY-1}"
+# Nobody has seen what the host in front of a deployment writes down of a request,
+# and the server says so to every visitor until the deployment says `verified`.
+export BEACON_FRONT_END="${BEACON_FRONT_END-unverified}"
+
+# What follows is the demonstration's, on the invented scenario only. A deployment
+# that names a real source names its own contact and its own run, or has none.
+if [ -z "${BEACON_LIVE_SOURCES-}" ]; then
+  # Whom a push service may write to about this server: the repository's page.
+  export BEACON_VAPID_SUBJECT="${BEACON_VAPID_SUBJECT-https://github.com/andrewtea/beacon}"
+  # The scale run whose results the results page shows.
+  export BEACON_SCALE_RUN="${BEACON_SCALE_RUN-demo}"
+  # The invented story is told again when it is over, where the pollers play it:
+  # a visitor days after a deploy finds a story in progress.
+  if [ "${BEACON_INGEST-1}" = 1 ]; then
+    export BEACON_MOCK_REPEAT="${BEACON_MOCK_REPEAT-1}"
+  fi
 fi
 
 export PYTHONPATH="$here/box/site"

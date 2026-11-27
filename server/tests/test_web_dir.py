@@ -36,6 +36,48 @@ def test_the_built_app_is_served_at_the_root_and_the_api_beside_it(built: Path) 
     assert client.post("/api/nothing").status_code in (404, 405)
 
 
+def test_the_api_answers_as_it_does_with_no_app_beside_it(
+    built: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A mount at the root matches every path, and would answer a request the API
+    # has no whole route for as a file that is not there: no redirect to a route's
+    # own address, and no "method not allowed". And a file named api/... in the
+    # directory would be served. Under /api nothing is the mount's.
+    (built / "api").mkdir()
+    (built / "api" / "health").write_text("a file's, not the server's")
+    (built / "api" / "left.json").write_text("left in the directory")
+    asked = [
+        ("GET", "/api/health/"),
+        ("POST", "/api/health"),
+        ("GET", "/api/taps"),
+        ("GET", "/api/taps/"),
+        ("GET", "/api/left.json"),
+        ("GET", "/api"),
+        ("GET", "/api/"),
+    ]
+
+    def answers() -> list[tuple[int, str | None]]:
+        client = TestClient(create_app(), follow_redirects=False)
+        return [
+            (answer.status_code, answer.headers.get("location"))
+            for answer in (client.request(method, path) for method, path in asked)
+        ]
+
+    beside = answers()
+    monkeypatch.delenv("BEACON_WEB_DIR")
+    alone = answers()
+
+    assert beside == alone
+    assert [status for status, _ in beside] == [307, 405, 405, 307, 404, 404, 404]
+    # And what is not under /api is the app's still, a path that only begins alike
+    # included.
+    monkeypatch.setenv("BEACON_WEB_DIR", str(built))
+    (built / "apiary.txt").write_text("the app's")
+    client = TestClient(create_app())
+    assert client.get("/apiary.txt").text == "the app's"
+    assert client.get("/api/health").json()["status"] == "ok"
+
+
 def test_what_changes_with_a_deploy_is_asked_about_each_time_and_the_rest_is_kept(
     built: Path,
 ) -> None:

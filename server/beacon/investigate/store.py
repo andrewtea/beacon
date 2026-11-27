@@ -64,6 +64,9 @@ _EARLIER = frozenset({0, 1})
 # 2 is read as naming none. The number is raised all the same, so that an older
 # Beacon refuses a file whose runs name feeds it would not show the credit of.
 _READABLE = frozenset({2})
+# Every shape this Beacon takes an investigations file in: its own and the ones it
+# makes its own from. A file in any other is refused, and is nobody's to delete.
+SHAPES = frozenset({_FORMAT, *_EARLIER, *_READABLE})
 _SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS run (

@@ -1,6 +1,7 @@
 #!/bin/sh
 # Sets a Box up, once, so that Beacon takes a photo with a tap. Run it on the Box as
-# its `user`, who has sudo; README, "Deploy", says how. It can be run again.
+# its `user`, who has sudo; README, "Deploy", says how. It can be run again, and
+# changes nothing that is already as it should be.
 #
 # A photo is drawn again by ffmpeg, confined by bubblewrap, on a host that hands no
 # core dump to a collector (beacon/radio/audio.py says why). A new Box has neither
@@ -10,22 +11,49 @@
 # the same three things.
 set -eu
 
-sudo apt-get update -q
-sudo env DEBIAN_FRONTEND=noninteractive \
-  apt-get install -y -q --no-install-recommends ffmpeg bubblewrap
+confines() {
+  # Whether bubblewrap may confine here: the one thing of these that fails quietly.
+  bwrap --unshare-all --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib \
+    --symlink usr/lib64 /lib64 /bin/true 2>/dev/null
+}
+
+if ! command -v ffmpeg >/dev/null || ! command -v bwrap >/dev/null; then
+  sudo apt-get update -q
+  sudo env DEBIAN_FRONTEND=noninteractive \
+    apt-get install -y -q --no-install-recommends ffmpeg bubblewrap
+fi
 
 # Core dumps go to no collector. apport sets the pattern to a pipe whenever it
 # starts, so it is turned off for good; the setting below is what holds at boot.
-sudo systemctl disable --now apport.service
-sudo sed -i 's/^enabled=1$/enabled=0/' /etc/default/apport
-printf '# Beacon: a core dump is handed to no collector (deploy/box-setup).\nkernel.core_pattern = core\n' |
-  sudo tee /etc/sysctl.d/60-beacon-core-pattern.conf >/dev/null
-sudo /usr/sbin/sysctl -q -p /etc/sysctl.d/60-beacon-core-pattern.conf
+case "$(cat /proc/sys/kernel/core_pattern)" in
+"|"* | "@"*)
+  if systemctl list-unit-files apport.service >/dev/null 2>&1; then
+    sudo systemctl disable --now apport.service
+    sudo sed -i 's/^enabled=1$/enabled=0/' /etc/default/apport
+  fi
+  printf '# Beacon: a core dump is handed to no collector (deploy/box-setup).\nkernel.core_pattern = core\n' |
+    sudo tee /etc/sysctl.d/60-beacon-core-pattern.conf >/dev/null
+  sudo /usr/sbin/sysctl -q -p /etc/sysctl.d/60-beacon-core-pattern.conf
+  ;;
+esac
 
 # bubblewrap, and no other program, may make a user namespace. Ubuntu's AppArmor
-# refuses that to an unprivileged program with no profile; this is the profile,
-# which leaves the restriction on for everything else on the Box.
-sudo tee /etc/apparmor.d/bwrap >/dev/null <<'EOF'
+# refuses that to an unprivileged program with no profile. Where bubblewrap can
+# confine already, whatever policy lets it is left alone. Where it cannot and a
+# policy for it is there, that policy is somebody's decision and is not replaced:
+# this stops. Only where there is none is one added, which leaves the restriction
+# on for everything else on the Box.
+if ! confines; then
+  existing=$(sudo grep -rlsE '(^|[[:space:]])/usr/bin/bwrap([[:space:]]|$)' /etc/apparmor.d || true)
+  if [ -n "$existing" ] || [ -e /etc/apparmor.d/bwrap ]; then
+    echo "bubblewrap cannot confine here, and a policy for it is already in" >&2
+    echo "/etc/apparmor.d, which this script does not replace:" >&2
+    echo "${existing:-/etc/apparmor.d/bwrap}" >&2
+    exit 1
+  fi
+  new=$(sudo mktemp /etc/apparmor.d/.beacon-bwrap.XXXXXX)
+  trap 'sudo rm -f "$new"' EXIT
+  sudo tee "$new" >/dev/null <<'PROFILE'
 # Beacon: lets bubblewrap make the user namespace it confines ffmpeg in
 # (deploy/box-setup). Nothing else is changed for it.
 abi <abi/4.0>,
@@ -36,12 +64,16 @@ profile bwrap /usr/bin/bwrap flags=(unconfined) {
 
   include if exists <local/bwrap>
 }
-EOF
-sudo apparmor_parser -r /etc/apparmor.d/bwrap
+PROFILE
+  sudo chmod 644 "$new"
+  # Read by AppArmor's own parser before it is put anywhere it would be loaded from.
+  sudo apparmor_parser --skip-kernel-load "$new"
+  # A link is made only where no file is: a policy put there meanwhile is kept.
+  sudo ln "$new" /etc/apparmor.d/bwrap
+  sudo apparmor_parser -r /etc/apparmor.d/bwrap
+  confines
+fi
 
 echo "core_pattern: $(cat /proc/sys/kernel/core_pattern)"
-# The one thing of these that fails quietly: whether bubblewrap may confine.
-bwrap --unshare-all --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib \
-  --symlink usr/lib64 /lib64 /bin/true
 echo "Set up. Restart Beacon's service, or deploy again: a server that still takes"
 echo "no photos says so in its log when it starts."

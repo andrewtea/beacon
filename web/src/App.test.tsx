@@ -86,6 +86,40 @@ test('says, in the server’s sentence, that the invented scenario is told again
   expect(banner).toHaveTextContent(repeats)
 })
 
+test('says, in the server’s sentence, that nobody has checked what the host in front of it writes down', async () => {
+  const front =
+    'What you send here is real, whatever the scenario. Nobody has checked what the hosting service writes down.'
+  serve({ 'GET /api/health': { ...MOCK_HEALTH, front_text: front } })
+
+  render(<App />)
+
+  // On the page a tap is sent from, before anybody taps, apart from what says
+  // the scenario is invented: it is about what a person sends, not the incidents.
+  expect(await screen.findByText(front)).toBeInTheDocument()
+  expect(screen.getByText(INVENTED)).not.toHaveTextContent(front)
+})
+
+test('a tap that is gone says the most an answer is kept, and on a server that tells its story again, that', async () => {
+  const repeats =
+    'On this server the invented scenario is told again from its beginning when it is over.'
+  serve({
+    'GET /api/health': { ...MOCK_HEALTH, repeats_text: repeats },
+    [`GET /api/taps/${FIRE_TAP}`]: () =>
+      Response.json({ detail: 'There is no such tap.' }, { status: 404 }),
+  })
+  window.location.hash = `#/tap/${FIRE_TAP}`
+
+  render(<App />)
+
+  // No promise that an answer is kept for 23 hours: that is the most.
+  expect(
+    await screen.findByText(
+      'Beacon does not have this tap. An answer is kept for 23 hours at most.',
+    ),
+  ).toBeInTheDocument()
+  expect(await screen.findByText(repeats)).toBeInTheDocument()
+})
+
 test('takes no tap until the server has said whether it runs on real sources', async () => {
   // The server answers only when it is let: until then nobody has been told
   // whether a tap would go to the invented scenario.

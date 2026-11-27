@@ -27,8 +27,10 @@ written once:
 import sqlite3
 from collections.abc import Collection, Sequence
 from contextlib import closing
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from urllib.parse import quote
 
 Mode = Literal["live", "mock"]
 
@@ -106,3 +108,38 @@ def _refusal(
     if begun is not None and begun[0] != mode:
         return f"The {what} file was begun as the {begun[0]} one, and cannot be the {mode} one."
     return None
+
+
+@dataclass(frozen=True)
+class Look:
+    """What a SQLite file says of itself, read without writing to it."""
+
+    # The mode written in its table of that name, or None when it says none.
+    mode: str | None
+    # Its `user_version`: 0 for a file that says no shape.
+    shape: int
+    # Whether it has any table at all. A file with none was begun and never used.
+    tables: bool
+
+
+def look(path: Path, *, meta: str = "meta") -> Look:
+    """Read what the file at `path` says of itself, through a connection that
+    cannot write: its mode, from the table `meta` (key, value), and its shape.
+    `begin_file` is how a file is opened for use; this is for deciding about a
+    file without changing it, as before a deletion. Nothing is written to the
+    file. To read one that is in write-ahead mode, SQLite can make the `-shm` file
+    and an empty `-wal` beside it, as any reader of it does.
+
+    Raises sqlite3.Error for a file that is no SQLite database or cannot be read."""
+    if not meta.isidentifier():
+        raise ValueError("meta names a table")
+    address = f"file:{quote(str(path))}?mode=ro"
+    with closing(sqlite3.connect(address, uri=True, timeout=_WAIT_SECONDS)) as db:
+        shape = db.execute("PRAGMA user_version").fetchone()[0]
+        tables = {
+            row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        said = None
+        if meta in tables:
+            said = db.execute(f"SELECT value FROM {meta} WHERE key = 'mode'").fetchone()
+    return Look(mode=None if said is None else said[0], shape=shape, tables=bool(tables))

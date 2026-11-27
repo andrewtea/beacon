@@ -20,6 +20,10 @@ class Health(BaseModel):
     # becomes of the taps sent before. Shown with what says the scenario is
     # invented. Null on every other server.
     repeats_text: str | None = None
+    # On a server reached through a host nobody has seen keep the private routes
+    # out of its records (`BEACON_FRONT_END=unverified`): a sentence that says so,
+    # shown wherever a person is about to send something. Null on every other.
+    front_text: str | None = None
 
 
 @router.get("/health")
@@ -30,4 +34,5 @@ def health(request: Request) -> Health:
         version=__version__,
         mode=None if engine is None else engine.mode,
         repeats_text=getattr(request.app.state, "repeats_text", None),
+        front_text=getattr(request.app.state, "front_text", None),
     )

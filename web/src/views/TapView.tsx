@@ -107,7 +107,15 @@ function Others({
   )
 }
 
-export function TapView({ id }: { id: string }) {
+export function TapView({
+  id,
+  repeatsText = null,
+}: {
+  id: string
+  // The server's sentence about telling its story again, when it does: why a
+  // tap can be gone sooner than on another server.
+  repeatsText?: string | null
+}) {
   const polled = usePolled(
     `tap:${id}`,
     (signal) => fetchTapAnswer(id, signal),
@@ -132,9 +140,12 @@ export function TapView({ id }: { id: string }) {
             <h1>{gone ? 'This tap is gone' : 'No answer yet'}</h1>
             <p role="status">
               {gone
-                ? 'Beacon does not have this tap. An answer is kept for 23 hours.'
+                ? 'Beacon does not have this tap. An answer is kept for 23 hours at most.'
                 : polled.error.message}
             </p>
+            {gone && repeatsText !== null && (
+              <p className="meta">{repeatsText}</p>
+            )}
           </>
         )}
         <a className="action" href={href.home}>

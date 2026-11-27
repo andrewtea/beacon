@@ -10,6 +10,10 @@ export type Health = {
   // server's sentence that says so, and what becomes of the taps sent before.
   // Shown with what says the scenario is invented. Null on every other server.
   repeats_text: string | null
+  // On a server reached through a host nobody has seen keep the private routes
+  // out of its records: the server's sentence that says so, shown wherever a
+  // person is about to send something. Null on every other server.
+  front_text: string | null
 }
 
 export function fetchHealth(signal?: AbortSignal): Promise<Health> {
