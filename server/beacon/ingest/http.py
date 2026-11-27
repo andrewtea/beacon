@@ -281,13 +281,16 @@ class SourceHttp:
         params: Mapping[str, str] | None,
         headers: Mapping[str, str] | None,
         data: Mapping[str, str] | None,
+        max_seconds: float | None = None,
+        read_body: bool = True,
     ) -> "bytes | SourceError":
         """The body of a 2xx reply, or the error to raise. It is returned and not
         raised here, so that it is raised with nothing under it."""
         body = bytearray()
         try:
             async with (
-                asyncio.timeout(MAX_SECONDS),
+                # The module's limit is read now, not when this was defined.
+                asyncio.timeout(MAX_SECONDS if max_seconds is None else max_seconds),
                 httpx2.AsyncClient(
                     timeout=TIMEOUT_SECONDS,
                     follow_redirects=False,
@@ -314,6 +317,10 @@ class SourceHttp:
                         status=response.status_code,
                         retry_after=_retry_after(response.headers),
                     )
+                if not read_body:
+                    # The status was the answer. Whatever follows it is not waited
+                    # for, so nothing that goes wrong in it undoes the answer.
+                    return b""
                 if encoding not in ("", "identity", "gzip"):
                     return SourceError(source, _PACKED_ANOTHER_WAY)
                 unpack = _Gunzip() if encoding == "gzip" else None
@@ -358,13 +365,18 @@ def fetch(
     params: Mapping[str, str] | None = None,
     headers: Mapping[str, str] | None = None,
     data: Mapping[str, str] | None = None,
+    max_seconds: float | None = None,
+    read_body: bool = True,
 ) -> bytes:
-    """The body of a 2xx reply, of at most `max_bytes` once it is unpacked.
+    """The body of a 2xx reply, of at most `max_bytes` once it is unpacked. With
+    `read_body=False` the reply's status is the whole answer: a 2xx reply returns
+    nothing as soon as its status is read, and its body is not read at all.
 
     Raises SourceError when the source cannot be reached, answers with anything but
     2xx, sends more than `max_bytes`, packs its reply in a way Beacon does not read
-    or does not finish it, takes longer than `MAX_SECONDS` over the whole exchange,
-    or when the client is closed, before or during the exchange."""
+    or does not finish it, takes longer than `max_seconds` (`MAX_SECONDS` when none
+    is given) over the whole exchange, or when the client is closed, before or
+    during the exchange."""
     outcome = http._run(
         http._exchange(
             method,
@@ -374,6 +386,8 @@ def fetch(
             params=params,
             headers=headers,
             data=data,
+            max_seconds=max_seconds,
+            read_body=read_body,
         )
     )
     if outcome is None:

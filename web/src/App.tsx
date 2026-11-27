@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import './App.css'
 import { fetchHealth } from './api/health.ts'
 import { Icon } from './components/Icon.tsx'
 import { usePolled } from './lib/poll.ts'
+import { usePushSync } from './lib/pushSync.ts'
 import { href, type Route, useRoute } from './lib/router.ts'
 import { sweepTaps } from './lib/tapStore.ts'
 import { Home } from './views/Home.tsx'
@@ -63,6 +64,9 @@ export default function App() {
   const mode = unreachable ? null : (health.data?.mode ?? null)
   // A tap the server no longer answers for is deleted from this device.
   useEffect(() => sweepTaps(), [])
+  const askAgain = useCallback(() => setAsked((count) => count + 1), [])
+  // The server is kept told of what this device wants of notifications.
+  usePushSync(mode, askAgain)
 
   return (
     <div className="app">
@@ -89,11 +93,7 @@ export default function App() {
         </p>
       )}
       <main>
-        <View
-          route={route}
-          mode={mode}
-          onOtherMode={() => setAsked((count) => count + 1)}
-        />
+        <View route={route} mode={mode} onOtherMode={askAgain} />
       </main>
       <footer>
         <p>

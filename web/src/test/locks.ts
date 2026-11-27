@@ -1,13 +1,30 @@
 import { vi } from 'vitest'
 
-/** The browser's lock, as the tabs of one app share it: one holder at a time, in
- * the order they asked. jsdom has none. */
+type Work = (lock: { name: string } | null) => unknown
+
+/** The browser's locks, as the tabs of one app share them: for each name one
+ * holder at a time, in the order they asked. One asked for only `ifAvailable`
+ * is given none, and is not made to wait, while the lock is held or asked for.
+ * jsdom has none. */
 export function fakeLocks() {
-  let last: Promise<unknown> = Promise.resolve()
-  const request = vi.fn((_name: string, work: () => unknown) => {
-    const turn = last.then(() => work())
-    last = turn.catch(() => undefined)
-    return turn
-  })
+  const last = new Map<string, Promise<unknown>>()
+  const asking = new Map<string, number>()
+  const request = vi.fn(
+    (name: string, second: Work | { ifAvailable?: boolean }, third?: Work) => {
+      const work = typeof second === 'function' ? second : third!
+      const options = typeof second === 'function' ? {} : second
+      if (options.ifAvailable === true && (asking.get(name) ?? 0) > 0)
+        return Promise.resolve().then(() => work(null))
+      asking.set(name, (asking.get(name) ?? 0) + 1)
+      const turn = (last.get(name) ?? Promise.resolve()).then(() =>
+        work({ name }),
+      )
+      const ended = turn
+        .catch(() => undefined)
+        .then(() => asking.set(name, (asking.get(name) ?? 1) - 1))
+      last.set(name, ended)
+      return turn
+    },
+  )
   return { request }
 }

@@ -61,6 +61,9 @@ export default defineConfig({
         ],
       },
       workbox: {
+        // Notifications have a service worker of their own (public/push-sw.js),
+        // which the app registers at another scope. It is no part of this one.
+        globIgnores: ['push-sw.js'],
         // API requests must reach the server, never the cached app shell.
         // Workbox tests the path plus the query string, so this also covers
         // /api and /api?x.

@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Beacon server: source pollers, the incident engine, and the Muse Ember client."
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "cryptography>=50.0.2",
     "fastapi>=0.165.0",
     "httpx2>=2.16.2",
     "openai>=3.59.0",
