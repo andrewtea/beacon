@@ -305,12 +305,10 @@ from beacon.push import open_push
 
 push = open_push(os.environ, engine, runs)  # in the server, request.app.state.push; always there, with this mode's file open
 push.sends  # False with BEACON_PUSH=0 and with no BEACON_VAPID_SUBJECT: it then only deletes
-permit = push.subscriptions.permit(now)  # what POST /api/push/permit does: good once, for two minutes
-push.subscriptions.put(endpoint, points, now, permit=permit)  # POST /api/push/subscribe, after `checked(endpoint)`
 push.work(engine.snapshot, now)  # one pass, answered in counts (`Pass`); the server makes one every 15 s
 ```
 
-README "Notifications" says what a person is told. The rules:
+README "Notifications" says what a person is told. An address is kept by the routes in `beacon/api/push.py` and by nothing else: only on a server that sends (`push.sends`), only an address `checked` passed, and only with a permit `Subscriptions.permit` gave that is not None (it is None when as many are out as may be). `Subscriptions.put` called without a permit keeps what it is handed, which is for tests; do not call it so from code that serves a request. The rules:
 
 - **A push carries no content.** It is a POST with no body, signed with the server's key. Do not add a payload, and so do not keep a browser's `p256dh` or `auth` key. The words a device shows are `notice_of(mode)`, handed to the app in `GET /api/push` and kept on the device (`keepNotice`) **before** the server is given the address, so no push arrives ahead of its words. They name no incident, say the decision is the investigator's and no authority's, tell nobody what to do, and on the mock store say first that the scenario is invented and a stand-in decided. A change to them reaches a device when it next syncs.
 - **`ABOUT` names everything the file holds, and every lifetime.** A person reads it before they turn notifications on. When you add a column to `store.py`, or change `KEPT` or `SENT_KEPT`, change `ABOUT` in `notice.py` with it; `test_a_subscription_is_an_address_and_places_and_a_place_keeps_when_it_was_added` lists the columns. Do not add a column that says who or what the device is (a name, a browser, an address a request came from, a tap's id), and do not join a subscription to a tap. Say what the push service is sent and what it learns, never that it learns nothing.

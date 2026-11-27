@@ -4,9 +4,12 @@
 
     push = open_push(os.environ, engine, runs)  # always with this mode's file open
     push.sends  # False with BEACON_PUSH=0, and with no BEACON_VAPID_SUBJECT
-    permit = push.subscriptions.permit(now)  # what POST /api/push/permit does
-    push.subscriptions.put(endpoint, points, now, permit=permit)  # POST /api/push/subscribe
     push.work(engine.snapshot, now)  # one pass; the server makes one every 15 s
+
+An address is kept by the routes and by nothing else (`beacon.api.push`): only on a
+server that sends, only an address `checked` passed, and only with a permit that
+`Subscriptions.permit` gave and that is not None. `Subscriptions.put` called
+without a permit keeps what it is handed, which is for tests.
 
 This is the first thing Beacon keeps that is tied to a device, so it keeps as little
 as sends a notification, and says all of it (`ABOUT`):
