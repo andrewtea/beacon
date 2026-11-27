@@ -30,11 +30,13 @@ compare the ledger with Meta's Usage page before starting them again.
 
 A ledger begins a file where it finds none, which is right for a first call and
 wrong for whoever means to go on paying from the ledger that was paid from before.
-**A ledger opened on a file that was named to it (`only`) never begins one**: it
-opens what is at the path and makes no file and no table, when it is opened and for
-as long as it is used. A file that is not the named one refuses it
-(`OtherLedgerError`), and one that goes from under it afterwards is a replaced
-ledger with nothing put in its place.
+**A ledger opened on a file that was named to it (`only`) never begins one, and
+never reads or writes another**: every connection it makes, when it is opened and
+for as long as it is used, is to that file, seen to be it by device, inode, and
+generation, and makes no file and no table. A file that is not the named one
+refuses it (`OtherLedgerError`), and when the file goes from under it afterwards,
+or another ledger is put at the path, it is a replaced ledger to every reader and
+writer, with nothing put in its place and nothing read from or logged in the other.
 """
 
 import json
@@ -195,11 +197,13 @@ class Ledger:
         `only` is for whoever goes on with a ledger that was paid from before: the
         name of its file, as `opened_file` and `kept_file` give it. The ledger is
         then opened only when the file at the path is that one, and **neither now
-        nor later does it begin a file or make a table**: every connection is to
-        what is there (`mode=rw`). When the file goes from under it, what reads it
-        or writes to it raises LedgerReplacedError (`spent_nanousd`, `generation`,
-        `scope_spend`, `reserve`, `record`, `export_trace`), `settle` and
-        `is_opened_file` answer False, and `calls` answers none.
+        nor later does it begin a file or make a table, or read or write another
+        file**: every connection is to that file (`mode=rw`, its device, inode, and
+        generation seen each time) or is not made. When the file goes from under
+        it, or another is put in its place, a ledger or a copy of this one, what
+        reads it or writes to it raises LedgerReplacedError (`spent_nanousd`,
+        `generation`, `scope_spend`, `reserve`, `record`, `export_trace`), `settle`
+        and `is_opened_file` answer False, and `calls` answers none.
 
         Raises OtherLedgerError, having made nothing, when `only` is given and what
         is at the path is not that file."""
@@ -213,27 +217,23 @@ class Ledger:
                 self._opened = _generation(db)
                 self._identity = _identity(db_path)
             return
-        found = self._existing()
-        if found is None or f"{found[0]}:{found[1][0]}:{found[1][1]}" != only:
+        # Which file it is, from its name, before anything is opened: every
+        # connection is then to that file or to none (`_connect_existing`).
+        named = FILE_NAME.fullmatch(only) is not None
+        generation, _, where = only.partition(":")
+        device, _, inode = where.partition(":")
+        self._opened = generation
+        self._identity = (int(device), int(inode)) if named else None
+        there = False
+        if named:
+            try:
+                self._connect().close()
+                there = True
+            except (sqlite3.Error, LedgerReplacedError):
+                # Not under the error raised below.
+                pass
+        if not there:
             raise_bare(OtherLedgerError(_OTHER_LEDGER))
-        self._opened, self._identity = found
-
-    def _existing(self) -> tuple[str, tuple[int, int]] | None:
-        """The generation and the identity of the ledger that is at the path, read
-        through a connection that makes nothing, or None when no ledger that was
-        begun is there or it was changed for another while it was read."""
-        try:
-            before = os.lstat(self._db_path)
-            if not stat.S_ISREG(before.st_mode):
-                return None
-            with closing(self._connect()) as db:
-                generation = _generation(db)
-            after = os.lstat(self._db_path)
-        except (OSError, sqlite3.Error, LedgerReplacedError):
-            return None
-        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-            return None
-        return generation, (after.st_dev, after.st_ino)
 
     def spent_nanousd(self) -> int:
         """Live spend so far, counting calls with an unknown outcome at their maximum."""
@@ -315,7 +315,7 @@ class Ledger:
             with closing(self._connect()) as db:
                 return self._is_opened_file(db)
         except LedgerReplacedError:
-            # Nothing is at the path, for a ledger that begins no file.
+            # The file that was named is not at the path, for a ledger that was named one.
             return False
 
     def opened_file(self) -> str:
@@ -354,7 +354,7 @@ class Ledger:
         try:
             return self._settle(row, status, cost_nanousd, latency_ms, usage, response, error)
         except LedgerReplacedError:
-            # Nothing is at the path, for a ledger that begins no file.
+            # The file that was named is not at the path, for a ledger that was named one.
             return False
 
     def _settle(
@@ -427,7 +427,7 @@ class Ledger:
         try:
             db = self._connect()
         except LedgerReplacedError:
-            # Nothing is at the path, for a ledger that begins no file.
+            # The file that was named is not at the path, for a ledger that was named one.
             return []
         with closing(db):
             generation = _generation(db)
@@ -499,37 +499,55 @@ class Ledger:
         return db
 
     def _connect_existing(self) -> sqlite3.Connection:
-        """A connection to the ledger that is at the path, for a ledger that begins
+        """A connection to the ledger file that was named, for a ledger that begins
         none (`only`): `mode=rw` opens a file and makes none, and no table is made
-        in a file that has none.
+        in a file that has none. **It is a connection to the named file or there is
+        none**: the file at the path is seen to be that one, by its device and
+        inode before the connection is made and again after its generation is read
+        on it, and by that generation, so that no reader and no writer is handed
+        another ledger that was put at the path, a copy with the generation
+        included.
 
-        Raises LedgerReplacedError when nothing can be opened at the path, or what
-        is there was never begun as a ledger."""
+        Raises LedgerReplacedError when the named file is not what is at the path:
+        nothing is there, or another file is, a ledger or not."""
         address = f"file:{quote(str(self._db_path))}?mode=rw"
         db = None
-        begun = False
-        # Nothing that can be opened is there when this fails.
-        with suppress(sqlite3.OperationalError):
-            db = sqlite3.connect(address, uri=True, timeout=30, isolation_level=None)
+        same = False
+        if self._named_file_is_there():
+            # Nothing that can be opened is there when this fails.
+            with suppress(sqlite3.OperationalError):
+                db = sqlite3.connect(address, uri=True, timeout=30, isolation_level=None)
         if db is not None:
             db.row_factory = sqlite3.Row
             try:
-                begun = db.execute(_GENERATION).fetchone() is not None
+                found = db.execute(_GENERATION).fetchone()
+                same = (
+                    found is not None and found[0] == self._opened and self._named_file_is_there()
+                )
             except sqlite3.OperationalError as error:
-                # An empty file, or another database, has no such table. Anything
-                # else is the file's own trouble, and is raised as it is.
+                # A file that was emptied has no such table. Anything else is the
+                # file's own trouble, and is raised as it is.
                 if "no such table" not in str(error):
                     db.close()
                     raise
             except BaseException:
                 db.close()
                 raise
-        if not begun:
+        if not same:
             if db is not None:
                 db.close()
             raise_bare(LedgerReplacedError(_REPLACED))
         assert db is not None
         return db
+
+    def _named_file_is_there(self) -> bool:
+        """Whether what is at the path is the file this ledger was named (`only`):
+        a file of its own, no link, with that device and inode."""
+        try:
+            found = os.lstat(self._db_path)
+        except OSError:
+            return False
+        return stat.S_ISREG(found.st_mode) and (found.st_dev, found.st_ino) == self._identity
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
