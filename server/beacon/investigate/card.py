@@ -115,6 +115,10 @@ _REFUSED = {
     "no_such_incident": "Beacon no longer had that incident.",
     "no_clip": "The tap's clip was no longer kept.",
     "no_photo": "The tap's photo was no longer kept.",
+    "no_answer": (
+        "The investigator's answer was cut short or was not the form, so nothing is "
+        "known of what the clip or the photo holds."
+    ),
 }
 
 

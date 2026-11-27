@@ -61,7 +61,12 @@ from beacon.incident.build import NOT_AN_ORDER, STATUS_WORDS
 from beacon.radio.vocabulary import MEDICAL_EVENT
 
 TASK = "merge_incident"
-MAX_OUTPUT_TOKENS = 1000
+# Reasoning counts against the limit. Measured on the first real calls (2026-11-27,
+# the invented fire's lines): at `low` effort Ember reasoned for 998 of 1,000
+# tokens and wrote no form; at `minimal` it reasoned for 566 and chose eight
+# points, each of which passed the check.
+EFFORT = "minimal"
+MAX_OUTPUT_TOKENS = 2000
 
 # The kinds of line Ember is given, and so the only ones a point can cite.
 LINE_KINDS = ("radio", "closure", "aircraft", "taps")
@@ -237,7 +242,7 @@ def merge_incident(ember: EmberClient, incident: Incident) -> Draft:
         raise ValueError("The incident has no line a story could be made from.")
     answer = ember.respond(
         task=TASK,
-        effort="low",
+        effort=EFFORT,
         max_output_tokens=MAX_OUTPUT_TOKENS,
         sensitive=True,
         instructions=INSTRUCTIONS,

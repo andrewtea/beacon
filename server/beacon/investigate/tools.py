@@ -84,7 +84,13 @@ MAX_CALLS = 40
 MAX_TRACKS = 8
 # The most rows of taps and of aircraft positions one call reads.
 MAX_ROWS = 2_000
-MEDIA_OUTPUT_TOKENS = 200
+# A clip's or a photo's tags are about twenty tokens, and reasoning counts against
+# the limit. Measured on the first real calls (2026-11-27, an invented clip and an
+# invented picture): at `low` effort Ember reasoned for all of 200 tokens and wrote
+# no tags; at `minimal` it reasoned for about a hundred and wrote the same tags as
+# at `low` with 2,000.
+MEDIA_EFFORT = "minimal"
+MEDIA_OUTPUT_TOKENS = 600
 _ROUND_M = 50
 _EVENTS = (*CATEGORIES, MEDICAL_EVENT)
 _CLARITIES = ("clear", "partial", "unintelligible")
@@ -130,7 +136,8 @@ class Found:
     # Whether `nearby_incidents` ran at all: only then is "nothing near" known.
     looked: bool = False
     other_taps: int = 0
-    # None until the clip was listened to and the photo looked at.
+    # None until the clip was listened to and the photo looked at, and empty when
+    # Ember's answer about it was cut short or was no form: nothing is known then.
     heard: tuple[str, ...] | None = None
     seen: tuple[str, ...] | None = None
 
@@ -621,6 +628,8 @@ def _listen_clip(
 ) -> _Result:
     if found.heard is not None:
         # Listened to once, and paid for once.
+        if not found.heard:
+            return {"error": "no_answer"}, {"error": "no_answer"}, None
         kept = {"heard": list(found.heard), "again": True}
         return kept, kept, None
     clip = scene.media(scene.tap_id, "clip")
@@ -631,7 +640,10 @@ def _listen_clip(
         "input_audio": {"data": base64.b64encode(clip).decode(), "format": "wav"},
     }
     tags, paid = _media_tags(ember, "listen_clip", _CLIP_QUESTION, content, "heard", SOUNDS, limit)
-    found.heard = tags
+    # Listened to once and paid for once, whatever came of it.
+    found.heard = tags or ()
+    if tags is None:
+        return {"error": "no_answer"}, {"error": "no_answer"}, paid
     return {"heard": list(tags)}, {"heard": list(tags)}, paid
 
 
@@ -639,6 +651,8 @@ def _look_photo(
     ember: EmberClient, scene: Scene, found: Found, _args: Mapping[str, Any], limit: int | None
 ) -> _Result:
     if found.seen is not None:
+        if not found.seen:
+            return {"error": "no_answer"}, {"error": "no_answer"}, None
         kept = {"seen": list(found.seen), "again": True}
         return kept, kept, None
     photo = scene.media(scene.tap_id, "photo")
@@ -649,7 +663,9 @@ def _look_photo(
         "image_url": "data:image/jpeg;base64," + base64.b64encode(photo).decode(),
     }
     tags, paid = _media_tags(ember, "look_photo", _PHOTO_QUESTION, content, "seen", SIGHTS, limit)
-    found.seen = tags
+    found.seen = tags or ()
+    if tags is None:
+        return {"error": "no_answer"}, {"error": "no_answer"}, paid
     return {"seen": list(tags)}, {"seen": list(tags)}, paid
 
 
@@ -661,13 +677,14 @@ def _media_tags(
     name: str,
     allowed: Sequence[str],
     limit_nanousd: int | None,
-) -> tuple[tuple[str, ...], Accounting]:
+) -> tuple[tuple[str, ...] | None, Accounting]:
     """Have Ember say which of `allowed` a tap's clip or photo holds. Only tags
-    from the list are read from its answer; an answer that is no form reads as
-    `none`, which is what is known of a clip nothing was made of."""
+    from the list are read from its answer. An answer that was cut short or is no
+    form gives None and not `none`: Ember then said nothing of the clip, which is
+    not the same as its saying that none of the sounds is in it."""
     answer = ember.respond(
         task=task,
-        effort="low",
+        effort=MEDIA_EFFORT,
         max_output_tokens=MEDIA_OUTPUT_TOKENS,
         # A clip can hold a voice and a photo a face.
         sensitive=True,
@@ -690,11 +707,13 @@ def _media_tags(
         },
     )
     try:
-        said = json.loads(answer.output_text)
+        said = json.loads(answer.output_text) if answer.status == "completed" else None
     except ValueError:
         said = None
     given = said.get(name) if isinstance(said, dict) else None
-    tags = [tag for tag in allowed if isinstance(given, list) and tag in given and tag != "none"]
+    if not isinstance(given, list):
+        return None, Accounting.of(answer)
+    tags = [tag for tag in allowed if tag in given and tag != "none"]
     return tuple(tags) or ("none",), Accounting.of(answer)
 
 

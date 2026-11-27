@@ -186,6 +186,10 @@ class Settings:
     system: str = generate.SYSTEM
     talkgroups: tuple[int, ...] = (generate.TALKGROUP, generate.EMS_TALKGROUP)
     ems_talkgroups: tuple[int, ...] = (generate.EMS_TALKGROUP,)
+    # For generated calls: how many calls a sample holds. Only the first that many
+    # of the day's calls, in the order they were dispatched, are generated, heard,
+    # and scored. None for a run of the whole day.
+    sample: int | None = None
 
     @property
     def mode(self) -> Literal["mock", "live"]:
@@ -361,8 +365,8 @@ def begin(layout: Layout, asked: Settings) -> Settings:
         return asked
     if kept != asked:
         raise ScaleError(
-            "This run was begun as another: its day, its audio, who hears it, or its "
-            "talkgroups are not the ones asked for now. A run is one kind for good, "
+            "This run was begun as another: its day, its audio, who hears it, its "
+            "talkgroups, or its sample are not the ones asked for now. A run is one kind for good, "
             "so that its numbers are one kind's. Give the new run another --name."
         )
     return kept
@@ -387,9 +391,12 @@ def read_settings(layout: Layout) -> Settings | None:
             system=str(said["system"]),
             talkgroups=tuple(int(number) for number in said["talkgroups"]),
             ems_talkgroups=tuple(int(number) for number in said["ems_talkgroups"]),
+            # A run begun before a run could be of a sample is of its whole day.
+            sample=said.get("sample"),
         )
         if (
-            settings.audio not in ("generated", "recorded")
+            not _is_sample(settings)
+            or settings.audio not in ("generated", "recorded")
             or settings.hearer not in ("fake", "live")
             or settings.voice not in (None, "tones", "speech")
         ):
@@ -399,23 +406,49 @@ def read_settings(layout: Layout) -> Settings | None:
     return settings
 
 
+def _is_sample(settings: Settings) -> bool:
+    """Whether a run's sample is one a run can have: none, or a count of at least
+    one for generated calls. Recordings are heard as they were made."""
+    sample = settings.sample
+    if sample is None:
+        return True
+    whole = isinstance(sample, int) and not isinstance(sample, bool) and sample >= 1
+    return whole and settings.audio == "generated"
+
+
 def prepare(layout: Layout, settings: Settings, http: SourceHttp) -> list[datasf.Record]:
     """Fetch what a run is scored against and reads names from, once: DataSF's
     calls of the day, and the lists of streets, blocks, and units. For generated
     audio, write the calls. What is already there is read and not fetched again.
 
+    A run of a sample keeps only the sample's records, the first of the day in the
+    order they were dispatched, with how many the day had: everything that is made
+    of the run's records afterwards (the generated calls, the score, the taps) is
+    then of the sample and of nothing else.
+
     Raises SourceError when DataSF cannot be read, and ScaleError when the day has
-    no calls, the lists come out empty, or the calls cannot be written."""
+    no calls, has no more calls than the sample asks for, the lists come out
+    empty, or the calls cannot be written."""
     day = date.fromisoformat(settings.day)
     if not layout.records.exists():
         records, unread = datasf.read_records(datasf.fetch_day(http, day))
         if not records:
             raise ScaleError("DataSF lists no call for that day that Beacon can read.")
+        day_calls = len(records)
+        if settings.sample is not None:
+            if settings.sample >= day_calls:
+                raise ScaleError(
+                    "A sample holds fewer calls than the day has: DataSF's record of "
+                    f"that day has {day_calls} that Beacon can read. Make the run "
+                    "without --calls, under another --name."
+                )
+            records = records[: settings.sample]
         _write(
             layout.records,
             {
                 "unreadable_calls": unread.calls,
                 "unreadable_rows": unread.rows,
+                "day_calls": day_calls,
                 "records": [record.as_data() for record in records],
             },
         )
@@ -450,6 +483,22 @@ def read_day(layout: Layout) -> tuple[list[datasf.Record], datasf.Unread]:
             raise ValueError
         return datasf.records_from_data(said["records"]), datasf.Unread(*counts)
     except (OSError, ValueError, KeyError, TypeError):
+        pass
+    raise ScaleError("The run's records of DataSF's calls (records.json) cannot be read.")
+
+
+def read_day_calls(layout: Layout) -> int:
+    """How many calls of the day Beacon could read in DataSF's record, of which a
+    run of a sample kept the first. A run of the whole day kept them all, and one
+    begun before the number was kept says none: for both it is how many were kept.
+
+    Raises ScaleError when the run's records cannot be read."""
+    kept = len(read_day(layout)[0])
+    try:
+        said = json.loads(layout.records.read_text(encoding="utf-8")).get("day_calls", kept)
+        if isinstance(said, int) and not isinstance(said, bool) and said >= kept:
+            return said
+    except (OSError, ValueError, AttributeError):
         pass
     raise ScaleError("The run's records of DataSF's calls (records.json) cannot be read.")
 

@@ -42,9 +42,16 @@ from beacon.radio.vocabulary import (
 )
 
 TASK = "extract_transmission"
-# The form is about eighty tokens. The rest is room for the little reasoning that low
-# effort does, which counts against the same limit.
-MAX_OUTPUT_TOKENS = 512
+# The form is about eighty tokens. The rest is room for reasoning, which counts
+# against the same limit. Measured on the first real calls (2026-11-27, generated
+# speech): at `low` effort Ember reasoned for 510 of 512 tokens on one call and
+# wrote no form. Twelve generated calls were then heard once at each effort, with
+# room for both: every answer was a form, `minimal` and `low` agreed with the
+# script on the category of 9 and the place of 11, and on the units of 9 and 10,
+# and `low` cost 2.2 times as much. That is no gain to pay for, on speech that is
+# far cleaner than radio: when there are recordings, measure again.
+EFFORT = "minimal"
+MAX_OUTPUT_TOKENS = 1024
 
 # How well the call could be heard, in Ember's own judgment.
 Clarity = Literal["clear", "partial", "unintelligible"]
@@ -174,7 +181,7 @@ def extract_transmission(
     been paid for."""
     answer = ember.respond(
         task=TASK,
-        effort="low",
+        effort=EFFORT,
         max_output_tokens=MAX_OUTPUT_TOKENS,
         # Any call can be EMS traffic, and nobody knows before it is heard.
         sensitive=True,

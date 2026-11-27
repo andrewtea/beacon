@@ -70,6 +70,7 @@ from beacon.scale.run import (
     prepare,
     radio_ember,
     read_day,
+    read_day_calls,
     read_lists,
 )
 
@@ -140,6 +141,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--talkgroups", default="", help="the talkgroups to hear, as 1201,1203")
     parser.add_argument(
         "--ems-talkgroups", default="", help="the ones among them that carry EMS only"
+    )
+    parser.add_argument(
+        "--calls",
+        type=int,
+        help="make the run of a sample: generate, hear, and score only the first this "
+        "many calls of the day, in the order they were dispatched; for generated calls "
+        "only, and for good, like everything else a run is",
     )
     parser.add_argument(
         "--taps", type=int, default=taps.MAX_TAPS, help="how many taps to replay; 0 for none"
@@ -228,11 +236,21 @@ def _run(
                     )
                 )
             )
-        print(results.basis(settings), file=out)
+        if settings.sample is None:
+            print(results.basis(settings), file=out)
         prepare(layout, settings, http)
         records, unread = read_day(layout)
+        day_calls = read_day_calls(layout)
+        if settings.sample is not None:
+            # What a sample is of is known once DataSF's record of the day is read.
+            print(results.basis(settings, day_calls=day_calls), file=out)
         print(
-            f"{len(records)} calls in DataSF's record of {settings.day} that Beacon could read.",
+            f"{day_calls} calls in DataSF's record of {settings.day} that Beacon could read."
+            + (
+                ""
+                if settings.sample is None
+                else f" This run is of the first {len(records)} of them."
+            ),
             file=out,
         )
         known_blocks = read_lists(layout)[1]
@@ -343,6 +361,7 @@ def _run(
             settings,
             records,
             unread=unread,
+            day_calls=day_calls,
             rows=store.count_by_source().get(RADIO_SOURCE, 0),
             no_row=store.claimed_without_row(RADIO_SOURCE),
             listed=None if script is None else script.calls,
@@ -411,6 +430,13 @@ def _settings(options: argparse.Namespace, env: Mapping[str, str]) -> Settings:
         raise ScaleError("--day is a day, as YYYY-MM-DD.") from None
     if day >= datetime.now(datasf.LOCAL).date():
         raise ScaleError("--day is a day that is over: DataSF's record of it is what is scored.")
+    if options.calls is not None and options.recordings is not None:
+        raise ScaleError(
+            "A sample is of generated calls: recordings are heard as they were made, "
+            "and --calls does not go with --recordings."
+        )
+    if options.calls is not None and options.calls < 1:
+        raise ScaleError("--calls is how many calls a sample holds: 1 or more.")
     if options.recordings is None:
         if options.paid and options.voice == "tones":
             raise ScaleError(
@@ -422,6 +448,7 @@ def _settings(options: argparse.Namespace, env: Mapping[str, str]) -> Settings:
             audio="generated",
             voice=options.voice,
             hearer="live" if options.paid else "fake",
+            sample=options.calls,
         )
     if not options.paid:
         raise ScaleError(

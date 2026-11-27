@@ -53,7 +53,7 @@ from beacon.investigate.tools import Accounting, Call
 KEPT = timedelta(hours=24)
 
 _WAIT_SECONDS = 5.0
-_FORMAT = 3
+_FORMAT = 4
 # The earlier shapes whose runs and decisions are dropped. 0 is a file that says no
 # shape, which a new file is too. 1 kept a decision's signals as their kinds only,
 # and of `nearby_incidents` only the ids.
@@ -63,7 +63,11 @@ _EARLIER = frozenset({0, 1})
 # `aircraft_credits`, `rotorcraft_credits`, and a cited signal's `credits`); a run of
 # 2 is read as naming none. The number is raised all the same, so that an older
 # Beacon refuses a file whose runs name feeds it would not show the credit of.
-_READABLE = frozenset({2})
+# 3 had no `no_answer` for a clip or a photo: an answer that was cut short was kept
+# as `none`. Only a stand-in had investigated by then, whose answer is never cut
+# short, so a run of 3 is read as it is; an older Beacon would word a `no_answer`
+# as a tool that was not run.
+_READABLE = frozenset({2, 3})
 # Every shape this Beacon takes an investigations file in: its own and the ones it
 # makes its own from. A file in any other is refused, and is nobody's to delete.
 SHAPES = frozenset({_FORMAT, *_EARLIER, *_READABLE})

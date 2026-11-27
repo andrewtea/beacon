@@ -77,7 +77,11 @@ ROLE_WORDS = {
 # The most codes one call asks about. A day in San Francisco has about twenty.
 MAX_CODES = 40
 _CODE = re.compile(r"[A-Z]{1,3}")
-_MAX_OUTPUT_TOKENS = 2048
+# Reasoning counts against the limit: on the first real calls (2026-11-27, a table
+# of three codes) Ember reasoned at `low` effort for 1,475 tokens when given 2,048
+# and for 2,942 when given 4,096, before a form of fifty. A day's table has about
+# twenty codes, and the call is made once for a run, so there is room for more.
+_MAX_OUTPUT_TOKENS = 8192
 # The categories a count can be of: an incident's, which for a medical one is
 # `medical response` and nothing more.
 _CATEGORIES = frozenset((*CATEGORIES, MEDICAL_EVENT))
