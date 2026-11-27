@@ -171,7 +171,7 @@ def test_an_aircraft_of_the_timeline_is_drawn_where_it_was_seen_oldest_first(row
     # The line the timeline has for it, with that line's sources and confidence.
     assert aircraft.text == line_of(fire, "aircraft", track.rows[0].id)
     assert aircraft.text.startswith("A helicopter (TEST1) circled nearby")
-    assert {source.source for source in aircraft.sources} == {"opensky"}
+    assert {source.source for source in aircraft.sources} == {"adsblol"}
     assert (aircraft.confidence, aircraft.note) == ("high", None)
 
 

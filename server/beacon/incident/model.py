@@ -58,7 +58,7 @@ class Source:
 
     kind: Kind
     # The feed, as the evidence store names it: `openmhz`, `nws`, `511`, `notices`,
-    # `opensky`, `app`.
+    # `adsblol`, `app`.
     source: str
     # The feed in words, for a person.
     label: str

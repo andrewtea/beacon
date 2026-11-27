@@ -7,7 +7,7 @@ import pytest
 
 from beacon.evidence import NewEvidence, Point
 from beacon.incident import NO_BLOCKS, Blocks, Engine, Incident
-from beacon.incident.build import CREDIT_511
+from beacon.incident.build import CREDIT_511, CREDIT_ADSBLOL
 from beacon.ingest import nws, traffic511
 from beacon.redact import Names
 from tests.incident_rows import HAYES, Rows, area, at, mock_store
@@ -483,6 +483,14 @@ def test_a_circling_helicopter_is_a_line_and_a_signal_and_a_high_airliner_is_nei
     assert (entry.confidence, len(entry.sources)) == ("high", 2)
     (signal,) = incident.signals
     assert (signal.kind, signal.confidence) == ("aircraft_circling", "high")
+    # Every position is adsb.lol's, so the line and the signal carry the notice its
+    # license asks for wherever something made from its data is shown.
+    assert {source.credit for source in (*entry.sources, *signal.sources)} == {CREDIT_ADSBLOL}
+    assert CREDIT_ADSBLOL.text == (
+        "Contains information from adsb.lol, which is made available here under the "
+        "Open Database License (ODbL): https://opendatacommons.org/licenses/odbl/1-0/"
+    )
+    assert CREDIT_ADSBLOL.url == "https://www.adsb.lol"
 
 
 def test_a_circling_aircraft_is_trusted_as_little_as_its_weakest_position(rows: Rows) -> None:

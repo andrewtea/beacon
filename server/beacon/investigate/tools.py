@@ -42,7 +42,7 @@ from beacon.incident import Incident, Snapshot
 from beacon.incident.aircraft import NEAR_M as AIRCRAFT_NEAR_M
 from beacon.incident.aircraft import Track, tracks
 from beacon.incident.model import SignalKind
-from beacon.ingest.opensky import AIRCRAFT_CATEGORIES
+from beacon.ingest.adsblol import AIRCRAFT_CATEGORIES
 from beacon.notice import NOTICE_TYPES
 from beacon.radio.vocabulary import CATEGORIES, DETAILS, MEDICAL_EVENT, STATUSES
 

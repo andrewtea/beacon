@@ -225,7 +225,7 @@ class Rows:
     ) -> Evidence:
         return self._add(
             kind="aircraft",
-            source="opensky",
+            source="adsblol",
             ref=f"{icao24}@{at(minute).timestamp()}",
             occurred_at=at(minute),
             confidence=confidence,

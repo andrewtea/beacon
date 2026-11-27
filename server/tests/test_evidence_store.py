@@ -200,7 +200,7 @@ def test_search_filters_by_kind_and_source_and_orders_and_limits(store: Evidence
     store.add(
         [
             row("alert-1", occurred_at=minutes(1)),
-            row("plane-2", kind="aircraft", source="opensky", occurred_at=minutes(2)),
+            row("plane-2", kind="aircraft", source="adsblol", occurred_at=minutes(2)),
             row("road-3", kind="traffic", source="511", occurred_at=minutes(3)),
             row("alert-4", occurred_at=minutes(4)),
             # Two rows of one moment keep the order they were stored in.
@@ -214,7 +214,7 @@ def test_search_filters_by_kind_and_source_and_orders_and_limits(store: Evidence
         "alert-4",
         "alert-4b",
     ]
-    assert refs(store.search(sources=["opensky"])) == ["plane-2"]
+    assert refs(store.search(sources=["adsblol"])) == ["plane-2"]
     assert refs(store.search(kinds=[])) == []
     assert refs(store.search(limit=2)) == ["alert-1", "plane-2"]
     assert refs(store.search(newest_first=True, limit=3)) == ["alert-4b", "alert-4", "road-3"]

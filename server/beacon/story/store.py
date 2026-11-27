@@ -52,14 +52,17 @@ _WAIT_SECONDS = 5.0
 # are kept as code wrote them and shown as they were kept, so raise this whenever
 # `_as_json` changes what it writes **and whenever a sentence code writes for a story
 # changes** (`beacon.story.merge`, and the engine's timeline lines for a 511 event,
-# an aircraft, and taps, which a story reuses), and add the number it had to
-# `_EARLIER`: a file
+# an aircraft, and taps, which a story reuses), **or what a feed is called or
+# credited with changes**, since a story keeps each source's name, label, and
+# credit, and add the number it had to `_EARLIER`: a file
 # of an earlier number then has its stories dropped when it is opened, and keeps its
 # claims. A file of any other number, which a newer Beacon wrote, is refused as it is.
-_FORMAT = 3
+_FORMAT = 4
 # The earlier ones: 0 is a file that says none (the first shape, and a new file),
-# and 2 held sentences in words that have since changed.
-_EARLIER = frozenset({0, 2})
+# 2 held sentences in words that have since changed, and 3 held aircraft lines
+# under the name and the label of a feed Beacon never had the right to ask
+# (OpenSky), without the notice adsb.lol's license asks for beside them.
+_EARLIER = frozenset({0, 2, 3})
 # One statement each: they are run inside the transaction that begins a file.
 _SCHEMA = (
     """

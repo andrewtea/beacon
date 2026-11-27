@@ -40,8 +40,8 @@ from typing import Any, Literal, get_args
 
 from beacon.errors import raise_bare
 
-# What a row is about. A kind can have more than one source over time: aircraft can
-# come from OpenSky or airplanes.live.
+# What a row is about. A kind can have more than one source over time: aircraft
+# came from OpenSky's format once, and come from adsb.lol's now.
 Kind = Literal["radio", "aircraft", "alert", "traffic", "notice", "tap"]
 # How far to trust what the row says, strongest first. `official` is an authority
 # speaking for itself: a weather alert, a road closure, an evacuation order.
@@ -132,7 +132,7 @@ class NewEvidence:
     """One thing a source said, before it is stored."""
 
     kind: Kind
-    # The feed it came from, such as `nws` or `opensky`.
+    # The feed it came from, such as `nws` or `adsblol`.
     source: str
     # The source's own name for this item: an alert id, a call id, a transponder
     # address with a time. A source and a reference name one row, so a poller can

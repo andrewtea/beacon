@@ -61,7 +61,8 @@ The wording here is where the product's rules about words are kept:
 - Where the radio and an official source disagree, the official source holds, and
   the incident says so and why (`Incident.conflicts`): an all-clear on the radio
   does not end an alert or lift an order, and a notice's hazard outranks the radio's.
-- Everything from 511 carries the credit its data agreement requires.
+- Everything from 511 carries the credit its data agreement requires, and everything
+  from adsb.lol the notice its license does (`CREDITS`).
 """
 
 import hashlib
@@ -84,7 +85,7 @@ from beacon.incident.model import (
     Source,
 )
 from beacon.incident.places import Blocks
-from beacon.ingest import nws, traffic511
+from beacon.ingest import adsblol, nws, traffic511
 from beacon.notice import ORDERS, TEXT_TYPES
 from beacon.radio.vocabulary import MEDICAL_EVENT, clean_street, place_in_words
 from beacon.redact import Names, reading
@@ -105,6 +106,11 @@ MANY_UNITS = 8
 MANY_TAPS = 3
 
 CREDIT_511 = Credit("data provided by 511.org", "https://511.org")
+# The notice the Open Database License asks for wherever something made from
+# adsb.lol's data is shown (`beacon.ingest.adsblol`).
+CREDIT_ADSBLOL = Credit(adsblol.CREDIT_TEXT, adsblol.CREDIT_URL)
+# The credit a feed's terms require beside anything shown from one of its rows.
+CREDITS = {"511": CREDIT_511, adsblol.SOURCE: CREDIT_ADSBLOL}
 
 # Hands back the rows of one kind within so many metres of a point, between two
 # moments, and whether there were more of them than it hands back. Taps and aircraft
@@ -118,7 +124,7 @@ _LABELS = {
     "nws": "National Weather Service alert feed",
     "511": "511 SF Bay traffic events",
     "notices": "Official notice, as Ember read it",
-    "opensky": "OpenSky Network aircraft positions",
+    "adsblol": "adsb.lol aircraft positions",
     "app": "Taps in the Beacon app",
 }
 # What the two feeds a model writes the rows of are called when a stand-in wrote
@@ -415,7 +421,7 @@ def source_of(row: Evidence) -> Source:
         url=row.url,
         stand_in=row.stand_in,
         model=row.model,
-        credit=CREDIT_511 if row.source == "511" else None,
+        credit=CREDITS.get(row.source),
     )
 
 

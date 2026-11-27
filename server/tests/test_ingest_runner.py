@@ -189,8 +189,8 @@ def test_a_wait_too_long_to_be_a_date_does_not_stop_the_other_pollers(
 
 def test_a_wait_of_most_of_a_day_is_kept_in_full(store: EvidenceStore, time: Time) -> None:
     # A quota that is spent for the day comes back at midnight, hours away.
-    spent = FakePoller("opensky", 240)
-    spent.failures = [SourceError("opensky", "answered HTTP 429", status=429, retry_after=80_000)]
+    spent = FakePoller("adsblol", 240)
+    spent.failures = [SourceError("adsblol", "answered HTTP 429", status=429, retry_after=80_000)]
     runner = Runner([spent], store, Clock(time))
 
     for count in (0, 6 * 3600, 79_999, 80_000):

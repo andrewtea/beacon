@@ -5,7 +5,13 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from beacon.incident import Engine, Incident
-from beacon.incident.build import CREDIT_511, STATUS_WORDS, label_of, weakest
+from beacon.incident.build import (
+    CREDIT_511,
+    CREDIT_ADSBLOL,
+    STATUS_WORDS,
+    label_of,
+    weakest,
+)
 from beacon.investigate import Runs
 from beacon.investigate import card as words
 from beacon.mapping import NO_MAP_OF_MEDICAL, NO_POINT, Feature, drawn
@@ -144,9 +150,10 @@ class CitedOut(BaseModel):
     # How the incident has a signal of that kind now: `same` when it rests on those
     # rows still, `changed` when it rests on others, `gone` when it has none.
     now: Literal["same", "changed", "gone"]
-    # 511's credit for a `closure`, which its data agreement requires beside what
-    # is shown from it. It is here, and not only on the signal the incident has
-    # now, because that signal can be gone while this is still shown.
+    # The credit the signal's source requires beside what is shown from it: 511's
+    # for a `closure`, adsb.lol's for `aircraft_circling`. It is here, and not only
+    # on the signal the incident has now, because that signal can be gone while
+    # this is still shown.
     credit: CreditOut | None
 
 
@@ -402,9 +409,16 @@ def crisis_of(request: Request, incident: Incident) -> CrisisOut | None:
     )
 
 
+# The credit a signal of a kind carries, whichever rows it rested on: a closure is
+# a 511 event, and a circling aircraft is positions from adsb.lol.
+_SIGNAL_CREDITS = {"closure": CREDIT_511, "aircraft_circling": CREDIT_ADSBLOL}
+
+
 def cited_credit(kind: str) -> CreditOut | None:
-    """The credit that goes with a signal a decision cited: a closure is 511's."""
-    return CreditOut.model_validate(CREDIT_511) if kind == "closure" else None
+    """The credit that goes with a signal a decision cited: a closure is 511's, and
+    a circling aircraft is adsb.lol's."""
+    credit = _SIGNAL_CREDITS.get(kind)
+    return None if credit is None else CreditOut.model_validate(credit)
 
 
 def status_text_of(incident: Incident) -> str | None:

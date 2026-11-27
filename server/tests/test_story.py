@@ -382,7 +382,7 @@ def test_the_words_of_a_story_are_not_changed_without_the_files_number() -> None
     # sentence changed, raise `_FORMAT` in story/store.py and add the old number to
     # `_EARLIER`, so that kept stories in the old words are dropped; then put the
     # new number and digest here.
-    assert (store_module._FORMAT, digest) == (3, "df9585d83d76aaa6")
+    assert (store_module._FORMAT, digest) == (4, "df9585d83d76aaa6")
     assert store_module._FORMAT not in store_module._EARLIER
 
 
@@ -616,6 +616,32 @@ OLD_STORIES = {
         "cost_usd": 0.0,
         "latency_ms": 1,
     },
+}
+# As the third did: an aircraft's line under the name and the label of a feed Beacon
+# never had the right to ask, and without the notice adsb.lol's license asks for.
+OLD_STORIES[3] = OLD_STORIES[2] | {
+    "claims": [
+        {
+            "kind": "aircraft",
+            "text": "A helicopter (MOCKH1) circled nearby for about 6 min, as low as 300 m.",
+            "at": "2026-11-27T20:00:20+00:00",
+            "confidence": "high",
+            "sources": [
+                {
+                    "kind": "aircraft",
+                    "source": "opensky",
+                    "label": "OpenSky Network aircraft positions",
+                    "confidence": "high",
+                    "at": "2026-11-27T20:00:20+00:00",
+                    "evidence_id": 7,
+                    "url": None,
+                    "stand_in": True,
+                    "model": None,
+                    "credit": None,
+                }
+            ],
+        }
+    ]
 }
 SCHEMA = """
 CREATE TABLE story (incident_id TEXT NOT NULL, basis TEXT NOT NULL, claimed_at TEXT NOT NULL,

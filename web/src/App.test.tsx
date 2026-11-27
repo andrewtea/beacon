@@ -456,7 +456,7 @@ test('shows 511’s credit beside every line that is from 511', async () => {
 
   const timeline = await screen.findByRole('region', { name: /timeline/i })
   const from511 = fireIncident.incident.timeline.filter((entry) =>
-    entry.sources.some((source) => source.credit !== null),
+    entry.sources.some((source) => source.source === '511'),
   )
   expect(from511.length).toBeGreaterThan(0)
   const credits = within(timeline).getAllByRole('link', {
@@ -464,6 +464,27 @@ test('shows 511’s credit beside every line that is from 511', async () => {
   })
   expect(credits).toHaveLength(from511.length)
   expect(credits[0]).toHaveAttribute('href', 'https://511.org')
+})
+
+test('shows the notice adsb.lol’s license asks for beside every line that rests on an aircraft’s positions', async () => {
+  serve(fireRoutes)
+  window.location.hash = `#/incident/${FIRE_ID}`
+  render(<App />)
+
+  const timeline = await screen.findByRole('region', { name: /timeline/i })
+  const fromTheSky = fireIncident.incident.timeline.filter((entry) =>
+    entry.sources.some((source) => source.source === 'adsblol'),
+  )
+  expect(fromTheSky.length).toBeGreaterThan(0)
+  const credits = within(timeline).getAllByRole('link', {
+    name: /^Contains information from adsb\.lol, which is made available here under the Open Database License \(ODbL\)/,
+  })
+  expect(credits).toHaveLength(fromTheSky.length)
+  expect(credits[0]).toHaveAttribute('href', 'https://www.adsb.lol')
+  // The license's own address is in the words, since a credit has one link.
+  expect(credits[0]).toHaveTextContent(
+    'https://opendatacommons.org/licenses/odbl/1-0/',
+  )
 })
 
 test('the trace shows each tool call in the server’s words and never calls the stand-in Muse Ember', async () => {

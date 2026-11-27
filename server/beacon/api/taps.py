@@ -10,7 +10,7 @@ from beacon.api.body import read_body
 from beacon.api.incidents import CreditOut, IncidentSummary, cited_credit, summary_of
 from beacon.evidence import Evidence
 from beacon.incident import Engine, Snapshot
-from beacon.incident.build import CREDIT_511
+from beacon.incident.build import CREDIT_511, CREDIT_ADSBLOL
 from beacon.investigate import KEPT, Accounting, InvestigationDesk, Outcome, Run, Runs
 from beacon.investigate import card as words
 from beacon.investigate.tools import Call
@@ -87,7 +87,8 @@ class GroundOut(BaseModel):
     # `incident_aircraft` for the incident's own aircraft in the run's reading.
     basis: str
     # The credit a source's terms require beside it: 511's, when the incident's
-    # place was taken from a closure 511 lists. Show it with the ground.
+    # place was taken from a closure 511 lists, and adsb.lol's for an aircraft.
+    # Show it with the ground.
     credit: CreditOut | None
 
 
@@ -201,7 +202,8 @@ class CallOut(BaseModel):
     returned: dict[str, Any]
     returned_text: str
     # The credits the sources of what came back require: 511's, when a count of
-    # road closures or an incident's place is from 511. Show them with the call.
+    # road closures or an incident's place is from 511, and adsb.lol's, when
+    # aircraft were found. Show them with the call.
     credits: list[CreditOut]
     # The call to Ember a clip or a photo was given to. Null for the other tools.
     ember: EmberCallOut | None
@@ -220,8 +222,8 @@ class CitedThen(BaseModel):
     kind: str
     confidence: Literal["official", "high", "medium", "low"]
     evidence_ids: list[int]
-    # 511's credit for a `closure`, to be shown with it: the incident may have no
-    # closure signal now to carry it.
+    # 511's credit for a `closure` and adsb.lol's for `aircraft_circling`, to be
+    # shown with it: the incident may have no such signal now to carry it.
     credit: CreditOut | None
 
 
@@ -512,8 +514,7 @@ def _match(run: Run, outcome: Outcome) -> MatchOut | None:
                 kind=ground,
                 text=words.ground_text(ground, run),
                 basis=words.GROUND_BASIS.get(ground, "unknown"),
-                # How far it was is measured from a point of 511's.
-                credit=_credit() if ground == "near" and from_511 else None,
+                credit=_ground_credit(ground, from_511),
             )
             for ground in outcome.grounds
         ],
@@ -525,9 +526,21 @@ def _credit() -> CreditOut:
     return CreditOut.model_validate(CREDIT_511)
 
 
+def _ground_credit(ground: str, from_511: bool) -> CreditOut | None:
+    """The credit a ground requires where it is shown: 511's when how far the
+    incident was is measured from a point of 511's, and adsb.lol's for a ground
+    that rests on an aircraft's positions."""
+    if ground == "near" and from_511:
+        return _credit()
+    if ground == "aircraft_overhead":
+        return CreditOut.model_validate(CREDIT_ADSBLOL)
+    return None
+
+
 def _credits(call: Call) -> list[CreditOut]:
     """The credits a call's answer requires where it is shown: 511's for a count
-    of the closures it lists, and for an incident whose place is one of them."""
+    of the closures it lists, and for an incident whose place is one of them, and
+    adsb.lol's for the aircraft it found."""
     got = call.returned
     found = got.get("incidents")
     placed_by_511 = call.tool == "nearby_incidents" and any(
@@ -535,7 +548,10 @@ def _credits(call: Call) -> list[CreditOut]:
         for item in (found if isinstance(found, list) else [])
     )
     counted = call.tool == "get_official" and bool(got.get("closures"))
-    return [_credit()] if placed_by_511 or counted else []
+    credits = [_credit()] if placed_by_511 or counted else []
+    if call.tool == "get_aircraft" and got.get("tracks"):
+        credits.append(CreditOut.model_validate(CREDIT_ADSBLOL))
+    return credits
 
 
 def _nearby(run: Run, snapshot: Snapshot) -> list[Any]:

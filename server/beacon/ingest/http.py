@@ -51,7 +51,8 @@ MAX_SECONDS = 60.0
 # the resolver gives up, and the exchanges that follow share what is left.
 _LOOKUP_THREADS = 2
 
-# The header OpenSky sends beside 429, and the standard one.
+# The standard header beside 429, which adsb.lol sends, and one some APIs send
+# in its place, as a number of seconds.
 _RETRY_HEADERS = ("retry-after", "x-rate-limit-retry-after-seconds")
 
 # The HTTP library logs every request's whole address at INFO, and the transport
@@ -411,7 +412,7 @@ def read_json(body: bytes, source: str) -> Any:
 
 def _retry_after(headers: httpx2.Headers) -> float | None:
     """The seconds a reply asks the caller to wait, counted from the reply. The
-    standard header says it as a number of seconds or as a date, and OpenSky's own
+    standard header says it as a number of seconds or as a date, and the other
     as a number."""
     for name in _RETRY_HEADERS:
         value = headers.get(name, "").strip()

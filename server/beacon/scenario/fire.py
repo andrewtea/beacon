@@ -186,59 +186,69 @@ class Scenario:
             "updated": at.isoformat(),
         }
 
-    # OpenSky Network: GET /api/states/all
+    # adsb.lol: GET /v2/point/{lat}/{lon}/{radius}
 
-    def opensky_states(self, at: datetime) -> dict[str, Any]:
-        # OpenSky answers for a time rounded down to five seconds.
+    def adsblol_point(self, at: datetime) -> dict[str, Any]:
+        # A receiver hears a position every few seconds: each is given as it was at
+        # a time rounded down to five seconds, with how long ago that was.
         seconds = int(at.timestamp()) // 5 * 5
+        age = round(at.timestamp() - seconds, 3)
         minute = (seconds - self.start.timestamp()) / 60
-        states = [
+        aircraft = [
             # An airliner at cruise, crossing the city every ten minutes.
-            _state(
+            _aircraft(
                 "beac03",
                 "MOCK303",
-                seconds,
+                age,
                 Point(37.75, -122.52 + (seconds % 600) / 600 * 0.16),
                 altitude_m=10_500.0,
                 speed_mps=230.0,
                 track_deg=90.0,
-                category=4,
+                category="A3",
             )
         ]
         helicopter = _helicopter(minute)
         if helicopter is not None:
             point, track = helicopter
-            states.append(
-                _state(
+            aircraft.append(
+                _aircraft(
                     "beac01",
                     "MOCKH1",
-                    seconds,
+                    age,
                     point,
                     altitude_m=320.0,
                     speed_mps=28.0,
                     track_deg=track,
-                    category=8,
+                    category="A7",
                 )
             )
         if 25 <= minute < 29:
             # A light aircraft along the northern waterfront, which has nothing to do
             # with the fire.
             along = (minute - 25) / 4
-            states.append(
-                _state(
+            aircraft.append(
+                _aircraft(
                     "beac02",
                     "MOCK202",
-                    seconds,
+                    age,
                     Point(37.812, -122.52 + along * 0.16),
                     altitude_m=610.0,
                     speed_mps=58.0,
                     track_deg=90.0,
-                    category=2,
+                    category="A1",
                     # Worked out from several receivers, not broadcast by the aircraft.
-                    position_source=2,
+                    kind="mlat",
                 )
             )
-        return {"time": seconds, "states": states}
+        made_ms = round(at.timestamp() * 1000)
+        return {
+            "ac": aircraft,
+            "msg": "No error",
+            "now": made_ms,
+            "total": len(aircraft),
+            "ctime": made_ms,
+            "ptime": 0,
+        }
 
     # 511 SF Bay: GET /traffic/events
 
@@ -385,39 +395,39 @@ def _alert(
     }
 
 
-def _state(
-    icao24: str,
+def _aircraft(
+    address: str,
     callsign: str,
-    seconds: int,
+    age: float,
     point: Point,
     *,
     altitude_m: float,
     speed_mps: float,
     track_deg: float,
-    category: int,
-    position_source: int = 0,
-) -> list[Any]:
-    """One state vector, in the order OpenSky documents its fields."""
-    return [
-        icao24,
-        callsign.ljust(8),
-        "United States",
-        seconds,
-        seconds,
-        round(point.lon, 5),
-        round(point.lat, 5),
-        altitude_m - 15.0,  # barometric
-        False,
-        speed_mps,
-        round(track_deg, 1),
-        0.0,
-        None,
-        altitude_m,  # geometric
-        None,
-        False,
-        position_source,
-        category,
-    ]
+    category: str,
+    kind: str = "adsb_icao",
+) -> dict[str, Any]:
+    """One aircraft as adsb.lol lists it: heights in feet, speeds in knots, and
+    how many seconds ago its position is from."""
+    feet = altitude_m / 0.3048
+    return {
+        "hex": address,
+        "type": kind,
+        "flight": callsign.ljust(8),
+        "r": "N-MOCK",
+        "alt_baro": round(feet - 50),
+        "alt_geom": round(feet, 2),
+        "gs": round(speed_mps * 3600 / 1852, 2),
+        "track": round(track_deg, 1),
+        "baro_rate": 0,
+        "category": category,
+        "lat": round(point.lat, 5),
+        "lon": round(point.lon, 5),
+        "seen_pos": age,
+        "seen": age,
+        "messages": 1000,
+        "rssi": -12.5,
+    }
 
 
 def _helicopter(minute: float) -> tuple[Point, float] | None:
