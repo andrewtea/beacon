@@ -21,16 +21,35 @@ of its own and the one ledger, takes its own (`beacon.scale.run.alone`), and
 `python -m beacon.taps`, which opens no store, takes the taps' (`TapMedia`).
 The lock is the operating system's (`flock`), on a file that is never deleted, so
 it is gone when its process is, however that ends.
+
+**A mock store that was set aside only in part keeps everything out.** Setting a
+store aside (`beacon.serve.set_aside`) moves its files under `told/`, and writes
+down where to (`PENDING`) before it moves the first and takes that note away after
+the last. While the note is there the lock is refused to everybody but the command
+that finishes the move (`HalfAsideError`): a server that started then would begin a
+new story beside what is left of the last one's stories and investigations, and a
+server that tells the story again would delete those.
 """
 
 import fcntl
 import os
+import re
 import threading
 from pathlib import Path
 
 from beacon.errors import raise_bare
 
 LOCK_FILE = ".stores.lock"
+# Where a mock store's files are moved to when they are set aside: a directory
+# for each time, under this one in the data directory.
+ASIDE = "told"
+# The note of a move that is under way or was cut short: the name of the directory
+# under `ASIDE` it goes into. It is there from before the first file is moved until
+# after the last.
+PENDING = ".pending"
+# What such a directory is named: the moment its store was set aside, and a
+# number when two were in one second.
+ASIDE_NAME = re.compile(r"\d{8}T\d{6}Z(-\d{1,2})?")
 
 
 class DataLockedError(Exception):
@@ -38,15 +57,46 @@ class DataLockedError(Exception):
     share. The text is fixed."""
 
 
+class HalfAsideError(DataLockedError):
+    """A mock store under the data directory was set aside only in part: nothing
+    opens a store there until the move is finished. The text is fixed."""
+
+
+HALF_ASIDE = (
+    "A mock store under this data directory was being set aside, and the move did "
+    f"not finish: some of its files are under {ASIDE}/ and some are where they "
+    "were. Nothing that opens a store runs on this data directory until it has. "
+    "Give the command again, which moves what is left to the same place: "
+    "python -m beacon.serve --set-aside"
+)
+
+
+def aside_pending(data: Path) -> bool:
+    """Whether a move of a mock store's files under `ASIDE` was begun and not
+    finished. A note that cannot be looked at is taken to be there."""
+    try:
+        os.lstat(data / ASIDE / PENDING)
+    except FileNotFoundError:
+        return False
+    except NotADirectoryError:
+        # `told` is a file: nothing was ever moved into it.
+        return False
+    except OSError:
+        return True
+    return True
+
+
 class DataLock:
     """The lock on one data directory's stores, held until `close`."""
 
-    def __init__(self, data: Path, *, shared: bool) -> None:
+    def __init__(self, data: Path, *, shared: bool, finishing: bool = False) -> None:
         """Take the lock, alone or together with others that share it, without
-        waiting.
+        waiting. `finishing` is for the command that sets a store aside, which is
+        the one thing that runs while a move is unfinished.
 
-        Raises DataLockedError when it is held in a way that excludes this, and
-        OSError when the directory or the lock's file cannot be made."""
+        Raises DataLockedError when it is held in a way that excludes this,
+        HalfAsideError when a store under the directory was set aside only in
+        part, and OSError when the directory or the lock's file cannot be made."""
         self.exclusive = not shared
         self.data = data
         self._closing = threading.Lock()
@@ -79,6 +129,11 @@ class DataLock:
             os.close(self._file)
             self._file = -1
             raise
+        # Looked at under the lock: the command that moves holds it alone.
+        if not finishing and aside_pending(data):
+            os.close(self._file)
+            self._file = -1
+            raise_bare(HalfAsideError(HALF_ASIDE))
 
     @property
     def held(self) -> bool:

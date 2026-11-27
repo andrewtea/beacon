@@ -310,16 +310,26 @@ def test_a_new_mock_store_begins_its_story_at_the_minute_it_is_told_to(
 
     # The setting is read when a story begins and at no other time: a store whose
     # story has begun goes on with it, and the server says the setting did nothing.
-    caplog.clear()
-    again = build(env | {setup.STORY_MINUTE_VARIABLE: "5"}, Clock(time))
-    assert again.store.state("scenario")["start"] == start.isoformat()
-    assert [record.getMessage() for record in caplog.records] == [setup._ALREADY_BEGUN]
+    # A setting that is no minute does not keep a story that has begun from going
+    # on, and one that names the usual twenty did nothing either.
+    for ignored in ("5", "20", "96", "seven"):
+        caplog.clear()
+        again = build(env | {setup.STORY_MINUTE_VARIABLE: ignored}, Clock(time))
+        assert again.store.state("scenario")["start"] == start.isoformat()
+        assert [record.getMessage() for record in caplog.records] == [setup._ALREADY_BEGUN]
+    # Not said by a server that asked for nothing.
     caplog.clear()
     build(env, Clock(time))
-    build(env | {setup.STORY_MINUTE_VARIABLE: "77"}, Clock(time))
-    # Not said by a server that asked for nothing, and the story is 78 minutes
-    # old by now, not 77.
-    assert [record.getMessage() for record in caplog.records] == [setup._ALREADY_BEGUN]
+    assert caplog.records == []
+
+
+def test_a_server_that_began_the_story_at_the_minute_it_was_told_to_says_nothing_of_it(
+    env: dict[str, str], time: Time, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The usual twenty, named outright, on a new store: the setting did what it says.
+    build(env | {setup.STORY_MINUTE_VARIABLE: "20"}, Clock(time))
+
+    assert setup._ALREADY_BEGUN not in [record.getMessage() for record in caplog.records]
 
 
 def test_the_minute_a_story_begins_at_is_a_whole_minute_the_story_has(
@@ -332,9 +342,11 @@ def test_the_minute_a_story_begins_at_is_a_whole_minute_the_story_has(
     for setting in ("96", "-1", "+7", "7.5", "", " 7", "1_0", "seven", "\u0667"):
         with pytest.raises(IngestConfigError, match="a whole number from 0 to 95"):
             build(env | {setup.STORY_MINUTE_VARIABLE: setting})
-    # A real source has no story, and the setting is not let pass as if it did something.
-    with pytest.raises(IngestConfigError, match="there is no story to begin"):
-        build(env | {setup.STORY_MINUTE_VARIABLE: "7", "BEACON_LIVE_SOURCES": "nws"})
+    # A real source has no story, and the setting is not let pass as if it did
+    # something, whatever it is set to.
+    for setting in ("7", "seven"):
+        with pytest.raises(IngestConfigError, match="there is no story to begin"):
+            build(env | {setup.STORY_MINUTE_VARIABLE: setting, "BEACON_LIVE_SOURCES": "nws"})
     # A refused setting leaves no store.
     assert not (tmp_path / "evidence").exists()
 

@@ -4,9 +4,11 @@
 
 For somebody who shows the invented story to others (`BEACON_MOCK_STORY_MINUTE`,
 `scripts/film`): given the moment the story's first minute is counted from
-(`story_began_at` of `GET /api/sources`), it prints each moment of the story with
-the time it comes at, and which of them are past. It reads no store and asks no
-server; everything it prints is the invented scenario's own, made up for Beacon.
+(`story_began_at` of `GET /api/sources`), it prints what changes in the story with
+the time each change comes at, and which of them are past. What is there from
+before the story to its end is not a moment of it, and is named in one line
+(`THROUGHOUT`). It reads no store and asks no server; everything it prints is the
+invented scenario's own, made up for Beacon.
 
 The radio calls and the notices are read from the scenario (`CALLS`, `NOTICES`),
 so a change to either is a change here. What the other sources do is written down
@@ -30,16 +32,27 @@ _OTHERS: tuple[tuple[float, str], ...] = (
     (9.0, "511: Hayes St is listed as closed between Gough St and Octavia St."),
     (16.0, "NWS: a shelter-in-place warning for smoke is issued for Hayes Valley."),
     (20.0, "511: the closure is widened to Fell St."),
+    (25.0, "Aircraft: a second aircraft passes along the northern waterfront until minute 29."),
     (40.0, "NWS: the warning is replaced by one for a smaller area."),
     (48.0, "Aircraft: the helicopter leaves, and is gone by minute 50."),
     (70.0, "NWS: the warning is no longer listed."),
     (80.0, "511: the closure is no longer listed."),
 )
 
+# What the invented sources say from before the story to its end, which no line
+# above is about.
+THROUGHOUT = (
+    "There throughout, and in no line above: a wind advisory, road work elsewhere "
+    "in the city, an airliner that crosses the city every ten minutes, and what "
+    "each source carries for Beacon to leave out (a test alert, an event in "
+    "Oakland, pages of the notices feed that are no notices)."
+)
+
 
 def moments() -> list[tuple[float, str]]:
-    """Each moment of the invented story, as the minute it comes at and a line
-    about it, in the story's order."""
+    """What changes in the invented story, as the minute each change comes at and
+    a line about it, in the story's order. Not what is there throughout
+    (`THROUGHOUT`)."""
     radio = [
         (
             call.minute,
@@ -70,7 +83,7 @@ def lines(began_at: datetime, now: datetime) -> list[str]:
     for at, what in moments():
         when = (began_at + timedelta(minutes=at)).astimezone(UTC).strftime("%H:%M:%S")
         told.append(f"{'past' if at <= minute else '    '}  min {at:>4.1f}  {when} UTC  {what}")
-    return told
+    return [*told, "", THROUGHOUT]
 
 
 def main(argv: Sequence[str] | None = None) -> int:

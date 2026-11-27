@@ -343,8 +343,12 @@ def build(
     clock = Clock() if clock is None else clock
     live = live_sources(env)
     teller = telling.teller_of(env)
-    # Read before any store is opened, so a refused setting leaves no file.
-    begin_at = head_start(env)
+    # Before any store is opened, so a refused setting leaves no file: the minute
+    # a story begins at is for the invented scenario, and is read for a story
+    # that begins. One that has begun goes on whatever the setting says.
+    check_story_minute(env)
+    if not live and not _story_begun(env):
+        head_start(env)
     if live:
         if teller == "ember":
             raise IngestConfigError(
@@ -359,9 +363,9 @@ def build(
         paying = [poller for poller in pollers if isinstance(poller, PaidWork)]
         return Ingest(store, Runner(pollers, store, clock), clock, http, None, paying)
     if teller == "ember":
-        return _told_by_ember(env, clock, paid, begin_at)
+        return _told_by_ember(env, clock, paid)
     store = open_store(env)
-    scenario = _scenario(store, clock.now(), teller, begin_at)
+    scenario = _scenario(store, clock.now(), teller, env)
     http = SourceHttp(scenario_transport(scenario, clock.now))
     # Stands in for Ember: it spends nothing, and what it "hears" in the story's
     # tones is the story's own. Its rows say `model == "fake"`.
@@ -386,12 +390,7 @@ def build(
     return _mock_ingest(store, clock, http, scenario, radio, notices, teller)
 
 
-def _told_by_ember(
-    env: Mapping[str, str],
-    clock: Clock,
-    paid: telling.PaidClient | None,
-    begin_at: timedelta = MOCK_HEAD_START,
-) -> Ingest:
+def _told_by_ember(env: Mapping[str, str], clock: Clock, paid: telling.PaidClient | None) -> Ingest:
     """The invented story with Muse Ember hearing its calls and reading its
     notices (`beacon.telling`). The pollers are the ones a stand-in's telling has;
     the calls are synthesized speech, made in memory on a shelf of the story's own
@@ -421,7 +420,7 @@ def _told_by_ember(
         clients.append(telling.paying(env, telling.RADIO, paid))
         clients.append(telling.paying(env, telling.NOTICES, paid))
         store = open_store(env)
-        scenario = _scenario(store, clock.now(), "ember", begin_at)
+        scenario = _scenario(store, clock.now(), "ember", env)
         http = SourceHttp(scenario_transport(scenario, clock.now))
         radio = RecordedRadio(
             # The story's calls as speech, where a directory of recordings would be.
@@ -749,8 +748,20 @@ def _saved_polls(saved: Any) -> list[PollerStatus]:
     return polls
 
 
+def check_story_minute(env: Mapping[str, str]) -> None:
+    """Refuse `BEACON_MOCK_STORY_MINUTE` beside a real source, which has no story.
+    Whatever starts on a data directory asks this, with its pollers or without.
+
+    Raises IngestConfigError for that, and as `live_sources` does."""
+    if STORY_MINUTE_VARIABLE in env and live_sources(env):
+        raise IngestConfigError(
+            f"{STORY_MINUTE_VARIABLE} is for the invented scenario: with a real source "
+            "named there is no story to begin."
+        )
+
+
 def head_start(env: Mapping[str, str]) -> timedelta:
-    """How far into its story a mock store that is begun starts, by
+    """How far into its story a mock store that is begun now starts, by
     `BEACON_MOCK_STORY_MINUTE`: twenty minutes when it is not set.
 
     The story is not made to run faster, held, or moved by it: a store that is
@@ -759,8 +770,12 @@ def head_start(env: Mapping[str, str]) -> timedelta:
     the clock. It is how somebody who shows the story comes to a moment of it (the
     all-clear on the radio is in its 78th minute) without waiting for it.
 
+    **It is read for a story that begins, and for no other** (`_scenario`): a
+    store whose story has begun goes on with it whatever the setting says, a
+    setting that is no minute included.
+
     Raises IngestConfigError for a setting that is no whole number of minutes the
-    story has, and for one beside a real source, which has no story."""
+    story has."""
     setting = env.get(STORY_MINUTE_VARIABLE)
     if setting is None:
         return MOCK_HEAD_START
@@ -771,41 +786,60 @@ def head_start(env: Mapping[str, str]) -> timedelta:
             f"{STORY_MINUTE_VARIABLE} is the minute of the invented story a new mock "
             f"store begins at: a whole number from 0 to {last}."
         )
-    if live_sources(env):
-        raise IngestConfigError(
-            f"{STORY_MINUTE_VARIABLE} is for the invented scenario: with a real source "
-            "named there is no story to begin."
-        )
     return timedelta(minutes=int(setting))
 
 
-# Logged by a server that is set to begin the story at a minute, on a store whose
-# story has begun: the setting does nothing there, and the operator may think it did.
+# Logged by a server that is set to begin the story at a minute and did not begin
+# it: the setting did nothing, and the operator may think it did.
 _ALREADY_BEGUN = (
-    f"{STORY_MINUTE_VARIABLE} is set, and the mock store's story has already begun: "
-    "it goes on from where it is. The setting is read only when a story begins "
-    "(`python -m beacon.serve --set-aside` sets a store aside so that one does)."
+    f"{STORY_MINUTE_VARIABLE} is set, and this server did not begin the mock store's "
+    "story: it had begun, and goes on from where it is. The setting is read only "
+    "when a story begins (`python -m beacon.serve --set-aside` sets a store aside so "
+    "that one does)."
+)
+# And by a server without its pollers, which begins no story.
+NO_POLLERS_NO_STORY = (
+    f"{STORY_MINUTE_VARIABLE} is set, and this server runs no pollers: it begins no "
+    "story, so the setting does nothing here."
 )
 
 
+def _story_begun(env: Mapping[str, str]) -> bool:
+    """Whether the mock store under the data directory has a story that has
+    begun, asked without making a file.
+
+    Raises EvidenceStoreError when what is there cannot be opened as the mock
+    store."""
+    path = default_data_dir(env) / "evidence" / "mock.sqlite3"
+    if not path.is_file():
+        return False
+    store = EvidenceStore(path, "mock")
+    try:
+        return isinstance(store.state(_SCENARIO_STATE).get("start"), str)
+    finally:
+        store.close()
+
+
 def _scenario(
-    store: EvidenceStore, now: datetime, teller: Teller, begin_at: timedelta = MOCK_HEAD_START
+    store: EvidenceStore, now: datetime, teller: Teller, env: Mapping[str, str]
 ) -> Scenario:
     """The story of this mock store. Its start is drawn once and kept in the store,
     so a restart continues the story it was telling and does not begin a second one
-    beside it. `begin_at` is how old a story that begins now is (`head_start`).
+    beside it. A story that begins now is as old as `head_start(env)` says, which
+    is read only then.
 
     Who does the model's work on the story is kept with it (`keep_teller`): a
     story is told by a stand-in or by Muse Ember from its beginning to its end.
 
-    Raises IngestConfigError when the store is the other's."""
+    Raises IngestConfigError when the store is the other's, and for a story that
+    would begin at a minute that is none."""
+    begun = isinstance(store.state(_SCENARIO_STATE).get("start"), str)
+    begin_at = MOCK_HEAD_START if begun else head_start(env)
     state = keep_teller(store, teller, now, begin=True, begin_at=begin_at)
-    if (
-        begin_at != MOCK_HEAD_START
-        and state.get("start") != (now.replace(microsecond=0) - begin_at).isoformat()
-    ):
-        # Another minute was asked for than the default, and the story's start is
-        # not the one that would have been written just now.
+    # Whether this call began the story, at the minute it was told to. Another
+    # process can have begun it between the look and the write.
+    wrote = not begun and state.get("start") == (now.replace(microsecond=0) - begin_at).isoformat()
+    if STORY_MINUTE_VARIABLE in env and not wrote:
         logger.warning(_ALREADY_BEGUN)
     return Scenario(start=datetime.fromisoformat(state["start"]))
 

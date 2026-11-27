@@ -335,6 +335,20 @@ class Subscriptions:
         with self._writing() as db:
             return _sweep(db, now)
 
+    def forget_sent(self) -> int:
+        """Delete what is kept of every push that was sent or tried, and keep the
+        subscriptions, their places, and the permits. Returns how many rows went.
+
+        For when the invented story is begun anew (`beacon.serve.set_aside`): what
+        was sent is kept under an incident's id, and a story begun anew can give
+        an incident the id one had in the last telling, of which a device would
+        then not be notified. Sooner than `SENT_KEPT`, which is the most a row is
+        kept.
+
+        Raises SubscriptionsError when the file is closed."""
+        with self._writing() as db:
+            return db.execute("DELETE FROM sent").rowcount
+
     def all(self) -> tuple[Subscription, ...]:
         """Every subscription, in the order they were first kept: at most
         `MAX_SUBSCRIPTIONS`."""

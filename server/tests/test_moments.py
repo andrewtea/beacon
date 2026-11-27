@@ -38,6 +38,11 @@ def test_each_moment_is_given_the_time_it_comes_at_and_whether_it_is_past() -> N
     before = moments.lines(BEGAN, BEGAN - timedelta(seconds=1))
     assert before[0] == "The invented story has not begun."
     assert not any(line.startswith("past") for line in before)
+    # What is there throughout is no moment, and is said to be left out.
+    assert told[-1] == moments.THROUGHOUT
+    assert "airliner" in told[-1]
+    assert "in no line above" in told[-1]
+    assert sum("second aircraft" in line for line in told) == 1
 
 
 def test_the_command_wants_the_moment_the_story_began_with_its_offset(

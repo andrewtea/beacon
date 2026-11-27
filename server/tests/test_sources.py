@@ -1,5 +1,6 @@
 """The sources route, and the pollers the server runs."""
 
+import logging
 import threading
 import time as system_time
 from datetime import UTC, datetime
@@ -9,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from beacon.evidence import EvidenceStore
-from beacon.ingest import Clock, IngestConfigError, build
+from beacon.ingest import Clock, IngestConfigError, build, setup
 from beacon.main import create_app
 
 NOON = datetime(2026, 11, 27, 20, 0, tzinfo=UTC)
@@ -106,6 +107,27 @@ def test_the_server_runs_the_pollers_on_the_mock_scenario_while_it_is_up() -> No
     assert ingest.http.closed
     assert ingest.store.closed
     assert "beacon-ingest" not in [thread.name for thread in threading.enumerate()]
+
+
+def test_a_server_without_its_pollers_says_the_minute_a_story_begins_at_does_nothing_there(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("BEACON_INGEST", "0")
+    monkeypatch.setenv("BEACON_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("BEACON_MOCK_STORY_MINUTE", "12")
+
+    with caplog.at_level(logging.WARNING, logger="beacon"), TestClient(create_app()) as client:
+        assert client.get("/api/health").status_code == 200
+    assert setup.NO_POLLERS_NO_STORY in [record.getMessage() for record in caplog.records]
+
+    # And beside a real source it is refused, with the pollers or without them.
+    monkeypatch.setenv("BEACON_LIVE_SOURCES", "nws")
+    with (
+        pytest.raises(IngestConfigError, match="there is no story to begin"),
+        TestClient(create_app()),
+    ):
+        pass
+    assert not (tmp_path / "evidence" / "live.sqlite3").exists()
 
 
 def test_a_server_told_not_to_ingest_runs_no_pollers_and_says_so(
