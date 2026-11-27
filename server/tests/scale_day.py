@@ -106,6 +106,8 @@ class DataSf:
         self.rows = rows
         self.roster = roster
         self.unit_types = dict(UNIT_TYPES)
+        # Rows to answer the question about unit types with, in place of the day's.
+        self.type_rows: list[dict[str, Any]] | None = None
         self.requests: list[httpx2.Request] = []
 
     def __call__(self, request: httpx2.Request) -> httpx2.Response:
@@ -117,6 +119,8 @@ class DataSf:
             listed: list[dict[str, Any]] = centerlines()
         elif "$group" in asked and "unit_type" in asked["$select"]:
             # The units of the day's rows, each with its type.
+            if self.type_rows is not None:
+                return httpx2.Response(200, json=self.type_rows)
             units = sorted({row["unit_id"] for row in self.rows})
             return httpx2.Response(
                 200,

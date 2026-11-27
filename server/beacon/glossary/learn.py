@@ -32,6 +32,7 @@ shown as the glossary's proposal with who proposed it, and never as what a unit 
 """
 
 import json
+import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -39,6 +40,7 @@ from typing import Any
 
 from beacon.ember import EmberClient
 from beacon.ember.client import Source
+from beacon.radio.vocabulary import CATEGORIES, MEDICAL_EVENT
 
 TASK = "learn_glossary"
 # What a code can be said to name. A new kind of unit worth telling apart is a new
@@ -77,6 +79,11 @@ ROLE_WORDS = {
 MAX_CODES = 40
 _CODE = re.compile(r"[A-Z]{1,3}")
 _MAX_OUTPUT_TOKENS = 2048
+# The categories a count can be of: an incident's, which for a medical one is
+# `medical response` and nothing more.
+_CATEGORIES = frozenset((*CATEGORIES, MEDICAL_EVENT))
+# No count of a day is more than this.
+_MOST = 1_000_000
 
 INSTRUCTIONS = (
     "You are given a table about one day of a city fire department's dispatch radio. "
@@ -190,13 +197,20 @@ def learn_glossary(
     that pass the check. `limit_nanousd` is the most the call may cost.
 
     Raises ValueError when the patterns are not ones to ask about: none, more than
-    `MAX_CODES`, a code that is not letters, or a code twice. Raises EmberError as
+    `MAX_CODES`, a code that is not letters, a code twice, or a pattern that holds
+    anything but counts and categories from the closed list. Raises EmberError as
     the client does; the call is not tried again here."""
     codes = tuple(pattern.code for pattern in patterns)
     if not 0 < len(codes) <= MAX_CODES:
         raise ValueError(f"A glossary is learned for 1 to {MAX_CODES} codes.")
-    if len(set(codes)) != len(codes) or not all(_CODE.fullmatch(code) for code in codes):
+    if not all(isinstance(code, str) and _CODE.fullmatch(code) for code in codes) or len(
+        set(codes)
+    ) != len(codes):
         raise ValueError("A code is one to three capital letters, and is asked about once.")
+    if not all(_only_counts(pattern) for pattern in patterns):
+        # The call keeps its request, so nothing but counts and listed tags goes in:
+        # what a pattern holds is checked here, whoever made it.
+        raise ValueError("A pattern is counts and categories from Beacon's list, and nothing else.")
     answer = ember.respond(
         task=TASK,
         effort="low",
@@ -218,6 +232,33 @@ def learn_glossary(
     glossary = read_form(answer.output_text, codes, model=answer.source)
     cost = answer.usage.cost_nanousd if answer.source == "live" else None
     return replace(glossary, cost_nanousd=cost)
+
+
+def _count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _MOST
+
+
+def _only_counts(pattern: Pattern) -> bool:
+    """Whether a pattern holds what a request may be kept with: whole counts, a
+    mean that is a number, and categories that are on Beacon's closed list."""
+    mean = pattern.mean_units
+    if not (_count(pattern.units) and _count(pattern.incidents) and _count(pattern.alone)):
+        return False
+    if isinstance(mean, bool) or not isinstance(mean, int | float):
+        return False
+    if not (math.isfinite(mean) and 0 <= mean <= _MOST):
+        return False
+    by_category = pattern.by_category
+    if not isinstance(by_category, tuple) or len(by_category) > len(_CATEGORIES):
+        return False
+    return all(
+        isinstance(item, tuple)
+        and len(item) == 2
+        and isinstance(item[0], str)
+        and item[0] in _CATEGORIES
+        and _count(item[1])
+        for item in by_category
+    ) and len({item[0] for item in by_category}) == len(by_category)
 
 
 def read_form(text: str, codes: Sequence[str], *, model: Source) -> Glossary:

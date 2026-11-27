@@ -147,6 +147,33 @@ def test_codes_that_are_not_ones_to_ask_about_are_refused_before_ember_is_asked(
     assert script.requests == []
 
 
+@pytest.mark.parametrize(
+    "more",
+    [
+        {"by_category": (("Jane Doe, 123 Hayes St", 4),)},
+        {"by_category": (("alarm", 2), ("alarm", 3))},
+        {"by_category": {"alarm": 2}},
+        {"by_category": (("alarm", "many"),)},
+        {"units": "E36 and T6"},
+        {"units": True},
+        {"incidents": -1},
+        {"alone": 1.5},
+        {"mean_units": float("nan")},
+        {"mean_units": "about three"},
+    ],
+)
+def test_a_pattern_that_holds_anything_but_counts_and_listed_categories_is_never_sent(
+    more: dict[str, object], tmp_path: Path
+) -> None:
+    ember, script = fake(tmp_path)
+
+    # The call keeps its request, so what is in a pattern is checked whoever made it.
+    with pytest.raises(ValueError, match="A pattern is counts and categories"):
+        learn_glossary(ember, [pattern("E", **more)])
+
+    assert script.requests == []
+
+
 def test_the_stand_in_guesses_by_a_rule_of_thumb_and_gives_no_kind_for_a_code_seldom_named(
     tmp_path: Path,
 ) -> None:

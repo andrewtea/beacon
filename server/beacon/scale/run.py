@@ -40,7 +40,7 @@ hearing client has to have been made on the same file. Both are made before
 anything is heard, so a ledger that is replaced part of the way stops the taps as
 it stops the hearing, and the run is then not gone on with. A run whose hearing is
 closed makes no hearing client and needs nothing left of the hearing's budget: it
-can only pay for taps.
+can only pay for taps and for its glossary, each under a scope of its own.
 
 **The hearing is closed when it is first complete** (`close_hearing`), before the
 taps are replayed and the glossary is learned, so that everything made of the whole

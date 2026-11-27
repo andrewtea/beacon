@@ -89,10 +89,9 @@ INCOMPLETE = (
     "The numbers below are of what was heard so far."
 )
 CLOSED = (
-    "The hearing was closed when it was first complete, before the taps were "
-    "replayed and the glossary was learned, so that everything made of the whole day "
-    "is of the same evidence: a call put among the run's calls after that is not "
-    "heard in this run."
+    "The hearing was closed when it was first complete, so that whatever is made of "
+    "the whole day (answers to replayed taps, a glossary) is of the same evidence: a "
+    "call put among the run's calls after that is not heard in this run."
 )
 LEDGER_LOST = (
     "The Ember ledger was replaced while the run was under way, so what the run "
@@ -207,6 +206,7 @@ def build(
     ledger_lost: bool = False,
     taps: Sequence[tuple[Replay, Standing, Run | None]],
     taps_stopped: str | None,
+    taps_plan: str | None = None,
     glossary: Sequence[Number] = (),
     glossary_waiting: str | None = None,
     made_at: datetime | None = None,
@@ -283,6 +283,9 @@ def build(
         # replay not stopped, and the ledger the one the run began in.
         "heard_complete": heard_complete,
         "complete": complete,
+        # The plan of taps the result is of (`taps.plan_name`): the command given
+        # again with another plan has more to do than this result says.
+        "taps_plan": taps_plan,
         "basis_text": basis(settings),
         "caveats": caveats,
         "scored_against": {

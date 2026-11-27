@@ -258,14 +258,24 @@ def _run(
             )
         tap_runs = opened.enter_context(contextlib.closing(Runs(layout.taps, settings.mode)))
         held = taps.held_for(tap_runs)
-        before = results.read(layout) if held is not None else None
-        # A run that is complete has nothing left to ask, whatever hold is on: its
-        # hearing is closed, and every tap and its glossary are claimed. It is read
-        # again as it is, and anything new that was asked for (more taps) meets
-        # the hold where it would be asked.
-        if held is not None and not (before is not None and before["complete"]):
+        replays = taps.plan(records, options.taps)
+        if held is not None:
             # A refusal or a failure on a tap or on the glossary holds the whole run:
-            # nothing is heard either, and what the run came to so far is left as it is.
+            # nothing is heard either, and what the run came to so far is left as it
+            # is. A run that is complete, asked for with the plan of taps it was
+            # made with, has nothing left to ask: its result is shown as it was
+            # written, and not made again.
+            before = results.read(layout)
+            if (
+                before is not None
+                and before["complete"]
+                and before.get("taps_plan") == taps.plan_name(replays)
+            ):
+                print("", file=out)
+                for line in results.lines(before):
+                    print(line, file=out)
+                print("", file=out)
+                return 0
             print(
                 f"The run is leaving {results.who(live=live)} alone after a refusal or "
                 "a failure in the replay of taps or in learning the glossary. "
@@ -290,7 +300,6 @@ def _run(
             heard.stopped is None and heard.last_pass is not None and heard.last_pass.unready == 0
         )
         ledger_lost = heard.ledger_lost
-        replays = taps.plan(records, options.taps)
         taps_stopped: taps.Stopped | None = None
         if heard_complete and not ledger_lost and closed is None:
             # Before the first tap is claimed and the glossary is asked for: from
@@ -313,9 +322,11 @@ def _run(
             ledger_lost = True
         reading = score.read_incidents(store, known_blocks)
         learned: glossary.Learned | None = None
-        if heard_complete and not ledger_lost:
+        if heard_complete and not ledger_lost and taps_stopped != "store":
             # After the taps, which a failure here does not then hold up; while a
-            # hold of theirs is on, nothing is asked for the glossary either.
+            # hold of theirs is on, nothing is asked for the glossary either. When
+            # the investigations file could not be written, a hold the replay put
+            # on may not be in it: nothing is asked for a glossary then.
             learned = glossary.learn(layout, reading.incidents, learner, tap_runs)
             if learned.ledger_lost or (live and learner.ledger_replaced()):
                 ledger_lost = True
@@ -341,10 +352,13 @@ def _run(
             ledger_lost=ledger_lost,
             taps=standing,
             taps_stopped=taps_stopped,
+            taps_plan=taps.plan_name(replays),
             glossary=(
                 []
                 if learned is None
-                else glossary.numbers(learned, truth, generated=settings.audio == "generated")
+                else glossary.numbers(
+                    learned, truth, generated=settings.audio == "generated", live=live
+                )
             ),
             glossary_waiting=(
                 None if learned is None else glossary.waiting_text(learned, live=live)

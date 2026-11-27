@@ -158,6 +158,12 @@ def plan(records: Sequence[Record], count: int) -> list[Replay]:
     return replays
 
 
+def plan_name(replays: Sequence[Replay]) -> str:
+    """A name for a plan of taps: a digest of its taps' names, in their order. Two
+    plans have one name only when they ask the same questions."""
+    return hashlib.sha256("\n".join(tap.id for tap in replays).encode()).hexdigest()[:16]
+
+
 def _replay(at: datetime, point: Point, near: str | None) -> Replay:
     """A replayed tap, named by what it asks: its moment, its place, and what it was
     placed by. A claim is kept under the name for good, so the name of one question

@@ -313,6 +313,8 @@ class Meta:
         # next one fails.
         self.tables: list[Any] = []
         self.fail_glossary = False
+        # What the next glossary is answered with, in place of the stand-in's form.
+        self.glossary_text: str | None = None
         self.api = MetaApi(input_tokens=1_000, create=self.create)
 
     def create(self, request: httpx2.Request) -> httpx2.Response:
@@ -323,6 +325,8 @@ class Meta:
             if self.fail_glossary:
                 return httpx2.Response(500, json={"error": {"message": "It failed."}})
             answer = dict(stand_in_learner(body))
+            if self.glossary_text is not None:
+                answer = dict(fake_response(text=self.glossary_text))
         elif form != "transmission":
             self.tap_requests += 1
             if self.before_tap is not None:

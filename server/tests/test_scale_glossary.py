@@ -10,8 +10,9 @@ import pytest
 
 from beacon.ember import EmberClient, SpendScope, Storage
 from beacon.glossary import Pattern
+from beacon.ingest.paid import read_hold
 from beacon.investigate import Runs
-from beacon.scale import generate, glossary, results, run, score
+from beacon.scale import generate, glossary, results, run, score, taps
 from tests.scale_day import DataSf
 from tests.test_scale_run import PAID, ROWS, Meta, _clip, command, numbers_of, scored, texts_of
 
@@ -90,19 +91,52 @@ def test_datasfs_unit_types_are_asked_for_by_two_columns_and_give_a_kind_to_a_co
     assert request.url.params["$group"] == "unit_id,unit_type"
     # Each unit in its stored form; one whose id Beacon keeps no unit by is left out.
     assert types == {
-        "E36": "ENGINE",
-        "E5": "ENGINE",
-        "E31": "ENGINE",
-        "T6": "TRUCK",
-        "T12": "TRUCK",
-        "B2": "CHIEF",
-        "M552": "MEDIC",
+        "B2": ["CHIEF"],
+        "E31": ["ENGINE"],
+        "E36": ["ENGINE"],
+        "E5": ["ENGINE"],
+        "M552": ["MEDIC"],
+        "T12": ["TRUCK"],
+        "T6": ["TRUCK"],
     }
     assert glossary.truth_of(types) == {"E": "engine", "T": "truck", "B": "chief", "M": "medic"}
     # Two of DataSF's types can be one kind of unit, and a code whose units are of
     # several kinds, none of them more than half, has no kind to compare with.
-    mixed = {"AM1": "BLS", "AM2": "PRIVATE", "AM3": "PRIVATE", "EMS1": "CP", "EMS2": "CHIEF"}
+    mixed = {
+        "AM1": ["BLS"],
+        "AM2": ["PRIVATE"],
+        "AM3": ["BLS", "PRIVATE"],
+        "EMS1": ["CP"],
+        "EMS2": ["CHIEF"],
+    }
     assert glossary.truth_of(mixed) == {"AM": "ambulance"}
+
+
+def test_every_unit_of_a_code_counts_and_one_with_no_one_kind_counts_for_none(
+    site: DataSf,
+) -> None:
+    def rows(*given: tuple[str, str]) -> dict[str, list[str]]:
+        site.type_rows = [{"unit_id": unit, "unit_type": kind} for unit, kind in given]
+        http = site.http()
+        try:
+            return glossary.fetch_unit_types(http, date(2026, 3, 3))
+        finally:
+            http.close()
+
+    # One engine and two units of a type Beacon has no kind for: the engine is one
+    # of three, which is no majority. The type DataSF wrote is not kept.
+    types = rows(("E1", "ENGINE"), ("E2", "HOVERCRAFT"), ("E3", "Some new type"))
+    assert types == {"E1": ["ENGINE"], "E2": ["UNLISTED"], "E3": ["UNLISTED"]}
+    assert glossary.truth_of(types) == {}
+    # A unit whose rows give two kinds counts for neither, in whichever order the
+    # rows come: with one truck beside it, the code has no majority either way.
+    for order in ((("T1", "ENGINE"), ("T1", "TRUCK")), (("T1", "TRUCK"), ("T1", "ENGINE"))):
+        types = rows(*order, ("T2", "TRUCK"))
+        assert types == {"T1": ["ENGINE", "TRUCK"], "T2": ["TRUCK"]}
+        assert glossary.truth_of(types) == {}
+    # With a second truck, the trucks are two of three.
+    types = rows(("T1", "ENGINE"), ("T1", "TRUCK"), ("T2", "TRUCK"), ("T3", "TRUCK"))
+    assert glossary.truth_of(types) == {"T": "truck"}
 
 
 def test_a_stand_in_run_compares_before_and_after_and_says_a_stand_in_proposed_it(
@@ -119,15 +153,23 @@ def test_a_stand_in_run_compares_before_and_after_and_says_a_stand_in_proposed_i
     assert (numbers["glossary_before"], numbers["glossary_after"]) == (4, 4)
     assert (numbers["glossary_new"], numbers["glossary_wrong"], numbers["glossary_unknown"]) == (
         0,
-        1,
+        0,
         3,
     )
-    assert "A stand-in proposed them, by a rule of thumb" in texts["glossary_after"]
-    assert "says nothing of Muse Ember" in texts["glossary_after"]
-    assert "DataSF's dispatch pattern, not what Beacon heard on a radio" in texts["glossary_codes"]
+    # Its proposal for the engines is compared, and never applied.
+    assert numbers["glossary_overruled"] == 1
+    assert "never applied: what the person wrote stands" in texts["glossary_overruled"]
+    for key in ("glossary_after", "glossary_new", "glossary_wrong", "glossary_overruled"):
+        assert "A stand-in proposed them, by a rule of thumb" in texts[key]
+        assert "says nothing of Muse Ember" in texts[key]
+    # The table is of Beacon's incidents of generated calls, which follow DataSF's
+    # record and are not DataSF's record itself.
+    assert "the incidents Beacon made of generated calls" in texts["glossary_codes"]
+    assert "are of nothing heard on a radio" in texts["glossary_codes"]
     assert "The learner is never shown them" in texts["glossary_checked"]
+    assert "more than half of all the units" in texts["glossary_checked"]
     assert numbers["glossary_cost_usd"] is None
-    assert texts["glossary_cost_usd"].startswith("Not measured: a stand-in proposed")
+    assert texts["glossary_cost_usd"].startswith("Not measured: a stand-in was asked")
     assert "Codes Beacon has the kind of, after: 4 codes" in said
     layout = run.Layout.under(env, "day")
     kept = json.loads((layout.root / glossary.FILE).read_text())
@@ -189,13 +231,23 @@ def test_a_glossary_ember_failed_on_is_not_asked_for_again_and_the_run_is_still_
     kept = json.loads((layout.root / glossary.FILE).read_text())
     assert kept["state"] == "claimed"
 
-    # Given again while the hold the failure put on is running: the run is complete,
-    # so it is read as it is, and Ember is asked nothing.
+    # Given again while the hold the failure put on is running: the run is complete
+    # and its plan of taps the same, so its result is shown as it was written, not
+    # made again, and Ember is asked nothing.
     meta.fail_glossary = False
+    written = layout.results.read_bytes()
     status, said = command(env, site, *PAID, "--taps", "0", paid=meta.client(env))
     assert (status, len(meta.tables)) == (0, 1)
     assert "leaving Muse Ember alone" not in said
-    assert numbers_of(env)["glossary_after"] is None
+    assert "Codes Beacon has the kind of, after: none" in said
+    assert layout.results.read_bytes() == written
+
+    # With taps it was not made with, there is something to ask, and the hold is
+    # kept to: nothing is asked, and the result is left as it was.
+    status, said = command(env, site, *PAID, paid=meta.client(env))
+    assert (status, len(meta.tables), meta.tap_requests) == (1, 1, 0)
+    assert "leaving Muse Ember alone after a refusal or a failure" in said
+    assert layout.results.read_bytes() == written
 
 
 def test_a_glossary_that_was_refused_before_anything_was_sent_leaves_the_run_unfinished(
@@ -214,10 +266,16 @@ def test_a_glossary_that_was_refused_before_anything_was_sent_leaves_the_run_unf
     assert made is not None
     assert (made["heard_complete"], made["complete"]) == (True, False)
     assert any(
-        caveat.startswith("The glossary is not learned yet: the call was refused before")
+        caveat.startswith("No glossary was learned yet: the call was refused before")
+        and "the run's hold was put on" in caveat
         for caveat in made["caveats"]
     )
-    assert texts_of(env)["glossary_after"].startswith("Not learned yet: the call was refused")
+    assert texts_of(env)["glossary_after"].startswith("Not learned yet: nothing was sent")
+    # No glossary was learned, and nothing says one was: not the table's sentence,
+    # and not the one about the closed hearing.
+    assert "learned from" not in texts_of(env)["glossary_codes"]
+    assert "was learned" not in results.CLOSED
+    assert "glossary_cost_usd" not in numbers_of(env)
     assert "The run is not finished, and a hold is on." in said
     kept = layout.results.read_bytes()
 
@@ -309,7 +367,10 @@ def test_the_comparison_counts_what_agrees_with_datasf_and_never_replaces_what_a
         "RS": "rescue_squad",
     }
 
-    made = {number.key: number for number in glossary.numbers(learned, truth, generated=False)}
+    made = {
+        number.key: number
+        for number in glossary.numbers(learned, truth, generated=False, live=True)
+    }
 
     assert (made["glossary_codes"].value, made["glossary_checked"].value) == (7, 5)
     # Before: E and M, which a person wrote down. After: those and RC. The wrong
@@ -317,9 +378,119 @@ def test_the_comparison_counts_what_agrees_with_datasf_and_never_replaces_what_a
     assert (made["glossary_before"].value, made["glossary_after"].value) == (2, 3)
     assert made["glossary_new"].value == 1
     assert "RC (rescue captain)" in made["glossary_new"].text
-    assert (made["glossary_wrong"].value, made["glossary_unknown"].value) == (2, 2)
+    # AM is added wrongly; the proposal for E is only compared; M and RS have none.
+    assert (made["glossary_wrong"].value, made["glossary_overruled"].value) == (1, 1)
+    assert "Of 1 proposals for codes among the five" in made["glossary_overruled"].text
+    assert made["glossary_unknown"].value == 2
     assert made["glossary_left_out"].value == 2
     assert made["glossary_cost_usd"].value == pytest.approx(0.002)
-    assert "of the incidents Beacon made of recorded radio" in made["glossary_codes"].text
+    assert "the incidents Beacon made of recorded radio" in made["glossary_codes"].text
+    assert "Muse Ember proposed them" in made["glossary_wrong"].text
     # A run whose incidents name no unit has no glossary and no numbers of one.
-    assert glossary.numbers(glossary.Learned(state="nothing"), truth, generated=True) == []
+    nothing = glossary.Learned(state="nothing")
+    assert glossary.numbers(nothing, truth, generated=True, live=False) == []
+    # A claim that came to nothing names who was asked: a stand-in is not Ember.
+    claimed = glossary.Learned(state="claimed", patterns=learned.patterns)
+    by_key = {n.key: n for n in glossary.numbers(claimed, truth, generated=True, live=False)}
+    assert by_key["glossary_after"].text.startswith(
+        "Not learned: the call was claimed and nothing was kept of it. The stand-in for "
+        "Ember failed"
+    )
+    assert "glossary_cost_usd" not in by_key
+
+
+def test_an_answer_that_is_no_form_is_counted_with_the_taps_and_its_cost_is_still_reported(
+    env: dict[str, str], site: DataSf, speech: None
+) -> None:
+    layout, reading, _ = scored(env, site)
+    meta = Meta(layout)
+    scope = SpendScope(glossary.GLOSSARY_SCOPE, 250_000_000)
+    runs = Runs(layout.taps, "mock")
+    (layout.root / glossary.FILE).unlink()
+    # Two answers to taps in a row were no form, as the replay counted them.
+    runs.save_state({"held_until": None, "unusable_run": 2})
+    meta.glossary_text = "The codes are engines and trucks."
+
+    learned = glossary.learn(layout, reading.incidents, meta.client(env)(scope), runs)
+
+    # A third in a row: the run is held, as it is after three answers to taps.
+    assert (learned.state, learned.whole, len(meta.tables)) == ("made", False, 1)
+    held_until, _ = read_hold(runs.state())
+    assert held_until is not None
+    assert held_until > datetime.now(UTC) + timedelta(minutes=9)
+    # It was paid for, and its cost is reported though nothing of it is kept.
+    by_key = {n.key: n for n in glossary.numbers(learned, {}, generated=True, live=True)}
+    assert by_key["glossary_after"].value is None
+    assert "what Muse Ember answered was not the form" in by_key["glossary_after"].text
+    assert by_key["glossary_cost_usd"].value == pytest.approx(0.00015)
+    assert "whether or not the answer was the form" in by_key["glossary_cost_usd"].text
+
+    # Asked again with the same table, the client answers with its recording of
+    # that answer, which nobody is paid for: it is not counted as news about Ember,
+    # and it has no cost to report.
+    (layout.root / glossary.FILE).unlink()
+    runs.save_state({"held_until": None, "unusable_run": 1})
+    again = glossary.learn(layout, reading.incidents, meta.client(env)(scope), runs)
+    assert (again.model, again.whole, len(meta.tables)) == ("replay", False, 1)
+    assert read_hold(runs.state()) == (None, 1)
+    runs.close()
+    by_key = {n.key: n for n in glossary.numbers(again, {}, generated=True, live=True)}
+    assert by_key["glossary_cost_usd"].value is None
+    assert "a recording of an earlier call" in by_key["glossary_cost_usd"].text
+
+
+def test_an_answer_that_is_the_form_ends_the_runs_count_of_answers_that_were_not(
+    env: dict[str, str], site: DataSf, speech: None
+) -> None:
+    layout, reading, _ = scored(env, site)
+    meta = Meta(layout)
+    runs = Runs(layout.taps, "mock")
+    (layout.root / glossary.FILE).unlink()
+    runs.save_state({"held_until": None, "unusable_run": 2})
+    ember = meta.client(env)(SpendScope(glossary.GLOSSARY_SCOPE, 250_000_000))
+
+    learned = glossary.learn(layout, reading.incidents, ember, runs)
+
+    assert (learned.model, learned.whole) == ("live", True)
+    assert read_hold(runs.state()) == (None, 0)
+    runs.close()
+
+
+def test_a_client_that_was_closed_before_the_call_puts_no_hold_on_and_is_not_called_a_refusal(
+    env: dict[str, str], site: DataSf, speech: None
+) -> None:
+    layout, reading, _ = scored(env, site)
+    meta = Meta(layout)
+    runs = Runs(layout.taps, "mock")
+    (layout.root / glossary.FILE).unlink()
+    ember = meta.client(env)(SpendScope(glossary.GLOSSARY_SCOPE, 250_000_000))
+    ember.close()
+
+    learned = glossary.learn(layout, reading.incidents, ember, runs)
+
+    assert (learned.state, learned.hold_set, meta.tables) == ("refused", False, [])
+    assert read_hold(runs.state()) == (None, 0)
+    runs.close()
+    text = glossary.waiting_text(learned, live=True)
+    assert text is not None
+    assert "the client was closed before the call was sent" in text
+    assert "hold" not in text
+    assert "refused" not in text
+
+
+def test_no_glossary_is_asked_for_when_the_replays_hold_could_not_be_kept(
+    env: dict[str, str], site: DataSf, speech: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout = run.Layout.under(env, "day")
+    meta = Meta(layout)
+    # The replay stopped because the investigations file could not be written: a
+    # hold it put on after a failure may not be in the file.
+    monkeypatch.setattr(
+        taps, "replay", lambda *given, **more: taps.Replayed(made=0, stopped="store")
+    )
+
+    status, _ = command(env, site, *PAID, paid=meta.client(env))
+
+    assert (status, meta.tables) == (1, [])
+    assert not (layout.root / glossary.FILE).exists()
+    assert "glossary_codes" not in numbers_of(env)
