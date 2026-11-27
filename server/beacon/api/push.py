@@ -18,6 +18,9 @@ from beacon.push import (
     ABOUT,
     KEPT,
     OFF,
+    PERMIT_LIFE,
+    PERMIT_SHAPE,
+    SPENT,
     Push,
     SubscriptionsError,
     checked,
@@ -45,13 +48,33 @@ _OTHER_MODE = (
 )
 SUBSCRIBE_SHAPE = (
     "A request to be notified is a JSON object with endpoint, the address your "
-    "browser's push service gave this device, and places: a list of one to five "
-    "places, each with lat and lon in degrees and nothing else."
+    "browser's push service gave this device; places, a list of one to five "
+    "places, each with lat and lon in degrees and nothing else; and permit, the "
+    "permit this server gave for the request."
 )
 UNSUBSCRIBE_SHAPE = (
     "A request to stop notifications is a JSON object with endpoint, the address "
-    "your browser's push service gave this device, and nothing else."
+    "your browser's push service gave this device, and, when requests to be "
+    "notified are still out, permits: a list of their permits."
 )
+PERMIT_REQUEST_SHAPE = (
+    "A request for a permit is a JSON object with revoke: a list of the permits "
+    "of earlier requests, which can be empty."
+)
+# The most permits one request names: far more than a device ever has out.
+MAX_NAMED_PERMITS = 16
+NO_PERMITS = (
+    "Beacon has as many requests to be notified under way as it takes at once. Try "
+    "again in a moment."
+)
+PERMIT_SPENT = (
+    "This request to be notified came without a permit that is still good: the "
+    "permit was used, withdrawn, or its time is over. Nothing of the request was "
+    "kept."
+)
+# The status a request with such a permit is refused with. Not 409, which says
+# that the server is in another mode.
+PERMIT_SPENT_STATUS = 410
 NOT_A_PUSH_SERVICE = (
     "Beacon sends notifications only through the push services of Chrome, Edge, "
     "Firefox, and Safari, and this address is not one of theirs."
@@ -96,6 +119,14 @@ class PushInfo(BaseModel):
     kept_days: int
 
 
+class Permit(BaseModel):
+    mode: Literal["live", "mock"]
+    # What one request to be notified names, once, to have its address kept.
+    permit: str
+    # How long it is good for, in seconds.
+    seconds: int
+
+
 class Subscribed(BaseModel):
     mode: Literal["live", "mock"]
     # When the subscription is deleted if it is not renewed before.
@@ -123,6 +154,28 @@ async def info(request: Request) -> PushInfo:
     )
 
 
+@router.post("/push/permit")
+async def permit(request: Request) -> Permit:
+    """A permit for one request to be notified, good once and for two minutes.
+
+    **It is what makes a deletion final.** A request to be notified can reach
+    this server after its sender gave up on it and was told that its address is
+    deleted, and it would put the address back. So a request to be notified
+    names a permit, which is used up in the write that keeps the address, and a
+    request to delete names the permits of the requests its sender has out,
+    which are taken away in the write that deletes. `revoke` does the same for
+    the permits of this sender's earlier requests, so an older list of places
+    cannot follow a newer one. A permit is a random number beside no address and
+    no place. Like the other requests about notifications, this one names the
+    mode its sender was shown and is in no log."""
+    _shown(request)
+    push: Push | None = getattr(request.app.state, "push", None)
+    if push is None or not push.sends:
+        raise HTTPException(503, OFF)
+    sending = push
+    return await _admitted(request, lambda body: _permit(sending, body))
+
+
 @router.post("/push/subscribe")
 async def subscribe(request: Request) -> Subscribed:
     """Keep, or renew, the subscription of one device: the address its browser's
@@ -134,7 +187,11 @@ async def subscribe(request: Request) -> Subscribed:
     here and not by FastAPI, so that nothing of it is repeated in an error, and no
     log line is written about the request. Like a tap, it names the mode its
     sender was shown (`Beacon-Mode`), and a server in the other mode refuses it
-    unread."""
+    unread.
+
+    It names a permit (`POST /api/push/permit`), and keeps nothing without one
+    that is still good: `410` then, which is what a request gets that comes after
+    its sender had the address deleted, or after a later request of its."""
     _shown(request)
     push: Push | None = getattr(request.app.state, "push", None)
     if push is None or not push.sends:
@@ -153,7 +210,12 @@ async def unsubscribe(request: Request) -> Response:
     names (`Beacon-Mode`), whose file is another one, and `503` from a server
     that is busy or stopping. The answer is the same whether or not there was a
     subscription, so it tells nobody whether an address is kept. A server that
-    sends no notifications deletes as any other does."""
+    sends no notifications deletes as any other does.
+
+    **And the address is not put back by a request that was already on its
+    way**, when the sender names that request's permit in `permits`: the permits
+    are taken away in the write that deletes, and a request to be notified keeps
+    nothing without its permit."""
     _shown(request)
     push: Push | None = getattr(request.app.state, "push", None)
     kept = push
@@ -222,10 +284,16 @@ async def _admitted[T](request: Request, work: Callable[[bytes], T]) -> T:
     raise HTTPException(refused.status, str(refused))
 
 
-def _parse(body: bytes, fields: frozenset[str], shape: str) -> Mapping[str, Any]:
-    """The JSON object of a request's body, with exactly `fields`. A body with more
-    structure than such a request has is not parsed. Raises PlacesError, whose text
-    is fixed and repeats nothing."""
+def _parse(
+    body: bytes,
+    fields: frozenset[str],
+    shape: str,
+    *,
+    optional: frozenset[str] = frozenset(),
+) -> Mapping[str, Any]:
+    """The JSON object of a request's body, with exactly `fields` and any of
+    `optional`. A body with more structure than such a request has is not parsed.
+    Raises PlacesError, whose text is fixed and repeats nothing."""
     found: Any = None
     # An address holds no bracket or brace, so these are all the body's own.
     if body.count(b"{") <= MAX_PLACES + 1 and body.count(b"[") <= 1:
@@ -233,15 +301,37 @@ def _parse(body: bytes, fields: frozenset[str], shape: str) -> Mapping[str, Any]
         # before anything is raised.
         with contextlib.suppress(ValueError, RecursionError):
             found = json.loads(body.decode("utf-8"))
-    if not isinstance(found, Mapping) or found.keys() != fields:
+    if not isinstance(found, Mapping) or not fields <= found.keys() <= fields | optional:
         raise PlacesError(422, shape)
     return found
 
 
+def _permits(sent: Any, shape: str) -> tuple[str, ...]:
+    """The permits a request names. Raises PlacesError for anything that is not a
+    short list of things that look like permits."""
+    if (
+        not isinstance(sent, list)
+        or len(sent) > MAX_NAMED_PERMITS
+        or not all(isinstance(each, str) and PERMIT_SHAPE.fullmatch(each) for each in sent)
+    ):
+        raise PlacesError(422, shape)
+    return tuple(sent)
+
+
+def _permit(push: Push, body: bytes) -> Permit:
+    sent = _parse(body, frozenset({"revoke"}), PERMIT_REQUEST_SHAPE)
+    revoke = _permits(sent["revoke"], PERMIT_REQUEST_SHAPE)
+    made = push.subscriptions.permit(datetime.now(UTC), revoke)
+    if made is None:
+        raise PlacesError(503, NO_PERMITS)
+    return Permit(mode=push.mode, permit=made, seconds=int(PERMIT_LIFE.total_seconds()))
+
+
 def _subscribe(push: Push, body: bytes) -> Subscribed:
-    sent = _parse(body, frozenset({"endpoint", "places"}), SUBSCRIBE_SHAPE)
+    sent = _parse(body, frozenset({"endpoint", "places", "permit"}), SUBSCRIBE_SHAPE)
     if not isinstance(sent["endpoint"], str):
         raise PlacesError(422, SUBSCRIBE_SHAPE)
+    (permit,) = _permits([sent["permit"]], SUBSCRIBE_SHAPE)
     endpoint = checked(sent["endpoint"])
     if endpoint is None:
         raise PlacesError(422, NOT_A_PUSH_SERVICE)
@@ -256,16 +346,19 @@ def _subscribe(push: Push, body: bytes) -> Subscribed:
         # Under this request's own sentence when it is the shape that is wrong.
         elsewhere = str(refused) == ELSEWHERE
         raise PlacesError(refused.status, ELSEWHERE if elsewhere else SUBSCRIBE_SHAPE)
-    kept_until = push.subscriptions.put(endpoint, points, datetime.now(UTC))
+    kept_until = push.subscriptions.put(endpoint, points, datetime.now(UTC), permit=permit)
     if kept_until is None:
         raise PlacesError(503, FULL)
+    if kept_until == SPENT:
+        raise PlacesError(PERMIT_SPENT_STATUS, PERMIT_SPENT)
     return Subscribed(mode=push.mode, kept_until=kept_until)
 
 
 def _unsubscribe(push: Push | None, body: bytes) -> None:
-    sent = _parse(body, frozenset({"endpoint"}), UNSUBSCRIBE_SHAPE)
+    sent = _parse(body, frozenset({"endpoint"}), UNSUBSCRIBE_SHAPE, optional=frozenset({"permits"}))
+    permits = _permits(sent.get("permits", []), UNSUBSCRIBE_SHAPE)
     # An address Beacon would not have kept is not looked for, and a server with
-    # no subscriptions file of this mode keeps none.
+    # no subscriptions file of this mode keeps none, and has no permit out.
     endpoint = checked(sent["endpoint"])
-    if endpoint is not None and push is not None:
-        push.subscriptions.remove(endpoint)
+    if push is not None and (endpoint is not None or permits):
+        push.subscriptions.remove(endpoint, permits)

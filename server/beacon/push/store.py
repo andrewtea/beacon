@@ -13,6 +13,11 @@ they turn notifications on (`notice.ABOUT`):
   tries there were, and what came of the latest. It is what keeps a device from
   being sent a push for one incident again and again.
 
+- **A permit** (`permit`): a random number the server handed a device that is
+  about to give its address, and until when it is good, which is `PERMIT_LIFE`
+  at most. It is beside no address and no place, and it is deleted when it is
+  used, when it is withdrawn, and when its time is over.
+
 How long:
 
 - **A subscription is deleted** when the person turns notifications off
@@ -37,16 +42,33 @@ Sending:
   between the claim and the answer. A push service that took a push and whose
   answer was lost is asked again, and the device is then notified twice.
 - At most `MAX_SUBSCRIPTIONS` are kept. One more is refused.
+
+Giving an address:
+
+- **An address is kept only with a permit, which is good once** (`permit`,
+  `put`). A request to be notified can reach the server late: its sender gave up
+  on it, turned notifications off, and was told that the address is deleted, and
+  then the request arrives and would put the address and its places back, for
+  `KEPT`. So the sender names the permits of the requests it has out when it asks
+  for a deletion (`remove`), and the deletion takes them away in the same write.
+  Whichever of the two comes first, the file ends without the address: a request
+  whose permit is gone keeps nothing. A permit is also taken away by the request
+  for the next one (`permit(revoke=...)`), so an older request to be notified,
+  with places that were removed since, cannot follow a newer one.
 - A file is the mock store's or the live store's for life, in one shape
   (`beacon.files.begin_file`). **Shape 1** kept a place without the time it was
-  added, and is no shape this code can read or write: a file in it has its
-  subscriptions and what was sent to them deleted when it is opened (`_EXPIRE`),
-  which is the one thing that can be done with them on time. A device whose
-  subscription went that way gives the server its address again when its app is
-  next opened, with places that are added then.
+  added, and is no shape this code can read or write; **shape 2** took an address
+  without a permit. Neither was ever written by a Beacon on `main`, and there is
+  one rule for both: a file in an earlier shape has its subscriptions and what
+  was sent to them deleted when it is opened (`_EXPIRE`), which is the one thing
+  that can be done with them on time. A device whose subscription went that way
+  gives the server its address again when its app is next opened, with places
+  that are added then.
 """
 
 import json
+import re
+import secrets
 import sqlite3
 import threading
 from collections.abc import Collection, Iterator, Sequence
@@ -75,13 +97,24 @@ CLAIM_STALE = timedelta(minutes=5)
 # crisis mode lasts.
 SENT_KEPT = timedelta(hours=48)
 
+# How long a permit to give an address is good for: longer than the app waits
+# for one telling of the server, and no longer than a late request can matter.
+PERMIT_LIFE = timedelta(minutes=2)
+# The most permits that are out at once. One more is refused.
+MAX_PERMITS = 2_000
+# What a permit looks like: 24 random bytes, in URL-safe base64.
+PERMIT_SHAPE = re.compile(r"[A-Za-z0-9_-]{32}")
+# What `put` answers for a permit that is used, withdrawn, over, or was never
+# given: nothing was kept.
+SPENT: Literal["spent"] = "spent"
+
 Outcome = Literal["sent", "again", "failed"]
 
 _WAIT_SECONDS = 5.0
-_FORMAT = 2
+_FORMAT = 3
 # 0 is a file that says no shape, which a new file is too. 1 kept places as pairs
-# and a time a subscription was made.
-_EARLIER = frozenset({0, 1})
+# and a time a subscription was made, and 2 took an address without a permit.
+_EARLIER = frozenset({0, 1, 2})
 _SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS subscription (
@@ -100,6 +133,7 @@ _SCHEMA = (
         PRIMARY KEY (endpoint, incident_id)
     )
     """,
+    "CREATE TABLE IF NOT EXISTS permit (id TEXT PRIMARY KEY, until TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 )
 # Run on a file of an earlier shape, after `_SCHEMA`: its subscriptions and what
@@ -190,16 +224,50 @@ class Subscriptions:
         with self._closing:
             self._closed = True
 
-    def put(self, endpoint: str, points: Sequence[Point], now: datetime) -> datetime | None:
+    def permit(self, now: datetime, revoke: Collection[str] = ()) -> str | None:
+        """A permit to give an address once, good for `PERMIT_LIFE`, with the
+        permits in `revoke` taken away in the same write: they are the ones of
+        earlier requests of the same device, which are then too late whenever
+        they come. Returns None when as many permits are out as may be.
+
+        Raises SubscriptionsError when the file is closed."""
+        made = secrets.token_urlsafe(24)
+        with self._writing() as db:
+            _withdraw(db, revoke)
+            db.execute("DELETE FROM permit WHERE until <= ?", (_stamp(now),))
+            if db.execute("SELECT count(*) FROM permit").fetchone()[0] >= MAX_PERMITS:
+                return None
+            db.execute(
+                "INSERT INTO permit (id, until) VALUES (?, ?)", (made, _stamp(now + PERMIT_LIFE))
+            )
+        return made
+
+    def put(
+        self,
+        endpoint: str,
+        points: Sequence[Point],
+        now: datetime,
+        *,
+        permit: str | None = None,
+    ) -> datetime | Literal["spent"] | None:
         """Keep a subscription, or renew the one kept under its address with these
         places in place of the ones it had. A place it had already keeps the time
         it was added; any other is added now. Returns the moment it is kept until,
         or None when the file is full and this would be one more.
 
+        With a `permit`, which a request from a device always has, the permit is
+        used up in the same write, and `SPENT` is the answer, with nothing kept,
+        when it is not there to use: it was used, withdrawn by a deletion or by
+        the request for a later permit, or its time is over.
+
         Raises SubscriptionsError when the file is closed."""
         with self._writing() as db:
             # First, so that a file that is full of what ran out is not full.
             _sweep(db, now)
+            if permit is not None:
+                used = db.execute("DELETE FROM permit WHERE id = ?", (permit,))
+                if used.rowcount != 1:
+                    return SPENT
             known = db.execute(
                 "SELECT places FROM subscription WHERE endpoint = ?", (endpoint,)
             ).fetchone()
@@ -222,17 +290,29 @@ class Subscriptions:
             )
         return now + KEPT
 
-    def remove(self, endpoint: str) -> bool:
-        """Delete a subscription and what was sent to it. Returns whether there
-        was one. Raises SubscriptionsError when the file is closed."""
+    def remove(self, endpoint: str | None, permits: Collection[str] = ()) -> bool:
+        """Delete a subscription and what was sent to it, and take away
+        `permits` in the same write: the permits of the requests to be notified
+        that its device has out, none of which can then put the address back.
+        With no address, only the permits go. Returns whether there was a
+        subscription. Raises SubscriptionsError when the file is closed."""
         with self._writing() as db:
+            _withdraw(db, permits)
+            if endpoint is None:
+                return False
             db.execute("DELETE FROM sent WHERE endpoint = ?", (endpoint,))
             gone = db.execute("DELETE FROM subscription WHERE endpoint = ?", (endpoint,))
             return gone.rowcount > 0
 
+    def permits(self) -> int:
+        """How many permits are out."""
+        with closing(self._connect()) as db:
+            return db.execute("SELECT count(*) FROM permit").fetchone()[0]
+
     def sweep(self, now: datetime) -> int:
         """Delete the subscriptions that were last renewed more than `KEPT` ago,
-        with what was sent to them, and what was sent more than `SENT_KEPT` ago.
+        with what was sent to them, what was sent more than `SENT_KEPT` ago, and
+        the permits whose time is over.
         Returns how many subscriptions went. Raises SubscriptionsError when the
         file is closed."""
         with self._writing() as db:
@@ -274,14 +354,19 @@ class Subscriptions:
     def claim(self, endpoint: str, incident_id: str, place: Place, now: datetime) -> bool:
         """Whether a push about this incident may be sent to this address now,
         for `place`. True once, and again only for a send that may be tried once
-        more (`Try.again_at`). False for an address that is no longer kept, and
-        for one that no longer names `place` as it was when the send was found to
-        be due: a place that was removed, or removed and named again, since.
+        more (`Try.again_at`). False for an address that is no longer kept, for
+        one whose time is over at `now`, whether or not a sweep has deleted it
+        yet, and for one that no longer names `place` as it was when the send was
+        found to be due: a place that was removed, or removed and named again,
+        since.
 
         Raises SubscriptionsError when the file is closed."""
         with self._writing() as db:
+            # The same test as `_sweep` makes: a sweep can have failed, and what
+            # it would have deleted is sent nothing.
             kept = db.execute(
-                "SELECT places FROM subscription WHERE endpoint = ?", (endpoint,)
+                "SELECT places FROM subscription WHERE endpoint = ? AND renewed_at >= ?",
+                (endpoint, _stamp(now - KEPT)),
             ).fetchone()
             if kept is None or place not in _places(kept[0]):
                 return False
@@ -366,4 +451,10 @@ def _sweep(db: sqlite3.Connection, now: datetime) -> int:
         "OR endpoint NOT IN (SELECT endpoint FROM subscription)",
         (_stamp(now - SENT_KEPT),),
     )
+    db.execute("DELETE FROM permit WHERE until <= ?", (_stamp(now),))
     return gone
+
+
+def _withdraw(db: sqlite3.Connection, permits: Collection[str]) -> None:
+    for permit in dict.fromkeys(permits):
+        db.execute("DELETE FROM permit WHERE id = ?", (permit,))

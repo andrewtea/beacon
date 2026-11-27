@@ -11,7 +11,7 @@ says first that the incident is invented and that a stand-in decided.
 from dataclasses import dataclass
 
 from beacon.files import Mode
-from beacon.push.store import KEPT, SENT_KEPT
+from beacon.push.store import KEPT, PERMIT_LIFE, SENT_KEPT
 
 
 @dataclass(frozen=True)
@@ -42,7 +42,7 @@ _MOCK = Notice(
 
 # Everything Beacon keeps to send a notification and for how long, when it sends
 # one, and what the push service is and is not sent. Shown before a person turns
-# notifications on, so it has to name every column of `store`'s two tables. Its
+# notifications on, so it has to name every column of `store`'s tables. Its
 # paragraphs are parted by a blank line, which the app shows as paragraphs.
 ABOUT = (
     "To notify this device, Beacon's server keeps the address your browser's push "
@@ -53,7 +53,10 @@ ABOUT = (
     "incident it tries to notify this device about, it also keeps, beside that "
     "address, the incident's id, when it last tried, how many times it tried, and "
     f"whether the push service took the notification, for {SENT_KEPT.days} days at "
-    "most. It keeps no name, no browser, and no address a request came from.\n\n"
+    "most. While this device is giving it that address, it also keeps, for "
+    f"{int(PERMIT_LIFE.total_seconds()) // 60} minutes at most, a random number it "
+    "handed this device, which is tied to no address and no place. It keeps no name, no "
+    "browser, and no address a request came from.\n\n"
     "It sends a notification when its investigator turns crisis mode on for an "
     "incident it has within about a kilometre of one of those places, if this "
     "server had been told of the place by then: once for an incident as a rule, "

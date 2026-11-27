@@ -2,9 +2,9 @@ import { ApiError, fetchJson, MODE_HEADER } from './http.ts'
 import type { Mode } from './incidents.ts'
 import { roundToBlock } from '../lib/geo.ts'
 
-// The shapes of `GET /api/push`, `POST /api/push/subscribe`, and
-// `POST /api/push/unsubscribe`, field for field as `server/beacon/api/push.py`
-// documents them.
+// The shapes of `GET /api/push`, `POST /api/push/permit`,
+// `POST /api/push/subscribe`, and `POST /api/push/unsubscribe`, field for field
+// as `server/beacon/api/push.py` documents them.
 
 /** What a device shows when a push arrives, in the server's words. A push
  * carries no words, so the app keeps these for its service worker. */
@@ -32,17 +32,43 @@ export function fetchPushInfo(signal?: AbortSignal): Promise<PushInfo> {
   return fetchJson<PushInfo>('/api/push', { signal })
 }
 
+/** The status a request to be notified is refused with when its permit is used,
+ * withdrawn, or over: the server kept nothing of it. */
+export const PERMIT_SPENT = 410
+
+/**
+ * A permit for one request to be notified, good once and for `seconds`. The
+ * server takes away the permits in `revoke` as it gives this one: they are the
+ * permits of this device's earlier requests that were never answered, which
+ * are then too late whenever they reach the server.
+ */
+export function permitPush(
+  revoke: string[],
+  shown: Mode,
+  signal?: AbortSignal,
+): Promise<{ mode: Mode; permit: string; seconds: number }> {
+  return fetchJson('/api/push/permit', {
+    signal,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', [MODE_HEADER]: shown },
+    body: JSON.stringify({ revoke }),
+  })
+}
+
 /**
  * Has the server keep, or renew, this device's subscription: the address the
  * browser's push service made for it, and where the saved places are, each
  * rounded to about a block and without its name. They take the place of any
  * the server had. `shown` is the mode the app is showing, which a server in the
- * other mode refuses unread.
+ * other mode refuses unread. `permit` is the one the server gave for this
+ * request (`permitPush`); without one that is still good the server keeps
+ * nothing and answers `PERMIT_SPENT`.
  */
 export function subscribePush(
   endpoint: string,
   places: { lat: number; lon: number }[],
   shown: Mode,
+  permit: string,
   signal?: AbortSignal,
 ): Promise<{ mode: Mode; kept_until: string }> {
   return fetchJson('/api/push/subscribe', {
@@ -55,6 +81,7 @@ export function subscribePush(
         lat: roundToBlock(place.lat),
         lon: roundToBlock(place.lon),
       })),
+      permit,
     }),
   })
 }
@@ -69,10 +96,15 @@ export function subscribePush(
  * (a server that is busy, stopping, or not reached, and a request that was
  * aborted) is not the server saying so, and is an `ApiError`: the caller keeps
  * the address and asks again.
+ *
+ * `permits` are those of the requests to be notified that may still be on
+ * their way to that server. It takes them away in the write that deletes, so
+ * that none of those requests puts the address back after this was answered.
  */
 export async function unsubscribePush(
   endpoint: string,
   owner: Mode,
+  permits: string[] = [],
   signal?: AbortSignal,
 ): Promise<void> {
   let response: Response
@@ -81,7 +113,9 @@ export async function unsubscribePush(
       signal,
       method: 'POST',
       headers: { 'Content-Type': 'application/json', [MODE_HEADER]: owner },
-      body: JSON.stringify({ endpoint }),
+      body: JSON.stringify(
+        permits.length > 0 ? { endpoint, permits } : { endpoint },
+      ),
     })
   } catch {
     throw new ApiError('The server could not be reached.', null)

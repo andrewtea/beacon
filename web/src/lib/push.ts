@@ -2,6 +2,8 @@ import { ApiError, OTHER_MODE } from '../api/http.ts'
 import type { Mode } from '../api/incidents.ts'
 import {
   fetchPushInfo,
+  PERMIT_SPENT,
+  permitPush,
   type PushNotice,
   subscribePush,
   unsubscribePush,
@@ -15,7 +17,9 @@ import { placesSnapshot } from './placeStore.ts'
 // - On this device (`KEY`): the mode notifications were turned on for; the
 //   address the server of that mode was last given (`told`); and the addresses
 //   a server has yet to answer that it deleted, each with the mode of the server
-//   that has it (`forget`). Beside it (`OFF_KEY`), a mark of the latest time
+//   that has it (`forget`); and the permit of a request to be notified that
+//   may still be on its way to a server (`out`). Beside it (`OFF_KEY`), a mark
+//   of the latest time
 //   notifications were turned off, which `KEY` says it has taken note of
 //   (`seen`). Beside those, the words a notification shows (a cache the service
 //   worker reads, `public/push-sw.js`) and the browser's own subscription.
@@ -52,17 +56,30 @@ import { placesSnapshot } from './placeStore.ts'
 // delete (`read`), in every tab. A telling that was under way reads it after
 // each thing it waited for (`fence` in `tell`) and gives the server nothing
 // more; it then runs again as one for notifications that are off, and asks the
-// server to delete. A turning on that was waiting its turn sees that the mark
-// is another than when it began, and turns nothing on. Everything else that is
-// kept (`KEY`) is written only under the lock.
+// server to delete. **A press of On that is older than a press of Off never
+// undoes it**: `turnOn` takes the mark as it is when it is pressed, before the
+// browser is asked anything, turns nothing on when the mark is another by the
+// time its turn comes, and writes that it took note of that mark and of no
+// later one, so an Off that comes after its last look still reads as off.
+// Everything else that is kept (`KEY`) is written only under the lock, with the
+// mark of the one reading the write was made from (`writeWanted`).
 //
 // **One telling waits for nothing longer than `SYNC_MS` in all**: a server that
 // does not answer, or a browser that does not, ends it, and it is tried again
-// later. What cannot be had is certainty about a request that was cut off: it
-// may still reach the server, after the server has answered that it deleted the
-// address too. The address is then one the browser has let go of, which the
-// push service delivers nothing to and the server deletes when a push to it is
-// refused, or when its time is over.
+// later. Of that, the browser is given `BROWSER_MS` in all to say what it holds,
+// let go, and delete the words, so that a browser that does not answer keeps
+// neither the lock nor the request that has the server delete.
+//
+// **A request that was cut off can still reach the server, and puts nothing
+// back.** A request to be notified names a permit the server gave for it
+// (`permitPush`), good once. The permit is noted here (`out`) before the request
+// is sent, and it is named when the server is asked to delete the address and
+// when the next permit is asked for; the server takes it away in the same write.
+// So a request that arrives after the server answered that it deleted the
+// address keeps nothing, and neither does an older list of places that arrives
+// after a newer one. The other way round, a request to delete that arrives late
+// deletes an address that was given again since: the server then keeps nothing
+// of this device until the app next tells it, which is the safe way to be wrong.
 
 const KEY = 'beacon.push.v2'
 // Written anew each time notifications are turned off, and never taken away.
@@ -100,7 +117,12 @@ type Wanted = {
   told: Address | null
   // Addresses a server has yet to answer that it deleted.
   forget: Address[]
+  // The permits of requests to be notified that were sent and not answered, at
+  // most one for a mode: such a request can still reach its server.
+  out: Out[]
 }
+
+type Out = { permit: string; mode: Mode }
 
 export type PushStatus = {
   // The mode the person turned notifications on for, on this device.
@@ -148,7 +170,7 @@ let held = false
 let deleted = false
 let status: { from: Read; shown: PushStatus } | null = null
 
-const NOTHING_WANTED: Wanted = { on: null, told: null, forget: [] }
+const NOTHING_WANTED: Wanted = { on: null, told: null, forget: [], out: [] }
 
 function isMode(value: unknown): value is Mode {
   return value === 'mock' || value === 'live'
@@ -162,12 +184,18 @@ function addressOf(value: unknown): Address | null {
     : null
 }
 
+function outOf(value: unknown): Out | null {
+  if (typeof value !== 'object' || value === null) return null
+  const { permit, mode } = value as Record<string, unknown>
+  return typeof permit === 'string' && isMode(mode) ? { permit, mode } : null
+}
+
 function parsed(raw: string | null): { blob: Wanted; seen: string | null } {
   try {
     const kept: unknown = raw === null ? null : JSON.parse(raw)
     if (typeof kept !== 'object' || kept === null)
       return { blob: NOTHING_WANTED, seen: null }
-    const { on, told, forget, seen } = kept as Record<string, unknown>
+    const { on, told, forget, out, seen } = kept as Record<string, unknown>
     return {
       blob: {
         on: isMode(on) ? on : null,
@@ -176,6 +204,9 @@ function parsed(raw: string | null): { blob: Wanted; seen: string | null } {
         // answered.
         forget: Array.isArray(forget)
           ? forget.map(addressOf).filter((address) => address !== null)
+          : [],
+        out: Array.isArray(out)
+          ? out.map(outOf).filter((permit) => permit !== null)
           : [],
       },
       seen: typeof seen === 'string' ? seen : null,
@@ -220,11 +251,14 @@ function changed(what: 'wanted' | 'shown'): void {
   if (what === 'wanted') for (const listener of wantedListeners) listener()
 }
 
-/** Change what is kept, from what is wanted now, and note the mark that what
- * is wanted now was read with. Answers with whether it is kept. Called under
- * the lock only. */
-function writeWanted(change: (now: Wanted) => Wanted): boolean {
-  const now = read()
+/** Change what is kept, from what one reading (`now`) said is wanted, and note
+ * the mark of that same reading, never a later one: a turning off that came
+ * after the reading is then one the write knows nothing of, and holds. Answers
+ * with whether it is kept. Called under the lock only. */
+function writeWanted(
+  change: (now: Wanted) => Wanted,
+  now: Read = read(),
+): boolean {
   const raw = JSON.stringify({ ...change(now.wanted), seen: now.mark })
   // Nothing is written that says what is there already, and so nothing at
   // all on a device that never turned notifications on.
@@ -422,9 +456,13 @@ async function keepNotice(mode: Mode, notice: PushNotice): Promise<void> {
   )
 }
 
-async function dropNotice(mode: Mode): Promise<void> {
+/** Deletes the words a mode's notification shows, waiting for the browser no
+ * later than `until`. */
+async function dropNotice(mode: Mode, until: number): Promise<void> {
   try {
-    await (await window.caches.open(NOTICE_CACHE)).delete(NOTICE_URL + mode)
+    await within(until - Date.now(), async () => {
+      await (await window.caches.open(NOTICE_CACHE)).delete(NOTICE_URL + mode)
+    })
   } catch {
     // Words that could not be deleted are shown by no push: the subscription
     // they were for is let go of.
@@ -505,13 +543,16 @@ function within<T>(
  * browser does not allow notifications from this site; `no-worker` when this
  * copy of the app cannot have a service worker to receive one; `failed` when
  * the browser cannot do this or would not keep the change; `overtaken` when
- * notifications were turned off, in this tab or another, while this waited its
- * turn, and are off.
+ * notifications were turned off, in this tab or another, after this was
+ * pressed, and are off.
  */
 export async function turnOn(
   mode: Mode,
 ): Promise<'on' | 'blocked' | 'no-worker' | 'overtaken' | 'failed'> {
   if (!pushSupported()) return 'failed'
+  // The latest turning off there was when this was pressed, before anything
+  // is waited for: one that comes from here on is the later press.
+  const before = read().mark
   let allowed: NotificationPermission
   try {
     allowed = await Notification.requestPermission()
@@ -524,17 +565,22 @@ export async function turnOn(
   } catch {
     return 'no-worker'
   }
-  // The latest turning off there was when the turn was asked for.
-  const before = read().mark
   try {
     return await alone(async () => {
-      if (read().mark !== before) {
-        // Turned off, in this tab or another, while this waited its turn: the
+      // One reading, which the write below is made from and whose mark it
+      // notes. A second reading could take note of a turning off it never saw.
+      const now = read()
+      if (now.mark !== before) {
+        // Turned off, in this tab or another, since this was pressed: the
         // later press holds.
         settle()
         return 'overtaken'
       }
-      if (!writeWanted((now) => retired({ ...now, on: mode }))) return 'failed'
+      if (!writeWanted((wanted) => retired({ ...wanted, on: mode }), now))
+        return 'failed'
+      // Turned off after that reading: what was written knows nothing of it,
+      // and notifications are off.
+      if (readWanted().on !== mode) return 'overtaken'
       show(() => {
         const was = deleted
         deleted = false
@@ -552,19 +598,25 @@ export async function turnOn(
  * mode's, and this one's once notifications are off. Answers with whether it is
  * known that the browser holds none of them any more, which `held` then says
  * too: a browser that would not let go, would not say what it holds, or did not
- * answer in `ms` may hold one still.
+ * answer may hold one still. **Nothing here is waited for past `until`**, which
+ * is one moment for all of it: what the browser holds, its letting go, and the
+ * deleting of the words, for both modes.
  *
  * Under the lock (`noting`), each address is noted for its server to delete
  * before the browser is asked to let go of it. Outside it, where nothing is
  * written, only an address this device already has a note of is let go of; any
  * other is left for the telling that follows, and counts as held until then.
  */
-async function letGo(noting: boolean, ms = BROWSER_MS): Promise<boolean> {
+async function letGo(
+  noting: boolean,
+  until = Date.now() + BROWSER_MS,
+): Promise<boolean> {
   let all = true
+  const wordless: Mode[] = []
   for (const mode of MODES) {
     if (readWanted().on === mode) continue
     const held = () =>
-      within(ms, async () => {
+      within(until - Date.now(), async () => {
         const registration = await registrationOf(mode)
         return (await registration?.pushManager.getSubscription()) ?? null
       })
@@ -590,7 +642,7 @@ async function letGo(noting: boolean, ms = BROWSER_MS): Promise<boolean> {
     const mine = subscription
     let gone = false
     try {
-      gone = await within(ms, () => mine.unsubscribe())
+      gone = await within(until - Date.now(), () => mine.unsubscribe())
       // A browser also answers that it did not when the subscription was let
       // go of already, by another tab, say. What it holds now is what counts.
       if (!gone) gone = (await held()) === null
@@ -598,8 +650,12 @@ async function letGo(noting: boolean, ms = BROWSER_MS): Promise<boolean> {
       // Not known to be gone.
     }
     if (!gone) all = false
-    await dropNotice(mode)
+    wordless.push(mode)
   }
+  // Last, and together, with what is left of the time: a browser that is slow
+  // to delete the words takes nothing from the letting go, which is what keeps
+  // a push from being delivered.
+  await Promise.all(wordless.map((mode) => dropNotice(mode, until)))
   show(() => {
     const was = held
     held = !all
@@ -666,15 +722,35 @@ class Unanswered extends Error {}
 
 type Step = <T>(work: (signal: AbortSignal) => Promise<T>) => Promise<T>
 
-/** Has the `mode` server delete each address it is to delete. An address is
- * taken off the list only when the server answered that it did. Throws on the
- * first it did not. */
+const outFor = (mode: Mode) =>
+  readWanted()
+    .out.filter((sent) => sent.mode === mode)
+    .map((sent) => sent.permit)
+
+/** Without the permits `gone` of the `mode` server's. */
+const withdrawn =
+  (mode: Mode, gone: string[]) =>
+  (now: Wanted): Wanted => ({
+    ...now,
+    out: now.out.filter(
+      (sent) => !(sent.mode === mode && gone.includes(sent.permit)),
+    ),
+  })
+
+/** Has the `mode` server delete each address it is to delete, and with it take
+ * away the permits of the requests to be notified that may still be on their
+ * way to it, so that none of them puts an address back. An address is taken off
+ * the list only when the server answered that it did. Throws on the first it
+ * did not. */
 async function forgetHere(mode: Mode, step: Step): Promise<void> {
   for (const address of readWanted().forget) {
     if (address.mode !== mode) continue
-    await step((signal) => unsubscribePush(address.endpoint, mode, signal))
+    const permits = outFor(mode)
+    await step((signal) =>
+      unsubscribePush(address.endpoint, mode, permits, signal),
+    )
     keep((now) => ({
-      ...now,
+      ...withdrawn(mode, permits)(now),
       forget: now.forget.filter((kept) => !same(kept, address)),
     }))
     show(() => {
@@ -703,7 +779,9 @@ async function tell(mode: Mode, until: number): Promise<void> {
   keep((now) =>
     retired(now.on !== null && now.on !== mode ? { ...now, on: null } : now),
   )
-  await letGo(true, until - Date.now())
+  // The browser has a part of the telling's time and no more, so that the
+  // server is asked to delete whatever the browser does.
+  await letGo(true, Math.min(until, Date.now() + BROWSER_MS))
   if (readWanted().on !== mode || Notification.permission !== 'granted') {
     // Off, or the browser's leave was taken back, and its subscription with
     // it: the server's copy is to go.
@@ -768,22 +846,46 @@ async function tell(mode: Mode, until: number): Promise<void> {
     // Turned off while the browser made it: the server is not given it, and
     // the telling that is run next has the browser let go of it.
     fence()
+    // A permit for this one request, which also takes away the permit of an
+    // earlier request that was never answered: that one, with the places as
+    // they were then, is too late whenever it comes.
+    const earlier = outFor(mode)
+    const { permit } = await step((signal) => permitPush(earlier, mode, signal))
+    fence()
     // Noted before the server is given it: were this tab closed before the
-    // server answered, the address would still be known here, to be deleted.
+    // server answered, the address would still be known here, to be deleted,
+    // and so would the permit of the request that gave it.
     const address = { endpoint: subscription.endpoint, mode }
+    // Read at the last moment, with nothing waited for between the reading and
+    // the sending: a place that was removed while the browser subscribed, or
+    // while the permit was asked for, is not sent. One removed after this is
+    // sent by the sync its removal starts.
+    const places = rounded()
     keep((now) => ({
       ...now,
       told: address,
       forget: now.forget.filter((kept) => !same(kept, address)),
+      // The earlier permits were taken away with the giving of this one, and
+      // this one is out only when a request is about to carry it.
+      out: [
+        ...now.out.filter((sent) => sent.mode !== mode),
+        ...(places.length > 0 ? [{ permit, mode }] : []),
+      ],
     }))
-    // Read at the last moment, with nothing waited for between the reading and
-    // the sending: a place that was removed while the browser subscribed is not
-    // sent. One removed after this is sent by the sync its removal starts.
-    const places = rounded()
     if (places.length > 0) {
-      await step((signal) =>
-        subscribePush(address.endpoint, places, mode, signal),
-      )
+      try {
+        await step((signal) =>
+          subscribePush(address.endpoint, places, mode, permit, signal),
+        )
+      } catch (error) {
+        // Refused because the permit is no longer good: the request kept
+        // nothing and never will, so it is not out.
+        if (error instanceof ApiError && error.status === PERMIT_SPENT)
+          keep(withdrawn(mode, [permit]))
+        throw error
+      }
+      // Answered: the permit is used up, and the request is not out.
+      keep(withdrawn(mode, [permit]))
       // Turned off while the server was given it: the address is one for the
       // server to delete, which the telling that is run next asks for.
       fence()

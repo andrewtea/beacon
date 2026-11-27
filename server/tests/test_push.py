@@ -64,7 +64,7 @@ from beacon.push import (
     open_push,
     subject_of,
 )
-from beacon.push.store import SENT_KEPT
+from beacon.push.store import PERMIT_LIFE, PERMIT_SHAPE, SENT_KEPT, SPENT
 from beacon.push.vapid import SUBJECT_VARIABLE, TOKEN_LIFE, key_file, open_vapid
 from beacon.taps import TapMedia, Taps
 from tests.incident_rows import HAYES, Rows, at, mock_store
@@ -603,34 +603,30 @@ def test_a_subscriptions_file_is_one_modes_and_takes_nothing_once_closed(tmp_pat
     assert [found.endpoint for found in kept.all()] == [FCM]
 
 
+_PAIRS = (
+    "subscription (endpoint TEXT PRIMARY KEY, places TEXT NOT NULL, "
+    "created_at TEXT NOT NULL, renewed_at TEXT NOT NULL)",
+    (FCM, "[[37.776, -122.424]]", "2026-11-01T00:00:00.000000", "2026-11-20T00:00:00.000000"),
+)
+_TIMED = (
+    "subscription (endpoint TEXT PRIMARY KEY, places TEXT NOT NULL, renewed_at TEXT NOT NULL)",
+    (FCM, '[[37.776, -122.424, "2026-11-01T00:00:00.000000"]]', "2026-11-20T00:00:00.000000"),
+)
+
+
 @pytest.mark.parametrize(
-    ("table", "row"),
+    ("shape", "table", "row"),
     [
         # The first shape that was written: a place as a pair, and a time made.
-        (
-            "subscription (endpoint TEXT PRIMARY KEY, places TEXT NOT NULL, "
-            "created_at TEXT NOT NULL, renewed_at TEXT NOT NULL)",
-            (
-                FCM,
-                "[[37.776, -122.424]]",
-                "2026-11-01T00:00:00.000000",
-                "2026-11-20T00:00:00.000000",
-            ),
-        ),
+        (1, *_PAIRS),
         # The same number, with a place's time and without the time made.
-        (
-            "subscription (endpoint TEXT PRIMARY KEY, places TEXT NOT NULL, "
-            "renewed_at TEXT NOT NULL)",
-            (
-                FCM,
-                '[[37.776, -122.424, "2026-11-01T00:00:00.000000"]]',
-                "2026-11-20T00:00:00.000000",
-            ),
-        ),
+        (1, *_TIMED),
+        # The second: as now, and an address taken without a permit.
+        (2, *_TIMED),
     ],
 )
 def test_a_file_of_the_earlier_shape_has_its_subscriptions_deleted_and_stays_its_modes(
-    tmp_path: Path, table: str, row: tuple[str, ...]
+    tmp_path: Path, shape: int, table: str, row: tuple[str, ...]
 ) -> None:
     path = tmp_path / "mock.sqlite3"
     with sqlite3.connect(path) as db:
@@ -646,7 +642,7 @@ def test_a_file_of_the_earlier_shape_has_its_subscriptions_deleted_and_stays_its
         )
         db.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         db.execute("INSERT INTO meta VALUES ('mode', 'mock')")
-        db.execute("PRAGMA user_version = 1")
+        db.execute(f"PRAGMA user_version = {shape}")
 
     # It is still the mock store's, and is refused as the live one's as it was.
     before = path.read_bytes()
@@ -658,7 +654,7 @@ def test_a_file_of_the_earlier_shape_has_its_subscriptions_deleted_and_stays_its
 
     assert (kept.all(), kept.tries()) == ((), {})
     with sqlite3.connect(path) as db:
-        assert db.execute("PRAGMA user_version").fetchone() == (2,)
+        assert db.execute("PRAGMA user_version").fetchone() == (3,)
     # It is a file of this shape from then on, and keeps what it is given.
     kept.put(FCM, [NEAR], at(0))
     assert kept.claim(FCM, "inc-1", near(0), at(1))
@@ -1178,6 +1174,8 @@ def test_the_words_of_a_notification_say_whose_decision_it_is_and_tell_nobody_wh
     # It names everything the file holds beside an address, and does not say the
     # push service learns nothing.
     for kept in (
+        "a random number it handed this device, which is tied to no address and no place",
+        "for 2 minutes at most",
         "when this server was first told of it",
         "when this device last renewed all that",
         "the incident's id",
@@ -1199,9 +1197,30 @@ def test_the_words_of_a_notification_say_whose_decision_it_is_and_tell_nobody_wh
 # The routes.
 
 
-def body_of(endpoint: Any = FCM, places: Any = None) -> dict[str, Any]:
+# A permit no server gave: it has the shape of one.
+NO_PERMIT = "p" * 32
+
+
+def body_of(endpoint: Any = FCM, places: Any = None, permit: Any = NO_PERMIT) -> dict[str, Any]:
     listed = [{"lat": NEAR.lat, "lon": NEAR.lon}] if places is None else places
-    return {"endpoint": endpoint, "places": listed}
+    return {"endpoint": endpoint, "places": listed, "permit": permit}
+
+
+def permit_from(client: TestClient, revoke: Any = ()) -> str:
+    """A permit the server gives, as the app asks for one before each request to
+    be notified."""
+    answer = client.post("/api/push/permit", json={"revoke": list(revoke)}, headers=SHOWN)
+    assert answer.status_code == 200
+    return answer.json()["permit"]
+
+
+def subscribe(client: TestClient, headers: dict[str, str] | None = None, **body: Any) -> Any:
+    """Ask to be notified as the app does: with a permit asked for just before."""
+    return client.post(
+        "/api/push/subscribe",
+        json=body_of(**body, permit=permit_from(client)),
+        headers={**SHOWN, **(headers or {})},
+    )
 
 
 def test_the_app_is_told_the_key_and_what_is_kept_before_anyone_subscribes(world: World) -> None:
@@ -1227,10 +1246,10 @@ def test_subscribing_keeps_the_address_and_the_places_rounded_to_a_block_and_not
     client = world.app()
     places = [{"lat": 37.77664321, "lon": -122.42361234}, {"lat": 37.7801, "lon": -122.4199}]
 
-    response = client.post(
-        "/api/push/subscribe",
-        json=body_of(places=places),
-        headers={**SHOWN, "User-Agent": "A browser 1.0", "X-Forwarded-For": "203.0.113.9"},
+    response = subscribe(
+        client,
+        headers={"User-Agent": "A browser 1.0", "X-Forwarded-For": "203.0.113.9"},
+        places=places,
     )
 
     assert response.status_code == 200
@@ -1251,8 +1270,11 @@ def test_subscribing_keeps_the_address_and_the_places_rounded_to_a_block_and_not
     for private in (b"browser", b"203.0.113", b"37.7766"):
         assert private not in held
 
+    # The permit was used up with it, and the file holds none.
+    assert world.push.subscriptions.permits() == 0
+
     # Asked again with other places, it is the same subscription with those.
-    assert client.post("/api/push/subscribe", json=body_of(), headers=SHOWN).status_code == 200
+    assert subscribe(client).status_code == 200
     ((_, kept_places, renewed_again),) = world.kept()
     assert json.loads(kept_places) == [[round(NEAR.lat, 3), round(NEAR.lon, 3), renewed_again]]
     assert renewed_again > renewed_at
@@ -1260,7 +1282,7 @@ def test_subscribing_keeps_the_address_and_the_places_rounded_to_a_block_and_not
 
 def test_a_subscription_the_routes_made_is_sent_its_push(world: World) -> None:
     client = world.app()
-    assert client.post("/api/push/subscribe", json=body_of(), headers=SHOWN).status_code == 200
+    assert subscribe(client).status_code == 200
     world.places_added(5)
     world.decide(6.5)
 
@@ -1309,6 +1331,171 @@ def test_an_address_is_said_to_be_deleted_only_by_the_server_whose_file_it_is_in
     assert stopping.status_code == 503
 
 
+# A deletion is final: a request that was already on its way puts nothing back.
+
+
+def test_a_permit_is_good_once_for_two_minutes_and_only_so_many_are_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kept = subscriptions(tmp_path)
+
+    first = kept.permit(at(0))
+    assert first is not None
+    assert PERMIT_SHAPE.fullmatch(first)
+    assert kept.put(FCM, [NEAR], at(1), permit=first) == at(1) + KEPT
+    # Used up: the same request, come again, keeps nothing and changes nothing.
+    assert kept.put(FCM, [FAR], at(1.5), permit=first) == SPENT
+    assert kept.put(MOZ, [NEAR], at(1.5), permit=NO_PERMIT) == SPENT
+    assert [(found.endpoint, found.places) for found in kept.all()] == [(FCM, (near(1),))]
+
+    # Its time is over two minutes after it was given, to the second.
+    late, in_time = kept.permit(at(2)), kept.permit(at(2))
+    assert late is not None
+    assert in_time is not None
+    assert kept.put(MOZ, [NEAR], at(4) - timedelta(seconds=1), permit=in_time) != SPENT
+    assert kept.put(APPLE, [NEAR], at(4), permit=late) == SPENT
+    assert kept.permits() == 0
+    # One nobody used is deleted when its time is over.
+    assert kept.permit(at(5)) is not None
+    kept.sweep(at(7) - timedelta(seconds=1))
+    assert kept.permits() == 1
+    kept.sweep(at(7))
+    assert kept.permits() == 0
+
+    # Only so many are out at once, and those whose time is over make room.
+    monkeypatch.setattr(store_module, "MAX_PERMITS", 2)
+    assert kept.permit(at(10)) is not None
+    assert kept.permit(at(10)) is not None
+    assert kept.permit(at(11)) is None
+    assert kept.permit(at(12)) is not None
+    kept.close()
+    with pytest.raises(SubscriptionsError):
+        kept.permit(at(13))
+
+
+@pytest.mark.parametrize("first", ["the deletion", "the request to be notified"])
+def test_whichever_comes_first_a_deletion_leaves_no_address_behind(
+    world: World, monkeypatch: pytest.MonkeyPatch, first: str
+) -> None:
+    client = world.app()
+    kept = world.push.subscriptions
+    # A device asks to be notified, and the server has the request and is about
+    # to write it when the device, which gave up on it and turned notifications
+    # off, asks for the address to be deleted, naming the request's permit.
+    permit = permit_from(client)
+    late = body_of(permit=permit)
+    gone = {"endpoint": FCM, "permits": [permit]}
+    put = kept.put
+    deleted: list[int] = []
+
+    def held(*args: Any, **named: Any) -> Any:
+        # The deletion is asked for, and answered, while the write waits.
+        if first == "the deletion":
+            answer = client.post("/api/push/unsubscribe", json=gone, headers=SHOWN)
+            deleted.append(answer.status_code)
+        return put(*args, **named)
+
+    monkeypatch.setattr(kept, "put", held)
+
+    answer = client.post("/api/push/subscribe", json=late, headers=SHOWN)
+
+    if first == "the deletion":
+        # The device was told that the address is deleted, and it stays so: the
+        # request that comes after keeps nothing, and says why.
+        assert deleted == [204]
+        assert (answer.status_code, answer.json()) == (410, {"detail": api_push.PERMIT_SPENT})
+    else:
+        assert answer.status_code == 200
+        assert len(world.kept()) == 1
+        assert client.post("/api/push/unsubscribe", json=gone, headers=SHOWN).status_code == 204
+    assert world.kept() == []
+    assert kept.permits() == 0
+    # And the same request, sent once more by anything on the way, keeps nothing.
+    again = client.post("/api/push/subscribe", json=late, headers=SHOWN)
+    assert again.status_code == 410
+    assert world.kept() == []
+
+
+def test_an_older_request_to_be_notified_cannot_follow_a_newer_one(world: World) -> None:
+    client = world.app()
+    both = [{"lat": NEAR.lat, "lon": NEAR.lon}, {"lat": FAR.lat, "lon": FAR.lon}]
+    # A request with two places is out, and the device gave up on it. A place is
+    # removed, and the next request's permit takes the earlier one's away.
+    earlier = permit_from(client)
+    later = permit_from(client, revoke=[earlier])
+
+    assert (
+        client.post("/api/push/subscribe", json=body_of(permit=later), headers=SHOWN).status_code
+        == 200
+    )
+    late = client.post(
+        "/api/push/subscribe", json=body_of(places=both, permit=earlier), headers=SHOWN
+    )
+
+    assert late.status_code == 410
+    ((_, places, _),) = world.kept()
+    assert [place[:2] for place in json.loads(places)] == [[round(NEAR.lat, 3), round(NEAR.lon, 3)]]
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "shape"),
+    [
+        ("/api/push/permit", {}, api_push.PERMIT_REQUEST_SHAPE),
+        ("/api/push/permit", {"revoke": "secret-1"}, api_push.PERMIT_REQUEST_SHAPE),
+        ("/api/push/permit", {"revoke": ["secret-1"]}, api_push.PERMIT_REQUEST_SHAPE),
+        ("/api/push/permit", {"revoke": ["p" * 32] * 17}, api_push.PERMIT_REQUEST_SHAPE),
+        ("/api/push/permit", {"revoke": [], "endpoint": FCM}, api_push.PERMIT_REQUEST_SHAPE),
+        ("/api/push/unsubscribe", {"endpoint": FCM, "permits": ["secret-1"]}, None),
+        ("/api/push/unsubscribe", {"endpoint": FCM, "permits": "p" * 32}, None),
+        ("/api/push/unsubscribe", {"endpoint": FCM, "more": 1}, None),
+    ],
+)
+def test_a_request_about_a_permit_that_cannot_be_used_is_refused_and_deletes_nothing(
+    world: World, path: str, body: Any, shape: str | None
+) -> None:
+    client = world.app()
+    world.push.subscriptions.put(FCM, [NEAR], at(5))
+
+    response = client.post(path, json=body, headers=SHOWN)
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": shape or api_push.UNSUBSCRIBE_SHAPE}
+    assert "secret" not in response.text
+    assert len(world.kept()) == 1
+    assert world.push.subscriptions.permits() == 0
+
+
+def test_a_permit_is_given_only_by_a_server_that_sends_in_the_mode_that_is_named(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = world.app()
+
+    given = client.post("/api/push/permit", json={"revoke": []}, headers=SHOWN)
+    assert given.status_code == 200
+    answer = given.json()
+    assert set(answer) == {"mode", "permit", "seconds"}
+    assert (answer["mode"], answer["seconds"]) == ("mock", 120)
+    assert timedelta(seconds=120) == PERMIT_LIFE
+
+    unnamed = client.post("/api/push/permit", json={"revoke": []})
+    other = client.post("/api/push/permit", json={"revoke": []}, headers={"Beacon-Mode": "live"})
+    assert (unnamed.status_code, other.status_code) == (400, 409)
+    monkeypatch.setattr(store_module, "MAX_PERMITS", 1)
+    full = client.post("/api/push/permit", json={"revoke": []}, headers=SHOWN)
+    assert (full.status_code, full.json()) == (503, {"detail": api_push.NO_PERMITS})
+    # A permit that is withdrawn makes room for the next.
+    again = client.post("/api/push/permit", json={"revoke": [answer["permit"]]}, headers=SHOWN)
+    assert again.status_code == 200
+    assert world.push.subscriptions.permits() == 1
+
+    none = world.app(push=False)
+    off = none.post("/api/push/permit", json={"revoke": []}, headers=SHOWN)
+    assert (off.status_code, off.json()) == (503, {"detail": OFF})
+    # A deletion that names permits is answered by a server with no file, too.
+    gone = {"endpoint": FCM, "permits": [answer["permit"]]}
+    assert none.post("/api/push/unsubscribe", json=gone, headers=SHOWN).status_code == 204
+
+
 @pytest.mark.parametrize(
     ("body", "status", "detail"),
     [
@@ -1325,6 +1512,11 @@ def test_an_address_is_said_to_be_deleted_only_by_the_server_whose_file_it_is_in
         (body_of(places=[{"lat": 40.7128, "lon": -74.006}]), 422, ELSEWHERE),
         ({**body_of(), "keys": {"p256dh": "secret-1", "auth": "secret-1"}}, 422, None),
         ({"endpoint": FCM}, 422, api_push.SUBSCRIBE_SHAPE),
+        ({"endpoint": FCM, "places": [{"lat": 37.7766, "lon": -122.4236}]}, 422, None),
+        (body_of(permit="secret-1"), 422, api_push.SUBSCRIBE_SHAPE),
+        (body_of(permit=["p" * 32]), 422, api_push.SUBSCRIBE_SHAPE),
+        # A permit of the right shape that no server gave, or that was used.
+        (body_of(), 410, api_push.PERMIT_SPENT),
         (["secret-1"], 422, api_push.SUBSCRIBE_SHAPE),
         ("[" * 9 + "secret-1", 422, api_push.SUBSCRIBE_SHAPE),
     ],
@@ -1373,17 +1565,17 @@ def test_a_request_about_notifications_is_bounded_before_it_is_read(
     held = [admission.admit() for _ in range(8)]
     assert all(held)
     assert admission.admit() is None
-    for path in ("/api/push/subscribe", "/api/push/unsubscribe"):
+    for path in ("/api/push/permit", "/api/push/subscribe", "/api/push/unsubscribe"):
         busy = client.post(path, content="not read", headers=SHOWN)
         assert (busy.status_code, busy.headers["retry-after"]) == (503, "1")
     for give_back in held:
         give_back()
-    assert client.post("/api/push/subscribe", json=body_of(), headers=SHOWN).status_code == 200
+    assert subscribe(client).status_code == 200
     assert admission.held == 0
 
     # A file that is full takes no more, and says so.
     monkeypatch.setattr(store_module, "MAX_SUBSCRIPTIONS", 1)
-    full = client.post("/api/push/subscribe", json=body_of(endpoint=MOZ), headers=SHOWN)
+    full = subscribe(client, endpoint=MOZ)
     assert (full.status_code, full.json()) == (503, {"detail": api_push.FULL})
     assert admission.held == 0
 
@@ -1564,6 +1756,36 @@ def test_a_file_that_cannot_be_swept_does_not_keep_the_other_from_being_swept(
     both.close()
 
 
+def test_a_subscription_whose_time_is_over_is_sent_nothing_though_it_could_not_be_swept(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    day = 24 * 60
+    kept = world.push.subscriptions
+    # Two devices near the fire. One's time is over when crisis mode is turned
+    # on, and the file cannot be swept just then.
+    kept.put(FCM, [NEAR], at(5) - KEPT - timedelta(minutes=1))
+    kept.put(MOZ, [NEAR], at(5) - timedelta(days=1))
+    world.decide()
+    assert near(5 - 30 * day - 1) in kept.all()[0].places
+
+    def locked(now: datetime) -> int:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(kept, "sweep", locked)
+
+    assert world.notify(7) == Pass(sent=1, unswept=1)
+
+    assert [request.url.host for request in world.services.requests] == [
+        "updates.push.services.mozilla.com"
+    ]
+    assert set(kept.tries()) == {(MOZ, world.id_of("fire"))}
+    # At the moment its time is over, to the microsecond, and not before.
+    edge = at(7) - KEPT
+    kept.put(APPLE, [NEAR], edge)
+    assert kept.claim(APPLE, "inc-1", near(7 - 30 * day), at(7))
+    assert not kept.claim(APPLE, "inc-2", near(7 - 30 * day), at(7) + timedelta(microseconds=1))
+
+
 def test_a_server_told_to_send_none_deletes_what_ran_out_whatever_its_contact_is(
     world: World,
 ) -> None:
@@ -1613,7 +1835,7 @@ def test_the_server_opens_push_with_a_key_that_lasts_and_closes_it(
     with TestClient(create_app()) as client:
         first = client.get("/api/push").json()
         push: Push = client.app.state.push  # type: ignore[attr-defined]
-        assert client.post("/api/push/subscribe", json=body_of(), headers=SHOWN).status_code == 200
+        assert subscribe(client).status_code == 200
     assert (first["enabled"], first["mode"]) == (True, "mock")
     # Closed with the server: nothing more is kept, and nothing more is sent.
     with pytest.raises(SubscriptionsError):

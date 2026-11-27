@@ -28,6 +28,10 @@ const KEY = 'beacon.push.v2'
 const INFO = 'GET /api/push'
 const SUBSCRIBE = 'POST /api/push/subscribe'
 const UNSUBSCRIBE = 'POST /api/push/unsubscribe'
+const PERMIT = 'POST /api/push/permit'
+// The permits the server gives, in the order it gives them.
+let permitsGiven = 0
+const permitNo = (given: number) => `permit-${given}`.padEnd(32, '0')
 const CHECK = 'POST /api/places/check'
 const FIRE = { lat: 37.776, lon: -122.424 }
 const FAR = { lat: 37.8, lon: -122.41 }
@@ -115,8 +119,12 @@ function browser({
     shown,
     // Whether the browser lets go of a subscription when it is asked to.
     letsGo: true,
-    // Whether the browser says what it holds when it is asked.
+    // Whether the browser says what it holds when it is asked, and how long
+    // it takes to, in milliseconds.
     says: true,
+    saysAfter: 0,
+    // Whether the browser answers when it is asked to delete kept words.
+    deletes: true,
     // Done while the browser makes a subscription.
     whileSubscribing: async () => {},
     showing: vi.fn(async () => {}),
@@ -211,6 +219,7 @@ function browser({
         return body === undefined ? undefined : new Response(body)
       },
       delete: async (url: string) => {
+        if (!device.deletes) return new Promise<boolean>(() => {})
         events.push(`delete the words ${url.slice(NOTICE_URL.length)}`)
         return kept.delete(`${name} ${url}`)
       },
@@ -227,6 +236,8 @@ function browser({
       // asked about, which is the app's own when no other does.
       getRegistration: vi.fn(async (scope?: string) => {
         if (!device.says) throw new DOMException('No.', 'InvalidStateError')
+        if (device.saysAfter > 0)
+          await new Promise((resolve) => setTimeout(resolve, device.saysAfter))
         return (
           (scope === undefined ? undefined : registrations.get(scope)) ?? root
         )
@@ -240,6 +251,12 @@ function browser({
 const routes = (more: Record<string, unknown> = {}) => ({
   'GET /api/health': MOCK_HEALTH,
   [INFO]: info(),
+  [PERMIT]: () =>
+    Response.json({
+      mode: 'mock',
+      permit: permitNo((permitsGiven += 1)),
+      seconds: 120,
+    }),
   [SUBSCRIBE]: SUBSCRIBED,
   [UNSUBSCRIBE]: () => new Response(null, { status: 204 }),
   [CHECK]: NOTHING_NEAR,
@@ -270,10 +287,15 @@ const wanted = (): unknown => {
   }
 }
 const OFF = { on: null, told: null, forget: [] }
+/** The permits of the requests to be notified that the device holds to be out. */
+const out = (): unknown =>
+  (JSON.parse(window.localStorage.getItem(KEY) ?? '{}') as { out?: unknown })
+    .out ?? []
 const busy = () =>
   Response.json({ detail: 'Beacon is busy. Try again.' }, { status: 503 })
 
 beforeEach(() => {
+  permitsGiven = 0
   window.localStorage.clear()
   window.location.hash = '#/places'
   resetPush()
@@ -364,8 +386,16 @@ test('turning notifications on keeps the server’s words, then sends the addres
   expect(device.words('live')).toBeNull()
   const sent = of(asked, SUBSCRIBE)
   expect(sent).toHaveLength(1)
-  // No name, no id, and each place rounded to about a block.
-  expect(sent[0].body).toEqual({ endpoint: ADDRESS, places: [FIRE, FAR] })
+  // No name, no id, and each place rounded to about a block, with the permit
+  // the server gave for this one request just before.
+  expect(sent[0].body).toEqual({
+    endpoint: ADDRESS,
+    places: [FIRE, FAR],
+    permit: permitNo(1),
+  })
+  expect(of(asked, PERMIT).map((request) => request.body)).toEqual([
+    { revoke: [] },
+  ])
   expect(sent[0].headers['beacon-mode']).toBe('mock')
   // The address was noted on the device before the server had it: were the tab
   // closed before the server answered, the device could still have it deleted.
@@ -390,6 +420,7 @@ test('the server is told again when a place is saved or removed, and deletes the
   expect(of(asked, SUBSCRIBE)[1].body).toEqual({
     endpoint: ADDRESS,
     places: [FIRE, FAR],
+    permit: permitNo(2),
   })
   const ids = (
     JSON.parse(window.localStorage.getItem('beacon.places.v1')!) as {
@@ -432,6 +463,7 @@ test('the app renews what the server keeps when it is opened, with the subscript
   expect(of(asked, SUBSCRIBE)[0].body).toEqual({
     endpoint: `${ADDRESS}-old`,
     places: [FIRE],
+    permit: permitNo(1),
   })
   // The subscription the browser has is the one renewed: no other is made.
   expect(device.subscribe).not.toHaveBeenCalled()
@@ -456,8 +488,8 @@ test('a telling tells the server whatever this tab told it before, because anoth
   expect(await syncPush('mock')).toBe(true)
 
   expect(of(asked, SUBSCRIBE).map((request) => request.body)).toEqual([
-    { endpoint: ADDRESS, places: [FIRE] },
-    { endpoint: ADDRESS, places: [FIRE] },
+    { endpoint: ADDRESS, places: [FIRE], permit: permitNo(1) },
+    { endpoint: ADDRESS, places: [FIRE], permit: permitNo(2) },
   ])
 })
 
@@ -808,7 +840,7 @@ test('a subscription made for another key is let go of once its address is noted
     'subscribe mock',
   ])
   expect(of(asked, SUBSCRIBE).map((request) => request.body)).toEqual([
-    { endpoint: ADDRESS, places: [FIRE] },
+    { endpoint: ADDRESS, places: [FIRE], permit: permitNo(1) },
   ])
   expect(wanted()).toEqual({ ...MOCK_SERVER, forget: [] })
   expect(device.words('mock')).toEqual(NOTICE)
@@ -1077,7 +1109,7 @@ test('a place removed while the browser makes the subscription is not sent', asy
   expect(await syncPush('mock')).toBe(true)
 
   expect(of(asked, SUBSCRIBE).map((request) => request.body)).toEqual([
-    { endpoint: ADDRESS, places: [FAR] },
+    { endpoint: ADDRESS, places: [FAR], permit: permitNo(1) },
   ])
   expect(JSON.stringify(asked)).not.toContain(String(FIRE.lat))
 
@@ -1144,7 +1176,7 @@ test('a server that sends none is asked to delete what an earlier one kept, so a
   expect(await syncPush('mock')).toBe(true)
 
   expect(of(asked, SUBSCRIBE).map((request) => request.body)).toEqual([
-    { endpoint: `${ADDRESS}-old`, places: [FAR] },
+    { endpoint: `${ADDRESS}-old`, places: [FAR], permit: permitNo(1) },
   ])
   expect(JSON.stringify(asked)).not.toContain(String(FIRE.lat))
   expect(device.subscribe).not.toHaveBeenCalled()
@@ -1195,7 +1227,9 @@ test('notifications are turned off at once while the server holds a request open
       .filter((request) => request.key.includes('/api/push/'))
       .map((request) => [request.key, request.body]),
   ).toEqual([
-    [SUBSCRIBE, { endpoint: ADDRESS, places: [FIRE] }],
+    [PERMIT, { revoke: [] }],
+    [SUBSCRIBE, { endpoint: ADDRESS, places: [FIRE], permit: permitNo(1) }],
+    // The request was answered, so its permit is used up and none is named.
     [UNSUBSCRIBE, { endpoint: ADDRESS }],
   ])
   expect(
@@ -1349,6 +1383,221 @@ test('a server that does not answer ends a telling after so long, with its reque
   await vi.advanceTimersByTimeAsync(SYNC_MS)
   await next
   expect(of(asked, SUBSCRIBE)).toEqual([])
+})
+
+// A press of On that is older than a press of Off never undoes it.
+
+test('turning off while the browser asks its leave to turn on holds: nothing is turned on', async () => {
+  await savePlace('Home', FIRE)
+  const device = browser()
+  const asked = serve(routes())
+  // The person is asked for the browser's leave, and meanwhile notifications
+  // are turned off, in this tab or another.
+  device.notification.requestPermission.mockImplementation(async () => {
+    expect(await turnOff()).toBe('off')
+    device.notification.permission = 'granted'
+    return 'granted'
+  })
+
+  expect(await turnOn('mock')).toBe('overtaken')
+
+  expect(pushSnapshot().on).toBeNull()
+  expect(await syncPush('mock')).toBe(true)
+  expect(of(asked, SUBSCRIBE)).toEqual([])
+  expect(device.subscribe).not.toHaveBeenCalled()
+})
+
+test('turning off after turning on took its last look holds too: what is written took note of no later turning off', async () => {
+  await savePlace('Home', FIRE)
+  const device = browser({ permission: 'granted' })
+  const asked = serve(routes())
+  // Another tab turns notifications off right after this one, holding the
+  // lock, read whether they were turned off, and before it writes.
+  const getItem = Storage.prototype.getItem
+  const setItem = Storage.prototype.setItem
+  let looking = false
+  let looked = 0
+  // The browser's leave is the last thing waited for before the lock: the
+  // reading after it is the one turning on makes with the lock held.
+  device.notification.requestPermission.mockImplementation(async () => {
+    looking = true
+    return 'granted'
+  })
+  vi.spyOn(Storage.prototype, 'getItem').mockImplementation(function (
+    this: Storage,
+    key: string,
+  ) {
+    const found = getItem.call(this, key)
+    if (looking && key === OFF_KEY && (looked += 1) === 1)
+      setItem.call(this, OFF_KEY, 'turned-off-in-another-tab')
+    return found
+  })
+
+  expect(await turnOn('mock')).toBe('overtaken')
+
+  expect(looked).toBeGreaterThan(0)
+  vi.restoreAllMocks()
+  resetPush()
+  expect(pushSnapshot().on).toBeNull()
+  expect(await syncPush('mock')).toBe(true)
+  expect(of(asked, SUBSCRIBE)).toEqual([])
+  expect(device.subscribe).not.toHaveBeenCalled()
+  expect(pushSnapshot().on).toBeNull()
+})
+
+// A request that was cut off can still reach the server, and puts nothing back.
+
+test('a request to be notified that was never answered has its permit named when the server is asked to delete, and taken away by the next', async () => {
+  await savePlace('Home', FIRE)
+  window.localStorage.setItem(KEY, turnedOn(null))
+  browser({ permission: 'granted' })
+  let answers = true
+  const asked = serve(
+    routes({
+      [SUBSCRIBE]: () =>
+        answers ? Response.json(SUBSCRIBED) : new Promise<Response>(() => {}),
+    }),
+  )
+  vi.useFakeTimers()
+  const cutOff = async () => {
+    const telling = syncPush('mock')
+    await vi.advanceTimersByTimeAsync(SYNC_MS)
+    expect(await telling).toBe(false)
+    expect(of(asked, SUBSCRIBE).at(-1)?.signal?.aborted).toBe(true)
+  }
+
+  // The server has the request and does not answer: it is cut off, and may
+  // still be written. The device keeps its permit.
+  answers = false
+  await cutOff()
+  expect(out()).toEqual([{ permit: permitNo(1), mode: 'mock' }])
+
+  // The next request's permit takes the earlier one's away, so the earlier
+  // request, with the places as they were then, is too late whenever it comes.
+  await cutOff()
+  expect(of(asked, PERMIT).map((request) => request.body)).toEqual([
+    { revoke: [] },
+    { revoke: [permitNo(1)] },
+  ])
+  expect(of(asked, SUBSCRIBE).at(-1)?.body).toMatchObject({
+    permit: permitNo(2),
+  })
+  expect(out()).toEqual([{ permit: permitNo(2), mode: 'mock' }])
+
+  // Turned off: the deletion names the permit of the request that is out, and
+  // the server takes it away in the write that deletes.
+  expect(await turnOff()).toBe('off')
+  expect(await syncPush('mock')).toBe(true)
+  expect(of(asked, UNSUBSCRIBE).map((request) => request.body)).toEqual([
+    { endpoint: ADDRESS, permits: [permitNo(2)] },
+  ])
+  expect(wanted()).toEqual(OFF)
+  expect(out()).toEqual([])
+})
+
+test('a request to be notified that is answered, or refused for its permit, is not out', async () => {
+  await savePlace('Home', FIRE)
+  window.localStorage.setItem(KEY, turnedOn(null))
+  browser({ permission: 'granted' })
+  const spent =
+    'This request to be notified came without a permit that is still good.'
+  let refuse = true
+  // What the device held to be out when the server was given the request.
+  let outWhenSent: unknown = null
+  const asked = serve(
+    routes({
+      [SUBSCRIBE]: () => {
+        outWhenSent = out()
+        return refuse
+          ? Response.json({ detail: spent }, { status: 410 })
+          : Response.json(SUBSCRIBED)
+      },
+    }),
+  )
+
+  // Refused for its permit: the server kept nothing of it and never will.
+  expect(await syncPush('mock')).toBe(false)
+  expect(outWhenSent).toEqual([{ permit: permitNo(1), mode: 'mock' }])
+  expect(out()).toEqual([])
+  expect(pushSnapshot().problem).toBe(spent)
+
+  refuse = false
+  expect(await syncPush('mock')).toBe(true)
+  // The permit is noted before the request is sent, and gone once answered.
+  expect(outWhenSent).toEqual([{ permit: permitNo(2), mode: 'mock' }])
+  expect(out()).toEqual([])
+  expect(of(asked, PERMIT).map((request) => request.body)).toEqual([
+    { revoke: [] },
+    { revoke: [] },
+  ])
+})
+
+// The browser's own cleaning up keeps nothing from the server.
+
+test('a browser that never answers when asked to let go and to delete the words is waited for once, and the server is still asked to delete', async () => {
+  window.localStorage.setItem(
+    KEY,
+    JSON.stringify({ on: null, told: null, forget: [] }),
+  )
+  const device = browser({
+    permission: 'granted',
+    subscribed: { mode: 'mock', key: KEY_BYTES },
+  })
+  const asked = serve(routes())
+  device
+    .subscription('mock')!
+    .unsubscribe.mockImplementation(() => new Promise<boolean>(() => {}))
+  device.deletes = false
+  // And it is slow to say what it holds, which takes from the same time.
+  device.saysAfter = BROWSER_MS / 2
+  vi.useFakeTimers()
+
+  const telling = syncPush('mock')
+  await vi.advanceTimersByTimeAsync(BROWSER_MS - 100)
+  expect(of(asked, UNSUBSCRIBE)).toEqual([])
+  // One wait for all of it, not one for each thing the browser was asked.
+  await vi.advanceTimersByTimeAsync(200)
+
+  expect(of(asked, UNSUBSCRIBE).map((request) => request.body)).toEqual([
+    { endpoint: `${ADDRESS}-old` },
+  ])
+  // It is worth trying again, and says what is not known of the browser.
+  expect(await telling).toBe(false)
+  expect(pushSnapshot()).toMatchObject({ held: true, deleted: true })
+  expect(wanted()).toEqual(OFF)
+  // The lock is given back: the next telling, and a turning off, have it.
+  expect(
+    await navigator.locks.request(
+      'beacon.push',
+      { ifAvailable: true },
+      async (lock) => lock !== null,
+    ),
+  ).toBe(true)
+})
+
+test('kept words the browser never deletes keep neither the lock nor the deletion from the server', async () => {
+  window.localStorage.setItem(KEY, turnedOn(`${ADDRESS}-old`))
+  const device = browser({
+    permission: 'granted',
+    subscribed: { mode: 'mock', key: KEY_BYTES },
+  })
+  const asked = serve(routes())
+  device.deletes = false
+  vi.useFakeTimers()
+
+  const off = turnOff()
+  await vi.advanceTimersByTimeAsync(BROWSER_MS)
+  // The browser let go of the subscription, which is what was asked of it.
+  expect(await off).toBe('off')
+  const telling = syncPush('mock')
+  await vi.advanceTimersByTimeAsync(BROWSER_MS)
+
+  expect(await telling).toBe(true)
+  expect(of(asked, UNSUBSCRIBE).map((request) => request.body)).toEqual([
+    { endpoint: `${ADDRESS}-old` },
+  ])
+  expect(device.subscription('mock')).toBeNull()
+  expect(wanted()).toEqual(OFF)
 })
 
 // What is not known of the browser is not said to be nothing.
