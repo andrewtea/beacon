@@ -91,6 +91,7 @@ function View({
   input,
   repeatsText,
   mediaText,
+  about,
   onOtherMode,
 }: {
   route: Route
@@ -98,6 +99,9 @@ function View({
   input: Input | null
   repeatsText: string | null
   mediaText: string | null
+  // What is said of this server on the pages a person sends something from
+  // (`AboutServer`), which each of those pages puts under its own first control.
+  about: ReactNode
   onOtherMode: () => void
 }) {
   switch (route.view) {
@@ -107,6 +111,7 @@ function View({
           mode={mode}
           input={input}
           mediaText={mediaText}
+          about={about}
           onOtherMode={onOtherMode}
         />
       )
@@ -145,7 +150,14 @@ function View({
     case 'map':
       return <MapView key={route.id} id={route.id} />
     case 'places':
-      return <PlacesView mode={mode} input={input} onOtherMode={onOtherMode} />
+      return (
+        <PlacesView
+          mode={mode}
+          input={input}
+          about={about}
+          onOtherMode={onOtherMode}
+        />
+      )
     case 'results':
       return <ResultsView />
     case 'unknown':
@@ -159,6 +171,62 @@ function View({
         </div>
       )
   }
+}
+
+/**
+ * What is said of this server on the pages a person sends something from: that
+ * its scenario is invented, with the server's sentences about telling the story
+ * again and about who does the model's work on it, and the server's sentence
+ * about what it takes of a visitor and why. Every sentence is whole and is on
+ * the page without a press. It is put under the page's first control, so that
+ * the button is what a person meets first; the line above the control and the
+ * sentence under the button say the short of it before anything is sent.
+ */
+function AboutServer({
+  mock,
+  repeatsText,
+  tellerText,
+  frontText,
+  frontMore,
+}: {
+  mock: boolean
+  repeatsText: string | null
+  tellerText: string | null
+  frontText: string | null
+  frontMore: string | null
+}) {
+  if (!mock && frontText === null) return null
+  return (
+    <section className="about-server" aria-labelledby="about-server-heading">
+      <h2 id="about-server-heading">About this server</h2>
+      {mock && (
+        <p className="mock-banner">
+          Beacon is running on an invented scenario, not real sources. The
+          incidents, alerts, and notices it shows are made up and are not a
+          record of anything that happened.
+          {/* On a server that tells the story again, the server's sentence
+              about that: a tap sent now is gone when it does. */}
+          {repeatsText !== null && <> {repeatsText}</>}
+          {/* Where a model works on the invented story, the server's
+              sentence about that: the story is made up all the same. */}
+          {tellerText !== null && <> {tellerText}</>}
+        </p>
+      )}
+      {/* On a server behind a host nobody has checked: the server's sentence
+          about what it takes and why. */}
+      {frontText !== null && (
+        <div className="note front-note">
+          <p>{frontText}</p>
+          {frontMore !== null && (
+            <details>
+              <summary>More about this</summary>
+              <p>{frontMore}</p>
+            </details>
+          )}
+        </div>
+      )}
+    </section>
+  )
 }
 
 export default function App() {
@@ -191,6 +259,8 @@ export default function App() {
   // The server is kept told of what this device wants of notifications, as far
   // as it has said it takes that.
   usePushSync(mode, input, askAgain)
+  // The pages a person sends something from: the button's and the places'.
+  const sends = route.view === 'home' || route.view === 'places'
 
   return (
     <div className="app">
@@ -203,35 +273,15 @@ export default function App() {
           <span className="tag stand-in">Invented scenario</span>
         )}
       </header>
-      {mode === 'mock' &&
-        (route.view === 'home' || route.view === 'places') && (
-          <p className="mock-banner">
-            Beacon is running on an invented scenario, not real sources. The
-            incidents, alerts, and notices it shows are made up and are not a
-            record of anything that happened.
-            {/* On a server that tells the story again, the server's sentence
-                about that: a tap sent now is gone when it does. */}
-            {repeatsText !== null && <> {repeatsText}</>}
-            {/* Where a model works on the invented story, the server's
-                sentence about that: the story is made up all the same. */}
-            {tellerText !== null && <> {tellerText}</>}
-          </p>
-        )}
-      {/* On a server behind a host nobody has checked: the server's sentence
-          about what it takes and why, on the pages a person sends something
-          from. */}
-      {frontText !== null &&
-        (route.view === 'home' || route.view === 'places') && (
-          <div className="note front-note">
-            <p>{frontText}</p>
-            {frontMore !== null && (
-              <details>
-                <summary>More about this</summary>
-                <p>{frontMore}</p>
-              </details>
-            )}
-          </div>
-        )}
+      {/* What the tag above means, in a line, before the first control of a
+          page a person sends something from. The rest of what is said of this
+          server is on the same page, under that control (`AboutServer`). */}
+      {mode === 'mock' && sends && (
+        <p className="mock-line">
+          Nothing Beacon shows here happened: the incidents, alerts, and notices
+          are made up.
+        </p>
+      )}
       {unreachable && (
         <p className="note problem" role="status">
           {health.error?.message}
@@ -244,6 +294,17 @@ export default function App() {
           input={input}
           repeatsText={repeatsText}
           mediaText={mediaText}
+          about={
+            sends ? (
+              <AboutServer
+                mock={mode === 'mock'}
+                repeatsText={repeatsText}
+                tellerText={tellerText}
+                frontText={frontText}
+                frontMore={frontMore}
+              />
+            ) : null
+          }
           onOtherMode={askAgain}
         />
       </main>

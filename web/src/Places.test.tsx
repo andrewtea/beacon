@@ -122,6 +122,38 @@ test('a place is kept on the device under its name, and only where it is is sent
   expect(within(section).getByText('Invented')).toBeInTheDocument()
 })
 
+test('what is said of the server is on the places’ page, under the control that saves a place', async () => {
+  const front = 'On this server a tap is sent from one of two invented places.'
+  serve({
+    'GET /api/health': {
+      ...MOCK_HEALTH,
+      input: 'invented',
+      front_text: front,
+      front_more_text: 'The rest.',
+    },
+  })
+  render(<App />)
+  window.location.hash = '#/places'
+
+  const about = await screen.findByRole('region', { name: 'About this server' })
+  const follows = (first: Element, second: Element) =>
+    Boolean(
+      first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING,
+    )
+  // The page's own heading and its first control come first, after a line
+  // that says the scenario is invented.
+  const line = screen.getByText(/Nothing Beacon shows here happened/)
+  const heading = screen.getByRole('heading', { name: 'Your places' })
+  const save = screen.getByRole('heading', { name: 'Save a place' })
+  expect(follows(line, heading)).toBe(true)
+  expect(follows(save, about)).toBe(true)
+  // Whole, and without a press.
+  expect(within(about).getByText(front)).toBeInTheDocument()
+  expect(
+    within(about).getByText(/running on an invented scenario/),
+  ).toBeInTheDocument()
+})
+
 test('a server that takes only the invented places is sent no place of a person’s own, and none is asked of the phone', async () => {
   // A place saved when another server took it: somebody's own.
   const OWN = { lat: 37.775, lon: -122.42 }

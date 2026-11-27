@@ -73,6 +73,16 @@ const INVENTED = /running on an invented scenario, not real sources/
 
 const click = (element: HTMLElement) => element.click()
 
+const FRONT =
+  'On this server a tap is sent from one of two invented places, not from where you are.'
+const FRONT_MORE = 'The address a tap’s answer is read at holds the tap’s id.'
+const INVENTED_ONLY = {
+  ...MOCK_HEALTH,
+  input: 'invented',
+  front_text: FRONT,
+  front_more_text: FRONT_MORE,
+}
+
 test('says that it runs on an invented scenario before anybody taps', async () => {
   serve({ 'GET /api/health': MOCK_HEALTH })
 
@@ -80,6 +90,49 @@ test('says that it runs on an invented scenario before anybody taps', async () =
 
   expect(await screen.findByText(INVENTED)).toBeInTheDocument()
   expect(screen.getByRole('button', { name: ASK })).toBeEnabled()
+})
+
+test('the button comes first, with a line that says the scenario is invented above it and the rest under it', async () => {
+  serve({ 'GET /api/health': INVENTED_ONLY })
+
+  render(<App />)
+
+  const about = await screen.findByRole('region', { name: 'About this server' })
+  const button = screen.getByRole('button', { name: ASK })
+  const follows = (first: Element, second: Element) =>
+    Boolean(
+      first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING,
+    )
+  // What a person meets before the button: that nothing shown here happened.
+  const line = screen.getByText(/Nothing Beacon shows here happened/)
+  expect(follows(line, button)).toBe(true)
+  // Under the button, and on the page without a press: what says the scenario
+  // is invented, whole, and the server's sentence about what it takes.
+  expect(follows(button, about)).toBe(true)
+  expect(about).toContainElement(screen.getByText(INVENTED))
+  expect(about).toContainElement(screen.getByText(FRONT))
+  // Before the button's own sentence about what it sends is left behind.
+  const sends = screen.getByText(
+    /the button sends a tap from an invented place/,
+  )
+  expect(follows(sends, about)).toBe(true)
+  // Ahead of the places a tap can be sent as if from.
+  const spots = screen.getByRole('region', {
+    name: 'Try the invented scenario',
+  })
+  expect(follows(about, spots)).toBe(true)
+})
+
+test('on real sources nothing is said of an invented scenario, above the button or under it', async () => {
+  serve({ 'GET /api/health': { ...MOCK_HEALTH, mode: 'live', teller: null } })
+
+  render(<App />)
+
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: ASK })).toBeEnabled(),
+  )
+  expect(screen.queryByText(/Nothing Beacon shows here happened/)).toBeNull()
+  expect(screen.queryByRole('region', { name: 'About this server' })).toBeNull()
 })
 
 test('says, in the server’s sentence, that the invented scenario is told again and what becomes of taps', async () => {
@@ -131,16 +184,6 @@ test('says nothing of Meta where no clip or photo is sent there', async () => {
   await screen.findByRole('group', { name: 'Add to your tap' })
   expect(screen.queryByText(/Meta/)).not.toBeInTheDocument()
 })
-
-const FRONT =
-  'On this server a tap is sent from one of two invented places, not from where you are.'
-const FRONT_MORE = 'The address a tap’s answer is read at holds the tap’s id.'
-const INVENTED_ONLY = {
-  ...MOCK_HEALTH,
-  input: 'invented',
-  front_text: FRONT,
-  front_more_text: FRONT_MORE,
-}
 
 test('says, in the server’s sentences, what a server behind an unchecked host takes and why', async () => {
   serve({ 'GET /api/health': INVENTED_ONLY })
@@ -1346,6 +1389,11 @@ test('a run whose totals may be incomplete says so in the server’s sentence, a
   expect(totals).toHaveTextContent(cost)
   expect(totals).toHaveTextContent('Requests answered')
   expect(totals).not.toHaveTextContent(/not in these totals/)
+  // What the whole run took is read before its rounds.
+  const first = screen.getByRole('heading', { name: 'Round 1' })
+  expect(
+    totals.compareDocumentPosition(first) & Node.DOCUMENT_POSITION_FOLLOWING,
+  ).toBeTruthy()
 })
 
 test('takes no tap and no second picture while a chosen photo is still being drawn', async () => {

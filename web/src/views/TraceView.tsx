@@ -195,33 +195,8 @@ function Finished({ run }: { run: TapRun }) {
           </>
         )}
       </dl>
-      <ol className="rounds">
-        {run.rounds.map((round) => (
-          <li key={round.n} className="round">
-            <h3>Round {round.n}</h3>
-            <p className="meta">
-              {round.calls.length === 1
-                ? '1 tool call of this round was kept.'
-                : `${round.calls.length} tool calls of this round were kept.`}{' '}
-              A round can have asked for more than were kept.
-            </p>
-            <Accounting ember={round.ember} />
-            <ol className="calls">
-              {round.calls.map((call, index) => (
-                <Call key={index} call={call} />
-              ))}
-            </ol>
-          </li>
-        ))}
-        <li className="round answer">
-          <h3>Answer</h3>
-          {run.final !== null && <Accounting ember={run.final} />}
-          {run.cut_short_text !== null && (
-            <p className="note problem">{run.cut_short_text}</p>
-          )}
-          {run.outcome !== null && <OutcomePanel outcome={run.outcome} />}
-        </li>
-      </ol>
+      {/* Before the rounds: what the whole run took is what a reader asks first,
+          and each round below says what it took of it. */}
       <section className="panel totals" aria-labelledby="totals-heading">
         <h2 id="totals-heading">Totals</h2>
         <dl className="accounting">
@@ -261,6 +236,33 @@ function Finished({ run }: { run: TapRun }) {
         )}
         {run.cost_text !== null && <p className="note">{run.cost_text}</p>}
       </section>
+      <ol className="rounds">
+        {run.rounds.map((round) => (
+          <li key={round.n} className="round">
+            <h3>Round {round.n}</h3>
+            <p className="meta">
+              {round.calls.length === 1
+                ? '1 tool call of this round was kept.'
+                : `${round.calls.length} tool calls of this round were kept.`}{' '}
+              A round can have asked for more than were kept.
+            </p>
+            <Accounting ember={round.ember} />
+            <ol className="calls">
+              {round.calls.map((call, index) => (
+                <Call key={index} call={call} />
+              ))}
+            </ol>
+          </li>
+        ))}
+        <li className="round answer">
+          <h3>Answer</h3>
+          {run.final !== null && <Accounting ember={run.final} />}
+          {run.cut_short_text !== null && (
+            <p className="note problem">{run.cut_short_text}</p>
+          )}
+          {run.outcome !== null && <OutcomePanel outcome={run.outcome} />}
+        </li>
+      </ol>
     </>
   )
 }
