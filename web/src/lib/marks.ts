@@ -7,7 +7,8 @@ import type { MapFrame } from './tiles.ts'
 // never moved. For a thing that has a point the anchor is that point, exactly
 // where the frame puts it, and it is drawn as a dot. For an area it is a point
 // of the area's own outline that is in view, and never a point that is on
-// neither its outline nor its fill. The number is what gives way: to the edge
+// neither its outline nor its fill. For an aircraft none of whose positions is
+// in view it is a point of its drawn line that is, with no dot. The number is what gives way: to the edge
 // of the picture, to another number, and to a dot. A number that does not
 // stand on its anchor is joined to it by a line.
 
@@ -71,6 +72,17 @@ function clip(a: Spot, b: Spot, inset: number): [Spot, Spot] | null {
   ]
 }
 
+/** The parts of a line through `corners` that are in the picture, `inset` in
+ * from its edges, in the line's own order. */
+function partsIn(corners: Spot[], inset: number): [Spot, Spot][] {
+  const parts: [Spot, Spot][] = []
+  for (const [index, corner] of corners.slice(1).entries()) {
+    const part = clip(corners[index], corner, inset)
+    if (part !== null) parts.push(part)
+  }
+  return parts
+}
+
 /** The parts of an area's outline (every ring of every polygon, holes
  * included) that are in the picture, `inset` in from its edges. */
 function outlineIn(
@@ -78,17 +90,20 @@ function outlineIn(
   feature: Feature,
   inset: number,
 ): [Spot, Spot][] {
-  const parts: [Spot, Spot][] = []
-  for (const rings of feature.polygons)
-    for (const ring of rings) {
-      const corners = ring.map((point) => at(frame, point))
-      for (const [index, corner] of corners.slice(1).entries()) {
-        const part = clip(corners[index], corner, inset)
-        if (part !== null) parts.push(part)
-      }
-    }
-  return parts
+  return feature.polygons.flatMap((rings) =>
+    rings.flatMap((ring) =>
+      partsIn(
+        ring.map((point) => at(frame, point)),
+        inset,
+      ),
+    ),
+  )
 }
+
+const middleOf = ([a, b]: [Spot, Spot]): Spot => ({
+  x: (a.x + b.x) / 2,
+  y: (a.y + b.y) / 2,
+})
 
 function inRing(ring: Spot[], spot: Spot): boolean {
   let inside = false
@@ -124,17 +139,27 @@ export function coversView(frame: MapFrame, feature: Feature): boolean {
 
 type Anchor = {
   spot: Spot
-  // Whether the spot is the thing's own point, which is drawn as a dot. An
-  // area's is a point of its outline, and has no dot.
+  // Whether the spot is the thing's own point, which is drawn as a dot: a
+  // place, a 511 event, a position an aircraft was seen at. A point of an
+  // area's outline has no dot, and neither has a point of the line between two
+  // positions of an aircraft, where nobody saw it.
   dot: boolean
 }
 
-/** The place on the picture a thing's number is about: its point, or the
- * newest position of an aircraft that is in view. For an area, the middle of
- * the longest stretch of its outline that is in view, taken far enough in from
- * the picture's edge for a number to stand on it when there is such a stretch.
- * Null when nothing of the thing is in view to put a number to: a point out of
- * view, and an area with none of its outline in view. */
+/** The place on the picture a thing's number is about.
+ *
+ * - A thing with a point: the point.
+ * - An aircraft: the newest position it was seen at that is in view. With none
+ *   in view, the middle of the newest stretch of its drawn line that is: the
+ *   line between two positions can cross a picture that neither is in, and a
+ *   line that is drawn has its number. That middle is no sighting and gets no
+ *   dot.
+ * - An area: the middle of the longest stretch of its outline that is in view.
+ *
+ * A stretch is taken far enough in from the picture's edge for a number to
+ * stand on it when there is such a stretch. Null when nothing of the thing is
+ * in view to put a number to: a point out of view, an aircraft whose line does
+ * not cross the picture, and an area with none of its outline in view. */
 function anchorOf(frame: MapFrame, feature: Feature): Anchor | null {
   if (feature.point !== null) {
     const spot = at(frame, feature.point)
@@ -143,15 +168,20 @@ function anchorOf(frame: MapFrame, feature: Feature): Anchor | null {
   if (feature.path.length > 0) {
     const seen = feature.path.map((position) => at(frame, position))
     const spot = seen.findLast(inView)
-    return spot === undefined ? null : { spot, dot: true }
+    if (spot !== undefined) return { spot, dot: true }
+    for (const inset of [MARGIN, 0]) {
+      const newest = partsIn(seen, inset).at(-1)
+      if (newest !== undefined) return { spot: middleOf(newest), dot: false }
+    }
+    return null
   }
   for (const inset of [MARGIN, 0]) {
     const parts = outlineIn(frame, feature, inset)
     if (parts.length === 0) continue
-    const [a, b] = parts.reduce((longest, part) =>
-      apart(...part) > apart(...longest) ? part : longest,
+    const longest = parts.reduce((best, part) =>
+      apart(...part) > apart(...best) ? part : best,
     )
-    return { spot: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, dot: false }
+    return { spot: middleOf(longest), dot: false }
   }
   return null
 }
@@ -211,7 +241,7 @@ export function marksOf(frame: MapFrame, features: Feature[]): (Mark | null)[] {
     if (anchor === null) return null
     const { spot } = anchor
     const tries = [
-      // An area's number may stand on its outline. A point's stands beside it.
+      // A number may stand on an outline or a line. A point's stands beside it.
       ...(anchor.dot ? [] : [spot]),
       ...AROUND.map((offset) => ({
         x: spot.x + offset.x,

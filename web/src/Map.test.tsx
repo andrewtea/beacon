@@ -667,6 +667,85 @@ test('a number that is not on its area’s outline is drawn with a line to it, a
   expect(document.querySelectorAll('.map-dot')).toHaveLength(0)
 })
 
+test('an aircraft whose line crosses the picture between two positions out of view has its number on the line, and no dot', () => {
+  const seen = (...spots: [number, number][]) =>
+    feature({
+      kind: 'aircraft',
+      path: spots.map(([x, y], index) => ({
+        lat: y,
+        lon: x,
+        at: `2026-11-26T23:3${index}:00Z`,
+      })),
+    })
+  // West of the picture, then east of it: the line between runs through it.
+  const crossing = seen([-100, 100], [400, 100])
+  const [mark] = marksOf(UNITS, [crossing])
+  expect(mark).not.toBeNull()
+  // On the drawn line, inside the picture, and not presented as a sighting.
+  expect(mark!.anchor).toEqual({ x: 150, y: 100 })
+  expect(mark!.dot).toBe(false)
+  expect(mark!.number).toEqual(mark!.anchor)
+
+  // Two such aircraft are told apart: each number is on its own line.
+  const other = seen([-100, -50], [200, 400], [600, 400])
+  const [first, second] = marksOf(UNITS, [crossing, other])
+  expect(first!.anchor.y).toBe(100)
+  expect(second!.dot).toBe(false)
+  // On the line from (-100, -50) to (200, 400): y = 1.5 x + 100.
+  expect(second!.anchor.y).toBeCloseTo(1.5 * second!.anchor.x + 100)
+  expect(second!.anchor.x).toBeGreaterThan(0)
+  expect(second!.anchor.y).toBeLessThan(SIZE)
+
+  // Of several stretches in view, the newest carries the number.
+  const twice = seen([-50, 50], [350, 50], [350, 250], [-50, 250])
+  expect(marksOf(UNITS, [twice])[0]!.anchor).toEqual({ x: 150, y: 250 })
+
+  // A position in view is still what the number is about, with its dot.
+  const sighted = seen([-100, 100], [400, 100], [220, 180], [400, 300])
+  const [inView] = marksOf(UNITS, [sighted])
+  expect(inView!.anchor.x).toBeCloseTo(220)
+  expect(inView!.anchor.y).toBeCloseTo(180)
+  expect(inView!.dot).toBe(true)
+
+  // A line that never crosses the picture has no number.
+  expect(marksOf(UNITS, [seen([-100, -100], [400, -100], [400, 400])])).toEqual(
+    [null],
+  )
+  expect(marksOf(UNITS, [seen([-100, 100])])).toEqual([null])
+})
+
+test('a line through the picture with no position in view is drawn with a number and no dot', () => {
+  // A long way west of the incident, then a long way east.
+  const passing = feature({
+    kind: 'aircraft',
+    text: AIRCRAFT,
+    path: [
+      {
+        lat: HAYES.lat + 0.002,
+        lon: HAYES.lon - 0.05,
+        at: '2026-11-26T23:30:00Z',
+      },
+      {
+        lat: HAYES.lat + 0.002,
+        lon: HAYES.lon + 0.05,
+        at: '2026-11-26T23:30:30Z',
+      },
+    ],
+  })
+  for (const position of passing.path) {
+    const { x } = projected(position)
+    expect(x < 0 || x > SIZE).toBe(true)
+  }
+
+  canvas([passing])
+
+  expect(document.querySelectorAll('.map-path')).toHaveLength(1)
+  expect(numbers()).toHaveLength(1)
+  expect(numbers()[0].y).toBeCloseTo(projected(passing.path[0]).y, 1)
+  expect(document.querySelectorAll('.map-dot')).toHaveLength(0)
+  expect(document.querySelectorAll('.map-leader')).toHaveLength(0)
+})
+
 test('an area that holds the whole picture has no number on it, and the picture says which area that is', () => {
   const far = ring([-500, -500], [800, -500], [800, 800], [-500, 800])
   expect(coversView(UNITS, area([far]))).toBe(true)
