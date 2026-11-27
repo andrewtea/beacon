@@ -18,7 +18,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from beacon import serve, telling
-from beacon.ember import EmberClient, SpendScope, Storage
+from beacon.ember import EmberClient, EmberConfigError, SpendScope, Storage
 from beacon.evidence import EvidenceStore, EvidenceStoreError
 from beacon.incident.build import label_of
 from beacon.ingest import Clock, IngestConfigError, build
@@ -277,6 +277,130 @@ def test_ember_is_not_set_to_work_on_the_story_without_a_budget_a_key_or_a_voice
         build(env, clock, paid=Meta(tmp_path).client)
     # None of these left anything behind: no store, and no ledger either.
     assert list(tmp_path.iterdir()) == []
+
+
+def _ledger(data: Path) -> str:
+    """Begin a ledger under `data`, as a client that came before did, and answer
+    its generation."""
+    return EmberClient.replay_only(Storage.under(data)).ledger_generation()
+
+
+def test_a_telling_that_names_its_ledger_is_paid_from_that_ledger_or_not_at_all(
+    env: dict[str, str], tmp_path: Path
+) -> None:
+    clock = Clock(lambda: NOON)
+    ledger = tmp_path / "ember" / "ledger.sqlite3"
+    named = env | {telling.LEDGER_VARIABLE: "0" * 32}
+
+    # No ledger: none is begun, which would count nothing of what was spent.
+    with pytest.raises(telling.TellingConfigError, match="no ledger was begun"):
+        build(named, clock, paid=Meta(tmp_path).client)
+    assert list(tmp_path.iterdir()) == []
+    # An empty file where the ledger was is no ledger, and stays empty.
+    ledger.parent.mkdir()
+    ledger.write_bytes(b"")
+    with pytest.raises(telling.TellingConfigError, match="is not that one"):
+        build(named, clock, paid=Meta(tmp_path).client)
+    assert ledger.read_bytes() == b""
+    assert [path.name for path in tmp_path.iterdir()] == ["ember"]
+    ledger.unlink()
+
+    # Another ledger than the one named.
+    generation = _ledger(tmp_path)
+    assert generation != "0" * 32
+    with pytest.raises(telling.TellingConfigError, match="is not that one"):
+        build(named, clock, paid=Meta(tmp_path).client)
+    assert not (tmp_path / "evidence").exists()
+    # A setting that is no generation is refused as that.
+    with pytest.raises(telling.TellingConfigError, match="is the generation of the ledger"):
+        build(env | {telling.LEDGER_VARIABLE: "the one"}, clock, paid=Meta(tmp_path).client)
+
+    # The one named: the story is told, and paid for in it.
+    meta = Meta(tmp_path)
+    told(env | {telling.LEDGER_VARIABLE: generation}, 7, meta).close()
+    assert meta.spend(telling.RADIO)[0] == 5
+    assert _ledger(tmp_path) == generation
+
+
+def test_a_client_that_is_on_another_ledger_than_the_one_named_pays_nothing(
+    env: dict[str, str], tmp_path: Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    # The look before a client is made and the client's own file are two looks:
+    # the second is of the file the client pays in.
+    generation = _ledger(tmp_path)
+    elsewhere = Meta(tmp_path_factory.mktemp("elsewhere"))
+
+    with pytest.raises(telling.TellingConfigError, match="is not that one"):
+        telling.paying(env | {telling.LEDGER_VARIABLE: generation}, telling.TAPS, elsewhere.client)
+
+    assert elsewhere.api.requests == []
+
+
+def test_what_can_be_seen_before_a_server_is_started_is_looked_at_and_nothing_is_made(
+    env: dict[str, str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    live = env | {"REPLAY": "0", "EMBER_SPENT_BEFORE_USD": "0"}
+    ledger = tmp_path / "ember" / "ledger.sqlite3"
+    # A stand-in's telling needs nothing, and has no ledger to name.
+    assert telling.preflight({"BEACON_DATA_DIR": str(tmp_path)}) is None
+    assert telling.main({"BEACON_DATA_DIR": str(tmp_path)}) == 0
+    assert capsys.readouterr().out == ""
+
+    with pytest.raises(telling.TellingConfigError, match="stand-in, which is the default, or live"):
+        telling.preflight(live | {telling.MOCK_EMBER_VARIABLE: "yes"})
+    # Paid requests are asked for by name.
+    for replay in ({}, {"REPLAY": "1"}, {"REPLAY": ""}):
+        with pytest.raises(telling.TellingConfigError, match="Set REPLAY=0 beside it"):
+            telling.preflight(env | replay)
+    # A budget the server would refuse is refused here, before anything is moved.
+    for wrong in ("", "ten cents", "-1", "0.10 dollars"):
+        with pytest.raises(telling.TellingConfigError, match=telling.BUDGET_VARIABLE):
+            telling.preflight(live | {telling.BUDGET_VARIABLE: wrong})
+    with pytest.raises(EmberConfigError, match="absolute path"):
+        telling.preflight(live | {"BEACON_DATA_DIR": "data"})
+    # So are the spending settings it is handed, as a client would read them.
+    unsaid = {name: value for name, value in live.items() if name != "EMBER_SPENT_BEFORE_USD"}
+    with pytest.raises(telling.TellingConfigError, match="needs EMBER_SPENT_BEFORE_USD"):
+        telling.preflight(unsaid)
+    with pytest.raises(EmberConfigError, match="EMBER_SPENT_BEFORE_USD"):
+        telling.preflight(live | {"EMBER_SPENT_BEFORE_USD": "none"})
+    with pytest.raises(EmberConfigError, match="EMBER_STOP_USD"):
+        telling.preflight(live | {"EMBER_STOP_USD": "three"})
+    with pytest.raises(EmberConfigError, match="Lower EMBER_STOP_USD"):
+        telling.preflight(live | {"EMBER_SPENT_BEFORE_USD": "9", "EMBER_STOP_USD": "3"})
+
+    # No ledger that was begun: nothing there, an empty file, a link, another file.
+    with pytest.raises(telling.TellingConfigError, match="no ledger that was begun"):
+        telling.preflight(live)
+    assert list(tmp_path.iterdir()) == []
+    ledger.parent.mkdir()
+    ledger.write_bytes(b"")
+    assert telling.main(live) == 2
+    assert "A ledger begun anew would count nothing" in capsys.readouterr().err
+    assert ledger.read_bytes() == b""
+    ledger.unlink()
+    EvidenceStore(ledger, "mock").close()
+    with pytest.raises(telling.TellingConfigError, match="no ledger that was begun"):
+        telling.preflight(live)
+    for beside in ledger.parent.iterdir():
+        beside.unlink()
+    generation = _ledger(tmp_path / "kept")
+    ledger.symlink_to(tmp_path / "kept" / "ember" / "ledger.sqlite3")
+    with pytest.raises(telling.TellingConfigError, match="no ledger that was begun"):
+        telling.preflight(live)
+    ledger.unlink()
+
+    # The ledger that is there is named, to be handed to the server.
+    generation = _ledger(tmp_path)
+    before = ledger.read_bytes()
+    assert telling.preflight(live) == generation
+    assert telling.main(live) == 0
+    assert capsys.readouterr().out == generation + "\n"
+    assert ledger.read_bytes() == before
+    # One that is named already has to be that one.
+    assert telling.preflight(live | {telling.LEDGER_VARIABLE: generation}) == generation
+    with pytest.raises(telling.TellingConfigError, match="is not that one"):
+        telling.preflight(live | {telling.LEDGER_VARIABLE: "0" * 32})
 
 
 def test_the_budget_is_split_among_the_four_scopes_and_is_the_most_they_hold_together() -> None:

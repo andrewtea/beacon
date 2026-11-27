@@ -33,6 +33,7 @@ import json
 import os
 import secrets
 import sqlite3
+import stat
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
@@ -40,6 +41,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
+from urllib.parse import quote
 
 from beacon.ember.errors import BudgetExceededError, LedgerReplacedError
 from beacon.ember.pricing import MODEL, Usage, to_usd
@@ -431,6 +433,38 @@ class Ledger:
 def _generation(db: sqlite3.Connection) -> str:
     """The generation of the file this connection is open on."""
     return db.execute(_GENERATION).fetchone()[0]
+
+
+# The columns a ledger's accounting is read from: a file without them is no ledger
+# this Beacon counts spend in.
+_ACCOUNTING = frozenset({"id", "source", "status", "cost_nanousd", "scope", "token"})
+
+
+def kept_generation(path: Path) -> str | None:
+    """The generation of the ledger file at `path`, read through a connection that
+    cannot write, or None when no ledger that was begun is there: nothing at the
+    path, a link, an empty file, a file that is no SQLite database, or one without
+    the accounting table or a generation.
+
+    `Ledger` begins a file when it finds none, or an empty one, which is right for a
+    first call and wrong for whoever means to go on paying from the ledger that was
+    paid from before: a ledger begun anew counts nothing of what was spent. This is
+    how that is asked before anything is made. It says that a ledger is there and
+    which; it cannot say that it is the one its operator means."""
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return None
+        address = f"file:{quote(str(path))}?mode=ro"
+        with closing(sqlite3.connect(address, uri=True, timeout=30)) as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(ember_calls)")}
+            if not columns >= _ACCOUNTING:
+                return None
+            found = db.execute(_GENERATION).fetchone()
+    except (OSError, sqlite3.Error):
+        return None
+    if found is None or not isinstance(found[0], str) or not found[0]:
+        return None
+    return found[0]
 
 
 def _identity(path: Path) -> tuple[int, int] | None:

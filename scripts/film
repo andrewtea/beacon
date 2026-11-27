@@ -4,28 +4,25 @@
 # whoever can open the orb's thread, signed in to Amp. README "Showing the story"
 # says what it is for and what it costs.
 #
-#   scripts/film up [--own] [MINUTE]   start it, or say where it is
-#   scripts/film anew [--own] MINUTE   set the story's store aside and begin the story anew at MINUTE
-#   scripts/film where                 which minute the story is in, and when each moment comes
-#   scripts/film down                  stop it
+#   scripts/film up [MINUTE]   start it, or say where it is
+#   scripts/film anew MINUTE   set the story's store aside and begin the story anew at MINUTE
+#   scripts/film where         which minute the story is in, and when each moment comes
+#   scripts/film down          stop it
 #
 # MINUTE is the minute of the story a new mock store begins at (0 to 95). A store
 # whose story has begun goes on with it, whatever minute is given: only `anew`
 # begins a story, and with Muse Ember telling it, a story begun anew is paid for
 # anew.
 #
-# --own has the server take what is the visitor's own: where they are, a clip, a
-# photo, saved places, and a notification address. Without it the server takes
-# only the invented scenario's two places (BEACON_FRONT_END=unverified). --own
-# leaves that setting unset, as the orb's development server has it; it does not
-# say `verified`. Nobody has checked what an Amp portal writes down of a request,
-# and a portal opens for everybody who can open the orb's thread, not for one
-# person. So --own is for a thread only its operator can open, who accepts that
-# for their own device; in a thread others can open, they can send their own too.
+# The server takes only the invented scenario's two places (BEACON_FRONT_END=
+# unverified), as the public deployment does: no place, clip, photo, or
+# notification address of a visitor's own. Nobody has checked what an Amp portal
+# writes down of a request, and a portal opens for everybody who can open the
+# orb's thread. This script has no option that changes that.
 #
 # `up` starts a server only when none answers on the port. A server that is up
 # is left as it is, and `up` is refused (status 2) when that server is not what
-# was asked for: another teller, or one that takes other things of a visitor.
+# was asked for: another teller's, or one that takes other things of a visitor.
 #
 # Settings are read from the environment, and the script gives none a default
 # that costs money or decides where money is counted:
@@ -37,16 +34,22 @@
 #   EMBER_SPENT_BEFORE_USD         what was spent outside this data directory's ledger.
 #   MODEL_API_KEY                  read by the server from its own environment, the orb's.
 #                                  This script never reads, passes on, or prints it.
-# And with `live` the data directory has to hold the ledger already
-# (ember/ledger.sqlite3): a new ledger would count none of what was spent.
-#   EMBER_STOP_USD                 when set, the stop the server keeps, passed on as it is.
+# And with `live` the data directory has to hold a ledger that was begun
+# (ember/ledger.sqlite3): one begun anew would count none of what was spent. The
+# ledger that is there when the script looks is named to the server, which pays
+# from that one or not at all, at every start (BEACON_MOCK_EMBER_LEDGER).
+#   EMBER_STOP_USD                 when set, the stop the server keeps.
 #   FILM_PORT                      the port, 8010 unless set (1024 to 65535).
 #
-# The server is always the invented scenario's, with its pollers, told once: the
-# script takes BEACON_LIVE_SOURCES out of the server's environment, and sets
-# BEACON_INGEST=1 and BEACON_MOCK_REPEAT=0, whatever the orb's environment says.
-# Everything a command is given is looked at before anything is stopped, moved,
-# built, or started.
+# The server runs as an orb service, in the orb's environment and not in this
+# shell's. When the orb's environment has a spending setting of its own
+# (EMBER_SPENT_BEFORE_USD, EMBER_STOP_USD) that is not what this shell has, the
+# server is not started: the two are made to agree by whoever set them.
+#
+# The server is always the invented scenario's, with its pollers, told once,
+# whatever either environment says of that. Everything a command is given, and
+# what `python -m beacon.telling` can see of the settings, is looked at before
+# anything is stopped, moved, or started.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -54,6 +57,59 @@ service=film
 
 say() { printf '%s\n' "$*"; }
 refuse() { printf '%s\n' "$*" >&2; exit 2; }
+
+# What the service runs, in the orb's environment: `scripts/film _serve NAME=value ...`.
+# It is given settings and no key. Not for a person to call.
+serve() {
+  local pair name value port="" minute="" teller="" spent="" stop="" ledger="" budget="" data="" run="" subject=""
+  for pair in "$@"; do
+    name="${pair%%=*}" value="${pair#*=}"
+    case "$name" in
+      port) port="$value" ;;
+      minute) minute="$value" ;;
+      teller) teller="$value" ;;
+      spent) spent="$value" ;;
+      stop) stop="$value" ;;
+      ledger) ledger="$value" ;;
+      budget) budget="$value" ;;
+      data) data="$value" ;;
+      run) run="$value" ;;
+      subject) subject="$value" ;;
+      *) refuse "scripts/film _serve was given something it does not know." ;;
+    esac
+  done
+  [ -n "$port" ] && [ -n "$data" ] || refuse "scripts/film _serve is what the filming server's service runs. Start it with: scripts/film up"
+  # The invented scenario, with its pollers, told once, taking only the invented
+  # places, whatever the orb's environment says of them.
+  unset BEACON_LIVE_SOURCES BEACON_MOCK_STORY_MINUTE BEACON_SCALE_RUN BEACON_MOCK_EMBER \
+    BEACON_MOCK_EMBER_BUDGET_USD BEACON_MOCK_EMBER_LEDGER
+  export BEACON_INGEST=1 BEACON_MOCK_REPEAT=0 BEACON_FRONT_END=unverified
+  export BEACON_DATA_DIR="$data" BEACON_WEB_DIR="$root/web/dist" BEACON_VAPID_SUBJECT="$subject"
+  [ -z "$run" ] || export BEACON_SCALE_RUN="$run"
+  [ -z "$minute" ] || export BEACON_MOCK_STORY_MINUTE="$minute"
+  if [ "$teller" = ember ]; then
+    # A spending setting the orb has for itself is not replaced by the shell's.
+    if [ -n "${EMBER_SPENT_BEFORE_USD-}" ] && [ "$EMBER_SPENT_BEFORE_USD" != "$spent" ]; then
+      refuse "The filming server was not started: EMBER_SPENT_BEFORE_USD in the orb's environment is not what the shell that started it has. Make the two the same."
+    fi
+    if [ -n "${EMBER_STOP_USD-}" ] && [ -n "$stop" ] && [ "$EMBER_STOP_USD" != "$stop" ]; then
+      refuse "The filming server was not started: EMBER_STOP_USD in the orb's environment is not what the shell that started it has. Make the two the same."
+    fi
+    export EMBER_SPENT_BEFORE_USD="$spent"
+    [ -z "$stop" ] || export EMBER_STOP_USD="$stop"
+    # The server pays from the ledger that was looked at, or not at all.
+    export REPLAY=0 BEACON_MOCK_EMBER=live BEACON_MOCK_EMBER_BUDGET_USD="$budget" BEACON_MOCK_EMBER_LEDGER="$ledger"
+  else
+    export REPLAY=1
+  fi
+  cd "$root/server"
+  exec uv run --no-sync python -m beacon.serve --host 127.0.0.1 --port "$port"
+}
+
+if [ "${1-}" = _serve ]; then
+  shift
+  serve "$@"
+fi
 
 command -v amp >/dev/null || refuse "scripts/film runs in an Amp orb: there is no amp command here."
 
@@ -66,58 +122,56 @@ esac
 
 teller=stand_in
 [ "${BEACON_MOCK_EMBER-stand-in}" != live ] || teller=ember
+ledger=""
+
+# A setting that is put on the service's command line is plain: no space, quote,
+# or dollar sign, which whatever runs the command could read as its own.
+plain() {
+  case "$2" in
+    *[!A-Za-z0-9_./:@+-]*) refuse "$1 holds a character this script does not put on a command line: letters, digits, and _ . / : @ + - are taken." ;;
+  esac
+}
 
 # Everything the server is started with, looked at before anything is changed.
 settings() {
-  case "${BEACON_MOCK_EMBER-stand-in}" in
-    stand-in | live) ;;
-    *) refuse "BEACON_MOCK_EMBER is stand-in, which is the default, or live." ;;
-  esac
   case "${BEACON_DATA_DIR-}" in
     /*) ;;
     *) refuse "Set BEACON_DATA_DIR to the data directory, as an absolute path: the one that was paid from before, whose ledger counts every earlier request." ;;
   esac
+  plain BEACON_DATA_DIR "$BEACON_DATA_DIR"
+  plain BEACON_VAPID_SUBJECT "${BEACON_VAPID_SUBJECT-}"
+  plain BEACON_SCALE_RUN "${BEACON_SCALE_RUN-}"
   if [ "$teller" = ember ]; then
-    [ "${REPLAY-}" = 0 ] || refuse "BEACON_MOCK_EMBER=live makes paid requests, which REPLAY=0 asks for. Set REPLAY=0 yourself: this script does not."
-    [ -n "${BEACON_MOCK_EMBER_BUDGET_USD-}" ] || refuse "BEACON_MOCK_EMBER=live needs BEACON_MOCK_EMBER_BUDGET_USD. It has no default."
-    [ -n "${EMBER_SPENT_BEFORE_USD-}" ] || refuse "BEACON_MOCK_EMBER=live needs EMBER_SPENT_BEFORE_USD. It has no default."
-    local ledger="$BEACON_DATA_DIR/ember/ledger.sqlite3"
-    [ -f "$ledger" ] && [ ! -L "$ledger" ] \
-      || refuse "BEACON_MOCK_EMBER=live needs the ledger that was paid from before, and there is none at ember/ledger.sqlite3 under BEACON_DATA_DIR. A new ledger would count nothing of what was spent. Nothing was stopped, moved, or started."
+    plain BEACON_MOCK_EMBER_BUDGET_USD "${BEACON_MOCK_EMBER_BUDGET_USD-}"
+    plain EMBER_SPENT_BEFORE_USD "${EMBER_SPENT_BEFORE_USD-}"
+    plain EMBER_STOP_USD "${EMBER_STOP_USD-}"
   fi
+  # Who tells the story, and for Muse Ember: REPLAY=0, a budget every scope takes,
+  # spending settings a client can read, and a ledger that was begun, whose
+  # generation it prints. It makes nothing. Its own sentence says what is wrong.
+  (cd "$root/server" && uv sync --locked >/dev/null 2>&1) || refuse "The server's dependencies could not be installed (uv sync --locked)."
+  ledger="$(cd "$root/server" && env -u BEACON_LIVE_SOURCES -u BEACON_MOCK_EMBER_LEDGER uv run --no-sync python -m beacon.telling)" \
+    || refuse "Nothing was stopped, moved, or started."
 }
 
-# The server's command line. It holds settings and no key: the server reads
+# The service's command line. It holds settings and no key: the server reads
 # MODEL_API_KEY from the environment its service is given.
 command_line() {
-  local own="$1" minute="$2" line
-  line="cd $(printf %q "$root/server") && exec env"
-  # The invented scenario, with its pollers, told once, whatever the orb's
-  # environment says of them. Unset first: each name below is set once.
-  line+=" -u BEACON_LIVE_SOURCES -u BEACON_MOCK_STORY_MINUTE -u BEACON_FRONT_END -u BEACON_SCALE_RUN -u BEACON_MOCK_EMBER -u BEACON_MOCK_EMBER_BUDGET_USD"
-  line+=" BEACON_INGEST=1 BEACON_MOCK_REPEAT=0"
-  line+=" BEACON_DATA_DIR=$(printf %q "$BEACON_DATA_DIR")"
-  line+=" BEACON_WEB_DIR=$(printf %q "$root/web/dist")"
+  local minute="$1" line
+  line="exec $(printf %q "$root/scripts/film") _serve port=$port data=$BEACON_DATA_DIR teller=$teller"
   # Whom a push service may write to about this server: the repository's page.
-  line+=" BEACON_VAPID_SUBJECT=$(printf %q "${BEACON_VAPID_SUBJECT-https://github.com/andrewtea/beacon}")"
-  [ -z "${BEACON_SCALE_RUN-}" ] || line+=" BEACON_SCALE_RUN=$(printf %q "$BEACON_SCALE_RUN")"
-  [ "$own" = 1 ] || line+=" BEACON_FRONT_END=unverified"
-  [ -z "$minute" ] || line+=" BEACON_MOCK_STORY_MINUTE=$minute"
+  line+=" subject=${BEACON_VAPID_SUBJECT-https://github.com/andrewtea/beacon}"
+  [ -z "${BEACON_SCALE_RUN-}" ] || line+=" run=$BEACON_SCALE_RUN"
+  [ -z "$minute" ] || line+=" minute=$minute"
   if [ "$teller" = ember ]; then
-    line+=" REPLAY=0 BEACON_MOCK_EMBER=live"
-    line+=" BEACON_MOCK_EMBER_BUDGET_USD=$(printf %q "$BEACON_MOCK_EMBER_BUDGET_USD")"
-    line+=" EMBER_SPENT_BEFORE_USD=$(printf %q "$EMBER_SPENT_BEFORE_USD")"
-    [ -z "${EMBER_STOP_USD-}" ] || line+=" EMBER_STOP_USD=$(printf %q "$EMBER_STOP_USD")"
-  else
-    line+=" REPLAY=1"
+    line+=" ledger=$ledger budget=$BEACON_MOCK_EMBER_BUDGET_USD spent=$EMBER_SPENT_BEFORE_USD"
+    [ -z "${EMBER_STOP_USD-}" ] || line+=" stop=$EMBER_STOP_USD"
   fi
-  line+=" uv run --no-sync python -m beacon.serve --host 127.0.0.1 --port $port"
   printf '%s' "$line"
 }
 
 build() {
   (cd "$root/web" && pnpm install --frozen-lockfile >/dev/null && pnpm build >/dev/null)
-  (cd "$root/server" && uv sync --locked >/dev/null 2>&1)
 }
 
 running() { curl -fsS -o /dev/null "http://127.0.0.1:$port/api/health" 2>/dev/null; }
@@ -140,27 +194,23 @@ where() {
 }
 
 start() {
-  local own="$1" minute="$2"
+  local minute="$1"
   build
   if ! amp orb service start "$service" --port "$port" --portal \
     --title "Beacon, for filming" \
     --description "The invented story. Opens for whoever can open this thread." \
-    --command "$(command_line "$own" "$minute")"; then
+    --command "$(command_line "$minute")"; then
     # The server says in a sentence why it did not start, and never a key.
     amp orb service logs "$service" 2>/dev/null | tail -n 5 >&2 || true
     refuse "The filming server did not start."
-  fi
-  if [ "$own" = 1 ]; then
-    say "This server takes a visitor's own place, clip, photo, saved places, and notification address, from everybody who can open this thread. Nobody has checked what the portal in front of it writes down of a request."
   fi
   where
 }
 
 parse() {
-  own=0 minute=""
+  minute=""
   for argument in "$@"; do
     case "$argument" in
-      --own) own=1 ;;
       "" | *[!0-9]* | ???*) refuse "A minute is a whole number from 0 to 95." ;;
       *)
         minute="$((10#$argument))"
@@ -177,14 +227,14 @@ case "$action" in
     parse "$@"
     settings
     if running; then
-      wanted="mock $teller $([ "$own" = 1 ] && echo own || echo invented)"
+      wanted="mock $teller invented"
       found="$(answers)" || refuse "What answers on port $port did not say what it is. Nothing was changed."
       [ "$found" = "$wanted" ] \
         || refuse "A server is up on port $port, and it is not the one asked for: it says \"$found\" (its mode, who tells its story, what it takes of a visitor), and what was asked for is \"$wanted\". It was left as it is. Stop it first (scripts/film down), and mind that with Muse Ember a story is only begun anew by scripts/film anew."
       say "The filming server is already up. It goes on with its story:"
       where
     else
-      start "$own" "$minute"
+      start "$minute"
     fi
     ;;
   anew)
@@ -198,7 +248,7 @@ case "$action" in
     # finish ends the script here, with the command's own sentence.
     (cd "$root/server" && env -u BEACON_LIVE_SOURCES BEACON_DATA_DIR="$BEACON_DATA_DIR" \
       uv run --no-sync python -m beacon.serve --set-aside)
-    start "$own" "$minute"
+    start "$minute"
     ;;
   where) where ;;
   down)

@@ -22,6 +22,12 @@ written once:
   nothing of a refused file is written**: no table, no row, no journal mode. A file
   a newer Beacon wrote is the record of what it paid for, and is not this one's to
   empty.
+
+`change_as_it_is` is the other way into such a file, for upkeep of one that nothing
+has open for use (a store that was set aside, another store's file a command only
+deletes rows from): it runs given statements on a file that is seen, in the same
+write transaction, to be the kind, the mode, and a shape they were written for,
+and makes and migrates nothing.
 """
 
 import sqlite3
@@ -147,3 +153,69 @@ def look(path: Path, *, meta: str = "meta") -> Look:
     return Look(
         mode=None if said is None else said[0], shape=shape, tables=tables, objects=len(schema)
     )
+
+
+# The tables SQLite makes by itself in a file, which are no kind's of Beacon's.
+SQLITES_OWN = frozenset(
+    {"sqlite_sequence", "sqlite_stat1", "sqlite_stat2", "sqlite_stat3", "sqlite_stat4"}
+)
+
+
+def change_as_it_is(
+    path: Path,
+    mode: Mode,
+    *,
+    shapes: Collection[int],
+    tables: Collection[str],
+    own: str,
+    statements: Sequence[tuple[str, Sequence[str]]],
+    meta: str = "meta",
+) -> int | None:
+    """Run `statements` on the file at `path` as the file is, and say how many
+    rows they changed, or None, with nothing written, when the file is not what
+    was asked for.
+
+    For upkeep of a file that nothing has open for use: one that was set aside, or
+    another store's that a command only deletes rows from. `begin_file` is how a
+    file is opened for use, and makes a file this Beacon's shape; this makes no
+    table, drops nothing of an earlier shape, and leaves the file's shape number
+    and journal mode as they are. The file has to be there (none is made), say it
+    is `mode`'s in the table `meta`, be in one of `shapes`, hold the table `own`,
+    and hold no table that is not in `tables` or SQLite's own: a kind is known by
+    its tables, since several of Beacon's files say a mode in the same table with
+    the same shape number. **The look and the change are one write transaction**,
+    as `begin_file`'s are.
+
+    Raises sqlite3.Error for a file that is no SQLite database, is not there, or
+    cannot be written to."""
+    if not meta.isidentifier():
+        raise ValueError("meta names a table")
+    # `mode=rw`: a file that is not there is not made.
+    address = f"file:{quote(str(path))}?mode=rw"
+    with closing(
+        sqlite3.connect(address, uri=True, timeout=_WAIT_SECONDS, isolation_level=None)
+    ) as db:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            shape = db.execute("PRAGMA user_version").fetchone()[0]
+            schema = db.execute("SELECT type, name FROM sqlite_master").fetchall()
+            found = frozenset(name for kind, name in schema if kind == "table")
+            said = None
+            if meta in found:
+                said = db.execute(f"SELECT value FROM {meta} WHERE key = 'mode'").fetchone()
+            asked_for = (
+                said is not None
+                and said[0] == mode
+                and shape in shapes
+                and own in found
+                and found - SQLITES_OWN <= frozenset(tables)
+            )
+            changed = 0
+            if asked_for:
+                for statement, values in statements:
+                    changed += db.execute(statement, tuple(values)).rowcount
+        except BaseException:
+            db.execute("ROLLBACK")
+            raise
+        db.execute("COMMIT" if asked_for else "ROLLBACK")
+    return changed if asked_for else None

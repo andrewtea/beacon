@@ -39,14 +39,28 @@ worked on, nor Ember with a stand-in's, with the pollers or without them, and wh
 tells the story again by deleting the store refuses one that was paid for.
 """
 
+import os
+import re
+import sys
 from collections.abc import Callable, Mapping
 from typing import Literal
 
 from beacon.ember import EmberClient, SpendScope
-from beacon.ember.pricing import parse_usd
+from beacon.ember.client import Storage, default_data_dir
+from beacon.ember.errors import EmberConfigError
+from beacon.ember.ledger import kept_generation
+from beacon.ember.pricing import SPENT_BEFORE_VARIABLE, parse_usd, read_stop_settings
 
 MOCK_EMBER_VARIABLE = "BEACON_MOCK_EMBER"
 BUDGET_VARIABLE = "BEACON_MOCK_EMBER_BUDGET_USD"
+# The generation of the ledger a telling by Muse Ember pays from. When it is set,
+# no paying client is made unless the ledger under the data directory is there and
+# is of this generation, at every start of a server: a client begins a ledger where
+# it finds none, and a ledger begun anew counts nothing of what was spent. It only
+# refuses. `python -m beacon.telling` prints the generation of the ledger that is
+# there, for whoever starts a server to hand it on (`scripts/film`).
+LEDGER_VARIABLE = "BEACON_MOCK_EMBER_LEDGER"
+_GENERATION = re.compile(r"[0-9a-f]{32}")
 
 # Who does the model's work on the invented story.
 Teller = Literal["stand_in", "ember"]
@@ -136,23 +150,109 @@ def check(env: Mapping[str, str], make: PaidClient | None = None) -> None:
     anything is made**: a client, even one that only replays, makes the ledger's
     file, and a store that was opened for a telling is that telling's from then on.
 
-    Raises TellingConfigError when `REPLAY` is not 0 or there is no key. A test
-    that hands in what makes its clients (`make`) is asked for nothing here."""
+    Raises TellingConfigError when `REPLAY` is not 0 or there is no key, and when
+    `BEACON_MOCK_EMBER_LEDGER` names a ledger that is not the one under the data
+    directory (`pinned_ledger`); EmberConfigError for a relative `BEACON_DATA_DIR`.
+    A test that hands in what makes its clients (`make`) is asked only for the
+    ledger."""
     if make is None and (env.get("REPLAY", "1") != "0" or not env.get("MODEL_API_KEY")):
         raise TellingConfigError(_NO_LIVE_EMBER)
+    pinned_ledger(env)
+
+
+def pinned_ledger(env: Mapping[str, str]) -> str | None:
+    """The generation `BEACON_MOCK_EMBER_LEDGER` names, seen to be that of the
+    ledger under the data directory, or None when the setting is not there. The
+    ledger is read through a connection that cannot write, and nothing is made.
+
+    Raises TellingConfigError when the setting is no generation, and when the
+    ledger that is there is not of it or no ledger is there; EmberConfigError for
+    a relative `BEACON_DATA_DIR`."""
+    if LEDGER_VARIABLE not in env:
+        return None
+    named = env[LEDGER_VARIABLE]
+    if _GENERATION.fullmatch(named) is None:
+        raise TellingConfigError(
+            f"{LEDGER_VARIABLE} is the generation of the ledger that is paid from, as "
+            "`python -m beacon.telling` prints it."
+        )
+    if kept_generation(Storage.under(default_data_dir(env)).ledger_db) != named:
+        raise TellingConfigError(OTHER_LEDGER)
+    return named
+
+
+OTHER_LEDGER = (
+    f"{LEDGER_VARIABLE} names the ledger this telling is paid from, and the ledger "
+    "under the data directory (ember/ledger.sqlite3) is not that one, or no ledger is "
+    "there. Nothing was paid for, and no ledger was begun: one begun anew would count "
+    "nothing of what was spent. Find out what became of the ledger before a server "
+    "is started here, and compare Meta's Usage page with what the ledger held."
+)
+NO_LEDGER = (
+    f"{MOCK_EMBER_VARIABLE}=live is to go on paying from the ledger that was paid from "
+    "before, and no ledger that was begun is at ember/ledger.sqlite3 under the data "
+    "directory: nothing is there, or what is there is empty, a link, or no ledger. A "
+    "ledger begun anew would count nothing of what was spent."
+)
+
+
+def preflight(env: Mapping[str, str]) -> str | None:
+    """What can be seen, before anything is stopped, moved, or made, of whether a
+    server can be started on `env` to tell the invented story: who tells it, and,
+    for Muse Ember, that paid requests are asked for by name (`REPLAY=0`), that the
+    budget is one every scope takes, and that a ledger that was begun is under the
+    data directory. Answers that ledger's generation, to be handed to the server
+    as `BEACON_MOCK_EMBER_LEDGER`, or None for a stand-in's telling.
+
+    The spending settings in `env` (`EMBER_SPENT_BEFORE_USD`, which has to be
+    there, and `EMBER_STOP_USD`) are read as the client reads them, so that one it
+    would refuse is refused here. **That is a look at what `env` holds, and not at
+    what the server will keep**: a client reads both from its own process's
+    environment, and the key too, which this does not look for. It makes nothing
+    and asks nobody.
+
+    Raises TellingConfigError when it cannot, and EmberConfigError for a relative
+    `BEACON_DATA_DIR` and for a spending setting that cannot be read."""
+    if teller_of(env) == "stand_in":
+        return None
+    if env.get("REPLAY") != "0":
+        raise TellingConfigError(
+            f"{MOCK_EMBER_VARIABLE}=live makes paid requests, which REPLAY=0 asks for. "
+            "Set REPLAY=0 beside it."
+        )
+    for label in SCOPES:
+        scope_of(env, label)
+    if read_stop_settings(env)[1] is None:
+        raise TellingConfigError(
+            f"{MOCK_EMBER_VARIABLE}=live needs {SPENT_BEFORE_VARIABLE}: what Meta's Usage "
+            "page showed as spent before the ledger began. It has no default."
+        )
+    generation = kept_generation(Storage.under(default_data_dir(env)).ledger_db)
+    if generation is None:
+        raise TellingConfigError(NO_LEDGER)
+    if LEDGER_VARIABLE in env:
+        pinned_ledger(env)
+    return generation
 
 
 def paying(env: Mapping[str, str], label: str, make: PaidClient | None = None) -> EmberClient:
     """A live Ember client that pays under the scope `label`, one of `SCOPES`.
 
-    Raises TellingConfigError when the budget is not one or there is no live Ember,
-    and EmberConfigError as `EmberClient.from_env` does."""
+    Raises TellingConfigError when the budget is not one, there is no live Ember,
+    or the ledger is not the one `BEACON_MOCK_EMBER_LEDGER` names, and
+    EmberConfigError as `EmberClient.from_env` does."""
     scope = scope_of(env, label)
     check(env, make)
     ember = EmberClient.from_env(env, scope=scope) if make is None else make(scope)
+    refusal = None
     if ember.mode != "live":
+        refusal = _NO_LIVE_EMBER
+    elif LEDGER_VARIABLE in env and ember.ledger_generation() != env[LEDGER_VARIABLE]:
+        # The file the client is open on, which is the one it pays in from here on.
+        refusal = OTHER_LEDGER
+    if refusal is not None:
         ember.close()
-        raise TellingConfigError(_NO_LIVE_EMBER)
+        raise TellingConfigError(refusal)
     return ember
 
 
@@ -167,3 +267,24 @@ def other_teller(began: Teller, now: Teller) -> str:
     return OTHER_TELLER.format(
         began=_AS[began], now=_WITH[now], variable=MOCK_EMBER_VARIABLE, how=_HOW[began]
     )
+
+
+def main(env: Mapping[str, str], out: Callable[[str], None] = print) -> int:
+    """`python -m beacon.telling`: look before a server is started to tell the
+    invented story (`preflight`), and print the generation of the ledger a telling
+    by Muse Ember would pay from, or nothing for a stand-in's. It makes nothing."""
+    try:
+        generation = preflight(env)
+    except (TellingConfigError, EmberConfigError) as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    if generation is not None:
+        out(generation)
+    return 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1:]:
+        print("python -m beacon.telling takes no arguments.", file=sys.stderr)
+        raise SystemExit(2)
+    raise SystemExit(main(os.environ))
