@@ -1939,7 +1939,7 @@ export const quietAnswer: TapAnswer = {
 // made-up calls in `server/tests/scale_day.py`), not of any real day of DataSF's.
 export const scaleAnswer: Scale = {
   about_text:
-    "A scale run puts one day of fire dispatch calls through the code this server runs and compares what Beacon made of them with DataSF's public record of that day. It is made by a command, apart from this server: nothing on this page is about the incidents this server shows, or about any tap it was sent.",
+    "A scale run puts one day of fire dispatch calls, or the first calls of one, through the code this server runs and compares what Beacon made of them with DataSF's public record of those calls. It is made by a command, apart from this server: nothing on this page is about the incidents this server shows, or about any tap it was sent.",
   run: {
     name: 'day',
     day: '2026-03-03',
@@ -1954,7 +1954,7 @@ export const scaleAnswer: Scale = {
     state_text:
       'The run is complete, which means nothing is left for its command to do. It does not mean every call has a row or every tap an answer: the numbers below say what came of each.',
     caveats: [
-      'A match is by kind, time, and unit or place. Nothing checks what an incident says beyond that, and a call DataSF does not list cannot be told from a wrong incident.',
+      'A match is by kind, time, and unit or place. Nothing checks what an incident says beyond that.',
       "The hearing was closed when it was first complete, so that whatever is made of the whole day (answers to replayed taps, a glossary) is of the same evidence: a call put among the run's calls after that is not heard in this run.",
     ],
     scored_against: {
@@ -2063,7 +2063,7 @@ export const scaleAnswer: Scale = {
             key: 'extra',
             label: 'Incidents no DataSF call fits',
             value_text: '0 incidents',
-            text: "Incidents of Beacon's that fit no DataSF call of this day. One can be a real call DataSF does not list, or a wrong incident: the rule cannot tell.",
+            text: "Incidents of Beacon's that fit no DataSF call of this day.",
           },
           {
             key: 'other_kind',

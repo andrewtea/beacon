@@ -257,3 +257,34 @@ def test_a_number_that_is_no_number_or_has_no_sentence_is_never_shown(
     # The fixed sentence, and nothing of the file: no bare count, no value with a
     # unit it is not of.
     assert (response.status_code, response.json()) == (503, {"detail": scale.UNREADABLE})
+
+
+def test_a_run_of_a_sample_says_so_beside_every_number_or_is_not_shown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = {"BEACON_DATA_DIR": os.environ["BEACON_DATA_DIR"]}
+    http = DataSf(ROWS).http()
+    try:
+        assert main(["--name", "part", "--day", DAY, "--calls", "3"], env, StringIO(), http) == 0
+    finally:
+        http.close()
+    layout = run.Layout.under(env, "part")
+    monkeypatch.setenv("BEACON_SCALE_RUN", "part")
+
+    with TestClient(create_app()) as client:
+        shown = client.get("/api/scale").json()["run"]
+
+        # The label that is beside every value, the sentence under every heading,
+        # and the words before any number all say what the run is of.
+        assert shown["kind_text"] == "Stand-in, generated calls, sample of 3 calls"
+        assert "the first 3 of the 6 calls Beacon could read for that day" in shown["reminder_text"]
+        assert "This run is of a sample: the first 3 calls of the day" in shown["basis_text"]
+
+        # A result that says it is of a sample its own words do not name is not
+        # relabeled: it is not shown.
+        made = json.loads(layout.results.read_text())
+        made["sample"] = None
+        layout.results.write_text(json.dumps(made))
+        refused = client.get("/api/scale")
+        assert refused.status_code == 503
+        assert refused.json()["detail"] == scale.UNREADABLE

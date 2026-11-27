@@ -1480,7 +1480,14 @@ button.quiet:hover {
   font-size: 0.72rem;
   font-weight: 600;
   line-height: 1.5;
-  white-space: nowrap;
+  /* A kind can be a line long ("Muse Ember, generated speech, sample of 100
+     calls"): it is shown whole on a phone, on as many lines as it needs. */
+  border-radius: 0.8rem;
+}
+
+.tag.scale-run-kind {
+  border-radius: 0.8rem;
+  white-space: normal;
 }
 
 /* A stand-in's number is in the colour of what is invented, wherever it is. */

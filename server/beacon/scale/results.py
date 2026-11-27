@@ -79,6 +79,12 @@ RECORDED_BY_EMBER = (
     "paid for each one it is asked to hear; the numbers below say how many that was. "
     "What Beacon makes of them is scored against DataSF's record of the same day."
 )
+# What the matching rule does not check. Of recorded radio it also cannot tell a
+# call DataSF does not list from a wrong incident; generated calls are each of a
+# record, so nothing is said of an unlisted call there.
+NOT_CHECKED_GENERATED = (
+    "A match is by kind, time, and unit or place. Nothing checks what an incident says beyond that."
+)
 NOT_CHECKED = (
     "A match is by kind, time, and unit or place. Nothing checks what an incident "
     "says beyond that, and a call DataSF does not list cannot be told from a wrong "
@@ -90,9 +96,60 @@ INCOMPLETE = (
 )
 CLOSED = (
     "The hearing was closed when it was first complete, so that whatever is made of "
-    "the whole day (answers to replayed taps, a glossary) is of the same evidence: a "
-    "call put among the run's calls after that is not heard in this run."
+    "all the run's calls (answers to replayed taps, a glossary) is of the same "
+    "evidence: a call put among the run's calls after that is not heard in this run."
 )
+
+
+def _sample_basis(calls: int, of: int) -> str:
+    """What is added to what a run is when it is of a sample of a day's calls: what
+    is the sample's, and the three things among the numbers that are not."""
+    return (
+        f" This run is of a sample: the first {calls} calls of the day, in the order "
+        f"they were dispatched, of the {of} in DataSF's record of the day that Beacon "
+        "could read. Only those were generated and are scored, and replayed taps are "
+        "planned from them alone, so the counts of calls, incidents, places, and taps "
+        "below are of that sample and of no whole day; a day's first calls need not "
+        "be like the rest of it. Three things below are not the sample's, and each "
+        "says so: what of DataSF's answer for the whole day could not be read, "
+        "DataSF's unit types, which a glossary is compared with and which are the "
+        "whole day's, and a cost of hearing, which is its spending scope's over "
+        "every paid run."
+    )
+
+
+def _sample_label(calls: int) -> str:
+    return f", sample of {calls} calls"
+
+
+def _sample_reminder(calls: int, of: int) -> str:
+    """What goes under every heading of a sampled run's numbers. A heading can hold
+    a number that is not the sample's (what of DataSF's whole answer could not be
+    read, the whole day's unit types, a scope's cost), so it claims the sample's
+    for none that says otherwise of itself."""
+    return (
+        f" It is of a sample, the first {calls} of the {of} calls Beacon could read "
+        "for that day, and of no whole day: a number here is of the sample unless "
+        "its own sentence says it is of the whole day or of a spending scope."
+    )
+
+
+def _sample_of(results: Mapping[str, Any]) -> tuple[int, int] | None:
+    """The sample a written result says it is of, as how many calls of how many,
+    or None for a result of a whole day.
+
+    Raises ValueError for a sample that is none a run can be of."""
+    said = results.get("sample")
+    if said is None:
+        return None
+    calls, of = (said.get("calls"), said.get("of")) if isinstance(said, dict) else (None, None)
+    counts = all(isinstance(n, int) and not isinstance(n, bool) for n in (calls, of))
+    # A sample is fewer calls than its day has: a run of them all is a day's.
+    if not counts or not 1 <= calls < of or results.get("audio") != "generated":
+        raise ValueError("The result's sample is none a run can be of.")
+    return calls, of
+
+
 LEDGER_LOST = (
     "The Ember ledger was replaced while the run was under way, so what the run "
     "spent is not known from it and no cost of hearing is reported. Compare Meta's "
@@ -241,6 +298,14 @@ def kind(results: Mapping[str, Any]) -> tuple[str, str | None]:
     `basis_text` is another kind's, or its `stand_in` is not what its kind makes it.
     Such a result is not relabeled; it is not shown."""
     label, reminder, said = _KINDS[results["audio"], results["hearer"]]
+    sample = _sample_of(results)
+    if sample is not None:
+        # A sample is said wherever the kind is: beside every number, under every
+        # heading, and in the words the result begins with.
+        assert reminder is not None
+        label += _sample_label(sample[0])
+        reminder += _sample_reminder(*sample)
+        said += _sample_basis(*sample)
     if results["basis_text"] != said:
         raise ValueError("The result's basis is not its kind's.")
     stand_in = results["stand_in"]
@@ -249,11 +314,20 @@ def kind(results: Mapping[str, Any]) -> tuple[str, str | None]:
     return label, reminder
 
 
-def basis(settings: Settings) -> str:
-    """What a run is, and what follows for its numbers."""
+def basis(settings: Settings, *, day_calls: int | None = None) -> str:
+    """What a run is, and what follows for its numbers. `day_calls` is how many
+    calls of the day Beacon could read in DataSF's record, which a run of a sample
+    is said with."""
     if settings.audio == "recorded":
         return RECORDED_BY_EMBER
-    return GENERATED_BY_EMBER if settings.hearer == "live" else GENERATED_BY_STAND_IN
+    said = GENERATED_BY_EMBER if settings.hearer == "live" else GENERATED_BY_STAND_IN
+    if settings.sample is None:
+        return said
+    if day_calls is None:
+        raise ValueError("A sample is said with how many calls the day has.")
+    if not 1 <= settings.sample < day_calls:
+        raise ValueError("A sample is fewer calls than the day has.")
+    return said + _sample_basis(settings.sample, day_calls)
 
 
 def build(
@@ -262,6 +336,7 @@ def build(
     records: Sequence[datasf.Record],
     *,
     unread: datasf.Unread | None = None,
+    day_calls: int | None = None,
     rows: int,
     no_row: int,
     listed: int | None,
@@ -284,6 +359,8 @@ def build(
     rows the run's store holds, `no_row` how many calls are claimed there with no
     row, and `listed` how many calls there are to hear, when that is known;
     `unplaced` is how many records the generator found no block for;
+    `day_calls` is how many calls of the day Beacon could read, for a run of a
+    sample, whose `records` are the sample's alone;
     `last_pass` and `stopped` are how the latest hearing ended, `closed` whether
     the hearing was closed for the replay, `unread` what of DataSF's answer could
     not be read, and `ledger_lost` whether the Ember ledger was replaced under the
@@ -294,6 +371,12 @@ def build(
     is not complete."""
     live = settings.hearer == "live"
     generated = settings.audio == "generated"
+    sample: tuple[int, int] | None = None
+    if settings.sample is not None:
+        if day_calls is None or not 1 <= len(records) < day_calls:
+            raise ValueError("A sample is fewer calls than the day has, and says how many.")
+        sample = (len(records), day_calls)
+    sampled = sample is not None
     heard_complete = stopped is None and last_pass is not None and last_pass.unready == 0
     waiting = sum(state == "waiting" for _, state, _ in taps)
     # A run is complete when nothing is left that the same command would still do:
@@ -308,7 +391,7 @@ def build(
         and glossary_waiting is None
         and not ledger_lost
     )
-    caveats = [NOT_CHECKED]
+    caveats = [NOT_CHECKED_GENERATED if generated else NOT_CHECKED]
     if not heard_complete:
         caveats.insert(0, INCOMPLETE)
     if stopped is not None:
@@ -320,13 +403,21 @@ def build(
     if reading.partial:
         caveats.append(PARTIAL_READING)
     numbers = [
-        *_under(RECORD, _record_numbers(records, unread or datasf.Unread())),
+        *_under(RECORD, _record_numbers(records, unread or datasf.Unread(), sample)),
         *_under(HEARD, _hearing_numbers(rows, no_row, listed, last_pass, live=live)),
-        *_under(MATCHED, _match_numbers(records, reading, matched, generated=generated, live=live)),
+        *_under(
+            MATCHED,
+            _match_numbers(
+                records, reading, matched, generated=generated, live=live, sampled=sampled
+            ),
+        ),
         *_under(PLACE, _place_numbers(matched, generated=generated, live=live, unplaced=unplaced)),
         *_under(TIME, _time_numbers(matched, generated=generated)),
         *_under(COST, _cost_numbers(radio_spend, live=live, generated=generated, lost=ledger_lost)),
-        *_under(TAPS, _tap_numbers(taps, reading, matched, live=live, generated=generated)),
+        *_under(
+            TAPS,
+            _tap_numbers(taps, reading, matched, live=live, generated=generated, sampled=sampled),
+        ),
         *_under(GLOSSARY, glossary),
     ]
     if taps_stopped is not None or waiting:
@@ -355,7 +446,10 @@ def build(
         # The plan of taps the result is of (`taps.plan_name`): the command given
         # again with another plan has more to do than this result says.
         "taps_plan": taps_plan,
-        "basis_text": basis(settings),
+        # For a run of a sample: how many calls it is of, of how many the day has.
+        # Null for a run of the whole day.
+        "sample": None if sample is None else {"calls": sample[0], "of": sample[1]},
+        "basis_text": basis(settings, day_calls=day_calls),
         "caveats": caveats,
         "scored_against": {
             "text": datasf.CREDIT,
@@ -394,26 +488,51 @@ def lines(results: dict[str, Any]) -> list[str]:
     out += [f"Note: {caveat}" for caveat in results["caveats"]]
     out.append(f"Scored against: {results['scored_against']['text']}")
     out.append("")
+    # Whose number it is, beside each number, as the page has it: a line read by
+    # itself, or copied out, still says what kind of run it is of.
+    label, reminder = kind(results)
+    whose = "" if reminder is None else f"  [{label}]"
     for number in results["numbers"]:
-        out.append(f"{number['label']}: {shown(number)}")
+        out.append(f"{number['label']}: {shown(number)}{whose}")
         out.append(f"    {number['text']}")
     return out
 
 
-def _record_numbers(records: Sequence[datasf.Record], unread: datasf.Unread) -> list[Number]:
+def _record_numbers(
+    records: Sequence[datasf.Record],
+    unread: datasf.Unread,
+    sample: tuple[int, int] | None = None,
+) -> list[Number]:
     medical = sum(record.medical for record in records)
-    return [
-        Number(
+    kept = (
+        f"{medical} of them are medical, of which Beacon keeps DataSF's number for "
+        "the call, the crews, the intersection, and the times, and nothing else."
+    )
+    of_day = Number(
+        "records",
+        "DataSF calls Beacon could read",
+        len(records),
+        "calls",
+        "Calls the fire department was dispatched to on this day, by DataSF's "
+        "record, that have a number, a type, and the times they were received and "
+        f"dispatched. Every count and share below is of these. {kept}",
+    )
+    if sample is not None:
+        of_day = Number(
             "records",
-            "DataSF calls Beacon could read",
+            "DataSF calls in the sample",
             len(records),
             "calls",
-            "Calls the fire department was dispatched to on this day, by DataSF's "
-            "record, that have a number, a type, and the times they were received and "
-            "dispatched. Every count and share below is of these. "
-            f"{medical} of them are medical, of which Beacon keeps DataSF's number for "
-            "the call, the crews, the intersection, and the times, and nothing else.",
-        ),
+            f"The first {sample[0]} calls the fire department was dispatched to on this "
+            f"day, in the order they were dispatched, of the {sample[1]} in DataSF's "
+            "record that have a number, a type, and the times they were received and "
+            "dispatched. The counts and shares of calls below are of these and not "
+            f"of the day. {kept}",
+        )
+    # What could not be read is of DataSF's whole answer, whatever the run is of.
+    whole = " This is of DataSF's answer for the whole day, not of the sample." if sample else ""
+    return [
+        of_day,
         Number(
             "records_unreadable",
             "DataSF calls Beacon could not read",
@@ -422,7 +541,7 @@ def _record_numbers(records: Sequence[datasf.Record], unread: datasf.Unread) -> 
             "Calls in DataSF's answer for the day, each with a number of its own, that "
             "lack a type or the time they were received or dispatched. They are in no "
             "count below, so the calls above are not all the calls DataSF lists when "
-            "this is not 0.",
+            f"this is not 0.{whole}",
         ),
         Number(
             "rows_unreadable",
@@ -432,7 +551,7 @@ def _record_numbers(records: Sequence[datasf.Record], unread: datasf.Unread) -> 
             "Rows of DataSF's answer, each of which is one unit sent to one call, that "
             "are not shaped as a row or have no call number Beacon reads. Several can "
             "be of one call, so this is a count of rows and not of calls; whatever "
-            "calls they are of may be missing from every count below.",
+            f"calls they are of may be missing from every count below.{whole}",
         ),
     ]
 
@@ -494,6 +613,7 @@ def _match_numbers(
     *,
     generated: bool,
     live: bool,
+    sampled: bool = False,
 ) -> list[Number]:
     if generated and not live:
         meaning = (
@@ -553,7 +673,12 @@ def _match_numbers(
             "Share of DataSF calls found",
             share,
             "percent",
-            f"The calls found, of the DataSF calls Beacon could read. {meaning}",
+            (
+                f"The calls found, of the {len(records)} DataSF calls of the sample. "
+                if sampled
+                else "The calls found, of the DataSF calls Beacon could read. "
+            )
+            + meaning,
         ),
         Number(
             "merged",
@@ -594,8 +719,20 @@ def _match_numbers(
             "Incidents no DataSF call fits",
             len(matched.extra),
             "incidents",
-            "Incidents of Beacon's that fit no DataSF call of this day. One can be a "
-            "real call DataSF does not list, or a wrong incident: the rule cannot tell.",
+            "Incidents of Beacon's that fit no DataSF call of "
+            + ("the sample" if sampled else "this day")
+            + (
+                # Of generated calls the count is said and not explained: `fits`
+                # shows only that no record fits, which a record can bring about
+                # by itself (one whose dispatch is more than `score.EARLY`, two
+                # minutes, before its call was received fits no incident opened
+                # at its dispatch). And every generated
+                # call is of a record, so none is of a call DataSF does not list.
+                "."
+                if generated
+                else ". One can be a real call DataSF does not list, or a wrong "
+                "incident: the rule cannot tell."
+            ),
         ),
         Number(
             "other_kind",
@@ -738,6 +875,9 @@ def _cost_numbers(
         f"run's hearing of {what}, this run's and any other's. A call that was not "
         "answered is counted at the most it can have cost."
     )
+    # Each of the three says of itself that it is its scope's, over every paid run:
+    # a second paid run of the same kind of audio adds to all of them.
+    every = f"every paid run's hearing of {what}, this run's and any other's"
     each = None if not spend.calls else round(to_usd(spend.spent_nanousd) / spend.calls * 1000, 4)
     return [
         Number(
@@ -748,14 +888,17 @@ def _cost_numbers(
             "Paid requests",
             spend.calls,
             "requests",
-            f"Requests to Muse Ember under {scope}, {spend.unanswered} of them not answered.",
+            f"Requests to Muse Ember that the Ember ledger holds under the scope {scope}, "
+            f"over {every}, and not this run's alone. {spend.unanswered} of them were "
+            "not answered.",
         ),
         Number(
             "radio_cost_per_1000_usd",
             "Cost per 1,000 transmissions",
             each,
             "USD",
-            f"That cost for each 1,000 of those requests, for {what}.",
+            f"The cost of hearing above for each 1,000 of those requests: a rate over "
+            f"{every} under the scope {scope}, and not this run's alone.",
         ),
     ]
 
@@ -773,6 +916,7 @@ def _tap_numbers(
     *,
     live: bool,
     generated: bool,
+    sampled: bool = False,
 ) -> list[Number]:
     if not taps:
         return []
@@ -839,13 +983,24 @@ def _tap_numbers(
             unconfirmed,
             "taps",
             f"Of {len(away)} answered taps placed at a place and a moment such that, "
-            "for every call DataSF lists within a kilometre, the moment is more than "
+            + (
+                "for every call of the sample within a kilometre, "
+                if sampled
+                else "for every call DataSF lists within a kilometre, "
+            )
+            + "the moment is more than "
             "an hour before the call was received or more than an hour after the last "
             "time DataSF records for it (the latest, over all its units, of a "
             "dispatch, a unit on scene, and a unit available again): those answered "
             '"unconfirmed". A call can have gone on '
-            "past the last time recorded for it, and a call DataSF does not list is "
-            "not known of.",
+            "past the last time recorded for it, and a call "
+            + (
+                "that is not in the sample, of which the run holds nothing, or that "
+                "DataSF does not list"
+                if sampled
+                else "DataSF does not list"
+            )
+            + " is not known of.",
         ),
     ]
     if not live:

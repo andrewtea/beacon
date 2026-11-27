@@ -341,6 +341,13 @@ def investigate_tap(
         paid = Accounting.of(answer)
         model = answer.source
         spent += paid.cost_nanousd
+        if answer.status != "completed":
+            # Cut short: what there is of it is no answer, whatever of it reads as
+            # a form, and no tool is run on the word of an answer that did not
+            # end, which could be paid for. It is kept with what it cost.
+            final = paid
+            said = None
+            break
         asked = [] if last else _function_calls(answer.output)
         if not asked:
             final = paid

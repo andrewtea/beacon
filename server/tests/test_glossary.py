@@ -129,6 +129,19 @@ def test_an_answer_that_is_not_the_whole_form_is_no_glossary(text: str) -> None:
     assert (glossary.whole, glossary.entries, glossary.left_out) == (False, (), 0)
 
 
+def test_an_answer_that_was_cut_short_is_no_glossary_whatever_of_it_reads_as_the_form(
+    tmp_path: Path,
+) -> None:
+    whole = json.dumps({"entries": [{"code": "E", "role": "engine"}]})
+    script = Script([fake_response(text=whole, status="incomplete")])
+    ember = EmberClient.fake(Storage.under(tmp_path), script)
+
+    glossary = learn_glossary(ember, [pattern("E")])
+
+    assert (glossary.whole, glossary.entries, glossary.left_out) == (False, (), 0)
+    assert read_form(whole, ["E"], model="fake").whole
+
+
 def test_codes_that_are_not_ones_to_ask_about_are_refused_before_ember_is_asked(
     tmp_path: Path,
 ) -> None:

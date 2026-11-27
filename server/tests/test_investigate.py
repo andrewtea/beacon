@@ -394,13 +394,18 @@ def test_a_clip_and_a_photo_are_each_looked_at_once_in_a_sensitive_call_and_kept
     first, again = made.run.rounds
     assert [dict(call.returned) for call in first.calls[1:]] == [
         {"heard": ["siren"]},
-        # An answer that is no form says nothing was made out.
-        {"seen": ["none"]},
+        # An answer that is no form is no answer: it does not say that none of
+        # the things asked about is in the photo.
+        {"error": "no_answer"},
     ]
     assert [dict(call.returned) for call in again.calls] == [
         {"heard": ["siren"], "again": True},
-        {"seen": ["none"], "again": True},
+        {"error": "no_answer"},
     ]
+    assert words.returned_text(first.calls[2]) == (
+        "The investigator's answer was cut short, was not the form, or named nothing "
+        "on Beacon's list, so nothing is known of what the clip or the photo holds."
+    )
     # Read once each, and paid for once each: five requests, not seven.
     assert asked == [(TAP, "clip"), (TAP, "photo")]
     assert len(script.requests) == 5
@@ -423,6 +428,119 @@ def test_a_clip_and_a_photo_are_each_looked_at_once_in_a_sensitive_call_and_kept
     for request_text in ("You are the investigator", "nearby_incidents", "Say which of these"):
         assert request_text not in kept
     assert len(ember.ledger_calls([call.ledger for call in made.run.calls])) == 5
+
+
+def test_an_answer_about_a_clip_that_was_cut_short_is_not_read_as_nothing_heard(
+    rows: Rows, storage: Storage
+) -> None:
+    # What the first real answers were: all of the output limit spent on reasoning,
+    # and what there was of a form cut off. It is paid for, and it is no "none".
+    city(rows)
+    scene = scene_of(rows, rows.tap(6, ref=TAP, clip=True), lambda _tap, _kind: CLIP)
+    fire = of_category(scene, "fire")
+    script = Script(
+        [
+            asks(NEAR, ("listen_clip", {})),
+            fake_response(text='{"heard": ["none"]}', status="incomplete", output_tokens=600),
+            asks(("listen_clip", {})),
+            form(fire.id, ("near", "heard_in_clip")),
+        ]
+    )
+
+    made = investigate_tap(EmberClient.fake(storage, script), scene)
+
+    first, again = made.run.rounds
+    listened = first.calls[1]
+    assert (listened.ok, dict(listened.returned)) == (False, {"error": "no_answer"})
+    # Paid for, and so not asked for again: the second call makes no request.
+    assert listened.ember is not None
+    assert (dict(again.calls[0].returned), again.calls[0].ember) == ({"error": "no_answer"}, None)
+    assert len(script.requests) == 4
+    assert "heard_in_clip" not in made.run.outcome.grounds
+    # Every request about a clip is made with the effort and the room the first
+    # real answers needed.
+    asked = script.requests[1]
+    assert (asked["reasoning"], asked["max_output_tokens"]) == ({"effort": "minimal"}, 600)
+
+
+@pytest.mark.parametrize(
+    ("heard", "returned"),
+    [
+        # Ember's own word that none of the sounds is in the clip.
+        (["none"], {"heard": ["none"]}),
+        # A list that names nothing does not say that, and neither does one that
+        # holds only what is on no list: Ember heard something Beacon has no tag for.
+        ([], {"error": "no_answer"}),
+        (["gunshots", "A man shouts Jane"], {"error": "no_answer"}),
+        ([None, 3], {"error": "no_answer"}),
+        # A tag with `none` beside it is the tag.
+        (["none", "siren"], {"heard": ["siren"]}),
+    ],
+)
+def test_only_embers_own_none_says_that_none_of_the_sounds_is_in_a_clip(
+    rows: Rows, storage: Storage, heard: list[Any], returned: dict[str, Any]
+) -> None:
+    city(rows)
+    scene = scene_of(rows, rows.tap(6, ref=TAP, clip=True), lambda _tap, _kind: CLIP)
+    script = Script(
+        [
+            asks(NEAR, ("listen_clip", {})),
+            fake_response(text=json.dumps({"heard": heard})),
+            form(),
+        ]
+    )
+
+    made = investigate_tap(EmberClient.fake(storage, script), scene)
+
+    listened = made.run.rounds[0].calls[1]
+    assert dict(listened.returned) == returned
+    assert listened.ok == ("error" not in returned)
+    # Paid for either way.
+    assert listened.ember is not None
+    assert "Jane" not in repr(made.run)
+
+
+def test_an_answer_that_was_cut_short_is_no_answer_and_no_tool_is_run_on_its_word(
+    rows: Rows, storage: Storage
+) -> None:
+    city(rows)
+    read: list[str] = []
+
+    def media(_tap: str, kind: str) -> bytes:
+        read.append(kind)
+        return CLIP
+
+    scene = scene_of(rows, rows.tap(6, ref=TAP, clip=True), media)
+    fire = of_category(scene, "fire")
+    # An answer that did not end, and asks for the clip to be listened to, which
+    # is a paid call: it is not made, and nothing is asked of Ember after it.
+    cut = fake_response(
+        function_calls=[("listen_clip", dict(SAID))],
+        status="incomplete",
+        input_tokens=2_000,
+        output_tokens=900,
+    )
+    script = Script([cut, form(fire.id, ("near",))])
+
+    made = investigate_tap(EmberClient.fake(storage, script), scene)
+
+    assert (read, len(script.requests), made.run.rounds) == ([], 1, ())
+    assert made.run.outcome == Outcome(status="unconfirmed", reason="no_answer")
+    assert (made.usable, made.failure, made.run.cut_short) == (False, None, None)
+    # What it cost is kept with the run, and nothing is left unaccounted.
+    final = made.run.final
+    assert final is not None
+    assert (final.input_tokens, final.output_tokens) == (2_000, 900)
+    assert made.run.unaccounted == 0
+    assert len(EmberClient.fake(storage, Script([])).ledger_calls([final.ledger])) == 1
+
+    # The same of a last answer that reads as a whole form naming the fire.
+    whole = form(fire.id, ("near",)) | {"status": "incomplete"}
+    script = Script([asks(NEAR), whole])
+    made = investigate_tap(EmberClient.fake(storage, script), scene)
+    assert made.run.outcome == Outcome(status="unconfirmed", reason="no_answer")
+    assert (made.usable, len(made.run.rounds), made.run.final is not None) == (False, 1, True)
+    assert made.run.outcome.incident_id is None
 
 
 def test_a_clip_that_is_no_longer_kept_is_said_to_be_gone(rows: Rows, storage: Storage) -> None:
@@ -1582,6 +1700,26 @@ def test_a_file_of_the_shape_before_keeps_its_runs_and_decisions_and_gets_this_s
     with closing(sqlite3.connect(path)) as db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == store_module._FORMAT
     assert store_module._FORMAT not in store_module._READABLE | store_module._EARLIER
+
+
+def test_a_file_from_before_an_answer_could_be_no_answer_keeps_its_runs(tmp_path: Path) -> None:
+    path = tmp_path / "investigate" / "mock.sqlite3"
+    runs = runs_file(tmp_path)
+    runs.claim(TAP, at(6))
+    run = crisis_run(TAP, "inc-1", 6, ("alarm",))
+    runs.write(run)
+    with closing(sqlite3.connect(path)) as db:
+        db.execute("PRAGMA user_version = 3")
+
+    again = Runs(path, "mock")
+
+    assert again.get(TAP) == (at(6), run)
+    assert again.crisis("inc-1") is not None
+    # The number goes up all the same: a Beacon of before would word a run's
+    # `no_answer` as a tool that was not run.
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == store_module._FORMAT == 4
+    assert {2, 3} == store_module._READABLE
 
 
 def test_a_decision_keeps_the_feeds_whose_credit_goes_with_each_signal_it_cited(

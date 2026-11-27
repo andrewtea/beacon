@@ -74,7 +74,9 @@ def everything_on_disk(root: Path) -> str:
     return "\n".join(found)
 
 
-def test_ember_is_handed_the_audio_and_a_form_at_low_effort(storage: Storage) -> None:
+def test_ember_is_handed_the_audio_and_a_form_at_the_effort_a_real_answer_needed(
+    storage: Storage,
+) -> None:
     heard, script = hear(storage, form())
 
     (request,) = script.requests
@@ -86,8 +88,10 @@ def test_ember_is_handed_the_audio_and_a_form_at_low_effort(storage: Storage) ->
         "input_audio": {"data": base64.b64encode(WAV).decode(), "format": "wav"},
     }
     assert request["instructions"] == INSTRUCTIONS
-    assert request["reasoning"] == {"effort": "low"}
-    assert request["max_output_tokens"] == 512
+    # At `low` effort the first real answer spent all of 512 tokens on reasoning
+    # and held no form.
+    assert request["reasoning"] == {"effort": "minimal"}
+    assert request["max_output_tokens"] == 1024
     assert request["text"]["format"] == {
         "type": "json_schema",
         "name": "transmission",

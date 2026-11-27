@@ -143,6 +143,242 @@ def test_a_stand_in_run_goes_from_datasfs_record_to_results_that_say_what_they_a
     assert generate.read_script(layout.calls).calls == CALLS
 
 
+def test_a_run_of_a_sample_is_of_the_days_first_calls_and_says_so_wherever_its_kind_is_said(
+    env: dict[str, str], site: DataSf
+) -> None:
+    status, said = command(env, site, "--calls", "3")
+
+    assert status == 0
+    layout = run.Layout.under(env, "day")
+    made = results.read(layout)
+    assert made is not None
+    # The fire, the medical call, and the first alarm: nothing of the three calls
+    # after them is generated, heard, or scored.
+    assert generate.read_script(layout.calls).calls == 3 + 3 + 2
+    assert [record.number for record in run.read_day(layout)[0]] == [
+        "260620001",
+        "260620002",
+        "260620003",
+    ]
+    assert run.read_day_calls(layout, run.read_settings(layout)) == 6
+    # On disk the run's audio says it is a sample's, so that a Beacon from before
+    # a run could be one refuses it and does not go on with it as a day's.
+    assert (
+        json.loads(layout.settings.read_text())["audio"]
+        == run.SAMPLED_AUDIO
+        == ("generated-sample")
+    )
+    assert run.read_settings(layout) == run.Settings(
+        day=DAY, audio="generated", voice="tones", hearer="fake", sample=3
+    )
+    numbers, texts = numbers_of(env), texts_of(env)
+    assert (numbers["records"], numbers["transmissions"]) == (3, 8)
+    assert (numbers["found"], numbers["found_share"], numbers["missed"]) == (3, 100.0, 0)
+    # What the run is of is in the words it begins with, on the terminal and in
+    # the file, in its label, and in the sentence that goes with every group.
+    sample = (
+        " This run is of a sample: the first 3 calls of the day, in the order they "
+        "were dispatched, of the 6 in DataSF's record of the day that Beacon could read."
+    )
+    assert made["sample"] == {"calls": 3, "of": 6}
+    assert made["basis_text"].startswith(results.GENERATED_BY_STAND_IN + sample)
+    assert "are of that sample and of no whole day" in made["basis_text"]
+    # What among the numbers is not the sample's is named, and each says so itself.
+    assert "Three things below are not the sample's, and each says so" in made["basis_text"]
+    whole_day = " This is of DataSF's answer for the whole day, not of the sample."
+    assert texts["records_unreadable"].endswith(whole_day)
+    assert texts["rows_unreadable"].endswith(whole_day)
+    assert "of the 3 DataSF calls of the sample" in texts["found_share"]
+    assert "midnight" not in json.dumps(made)
+    assert said.startswith(made["basis_text"])
+    assert "This run is of the first 3 of them." in said
+    label, reminder = results.kind(made)
+    assert label == "Stand-in, generated calls, sample of 3 calls"
+    assert reminder is not None
+    # The day's count is of the calls Beacon could read, and is called that.
+    assert reminder.endswith(
+        "It is of a sample, the first 3 of the 6 calls Beacon could read for that day, "
+        "and of no whole day: a number here is of the sample unless its own sentence "
+        "says it is of the whole day or of a spending scope."
+    )
+    # On the terminal the kind is beside every number, as it is on the page.
+    shown = [line for line in results.lines(made) if line and not line.startswith(" ")]
+    numbered = shown[shown.index("DataSF calls in the sample: 3 calls  [" + label + "]") :]
+    assert len(numbered) == len(made["numbers"])
+    assert all(line.endswith("  [" + label + "]") for line in numbered)
+    # Why an incident fits no call is not said: the rule shows only that none fits.
+    assert texts["extra"] == "Incidents of Beacon's that fit no DataSF call of the sample."
+    assert results.NOT_CHECKED_GENERATED in made["caveats"]
+    assert results.NOT_CHECKED not in made["caveats"]
+    assert texts["records"].startswith("The first 3 calls the fire department was dispatched to")
+    assert "of these and not of the day" in texts["records"]
+    assert "fit no DataSF call of the sample" in texts["extra"]
+    assert "for every call of the sample within a kilometre" in texts["taps_away_unconfirmed"]
+    assert "that is not in the sample" in texts["taps_away_unconfirmed"]
+    for text in texts.values():
+        assert "of this day. One can be" not in text
+        assert "for every call DataSF lists within a kilometre" not in text
+
+
+def _made(env: dict[str, str], name: str = "day") -> dict[str, Any]:
+    """A run's results, without the moment they were written at."""
+    made = results.read(run.Layout.under(env, name))
+    assert made is not None
+    return {key: value for key, value in made.items() if key != "made_at"}
+
+
+def test_a_run_is_of_a_sample_or_of_its_day_for_good(env: dict[str, str], site: DataSf) -> None:
+    assert command(env, site, "--calls", "3")[0] == 0
+    assert command(env, site, name="whole")[0] == 0
+    sampled, whole = _made(env), _made(env, "whole")
+
+    for name, change in (("day", []), ("day", ["--calls", "4"]), ("whole", ["--calls", "3"])):
+        status, said = command(env, site, *change, name=name)
+        assert status == 2
+        assert "its sample are not the ones asked for now" in said
+    # The same command again goes on with each, as with any run.
+    assert command(env, site, "--calls", "3")[0] == 0
+    assert (_made(env), _made(env, "whole")) == (sampled, whole)
+    # A whole day's result says nothing of a sample.
+    assert (whole["sample"], whole["basis_text"]) == (None, results.GENERATED_BY_STAND_IN)
+
+
+def test_a_sample_that_would_hold_the_whole_day_is_not_made(
+    env: dict[str, str], site: DataSf
+) -> None:
+    for calls in ("6", "7"):
+        status, said = command(env, site, "--calls", calls, name=f"of-{calls}")
+        assert status == 2
+        assert "A sample holds fewer calls than the day has" in said
+        assert "has 6 that Beacon can read" in said
+        assert "under another --name" in said
+        # Nothing of the day is kept for it, and nothing is generated or scored.
+        layout = run.Layout.under(env, f"of-{calls}")
+        assert not layout.records.exists()
+        assert not layout.calls.exists()
+        assert not layout.results.exists()
+
+
+def test_a_run_begun_before_a_run_could_be_a_sample_is_of_its_whole_day(
+    env: dict[str, str], site: DataSf
+) -> None:
+    assert command(env, site)[0] == 0
+    layout = run.Layout.under(env, "day")
+    before = _made(env)
+    # As such a run kept what it is and its records: with no word of a sample.
+    kept = json.loads(layout.settings.read_text())
+    del kept["sample"]
+    layout.settings.write_text(json.dumps(kept))
+    records = json.loads(layout.records.read_text())
+    del records["day_calls"]
+    layout.records.write_text(json.dumps(records))
+
+    assert run.read_settings(layout) == run.Settings(
+        day=DAY, audio="generated", voice="tones", hearer="fake"
+    )
+    assert run.read_day_calls(layout, run.read_settings(layout)) == 6
+    assert command(env, site)[0] == 0
+    assert _made(env) == before
+
+
+def test_a_run_whose_files_do_not_agree_about_its_sample_is_not_gone_on_with(
+    env: dict[str, str], site: DataSf
+) -> None:
+    assert command(env, site, "--calls", "3")[0] == 0
+    layout = run.Layout.under(env, "day")
+    settings, records = layout.settings.read_text(), layout.records.read_text()
+    made = layout.results.read_bytes()
+
+    # Settings that say a sample by one of its two words and not by the other, as
+    # a run would whose `sample` a Beacon from before had read past.
+    for change in ({"audio": "generated"}, {"sample": None}):
+        layout.settings.write_text(json.dumps(json.loads(settings) | change))
+        with pytest.raises(run.ScaleError, match=r"run\.json"):
+            run.read_settings(layout)
+        status, said = command(env, site, "--calls", "3")
+        assert (status, layout.results.read_bytes()) == (2, made)
+        assert "The run's settings (run.json) cannot be read." in said
+    layout.settings.write_text(settings)
+
+    # Records that are not the sample's: the whole day's, a day's that is no more
+    # than the sample, more or fewer than the sample holds, and no count of the day.
+    kept = json.loads(records)
+    for change in (
+        {"day_calls": 3},
+        {"day_calls": 2},
+        {"day_calls": None},
+        {"day_calls": True},
+        {"records": kept["records"][:2]},
+    ):
+        layout.records.write_text(json.dumps(kept | change))
+        status, said = command(env, site, "--calls", "3")
+        assert (status, layout.results.read_bytes()) == (2, made)
+        assert "are not what the run's settings say they are" in said
+    without = {key: value for key, value in kept.items() if key != "day_calls"}
+    layout.records.write_text(json.dumps(without))
+    assert command(env, site, "--calls", "3")[0] == 2
+    layout.records.write_text(records)
+    assert command(env, site, "--calls", "3")[0] == 0
+
+    # And a whole day's records that say the day had more calls than were kept.
+    assert command(env, site, name="whole")[0] == 0
+    whole = run.Layout.under(env, "whole")
+    kept = json.loads(whole.records.read_text())
+    whole.records.write_text(json.dumps(kept | {"day_calls": 7}))
+    status, said = command(env, site, name="whole")
+    assert status == 2
+    assert "are not what the run's settings say they are" in said
+
+
+def test_a_sample_is_fewer_calls_than_its_day_wherever_it_is_said(
+    env: dict[str, str], site: DataSf
+) -> None:
+    assert command(env, site, "--calls", "3")[0] == 0
+    made = results.read(run.Layout.under(env, "day"))
+    assert made is not None
+    settings = run.Settings(day=DAY, audio="generated", voice="tones", hearer="fake", sample=3)
+
+    # A result that says its sample is its whole day, in its words too.
+    whole = made | {
+        "sample": {"calls": 6, "of": 6},
+        "basis_text": results.GENERATED_BY_STAND_IN + results._sample_basis(6, 6),
+    }
+    with pytest.raises(ValueError, match="The result's sample is none a run can be of"):
+        results.kind(whole)
+    for day_calls in (3, 2):
+        with pytest.raises(ValueError, match="A sample is fewer calls than the day has"):
+            results.basis(settings, day_calls=day_calls)
+    assert results.basis(settings, day_calls=4).startswith(results.GENERATED_BY_STAND_IN)
+
+
+@pytest.mark.parametrize(
+    "sample",
+    [
+        {"calls": 4, "of": 6},
+        {"calls": 3, "of": 7},
+        {"calls": 7, "of": 6},
+        {"calls": 0, "of": 6},
+        {"calls": True, "of": 6},
+        {"calls": "3", "of": 6},
+        [3, 6],
+        None,
+    ],
+)
+def test_a_result_whose_sample_is_not_the_one_its_words_say_is_of_no_kind(
+    env: dict[str, str], site: DataSf, sample: object
+) -> None:
+    assert command(env, site, "--calls", "3")[0] == 0
+    made = results.read(run.Layout.under(env, "day"))
+    assert made is not None
+    results.kind(made)
+
+    with pytest.raises(ValueError, match=r"The result's (sample|basis) is no"):
+        results.kind(made | {"sample": sample})
+    # And a sample is of generated calls only.
+    with pytest.raises(ValueError, match="The result's sample is none a run can be of"):
+        results.kind(made | {"audio": "recorded", "hearer": "live", "stand_in": False})
+
+
 def test_a_stand_ins_run_reports_no_cost_no_speed_and_no_lead_time(
     env: dict[str, str], site: DataSf
 ) -> None:
@@ -244,6 +480,11 @@ def test_a_run_is_one_kind_for_good(env: dict[str, str], site: DataSf) -> None:
         (["--voice", "speech", "--paid", "--radio-budget", "lots"], "A budget is a dollar amount"),
         (["--voice", "speech", "--paid", "--taps-budget", "0.51"], "at most $0.50"),
         (["--taps", "301"], "From 0 to 300 taps"),
+        (["--calls", "0"], "--calls is how many calls a sample holds"),
+        (
+            ["--recordings", "/somewhere", "--paid", "--calls", "3"],
+            "--calls does not go with --recordings",
+        ),
         (["--voice", "speech", "--paid"], "A paid run needs a live Ember"),
     ],
 )
@@ -315,6 +556,8 @@ class Meta:
         self.fail_glossary = False
         # What the next glossary is answered with, in place of the stand-in's form.
         self.glossary_text: str | None = None
+        # How the next glossary's answer ended, as the API says it.
+        self.glossary_status = "completed"
         self.api = MetaApi(input_tokens=1_000, create=self.create)
 
     def create(self, request: httpx2.Request) -> httpx2.Response:
@@ -327,6 +570,7 @@ class Meta:
             answer = dict(stand_in_learner(body))
             if self.glossary_text is not None:
                 answer = dict(fake_response(text=self.glossary_text))
+            answer["status"] = self.glossary_status
         elif form != "transmission":
             self.tap_requests += 1
             if self.before_tap is not None:
@@ -423,7 +667,19 @@ def test_a_paid_run_of_generated_speech_reports_what_the_ledger_holds_and_says_w
     assert numbers["radio_cost_usd"] == pytest.approx(CALLS * 0.00015)
     assert numbers["radio_cost_per_1000_usd"] == pytest.approx(0.15)
     assert "generated speech, not radio" in texts["radio_cost_usd"]
+    # The total, the count, and the rate each say they are their scope's over
+    # every paid run: a second paid run of generated speech adds to all three.
+    every = "every paid run's hearing of generated speech, not radio, this run's and any other's"
+    for key in ("radio_cost_usd", "radio_paid_calls", "radio_cost_per_1000_usd"):
+        assert every in texts[key]
+        assert run.SPEECH_SCOPE in texts[key]
+    for key in ("radio_paid_calls", "radio_cost_per_1000_usd"):
+        assert "and not this run's alone" in texts[key]
     assert "no measure of Beacon on real radio" in texts["found"]
+    # Every generated call is of a record: nothing is said of a call DataSF does
+    # not list, and an incident no call fits is counted and not explained.
+    assert made["caveats"][0] == results.NOT_CHECKED_GENERATED
+    assert texts["extra"] == "Incidents of Beacon's that fit no DataSF call of this day."
     # Generated calls are placed at DataSF's times, paid for or not.
     assert numbers["heard_after_dispatch_s"] is None
     # The taps were investigated by the paid client too, under their own scope.
@@ -1518,6 +1774,12 @@ def test_a_run_over_recordings_is_the_one_whose_numbers_are_about_real_radio(
     numbers, texts = numbers_of(env), texts_of(env)
     # Only the day's two calls were heard: not the evening before, nor the morning after.
     assert (numbers["transmissions"], numbers["radio_paid_calls"]) == (2, 2)
+    # Of real radio, a call DataSF does not list cannot be told from a wrong incident.
+    assert results.NOT_CHECKED in made["caveats"]
+    assert texts["extra"].endswith(
+        "One can be a real call DataSF does not list, or a wrong incident: the rule cannot tell."
+    )
+    assert "every paid run's hearing of recorded radio" in texts["radio_cost_per_1000_usd"]
     assert len(meta.audio) == 2
     assert (numbers["incidents"], numbers["found"], numbers["missed"]) == (1, 1, 5)
     assert "not_generated" not in numbers
@@ -1821,9 +2083,12 @@ def test_the_lines_for_a_terminal_put_what_the_run_is_before_any_number(
     )
     assert first_number > 2
     # Every number is followed by its sentence, and one with no value says "none".
-    assert "Cost of hearing: none" in lines
-    assert lines[lines.index("Cost of hearing: none") + 1].strip().startswith("Not measured:")
-    assert "Share of DataSF calls found: 66.7%" in lines
+    # Beside each number is whose it is: a line copied out by itself still says.
+    whose = "  [" + results.kind(made)[0] + "]"
+    assert whose == "  [Stand-in, generated calls]"
+    cost = "Cost of hearing: none" + whose
+    assert lines[lines.index(cost) + 1].strip().startswith("Not measured:")
+    assert "Share of DataSF calls found: 66.7%" + whose in lines
 
 
 def test_results_of_another_shape_are_not_read(env: dict[str, str], site: DataSf) -> None:
