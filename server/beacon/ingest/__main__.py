@@ -21,6 +21,7 @@ from beacon.ember.client import default_data_dir
 from beacon.ember.errors import EmberConfigError
 from beacon.evidence import EvidenceStoreError
 from beacon.ingest.setup import IngestConfigError, build
+from beacon.telling import MOCK_EMBER_VARIABLE, TellingConfigError, teller_of
 
 
 def main() -> None:
@@ -42,8 +43,16 @@ def main() -> None:
 
 def _poll(follow: bool) -> None:
     try:
+        if teller_of(os.environ) == "ember":
+            # This command shares the stores (`DataLock`), and a telling Muse
+            # Ember is paid for has one process, which has them alone.
+            raise IngestConfigError(
+                f"{MOCK_EMBER_VARIABLE}=live is for the server (`python -m beacon.serve`), "
+                "which has the data directory's stores alone while Muse Ember works on "
+                "the invented story. This command shares them, and does not."
+            )
         ingest = build(os.environ)
-    except (IngestConfigError, EvidenceStoreError, EmberConfigError) as error:
+    except (IngestConfigError, EvidenceStoreError, EmberConfigError, TellingConfigError) as error:
         raise SystemExit(str(error)) from error
     try:
         ingest.catch_up()

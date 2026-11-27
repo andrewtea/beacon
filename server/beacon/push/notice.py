@@ -5,9 +5,11 @@ when it subscribed (`notice_of`) and kept for its service worker. It says what a
 push means and no more: that the investigator's decision turned crisis mode on for
 an incident Beacon has near a place the device named. It is the investigator's
 reading, and the sentence says so; it tells nobody what to do. On the mock store it
-says first that the incident is invented and that a stand-in decided.
+says first that the incident is invented, and not who decided, a stand-in or a
+model (`beacon.telling`): the words on a device can be older than the telling.
 """
 
+import hashlib
 from dataclasses import dataclass
 
 from beacon.files import Mode
@@ -21,6 +23,14 @@ class Notice:
     title: str
     text: str
 
+    @property
+    def id(self) -> str:
+        """Names these words and no others. A device says which words it holds
+        when it gives its address (`POST /api/push/subscribe`), and the server
+        keeps an address only from a device that holds the words of now: a push
+        carries nothing, so what a device shows is what it was last handed."""
+        return hashlib.sha256(f"{self.title}\n{self.text}".encode()).hexdigest()[:16]
+
 
 _LIVE = Notice(
     title="Beacon: crisis mode near a saved place",
@@ -31,12 +41,19 @@ _LIVE = Notice(
         "Beacon to read what each source said."
     ),
 )
+# On the mock store. **It does not say who decided**: the words are kept on the
+# device from when it last opened the app, a push carries nothing, and a mock
+# store's investigator can be a stand-in for one telling of the invented story and
+# a model for the next (`beacon.telling`). So they say what is true of both, and
+# send the person to the app, which says who investigated beside the answer.
 _MOCK = Notice(
     title="Beacon: invented scenario",
     text=(
-        "Invented scenario, not a real event. A stand-in for Beacon's investigator "
-        "turned crisis mode on for an invented incident that Beacon has within about a "
-        "kilometre of a place you get notifications for. Open Beacon to read it."
+        "Invented scenario, not a real event. Beacon's investigator, which the app "
+        "names as a model or a stand-in for one, turned crisis mode on for an invented "
+        "incident that Beacon has within about a kilometre of a place you get "
+        "notifications for. That is the investigator's reading and no authority's. "
+        "Open Beacon to read it."
     ),
 )
 
@@ -74,4 +91,5 @@ OFF = "This server sends no notifications."
 
 
 def notice_of(mode: Mode) -> Notice:
+    """The words for a server in `mode`."""
     return _MOCK if mode == "mock" else _LIVE

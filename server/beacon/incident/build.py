@@ -141,7 +141,15 @@ _LABELS = {
 # What a feed is called for a row of the invented scenario, where the feed's own
 # name would say that the row came from it. The row is in adsb.lol's format and
 # holds nothing of adsb.lol's.
-_INVENTED_LABELS = {"adsblol": "Aircraft positions"}
+_INVENTED_LABELS = {
+    "adsblol": "Aircraft positions",
+    # A `mock` row a real Ember wrote: Ember heard or read something, and it was
+    # no radio and no authority's notice. It was generated for Ember to hear or
+    # read: the invented story's calls and documents when Muse Ember works on
+    # that story (`beacon.telling`).
+    "recordings": "Generated radio calls, synthesized speech and no radio, as Ember heard them",
+    "notices": "Invented notice, as Ember read it",
+}
 # What the two feeds a model writes the rows of are called when a stand-in wrote
 # the row: no Ember heard that call or read that document, so the label does not
 # say one did. That a stand-in did is said beside it, from the row's `stand_in`.

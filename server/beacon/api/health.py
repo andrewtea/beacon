@@ -3,7 +3,7 @@ from typing import Literal
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
-from beacon import __version__, front
+from beacon import __version__, front, telling
 
 router = APIRouter()
 
@@ -15,6 +15,20 @@ class Health(BaseModel):
     # then a stand-in's, and the app says so before anybody taps. Null when this
     # server reads no evidence.
     mode: Literal["live", "mock"] | None = None
+    # On a server on the invented scenario: who does the model's work on it
+    # (`beacon.telling`), a `stand_in` that works by rule or Muse Ember (`ember`).
+    # Null when the server is on real sources or reads no evidence. Every incident,
+    # story, and answer says of itself who made it; this says it of the server.
+    teller: telling.Teller | None = None
+    # Where Muse Ember works on the invented scenario: a sentence that says so, and
+    # that the story is still made up. Shown with what says the scenario is
+    # invented. Null on every other server.
+    teller_text: str | None = None
+    # Where a clip or a photo added to a tap can be sent to Meta, for Muse Ember
+    # to say what is in it (`beacon.investigate.setup.MEDIA_SENT`): a sentence
+    # that says so, shown where one is added. Null where the investigator is a
+    # stand-in, where no tap is investigated, and where no clip or photo is taken.
+    media_text: str | None = None
     # On a server that tells the invented scenario again when it is over
     # (`beacon.serve`, `BEACON_MOCK_REPEAT=1`): a sentence that says so, and what
     # becomes of the taps sent before. Shown with what says the scenario is
@@ -40,10 +54,14 @@ class Health(BaseModel):
 def health(request: Request) -> Health:
     engine = getattr(request.app.state, "incidents", None)
     takes: front.Input = getattr(request.app.state, "input", "own")
+    teller: telling.Teller | None = getattr(request.app.state, "teller", None)
     return Health(
         status="ok",
         version=__version__,
         mode=None if engine is None else engine.mode,
+        teller=teller,
+        teller_text=telling.TOLD_BY_EMBER if teller == "ember" else None,
+        media_text=getattr(request.app.state, "media_text", None),
         repeats_text=getattr(request.app.state, "repeats_text", None),
         input=takes,
         front_text=front.INVENTED if takes == "invented" else None,

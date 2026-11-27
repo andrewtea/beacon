@@ -3,6 +3,7 @@
 import logging
 from collections.abc import Mapping
 
+from beacon import telling
 from beacon.ember import EmberClient, SpendScope, Storage
 from beacon.ember.client import default_data_dir
 from beacon.ember.pricing import parse_usd
@@ -20,23 +21,39 @@ class StoryConfigError(Exception):
     """The environment asks for a story desk that cannot be built."""
 
 
-def open_stories(env: Mapping[str, str], engine: Engine) -> StoryDesk | None:
+def open_stories(
+    env: Mapping[str, str], engine: Engine, *, paid: telling.PaidClient | None = None
+) -> StoryDesk | None:
     """The desk that writes the stories of `engine`'s incidents, or None when
     stories are not written.
 
     On the mock store a stand-in for Ember writes them, which costs nothing, and
-    they go to `data/story/mock.sqlite3`. On the live store they are written by a
+    they go to `data/story/mock.sqlite3`; when Muse Ember works on the invented
+    story (`beacon.telling`), it picks their points, under a scope of the
+    telling's own, and they go to the same file, each saying who picked. `paid` is
+    how that paying client is made, which a test hands in. On the live store they are written by a
     live Ember under a budget of their own, `BEACON_STORY_BUDGET_USD`, and go to
     `data/story/live.sqlite3`; with no budget set none is written, which the log
     says, because every story is paid for.
 
     Raises StoryConfigError when a budget is set that is not a dollar amount, or
     is set without a live Ember, and StoriesError when the file was begun as the
-    other mode's."""
+    other mode's, and TellingConfigError as `beacon.telling.paying` does."""
     data_dir = default_data_dir(env)
     if engine.mode == "mock":
-        ember = EmberClient.fake(Storage.under(data_dir), stand_in_writer)
-        return StoryDesk(ember, Stories(data_dir / "story" / "mock.sqlite3", "mock"))
+        scope = SCOPE
+        if telling.teller_of(env) == "ember":
+            scope = telling.STORIES
+            ember = telling.paying(env, scope, paid)
+        else:
+            ember = EmberClient.fake(Storage.under(data_dir), stand_in_writer)
+        try:
+            stories = Stories(data_dir / "story" / "mock.sqlite3", "mock")
+        except BaseException:
+            # A client that was built is closed when the desk it was for is not.
+            ember.close()
+            raise
+        return StoryDesk(ember, stories, scope=scope)
     budget = env.get(BUDGET_VARIABLE, "").strip()
     if not budget:
         logger.warning(

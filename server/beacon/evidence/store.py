@@ -102,6 +102,14 @@ OWN_TABLE = "evidence"
 _SCHEMA_STATEMENTS = tuple(part.strip() for part in _SCHEMA.split(";") if part.strip())
 
 _MODE = "SELECT value FROM store_meta WHERE key = 'mode'"
+# What the file of a mock store says its mode is once Muse Ember has been set to
+# work on its invented story (`beacon.telling`): it then holds, or will hold, the
+# claims on what was paid for. **The word is for a Beacon from before there was such
+# a store**, which takes a file for the mock store only when it says `mock`: that
+# Beacon refuses to open this one, and its server that tells the story again
+# refuses to delete it, where it would otherwise go on with it, or delete it, as a
+# stand-in's. To this Beacon it is the mock store, and `paid` says the rest.
+PAID_MOCK = "mock-paid"
 
 _COLUMNS = (
     "id, kind, source, ref, url, occurred_ms, until_ms, lat, lon, place, confidence, "
@@ -277,6 +285,37 @@ class EvidenceStore:
                 )
         return added
 
+    def amend(
+        self,
+        name: str,
+        change: Callable[[dict[str, Any]], Mapping[str, Any] | None],
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Read what is saved under `name` and save what `change` makes of it, in
+        one write transaction, and return what is saved when it ends. `change` is
+        handed a copy and answers the state to save, or None to leave it as it is.
+
+        The look and the write are that one transaction, so of two processes on
+        one file that both find something missing, one writes it and the other is
+        handed what the first wrote.
+
+        Raises EvidenceStoreError when the state is not JSON or the store is
+        closed."""
+        recorded_ms = _to_ms(datetime.now(UTC) if now is None else now)
+        with self._writing() as db:
+            saved = _saved_state(db, name)
+            changed = change(dict(saved))
+            if changed is None:
+                return saved
+            db.execute(
+                "INSERT INTO poller_state (name, state, updated_ms) VALUES (?, ?, ?) "
+                "ON CONFLICT (name) DO UPDATE SET state = excluded.state, "
+                "updated_ms = excluded.updated_ms",
+                (name, _json(changed, "A poller's state"), recorded_ms),
+            )
+            return dict(changed)
+
     def claim(self, source: str, ref: str, *, now: datetime | None = None) -> bool:
         """Claim an item of a source's, and say whether the claim is this caller's.
         It is True for the one caller that claims an item first, and False for every
@@ -409,6 +448,35 @@ class EvidenceStore:
                 f"SELECT {_COLUMNS} FROM evidence WHERE source = ? AND ref = ?", (source, ref)
             ).fetchone()
         return None if row is None else _evidence(row)
+
+    @property
+    def paid(self) -> bool:
+        """Whether this is a mock store Muse Ember was set to work on (`mark_paid`)."""
+        with closing(self._connect()) as db:
+            return _begun(db) == PAID_MOCK
+
+    def mark_paid(self) -> None:
+        """Have the mock store's file say that Muse Ember works on its story, for
+        good (`PAID_MOCK`), before anything of it is paid for. It changes nothing
+        of a file that says so already.
+
+        Raises EvidenceStoreError for the live store, and when the store is closed."""
+        if self._mode != "mock":
+            raise_bare(EvidenceStoreError("Only a mock store is marked as paid for."))
+        with self._writing() as db:
+            db.execute(
+                "UPDATE store_meta SET value = ? WHERE key = 'mode' AND value = ?",
+                (PAID_MOCK, "mock"),
+            )
+
+    def used(self) -> bool:
+        """Whether anything was ever put into the store: a row, a claim, or what a
+        poller remembers. A store nothing was put into is nobody's yet."""
+        with closing(self._connect()) as db:
+            return any(
+                db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
+                for table in ("evidence", "claims", "poller_state")
+            )
 
     def count_by_source(self) -> dict[str, int]:
         """How many rows each source has."""
@@ -583,7 +651,7 @@ class EvidenceStore:
         except BaseException:
             db.close()
             raise
-        if begun != self._mode:
+        if ("mock" if begun == PAID_MOCK else begun) != self._mode:
             db.close()
             raise_bare(
                 EvidenceStoreError(

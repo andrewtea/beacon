@@ -43,9 +43,13 @@ const ADDRESS = 'https://fcm.googleapis.com/fcm/send/abc:DEF_123'
 const ABOUT =
   'To notify this device, Beacon keeps the address your browser’s push service made for it and the places you have saved.'
 const NOTICE = {
+  // Names these words, and goes back to the server with the device's address.
+  id: 'w0rd50fn0w',
   title: 'Beacon: invented scenario',
   text: 'Invented scenario, not a real event. A stand-in turned crisis mode on.',
 }
+// What a device keeps of them for its service worker: the words, not their id.
+const WORDS = { title: NOTICE.title, text: NOTICE.text }
 // A public key as the server writes one: 65 bytes, in URL-safe base64.
 const KEY_BYTES = Uint8Array.from({ length: 65 }, (_, index) =>
   index === 0 ? 4 : (index * 7) % 256,
@@ -384,7 +388,7 @@ test('turning notifications on keeps the server’s words, then sends the addres
   const [[subscribed]] = device.subscribe.mock.calls
   expect(subscribed.userVisibleOnly).toBe(true)
   expect([...subscribed.applicationServerKey]).toEqual([...KEY_BYTES])
-  expect(device.words('mock')).toEqual(NOTICE)
+  expect(device.words('mock')).toEqual(WORDS)
   expect(device.words('live')).toBeNull()
   const sent = of(asked, SUBSCRIBE)
   expect(sent).toHaveLength(1)
@@ -394,6 +398,7 @@ test('turning notifications on keeps the server’s words, then sends the addres
     endpoint: ADDRESS,
     places: [FIRE, FAR],
     permit: permitNo(1),
+    notice: NOTICE.id,
   })
   expect(of(asked, PERMIT).map((request) => request.body)).toEqual([
     { revoke: [] },
@@ -423,6 +428,7 @@ test('the server is told again when a place is saved or removed, and deletes the
     endpoint: ADDRESS,
     places: [FIRE, FAR],
     permit: permitNo(2),
+    notice: NOTICE.id,
   })
   const ids = (
     JSON.parse(window.localStorage.getItem('beacon.places.v1')!) as {
@@ -466,6 +472,7 @@ test('the app renews what the server keeps when it is opened, with the subscript
     endpoint: `${ADDRESS}-old`,
     places: [FIRE],
     permit: permitNo(1),
+    notice: NOTICE.id,
   })
   // The subscription the browser has is the one renewed: no other is made.
   expect(device.subscribe).not.toHaveBeenCalled()
@@ -490,8 +497,18 @@ test('a telling tells the server whatever this tab told it before, because anoth
   expect(await syncPush('mock', OWN)).toBe(true)
 
   expect(of(asked, SUBSCRIBE).map((request) => request.body)).toEqual([
-    { endpoint: ADDRESS, places: [FIRE], permit: permitNo(1) },
-    { endpoint: ADDRESS, places: [FIRE], permit: permitNo(2) },
+    {
+      endpoint: ADDRESS,
+      places: [FIRE],
+      permit: permitNo(1),
+      notice: NOTICE.id,
+    },
+    {
+      endpoint: ADDRESS,
+      places: [FIRE],
+      permit: permitNo(2),
+      notice: NOTICE.id,
+    },
   ])
 })
 
@@ -842,10 +859,15 @@ test('a subscription made for another key is let go of once its address is noted
     'subscribe mock',
   ])
   expect(of(asked, SUBSCRIBE).map((request) => request.body)).toEqual([
-    { endpoint: ADDRESS, places: [FIRE], permit: permitNo(1) },
+    {
+      endpoint: ADDRESS,
+      places: [FIRE],
+      permit: permitNo(1),
+      notice: NOTICE.id,
+    },
   ])
   expect(wanted()).toEqual({ ...MOCK_SERVER, forget: [] })
-  expect(device.words('mock')).toEqual(NOTICE)
+  expect(device.words('mock')).toEqual(WORDS)
 })
 
 test('turning notifications on for the invented scenario is not carried to real sources, and each server deletes only its own', async () => {
@@ -896,7 +918,11 @@ test('turning notifications on for the invented scenario is not carried to real 
 test('each mode has a service worker, a subscription, and words of its own', async () => {
   await savePlace('Home', FIRE)
   const device = browser({ permission: 'granted' })
-  const liveNotice = { title: 'Beacon: crisis mode', text: 'Real words.' }
+  const liveNotice = {
+    id: 'l1vew0rd5',
+    title: 'Beacon: crisis mode',
+    text: 'Real words.',
+  }
   window.localStorage.setItem(
     KEY,
     JSON.stringify({ on: 'live', told: null, forget: [] }),
@@ -909,7 +935,10 @@ test('each mode has a service worker, a subscription, and words of its own', asy
 
   expect(device.registered).toEqual([`${WORKER} ${scopeOf('live')}`])
   expect(device.events).toEqual(['keep the words live', 'subscribe live'])
-  expect(device.words('live')).toEqual(liveNotice)
+  expect(device.words('live')).toEqual({
+    title: liveNotice.title,
+    text: liveNotice.text,
+  })
   expect(device.words('mock')).toBeNull()
   expect(device.subscription('mock')).toBeNull()
   expect(of(asked, SUBSCRIBE)[0].headers['beacon-mode']).toBe('live')
@@ -1111,7 +1140,12 @@ test('a place removed while the browser makes the subscription is not sent', asy
   expect(await syncPush('mock', OWN)).toBe(true)
 
   expect(of(asked, SUBSCRIBE).map((request) => request.body)).toEqual([
-    { endpoint: ADDRESS, places: [FAR], permit: permitNo(1) },
+    {
+      endpoint: ADDRESS,
+      places: [FAR],
+      permit: permitNo(1),
+      notice: NOTICE.id,
+    },
   ])
   expect(JSON.stringify(asked)).not.toContain(String(FIRE.lat))
 
@@ -1178,7 +1212,12 @@ test('a server that sends none is asked to delete what an earlier one kept, so a
   expect(await syncPush('mock', OWN)).toBe(true)
 
   expect(of(asked, SUBSCRIBE).map((request) => request.body)).toEqual([
-    { endpoint: `${ADDRESS}-old`, places: [FAR], permit: permitNo(1) },
+    {
+      endpoint: `${ADDRESS}-old`,
+      places: [FAR],
+      permit: permitNo(1),
+      notice: NOTICE.id,
+    },
   ])
   expect(JSON.stringify(asked)).not.toContain(String(FIRE.lat))
   expect(device.subscribe).not.toHaveBeenCalled()
@@ -1230,7 +1269,15 @@ test('notifications are turned off at once while the server holds a request open
       .map((request) => [request.key, request.body]),
   ).toEqual([
     [PERMIT, { revoke: [] }],
-    [SUBSCRIBE, { endpoint: ADDRESS, places: [FIRE], permit: permitNo(1) }],
+    [
+      SUBSCRIBE,
+      {
+        endpoint: ADDRESS,
+        places: [FIRE],
+        permit: permitNo(1),
+        notice: NOTICE.id,
+      },
+    ],
     // The request was answered, so its permit is used up and none is named.
     [UNSUBSCRIBE, { endpoint: ADDRESS }],
   ])
@@ -1569,6 +1616,44 @@ test('a request to be notified that is answered, or refused for its permit, is n
     { revoke: [] },
     { revoke: [] },
   ])
+})
+
+test('a server whose words changed keeps nothing, and the next telling reads the words anew and names them', async () => {
+  await savePlace('Home', FIRE)
+  window.localStorage.setItem(KEY, turnedOn(null))
+  const device = browser({ permission: 'granted' })
+  const changed =
+    'What a notification from this server says has changed since this device was told, so this request to be notified kept nothing.'
+  // The words the server hands out by the time the device asks again.
+  const now = { id: 'w0rd5anew', title: 'Beacon', text: 'Other words.' }
+  let handed = NOTICE
+  const asked = serve(
+    routes({
+      [INFO]: () => Response.json(info({ notice: handed })),
+      // The server takes an address only with the id of the words of now.
+      [SUBSCRIBE]: () =>
+        handed === now
+          ? Response.json(SUBSCRIBED)
+          : Response.json({ detail: changed }, { status: 412 }),
+    }),
+  )
+
+  // Not taken for a server in the other mode: the telling failed, in the
+  // server's sentence, and is worth trying again.
+  expect(await syncPush('mock', OWN)).toBe(false)
+  expect(pushSnapshot().problem).toBe(changed)
+  expect((wanted() as { on: unknown }).on).toBe('mock')
+
+  handed = now
+  expect(await syncPush('mock', OWN)).toBe(true)
+  expect(
+    of(asked, SUBSCRIBE).map(
+      (request) => (request.body as { notice: string }).notice,
+    ),
+  ).toEqual([NOTICE.id, now.id])
+  // The words kept for the service worker are the ones the address was kept with.
+  expect(device.words('mock')).toEqual({ title: now.title, text: now.text })
+  expect(out()).toEqual([])
 })
 
 // The browser's own cleaning up keeps nothing from the server.

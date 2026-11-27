@@ -42,6 +42,14 @@ _OTHER_MODE = (
     "sources and the sender was shown the invented scenario, or the other way round. "
     "Nothing of the tap was read or kept. Look at what Beacon shows now, and tap again."
 )
+# Where a clip or a photo that comes with a tap can be sent to Meta
+# (`app.state.media_text`, `beacon.investigate.setup.MEDIA_SENT`), a tap that
+# holds either says its sender was shown that sentence when they pressed, in this
+# header: `meta`. A tap that holds one and does not say so is refused before
+# anything of it is kept. The app can only learn what a server does by asking, and
+# a page that asked an earlier server, or an older app, has not been told.
+MEDIA_HEADER = "Beacon-Media"
+MEDIA_TOLD = "meta"
 # For how long a tap's answer is read. A run is kept for `KEPT`, and a tap that is
 # older is answered as one Beacon does not have, not as one it did not look into.
 ANSWERED = KEPT - timedelta(hours=1)
@@ -311,7 +319,9 @@ async def tap(request: Request) -> TapReceipt:
 
     A tap names the mode its sender was shown in the `Beacon-Mode` header, and is
     refused with 409, unread, by a server in the other mode, and with 400 when it
-    names none."""
+    names none. Where a clip or a photo can be sent to Meta, a tap that holds
+    either is refused with 409, with nothing kept, unless it says its sender was
+    told (`MEDIA_HEADER`)."""
     taps: Taps | None = getattr(request.app.state, "taps", None)
     if taps is None:
         raise HTTPException(503, "This server is not taking taps.")
@@ -336,8 +346,14 @@ async def tap(request: Request) -> TapReceipt:
             # Off the event loop: the body is parsed, its media is decoded, and its
             # files and its row are written.
             desk: InvestigationDesk | None = getattr(request.app.state, "investigations", None)
+            # Whether the sender was told where a clip or a photo goes from here,
+            # where it goes anywhere: read before the body is parsed.
+            told = (
+                getattr(request.app.state, "media_text", None) is None
+                or request.headers.get(MEDIA_HEADER) == MEDIA_TOLD
+            )
             work = asyncio.get_running_loop().run_in_executor(
-                None, _take, taps, desk, body, give_back
+                None, _take, taps, desk, body, give_back, told
             )
         except BaseException:
             give_back()
@@ -363,13 +379,17 @@ async def tap(request: Request) -> TapReceipt:
 
 
 def _take(
-    taps: Taps, desk: InvestigationDesk | None, body: bytes, give_back: Callable[[], None]
+    taps: Taps,
+    desk: InvestigationDesk | None,
+    body: bytes,
+    give_back: Callable[[], None],
+    media_told: bool = True,
 ) -> tuple[Tap, bool]:
     """Take a tap and hand it to the investigator, and say whether it was taken
     there. Handed in, and not waited for: the answer is read with the tap's id. A
     tap whose request was called off is handed in all the same."""
     try:
-        taken = taps.take_body(body)
+        taken = taps.take_body(body, media_told=media_told)
     finally:
         give_back()
     return taken, desk is not None and desk.submit(taken.id)

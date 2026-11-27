@@ -85,8 +85,13 @@ function YourTaps() {
 export function Home({
   mode,
   input,
+  mediaText = null,
   onOtherMode,
 }: {
+  // Where a clip or a photo added to a tap can be sent to Meta for a model to
+  // say what is in it: the server's sentence about that, shown beside the
+  // controls that add one, before one is added.
+  mediaText?: string | null
   // What the server said it takes from a visitor at the latest asking, or null
   // when that is not known, and then no tap is taken. When it is only the
   // invented scenario's two places, the button sends a tap from the first of
@@ -109,6 +114,8 @@ export function Home({
   // sent now would go without it, and a second choice could finish first.
   const [drawing, setDrawing] = useState(false)
   const sending = useRef<AbortController | null>(null)
+  // Whether the tap that is on its way holds a clip or a photo.
+  const sendingMedia = useRef(false)
   const picker = useRef<HTMLInputElement | null>(null)
   // A tap that is on its way is called off when the view is left, and when
   // what the server says of its mode changes, to another mode or to not known:
@@ -125,6 +132,18 @@ export function Home({
       setPhase({ kind: 'idle' })
     },
     [mode, input],
+  )
+  // And a tap with a clip or a photo is called off when what the server says
+  // of where those go changes: it was made by somebody who was shown the other.
+  // A tap with neither goes on.
+  useLayoutEffect(
+    () => () => {
+      if (sending.current === null || !sendingMedia.current) return
+      sending.current.abort()
+      sending.current = null
+      setPhase({ kind: 'idle' })
+    },
+    [mediaText],
   )
 
   const busy = drawing ? 'Reading the picture…' : BUSY[phase.kind]
@@ -145,8 +164,13 @@ export function Home({
     // The mode that was on the screen when the button was pressed. The tap
     // names it, and a server in the other mode refuses the tap unread.
     const shown = mode
+    // Whether the server's sentence about where a clip or a photo goes was on
+    // the screen at the press. The tap says so, and a server that sends either
+    // to Meta refuses a tap that holds one without it.
+    const mediaTold = mediaText !== null
     const controller = new AbortController()
     sending.current = controller
+    sendingMedia.current = clipWanted || (photo !== null && !invented)
     // Asked after every wait: a tap that was called off while it waited for
     // the phone's place, the microphone, or a photo's bytes sends nothing.
     const unlessCalledOff = () => {
@@ -171,7 +195,7 @@ export function Home({
         body.photo = toBase64(new Uint8Array(await photo.arrayBuffer()))
         unlessCalledOff()
       }
-      const receipt = await sendTap(body, shown, controller.signal)
+      const receipt = await sendTap(body, shown, controller.signal, mediaTold)
       keepTap({
         id: receipt.id,
         at: receipt.received_at,
@@ -304,6 +328,7 @@ export function Home({
               {photoProblem}
             </p>
           )}
+          {mediaText !== null && <p className="note media-note">{mediaText}</p>}
           <p className="meta privacy">
             A tap sends where you are, rounded to about a block, and whatever
             you add. A clip or a photo goes only with the tap, as evidence for

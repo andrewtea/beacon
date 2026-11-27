@@ -101,6 +101,8 @@ def offline_environment(
         "BEACON_SCALE_RUN",
         "BEACON_WEB_DIR",
         "BEACON_MOCK_REPEAT",
+        "BEACON_MOCK_EMBER",
+        "BEACON_MOCK_EMBER_BUDGET_USD",
         "BEACON_FRONT_END",
     ):
         monkeypatch.delenv(name, raising=False)

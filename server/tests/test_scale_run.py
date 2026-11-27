@@ -496,7 +496,7 @@ def test_a_run_that_cannot_be_what_was_asked_for_is_not_made(
     problem: str,
 ) -> None:
     monkeypatch.setattr(generate, "can_speak", lambda: True)
-    monkeypatch.setattr(generate, "_speech", lambda root, words: _clip(words))
+    monkeypatch.setattr(generate, "_speech", _clip)
 
     status, said = command(env, site, *options)
 
@@ -632,7 +632,7 @@ def _digest(body: dict[str, Any]) -> str:
 def speech(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
     monkeypatch.setattr(generate, "can_speak", lambda: True)
-    monkeypatch.setattr(generate, "_speech", lambda root, words: _clip(words))
+    monkeypatch.setattr(generate, "_speech", _clip)
 
 
 PAID = ("--voice", "speech", "--paid")

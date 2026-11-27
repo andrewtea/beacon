@@ -7,8 +7,10 @@ import { roundToBlock } from '../lib/geo.ts'
 // as `server/beacon/api/push.py` documents them.
 
 /** What a device shows when a push arrives, in the server's words. A push
- * carries no words, so the app keeps these for its service worker. */
-export type PushNotice = { title: string; text: string }
+ * carries no words, so the app keeps these for its service worker. `id` names
+ * these words: the app sends it back with the device's address, and the server
+ * keeps an address only from a device that holds the words it hands out now. */
+export type PushNotice = { id: string; title: string; text: string }
 
 export type PushInfo = {
   mode: Mode
@@ -62,13 +64,16 @@ export function permitPush(
  * the server had. `shown` is the mode the app is showing, which a server in the
  * other mode refuses unread. `permit` is the one the server gave for this
  * request (`permitPush`); without one that is still good the server keeps
- * nothing and answers `PERMIT_SPENT`.
+ * nothing and answers `PERMIT_SPENT`. `notice` is the id of the words this
+ * device was handed and keeps (`PushNotice.id`); a server whose words are
+ * others by now keeps nothing, and the next sync reads the words anew.
  */
 export function subscribePush(
   endpoint: string,
   places: { lat: number; lon: number }[],
   shown: Mode,
   permit: string,
+  notice: string,
   signal?: AbortSignal,
 ): Promise<{ mode: Mode; kept_until: string }> {
   return fetchJson('/api/push/subscribe', {
@@ -82,6 +87,7 @@ export function subscribePush(
         lon: roundToBlock(place.lon),
       })),
       permit,
+      notice,
     }),
   })
 }

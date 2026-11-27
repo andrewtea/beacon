@@ -20,7 +20,10 @@ It is `uvicorn beacon.main:app` with three things a deployment wants:
 
 **What `begin_again` deletes, and what it does not.** The mock evidence store with
 every tap sent to it, the stand-in's investigations of those taps, and the
-stand-in's stories: `MOCK_FILES`. Nothing in them was paid for. It never touches a
+stand-in's stories: `MOCK_FILES`. Nothing in them was paid for: the setting is
+refused where Muse Ember works on the invented story (`beacon.telling`), and a
+store that says Muse Ember worked on it is not deleted whatever the setting
+(`PAID_FOR`), because it holds the claims on what was paid for. It never touches a
 live store's files, the Ember ledger, a scale run, or the push subscriptions, which
 are devices' and have their own lifetimes. A tap's photo or clip is left to the
 server's sweep, which deletes one once its hour is over and sooner once its tap
@@ -81,11 +84,13 @@ from beacon.ingest.setup import (
     MOCK_HEAD_START,
     IngestConfigError,
     live_sources,
+    whose,
 )
 from beacon.investigate import store as investigations
 from beacon.scenario import DURATION
 from beacon.story import store as stories
 from beacon.taps.media import MediaLockedError, TapMedia
+from beacon.telling import MOCK_EMBER_VARIABLE, TellingConfigError, teller_of
 
 REPEAT_VARIABLE = "BEACON_MOCK_REPEAT"
 INGEST_VARIABLE = "BEACON_INGEST"
@@ -111,6 +116,8 @@ class _Kind:
     shapes: frozenset[int]
     tables: frozenset[str]
     own: str
+    # What a file of the kind says its mode is, when it is the mock store's.
+    modes: frozenset[str] = frozenset({"mock"})
 
 
 # The evidence store says no shape.
@@ -119,8 +126,14 @@ _SAYS = {
         "meta", investigations.SHAPES, investigations.TABLES, investigations.OWN_TABLE
     ),
     "story": _Kind("meta", stories.SHAPES, stories.TABLES, stories.OWN_TABLE),
+    # A mock evidence store Muse Ember was set to work on says so in its mode
+    # (`PAID_MOCK`). It is the mock store's file, and is never deleted (`PAID_FOR`).
     "evidence": _Kind(
-        "store_meta", frozenset({0}), evidence_store.TABLES, evidence_store.OWN_TABLE
+        "store_meta",
+        frozenset({0}),
+        evidence_store.TABLES,
+        evidence_store.OWN_TABLE,
+        frozenset({"mock", evidence_store.PAID_MOCK}),
     ),
 }
 # How long a story is played for, from its start to the last moment anything of it
@@ -171,8 +184,10 @@ class ServeError(Exception):
 def repeats(env: Mapping[str, str]) -> bool:
     """Whether the invented story is told again when it is over.
 
-    Raises ServeError for a setting that is not 0 or 1, and for 1 on a server that
-    does not play the invented story; IngestConfigError as `live_sources` does."""
+    Raises ServeError for a setting that is not 0 or 1, for 1 on a server that
+    does not play the invented story, and for 1 where Muse Ember works on it
+    (`beacon.telling`); IngestConfigError as `live_sources` does, and
+    TellingConfigError as `teller_of` does."""
     setting = env.get(REPEAT_VARIABLE, "0")
     if setting not in ("0", "1"):
         raise ServeError(f"{REPEAT_VARIABLE} must be 1 or 0.")
@@ -185,7 +200,25 @@ def repeats(env: Mapping[str, str]) -> bool:
         )
     if env.get(INGEST_VARIABLE, "1") != "1":
         raise ServeError(f"{REPEAT_VARIABLE}=1 needs the pollers, which play the story.")
+    if teller_of(env) == "ember":
+        # Every telling by Muse Ember is paid for, and what is deleted between two
+        # tellings would be the claims on what was paid for.
+        raise ServeError(
+            f"{REPEAT_VARIABLE}=1 is for a stand-in's telling, which costs nothing: with "
+            f"{MOCK_EMBER_VARIABLE}=live the story is not told again by itself, and "
+            "nothing of a telling Muse Ember was paid for is deleted."
+        )
     return True
+
+
+# Said of a mock store Muse Ember worked on, by a server that would delete it.
+PAID_FOR = (
+    "The mock store under this data directory is one Muse Ember worked on: it holds "
+    "the claims on what was paid for. A server that tells the invented story again "
+    f"({REPEAT_VARIABLE}=1) deletes the mock store between tellings, and does not run "
+    "on this one. Nothing was deleted. Start the server as the store was begun: "
+    f"{MOCK_EMBER_VARIABLE}=live with its budget, and without {REPEAT_VARIABLE}=1."
+)
 
 
 def over_at(start: datetime) -> datetime:
@@ -222,8 +255,11 @@ def begin_again(env: Mapping[str, str], now: datetime, lock: DataLock) -> bool:
     no mock store or its story is not over. Only `MOCK_FILES` are deleted, and
     none of them before every one that is there was seen to be the mock store's.
 
-    Raises NotTheMockStoresError for a file that was not seen to be the mock
-    store's own of its kind, StillOpenError for one something has open,
+    Raises ServeError, with nothing changed, for a mock store Muse Ember worked
+    on (`beacon.telling`), whatever this server is set to: its files hold the
+    claims on what was paid for. NotTheMockStoresError for a file that was not
+    seen to be the mock store's own of its kind, StillOpenError for one something
+    has open,
     sqlite3.Error when its log could not be emptied, MediaLockedError when
     something has the taps' media, EvidenceStoreError when the mock store cannot
     be read as one, EmberConfigError for a relative `BEACON_DATA_DIR`, and OSError
@@ -249,9 +285,15 @@ def begin_again(env: Mapping[str, str], now: datetime, lock: DataLock) -> bool:
     try:
         store = EvidenceStore(evidence, "mock")
         try:
-            start = store.state(_SCENARIO_STATE).get("start")
+            state = store.state(_SCENARIO_STATE)
+            teller = whose(store)
         finally:
             store.close()
+        if teller == "ember":
+            # Whatever this server is set to: what the store says, read under the
+            # lock, before anything is changed.
+            raise ServeError(PAID_FOR)
+        start = state.get("start")
         if not isinstance(start, str) or now < over_at(datetime.fromisoformat(start)):
             return False
         # Every log is emptied before any file goes: one that is busy stops it all.
@@ -327,7 +369,7 @@ def _mock_stores(path: Path) -> None:
         if said.objects == 0 and said.shape == 0:
             return
         if (
-            said.mode == "mock"
+            said.mode in kind.modes
             and said.shape in kind.shapes
             and kind.own in said.tables
             # No table of another kind's, or of anybody else's.
@@ -447,9 +489,10 @@ def run(
     whole**: after any other, a thread may still have a store open, and the lock
     is kept until the process is gone.
 
-    Raises ServeError and IngestConfigError as `repeats` does, DataLockedError
-    when another process has the data directory's stores, and
-    NotTheMockStoresError when a file kept as the mock store's is not that."""
+    Raises ServeError and IngestConfigError as `repeats` does, ServeError as
+    `begin_again` does for a store Muse Ember worked on, DataLockedError when
+    another process has the data directory's stores, and NotTheMockStoresError
+    when a file kept as the mock store's is not that."""
     from beacon.main import create_app
 
     clock = (lambda: datetime.now(UTC)) if clock is None else clock
@@ -579,7 +622,7 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
 
     try:
         return run(env, make_server, leave=_leave)
-    except (ServeError, IngestConfigError, EmberConfigError) as error:
+    except (ServeError, IngestConfigError, EmberConfigError, TellingConfigError) as error:
         print(f"The server was not started. {error}", file=sys.stderr)
         return 2
     except NotTheMockStoresError as error:

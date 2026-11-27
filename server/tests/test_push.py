@@ -603,6 +603,74 @@ def test_a_subscriptions_file_is_one_modes_and_takes_nothing_once_closed(tmp_pat
     assert [found.endpoint for found in kept.all()] == [FCM]
 
 
+def _shape_three(path: Path, mode: str) -> None:
+    """A file as the Beacon before a device named its words left it: this
+    shape's tables, a subscription, what was sent to it, and a permit that is out."""
+    with sqlite3.connect(path) as db:
+        for statement in store_module._SCHEMA:
+            db.execute(statement)
+        db.execute(
+            "INSERT INTO subscription VALUES (?, ?, ?)",
+            (
+                FCM,
+                json.dumps([[NEAR.lat, NEAR.lon, store_module._stamp(at(0))]]),
+                store_module._stamp(at(0)),
+            ),
+        )
+        db.execute(
+            "INSERT INTO sent VALUES (?, 'inc-1', ?, 1, 'sent')", (FCM, store_module._stamp(at(0)))
+        )
+        db.execute("INSERT INTO permit VALUES (?, ?)", (NO_PERMIT, store_module._stamp(at(60))))
+        db.execute("INSERT INTO meta VALUES ('mode', ?)", (mode,))
+        db.execute("PRAGMA user_version = 3")
+
+
+def _counts(path: Path) -> tuple[int, int, int, int]:
+    with sqlite3.connect(path) as db:
+        return (
+            *(
+                db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("subscription", "sent", "permit")
+            ),
+            db.execute("PRAGMA user_version").fetchone()[0],
+        )
+
+
+def test_the_live_file_keeps_its_rows_when_a_device_begins_to_name_its_words(
+    tmp_path: Path,
+) -> None:
+    # The words for real sources did not change, so a device that holds them
+    # shows what this server would have it say.
+    path = tmp_path / "live.sqlite3"
+    _shape_three(path, "live")
+
+    kept = Subscriptions(path, "live")
+
+    assert [(found.endpoint, found.places) for found in kept.all()] == [(FCM, (near(0),))]
+    assert kept.tries()[(FCM, "inc-1")].tries == 1
+    assert _counts(path) == (1, 1, 1, 4)
+    # The permit that was out is still good for the address it was asked for.
+    assert kept.put(MOZ, [NEAR], at(1), permit=NO_PERMIT) != store_module.SPENT
+    kept.close()
+
+
+def test_the_mock_file_of_before_loses_its_subscriptions_and_every_permit_that_is_out(
+    tmp_path: Path,
+) -> None:
+    # A device told by that server shows words that say a stand-in decided, and
+    # a permit that is out was given for a request that names no words.
+    path = tmp_path / "mock.sqlite3"
+    _shape_three(path, "mock")
+
+    kept = Subscriptions(path, "mock")
+
+    assert (kept.all(), kept.tries()) == ((), {})
+    assert _counts(path) == (0, 0, 0, 4)
+    assert kept.put(MOZ, [NEAR], at(1), permit=NO_PERMIT) == store_module.SPENT
+    assert kept.all() == ()
+    kept.close()
+
+
 _PAIRS = (
     "subscription (endpoint TEXT PRIMARY KEY, places TEXT NOT NULL, "
     "created_at TEXT NOT NULL, renewed_at TEXT NOT NULL)",
@@ -623,6 +691,9 @@ _TIMED = (
         (1, *_TIMED),
         # The second: as now, and an address taken without a permit.
         (2, *_TIMED),
+        # The third: as now, from when a device was handed words for the invented
+        # scenario that said who decided.
+        (3, *_TIMED),
     ],
 )
 def test_a_file_of_the_earlier_shape_has_its_subscriptions_deleted_and_stays_its_modes(
@@ -654,7 +725,7 @@ def test_a_file_of_the_earlier_shape_has_its_subscriptions_deleted_and_stays_its
 
     assert (kept.all(), kept.tries()) == ((), {})
     with sqlite3.connect(path) as db:
-        assert db.execute("PRAGMA user_version").fetchone() == (3,)
+        assert db.execute("PRAGMA user_version").fetchone() == (4,)
     # It is a file of this shape from then on, and keeps what it is given.
     kept.put(FCM, [NEAR], at(0))
     assert kept.claim(FCM, "inc-1", near(0), at(1))
@@ -1157,16 +1228,19 @@ def test_the_words_of_a_notification_say_whose_decision_it_is_and_tell_nobody_wh
 
     assert live.title == "Beacon: crisis mode near a saved place"
     assert "the investigator's reading and no authority's" in live.text
-    # On the invented scenario it says so first, and that a stand-in decided.
+    # On the invented scenario it says so first. It does not say who decided: the
+    # words on a device can be older than the telling, whose investigator is a
+    # stand-in or a model, and the app says which.
     assert mock.title == "Beacon: invented scenario"
-    assert mock.text.startswith("Invented scenario, not a real event. A stand-in for")
+    assert mock.text.startswith("Invented scenario, not a real event. Beacon's investigator,")
+    assert "which the app names as a model or a stand-in for one" in mock.text
+    assert "no authority's" in mock.text
     for text in (live.title, live.text, mock.title, mock.text, ABOUT):
         said = text.lower()
         for word in ("stay", "leave", "evacuate", " go ", "shelter", "safe", "danger"):
             assert word not in said
-    # A model is not called a stand-in, nor a stand-in a model.
+    # On real sources nothing is a stand-in's.
     assert "stand-in" not in live.text
-    assert "model" not in mock.text
     assert "30 days" in ABOUT
     assert timedelta(days=30) == KEPT
     assert "2 days at most" in ABOUT
@@ -1201,9 +1275,13 @@ def test_the_words_of_a_notification_say_whose_decision_it_is_and_tell_nobody_wh
 NO_PERMIT = "p" * 32
 
 
-def body_of(endpoint: Any = FCM, places: Any = None, permit: Any = NO_PERMIT) -> dict[str, Any]:
+def body_of(
+    endpoint: Any = FCM, places: Any = None, permit: Any = NO_PERMIT, notice: Any = None
+) -> dict[str, Any]:
     listed = [{"lat": NEAR.lat, "lon": NEAR.lon}] if places is None else places
-    return {"endpoint": endpoint, "places": listed, "permit": permit}
+    # The id of the words the mock store's server hands out, as the app names it.
+    words = notice_of("mock").id if notice is None else notice
+    return {"endpoint": endpoint, "places": listed, "permit": permit, "notice": words}
 
 
 def permit_from(client: TestClient, revoke: Any = ()) -> str:
@@ -1223,6 +1301,32 @@ def subscribe(client: TestClient, headers: dict[str, str] | None = None, **body:
     )
 
 
+def test_an_address_is_kept_only_with_the_id_of_the_words_this_server_hands_out(
+    world: World,
+) -> None:
+    client = world.app()
+    permit = permit_from(client)
+    # The id of the words an earlier server handed out, of the other mode's
+    # words, and of none: each is a device that would show other words for a push.
+    for stale in ("0" * len(notice_of("mock").id), notice_of("live").id, ""):
+        refused = client.post(
+            "/api/push/subscribe", json=body_of(permit=permit, notice=stale), headers=SHOWN
+        )
+        assert (refused.status_code, refused.json()) == (412, {"detail": api_push.WORDS_CHANGED})
+    for shapeless in (None, 7):
+        body = {**body_of(permit=permit), "notice": shapeless}
+        assert client.post("/api/push/subscribe", json=body, headers=SHOWN).status_code == 422
+    unnamed = {key: value for key, value in body_of(permit=permit).items() if key != "notice"}
+    assert client.post("/api/push/subscribe", json=unnamed, headers=SHOWN).status_code == 422
+    assert world.kept() == []
+
+    # Nothing of a refused request was used, its permit included: the same
+    # permit keeps the address once the device names the words of now.
+    taken = client.post("/api/push/subscribe", json=body_of(permit=permit), headers=SHOWN)
+    assert taken.status_code == 200
+    assert [row[0] for row in world.kept()] == [FCM]
+
+
 def test_the_app_is_told_the_key_and_what_is_kept_before_anyone_subscribes(world: World) -> None:
     answer = world.app().get("/api/push").json()
 
@@ -1233,7 +1337,11 @@ def test_the_app_is_told_the_key_and_what_is_kept_before_anyone_subscribes(world
         "public_key": world.vapid.public_key,
         "about_text": ABOUT,
         # The invented scenario's words, for a device that subscribes to it.
-        "notice": {"title": notice_of("mock").title, "text": notice_of("mock").text},
+        "notice": {
+            "id": notice_of("mock").id,
+            "title": notice_of("mock").title,
+            "text": notice_of("mock").text,
+        },
         "reach_m": 1000,
         "max_places": 5,
         "kept_days": 30,

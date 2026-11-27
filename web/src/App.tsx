@@ -90,17 +90,26 @@ function View({
   mode,
   input,
   repeatsText,
+  mediaText,
   onOtherMode,
 }: {
   route: Route
   mode: 'live' | 'mock' | null
   input: Input | null
   repeatsText: string | null
+  mediaText: string | null
   onOtherMode: () => void
 }) {
   switch (route.view) {
     case 'home':
-      return <Home mode={mode} input={input} onOtherMode={onOtherMode} />
+      return (
+        <Home
+          mode={mode}
+          input={input}
+          mediaText={mediaText}
+          onOtherMode={onOtherMode}
+        />
+      )
     case 'tap':
       return (
         <AskedFor
@@ -165,6 +174,8 @@ export default function App() {
   // the server that comes back can be another one, on other sources.
   const mode = unreachable ? null : (health.data?.mode ?? null)
   const repeatsText = unreachable ? null : (health.data?.repeats_text ?? null)
+  const tellerText = unreachable ? null : (health.data?.teller_text ?? null)
+  const mediaText = unreachable ? null : (health.data?.media_text ?? null)
   // What the server takes from a visitor, when it has said so at the latest
   // asking, and else not known. Not known is not `own`: until the server says
   // that it takes where a person is, the phone is not asked for it, and nothing
@@ -201,6 +212,9 @@ export default function App() {
             {/* On a server that tells the story again, the server's sentence
                 about that: a tap sent now is gone when it does. */}
             {repeatsText !== null && <> {repeatsText}</>}
+            {/* Where a model works on the invented story, the server's
+                sentence about that: the story is made up all the same. */}
+            {tellerText !== null && <> {tellerText}</>}
           </p>
         )}
       {/* On a server behind a host nobody has checked: the server's sentence
@@ -229,6 +243,7 @@ export default function App() {
           mode={mode}
           input={input}
           repeatsText={repeatsText}
+          mediaText={mediaText}
           onOtherMode={askAgain}
         />
       </main>

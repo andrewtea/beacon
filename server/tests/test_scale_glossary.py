@@ -31,7 +31,7 @@ def env(tmp_path: Path) -> dict[str, str]:
 def speech(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
     monkeypatch.setattr(generate, "can_speak", lambda: True)
-    monkeypatch.setattr(generate, "_speech", lambda root, words: _clip(words))
+    monkeypatch.setattr(generate, "_speech", _clip)
 
 
 def test_a_days_incidents_are_counted_by_unit_type_code_and_nothing_else_is_kept(

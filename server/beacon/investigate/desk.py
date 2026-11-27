@@ -75,13 +75,16 @@ class InvestigationDesk:
         workers: int = WORKERS,
         clock: Callable[[], datetime] | None = None,
         wall_clock: Callable[[], datetime] | None = None,
+        scope: str = SCOPE,
     ) -> None:
         """`ember` is the desk's own client and is closed with it. A live one pays
-        under the scope `SCOPE`. `clock` is the time a run is stamped with, and
-        `wall_clock` the time a hold is counted by. With `workers=0` nothing runs
-        by itself, and `investigate` is called by hand."""
+        under the scope labelled `scope`: `SCOPE` on the live store, and a scope of
+        its own when Muse Ember works on the invented story (`beacon.telling`), so
+        that neither is counted against the other. `clock` is the time a run is
+        stamped with, and `wall_clock` the time a hold is counted by. With
+        `workers=0` nothing runs by itself, and `investigate` is called by hand."""
         self._paid = PaidDesk(
-            ember, poller="investigator", items="taps", scope=SCOPE, wall_clock=wall_clock
+            ember, poller="investigator", items="taps", scope=scope, wall_clock=wall_clock
         )
         self._ember = ember
         self._runs = runs
@@ -122,6 +125,12 @@ class InvestigationDesk:
     def active(self) -> bool:
         """Whether a tap that is handed in now will be looked into."""
         return not self._closing.is_set()
+
+    @property
+    def investigator(self) -> str:
+        """What investigates for this desk: `live` for Muse Ember, `fake` for a
+        stand-in. It says where a tap's clip or photo can be sent."""
+        return self._ember.mode
 
     def state_of(self, tap_id: str) -> str | None:
         """`queued` for a tap that waits for a worker, `running` for one a run is
