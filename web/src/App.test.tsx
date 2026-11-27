@@ -6,7 +6,14 @@ import {
   waitFor,
   within,
 } from '@testing-library/react'
-import { afterEach, beforeEach, expect, test, vi } from 'vitest'
+import {
+  afterEach,
+  beforeEach,
+  expect,
+  onTestFinished,
+  test,
+  vi,
+} from 'vitest'
 import App from './App.tsx'
 import { CrisisPanel } from './components/IncidentBody.tsx'
 import { IncidentCard } from './components/IncidentCard.tsx'
@@ -309,6 +316,7 @@ test('a tap that is gone is not asked for again, though storage would not forget
   // The device goes on knowing the tap, because storage refuses the write
   // that would forget it. The 404 is what holds: neither of the tap's views
   // asks again, on this server or after it says it takes a visitor's own.
+  vi.useFakeTimers({ shouldAdvanceTime: true })
   keepTap({
     id: FIRE_TAP,
     at: new Date().toISOString(),
@@ -321,12 +329,18 @@ test('a tap that is gone is not asked for again, though storage would not forget
     .mockImplementation(() => {
       throw new DOMException('Full.', 'QuotaExceededError')
     })
+  // However the test ends: the tests after it need storage that writes.
+  onTestFinished(() => refused.mockRestore())
   let takes = 'invented'
+  const said: string[] = []
   let has = true
   const gone = () =>
     Response.json({ detail: 'There is no such tap.' }, { status: 404 })
   const asked = serve({
-    'GET /api/health': () => Response.json({ ...INVENTED_ONLY, input: takes }),
+    'GET /api/health': () => {
+      said.push(takes)
+      return Response.json({ ...INVENTED_ONLY, input: takes })
+    },
     [`GET /api/taps/${FIRE_TAP}`]: () =>
       has ? Response.json(fireAnswer) : gone(),
     [`GET /api/taps/${FIRE_TAP}/run`]: gone,
@@ -352,9 +366,14 @@ test('a tap that is gone is not asked for again, though storage would not forget
 
   await goTo(`#/tap/${FIRE_TAP}`)
   await goTo(`#/tap/${FIRE_TAP}/trace`)
+  // The health is asked again, and now says the server takes a visitor's
+  // own, for which any tap may be asked for.
   takes = 'own'
+  await act(() => vi.advanceTimersByTimeAsync(30_100))
+  expect(said.length).toBeGreaterThan(1)
+  expect(said.at(-1)).toBe('own')
   await goTo(`#/tap/${FIRE_TAP}`)
-  await act(async () => undefined)
+  await act(() => vi.advanceTimersByTimeAsync(2_000))
 
   expect(
     screen.getByRole('heading', { name: 'This tap is gone' }),
@@ -363,7 +382,6 @@ test('a tap that is gone is not asked for again, though storage would not forget
     screen.queryByRole('heading', { name: /Fire at/ }),
   ).not.toBeInTheDocument()
   expect(tapRequests(asked)).toHaveLength(before)
-  refused.mockRestore()
 })
 
 test('a server that takes a visitor’s own is asked for any tap, once it has said so', async () => {
