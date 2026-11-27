@@ -60,6 +60,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from beacon import telling
 from beacon.ember import EmberClient, SpendScope, Storage
 from beacon.ember.client import REQUEST_TIMEOUT_SECONDS, default_data_dir
 from beacon.ember.pricing import parse_usd
@@ -74,10 +75,13 @@ from beacon.ingest.recordings import Directory, RecordedRadio
 from beacon.ingest.runner import Clock, PaidWork, Poller, PollerStatus, Runner
 from beacon.ingest.traffic511 import Traffic511
 from beacon.radio import Ffmpeg, Known, core_dump_problem, forbid_core_dumps
+from beacon.radio.speech import can_speak
 from beacon.radio.vocabulary import read_names
 from beacon.scenario import DURATION, Scenario, scenario_transport, stand_in_ember
 from beacon.scenario import notices as scenario_notices
 from beacon.scenario import radio as scenario_radio
+from beacon.scenario.recorder import CALLS_DIRECTORY, RecorderError, StoryRecorder
+from beacon.telling import Teller
 
 # The sources that can be named in BEACON_LIVE_SOURCES.
 SOURCES = ("nws", "adsblol", "511", "recordings", "notices")
@@ -144,6 +148,9 @@ class Ingest:
         http: SourceHttp,
         scenario: Scenario | None,
         paid: Sequence[PaidWork] = (),
+        *,
+        teller: Teller = "stand_in",
+        recorder: StoryRecorder | None = None,
     ) -> None:
         self.store = store
         self.runner = runner
@@ -153,6 +160,10 @@ class Ingest:
         self.paid = tuple(paid)
         # The story the pollers are fed, in mock mode.
         self.scenario = scenario
+        # Who does the model's work on that story (`beacon.telling`), and, when it
+        # is Muse Ember, what leaves the story's calls as files for it to hear.
+        self.teller: Teller = teller
+        self.recorder = recorder
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -180,6 +191,13 @@ class Ingest:
                 if stop is not None and stop.is_set():
                     return False
                 self.clock.hold(moment)
+                if self.recorder is not None:
+                    try:
+                        # The calls made by this moment, before the radio is polled.
+                        self.recorder.leave(moment)
+                    except RecorderError as error:
+                        logger.error("%s", error)
+                        return False
                 results = self.runner.step(stop, failed_stay_due=True)
                 if stop is not None and stop.is_set():
                     # The step may not have polled every source, so it is not done.
@@ -188,6 +206,7 @@ class Ingest:
                     return False
                 state = {
                     "start": self.scenario.start.isoformat(),
+                    "teller": self.teller,
                     "played_to": moment.isoformat(),
                     "polls": {
                         status.name: {
@@ -315,22 +334,39 @@ def open_store(env: Mapping[str, str]) -> EvidenceStore:
     return EvidenceStore(default_data_dir(env) / "evidence" / f"{mode}.sqlite3", mode)
 
 
-def build(env: Mapping[str, str], clock: Clock | None = None) -> Ingest:
-    """The store, the pollers, and the clock they share.
+def build(
+    env: Mapping[str, str],
+    clock: Clock | None = None,
+    *,
+    paid: telling.PaidClient | None = None,
+) -> Ingest:
+    """The store, the pollers, and the clock they share. `paid` is how a paying
+    client is made for the invented story when Muse Ember works on it
+    (`beacon.telling`), which a test hands in.
 
-    Raises IngestConfigError when a live source lacks a setting it needs, and what
-    `open_store` raises."""
+    Raises IngestConfigError when a live source lacks a setting it needs,
+    TellingConfigError for a setting of `beacon.telling` that cannot be had, and
+    what `open_store` raises."""
     clock = Clock() if clock is None else clock
     live = live_sources(env)
+    teller = telling.teller_of(env)
     if live:
+        if teller == "ember":
+            raise IngestConfigError(
+                f"{telling.MOCK_EMBER_VARIABLE}=live is for the invented story: with a real "
+                f"source named ({LIVE_SOURCES_VARIABLE}), Muse Ember works on that source "
+                "under the source's own settings."
+            )
         # Checked before the store is opened, so a refused setting leaves no file.
         http = SourceHttp()
         pollers = source_pollers(live, env, http)
         store = open_store(env)
-        paid = [poller for poller in pollers if isinstance(poller, PaidWork)]
-        return Ingest(store, Runner(pollers, store, clock), clock, http, None, paid)
+        paying = [poller for poller in pollers if isinstance(poller, PaidWork)]
+        return Ingest(store, Runner(pollers, store, clock), clock, http, None, paying)
+    if teller == "ember":
+        return _told_by_ember(env, clock, paid)
     store = open_store(env)
-    scenario = _scenario(store, clock.now())
+    scenario = _scenario(store, clock.now(), teller)
     http = SourceHttp(scenario_transport(scenario, clock.now))
     # Stands in for Ember: it spends nothing, and what it "hears" in the story's
     # tones is the story's own. Its rows say `model == "fake"`.
@@ -352,6 +388,72 @@ def build(env: Mapping[str, str], clock: Clock | None = None) -> Ingest:
         EmberClient.fake(storage, scenario_notices.stand_in_reader(scenario.start)),
         feed_url=scenario_notices.FEED_URL,
     )
+    return _mock_ingest(store, clock, http, scenario, radio, notices, teller, None)
+
+
+def _told_by_ember(env: Mapping[str, str], clock: Clock, paid: telling.PaidClient | None) -> Ingest:
+    """The invented story with Muse Ember hearing its calls and reading its
+    notices (`beacon.telling`). The pollers are the ones a stand-in's telling has;
+    the calls are synthesized speech in a directory marked as generated audio,
+    which the reader of recorded calls reads, and both clients are live ones, each
+    under a scope of the telling's own.
+
+    Raises IngestConfigError when this host cannot synthesize speech or the story
+    was begun with a stand-in, TellingConfigError when the budget or a live Ember
+    is missing, and RecorderError when the calls' directory is not Beacon's."""
+    if not can_speak():
+        raise IngestConfigError(
+            f"{telling.MOCK_EMBER_VARIABLE}=live has Muse Ember hear the invented story's "
+            "radio calls as synthesized speech, which needs ffmpeg with the flite voice "
+            "on this host. A tone says nothing, and is not sent to a paid Ember."
+        )
+    # Both clients before the store is opened, so a refused setting leaves no file.
+    clients: list[EmberClient] = []
+    store: EvidenceStore | None = None
+    try:
+        clients.append(telling.paying(env, telling.RADIO, paid))
+        clients.append(telling.paying(env, telling.NOTICES, paid))
+        store = open_store(env)
+        scenario = _scenario(store, clock.now(), "ember")
+        recorder = StoryRecorder(default_data_dir(env).joinpath(*CALLS_DIRECTORY), scenario.start)
+        recorder.begin()
+        http = SourceHttp(scenario_transport(scenario, clock.now))
+        radio = RecordedRadio(
+            Directory(recorder.root, scenario_radio.SYSTEM),
+            clients[0],
+            talkgroups=scenario_radio.TALKGROUPS,
+            ems_talkgroups=scenario_radio.EMS_TALKGROUPS,
+            known=scenario_radio.KNOWN,
+            scope=telling.RADIO,
+        )
+        notices = NoticeFeed(
+            http,
+            clients[1],
+            feed_url=scenario_notices.FEED_URL,
+            scope=telling.NOTICES,
+            generated=True,
+        )
+    except BaseException:
+        # What was built is closed when the pollers it was for are not.
+        for client in clients:
+            client.close()
+        if store is not None:
+            store.close()
+        raise
+    return _mock_ingest(store, clock, http, scenario, radio, notices, "ember", recorder)
+
+
+def _mock_ingest(
+    store: EvidenceStore,
+    clock: Clock,
+    http: SourceHttp,
+    scenario: Scenario,
+    radio: RecordedRadio,
+    notices: NoticeFeed,
+    teller: Teller,
+    recorder: StoryRecorder | None,
+) -> Ingest:
+    """The invented story's pollers, whoever hears its calls and reads its notices."""
     pollers = [
         NwsAlerts(http),
         AdsbLolAircraft(http, interval_seconds=MOCK_INTERVAL_SECONDS),
@@ -361,7 +463,9 @@ def build(env: Mapping[str, str], clock: Clock | None = None) -> Ingest:
     ]
     last = _saved_polls(store.state(_SCENARIO_STATE).get("polls"))
     runner = Runner(pollers, store, clock, last=last)
-    return Ingest(store, runner, clock, http, scenario, [radio, notices])
+    return Ingest(
+        store, runner, clock, http, scenario, [radio, notices], teller=teller, recorder=recorder
+    )
 
 
 def source_pollers(
@@ -642,13 +746,24 @@ def _saved_polls(saved: Any) -> list[PollerStatus]:
     return polls
 
 
-def _scenario(store: EvidenceStore, now: datetime) -> Scenario:
+def _scenario(store: EvidenceStore, now: datetime, teller: Teller) -> Scenario:
     """The story of this mock store. Its start is drawn once and kept in the store,
     so a restart continues the story it was telling and does not begin a second one
-    beside it. Deleting the mock store's file begins it again."""
-    saved = store.state(_SCENARIO_STATE).get("start")
+    beside it. Deleting the mock store's file begins it again.
+
+    Who does the model's work on the story is kept with it (`beacon.telling`): a
+    story is told by a stand-in or by Muse Ember from its beginning to its end. A
+    store from before that was written down was a stand-in's.
+
+    Raises IngestConfigError when the story was begun by the other."""
+    state = store.state(_SCENARIO_STATE)
+    saved = state.get("start")
     if isinstance(saved, str):
+        began: Teller = "ember" if state.get("teller") == "ember" else "stand_in"
+        if began != teller:
+            raise IngestConfigError(telling.other_teller(began, teller))
         return Scenario(start=datetime.fromisoformat(saved))
     start = now.replace(microsecond=0) - MOCK_HEAD_START
-    store.add([], state=(_SCENARIO_STATE, {"start": start.isoformat()}), now=now)
+    begun = {"start": start.isoformat(), "teller": teller}
+    store.add([], state=(_SCENARIO_STATE, begun), now=now)
     return Scenario(start=start)

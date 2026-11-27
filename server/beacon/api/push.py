@@ -144,7 +144,9 @@ async def info(request: Request) -> PushInfo:
     engine = _engine(request)
     push: Push | None = getattr(request.app.state, "push", None)
     vapid = None if push is None or not push.sends else push.vapid
-    notice = None if vapid is None else notice_of(engine.mode)
+    # Who investigates on the mock store, which the words name.
+    teller = getattr(request.app.state, "teller", None) or "stand_in"
+    notice = None if vapid is None else notice_of(engine.mode, teller)
     return PushInfo(
         mode=engine.mode,
         enabled=vapid is not None,

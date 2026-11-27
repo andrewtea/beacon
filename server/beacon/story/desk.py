@@ -59,11 +59,15 @@ class StoryDesk:
         *,
         interval: timedelta = INTERVAL,
         wall_clock: Callable[[], datetime] | None = None,
+        scope: str = SCOPE,
     ) -> None:
         """`ember` is the desk's own client and is closed with it. A live one pays
-        under the scope `SCOPE`. `wall_clock` is the time a hold is counted by."""
+        under the scope labelled `scope`: `SCOPE` on the live store, and a scope of
+        its own when Muse Ember works on the invented story (`beacon.telling`), so
+        that neither is counted against the other. `wall_clock` is the time a hold
+        is counted by."""
         self._paid = PaidDesk(
-            ember, poller="story", items="incidents", scope=SCOPE, wall_clock=wall_clock
+            ember, poller="story", items="incidents", scope=scope, wall_clock=wall_clock
         )
         self._ember = ember
         self._stories = stories

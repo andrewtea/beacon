@@ -67,6 +67,10 @@ class RadioCall:
     # The form the stand-in for Ember fills in when it hears the call. None for a
     # call nothing is made of.
     heard: dict[str, Any] | None = field(default=None, hash=False)
+    # What is said in the call when it is synthesized speech for Muse Ember to hear
+    # (`beacon.scenario.recorder`): invented words, as a dispatcher or a crew might
+    # say them. None for a call in which nothing is said: a click, or wind.
+    said: str | None = None
 
 
 def _form(category: str, status: str = "unknown", **fields: Any) -> dict[str, Any]:
@@ -91,8 +95,18 @@ CALLS: tuple[RadioCall, ...] = (
         FIRE_DISPATCH,
         6.0,
         _form("fire", "dispatched", units=["E36", "E21", "T6", "B2"], **_HAYES),
+        said=(
+            "Engine 36, Engine 21, Truck 6, Battalion 2. Respond to a structure fire. 400 block of"
+            " Hayes Street, cross of Gough Street."
+        ),
     ),
-    RadioCall(0.6, FIRE_DISPATCH, 2.0, _form("fire", "en_route", units=["E36", "T6", "B2"])),
+    RadioCall(
+        0.6,
+        FIRE_DISPATCH,
+        2.0,
+        _form("fire", "en_route", units=["E36", "T6", "B2"]),
+        said="Engine 36, Truck 6, Battalion 2, en route to the fire.",
+    ),
     RadioCall(
         3.0,
         FIRE_TACTICAL,
@@ -101,12 +115,20 @@ CALLS: tuple[RadioCall, ...] = (
         _form(
             "fire", "on_scene", details=["smoke_showing"], units=["E36"], **_HAYES | {"block": 458}
         ),
+        said=(
+            "Engine 36 is on scene of the fire at 458 Hayes Street, cross of Gough Street. Smoke "
+            "showing."
+        ),
     ),
     RadioCall(
         4.2,
         FIRE_TACTICAL,
         5.0,
         _form("fire", "working", details=["working_fire", "fire_showing"], units=["B2"], **_HAYES),
+        said=(
+            "Battalion 2. This is a working fire, with fire showing. 400 block of Hayes Street, "
+            "cross of Gough Street."
+        ),
     ),
     # A click of a microphone: too short to be worth hearing, so it is never heard.
     RadioCall(5.0, FIRE_TACTICAL, 0.3),
@@ -121,6 +143,11 @@ CALLS: tuple[RadioCall, ...] = (
             units=["E5", "E3", "T3", "B3", "RS1"],
             alarm=2,
             **_HAYES,
+        ),
+        said=(
+            "Second alarm. Engine 5, Engine 3, Truck 3, Battalion 3, Rescue Squad 1. Respond to "
+            "the working fire, 400 block of Hayes Street, cross of Gough Street. This is a second "
+            "alarm."
         ),
     ),
     RadioCall(
@@ -139,6 +166,7 @@ CALLS: tuple[RadioCall, ...] = (
             block=432,
             cross_street="Jane Doe St",
         ),
+        said="Medic 52 and Engine 21 are on scene of a medical call. 400 block of Fell Street.",
     ),
     RadioCall(
         12.0,
@@ -151,12 +179,20 @@ CALLS: tuple[RadioCall, ...] = (
             units=["B2"],
             **_HAYES,
         ),
+        said=(
+            "Battalion 2 at the working fire. The building next door is threatened. Requesting "
+            "police. The road is closed. 400 block of Hayes Street, cross of Gough Street."
+        ),
     ),
     RadioCall(
         14.0,
         FIRE_TACTICAL,
         4.0,
         _form("fire", "working", details=["evacuation"], units=["T6", "RS1"], **_HAYES),
+        said=(
+            "Truck 6 and Rescue Squad 1 at the working fire. We are evacuating the building next "
+            "door. 400 block of Hayes Street, cross of Gough Street."
+        ),
     ),
     RadioCall(
         15.5,
@@ -171,6 +207,7 @@ CALLS: tuple[RadioCall, ...] = (
             street="Geary Blvd",
             block=5200,
         ),
+        said="Medic 78 is en route to a medical call. 5200 block of Geary Boulevard.",
     ),
     RadioCall(
         18.0,
@@ -184,6 +221,10 @@ CALLS: tuple[RadioCall, ...] = (
             alarm=3,
             **_HAYES,
         ),
+        said=(
+            "Third alarm. Engine 1, Engine 29, Truck 1, Division 2. Respond to the working fire, "
+            "400 block of Hayes Street, cross of Gough Street. This is a third alarm."
+        ),
     ),
     # Wind across a microphone.
     RadioCall(21.0, FIRE_TACTICAL, 3.0, _form("unintelligible") | {"clarity": "unintelligible"}),
@@ -193,6 +234,7 @@ CALLS: tuple[RadioCall, ...] = (
         4.0,
         # An alarm sounding across town, which has nothing to do with the fire.
         _form("alarm", "dispatched", units=["E22", "T12"], street="Irving St", block=1900),
+        said="Engine 22, Truck 12. Respond to an alarm sounding. 1900 block of Irving Street.",
     ),
     RadioCall(
         26.0,
@@ -201,25 +243,47 @@ CALLS: tuple[RadioCall, ...] = (
         _form(
             "fire", "working", details=["aircraft_overhead", "utilities_requested"], units=["B2"]
         ),
+        said=(
+            "Battalion 2 at the working fire. There is a helicopter overhead. Requesting the "
+            "utility company."
+        ),
     ),
-    RadioCall(27.5, FIRE_DISPATCH, 3.0, _form("alarm", "cancelled", units=["E22", "T12"])),
+    RadioCall(
+        27.5,
+        FIRE_DISPATCH,
+        3.0,
+        _form("alarm", "cancelled", units=["E22", "T12"]),
+        said="Engine 22 and Truck 12, cancel. The alarm is cancelled.",
+    ),
     RadioCall(
         36.0,
         FIRE_TACTICAL,
         4.0,
         _form("fire", "working", details=["knocked_down"], units=["B2"], **_HAYES),
+        said=(
+            "Battalion 2. The fire is knocked down. 400 block of Hayes Street, cross of Gough "
+            "Street."
+        ),
     ),
     RadioCall(
         46.0,
         FIRE_DISPATCH,
         5.0,
         _form("fire", "under_control", units=["B2"], alarm=3, **_HAYES),
+        said=(
+            "Battalion 2. The fire is under control. This was a third alarm. 400 block of Hayes "
+            "Street, cross of Gough Street."
+        ),
     ),
     RadioCall(
         60.0,
         FIRE_TACTICAL,
         3.0,
         _form("fire", "under_control", details=["overhaul"], units=["E36", "T6"], **_HAYES),
+        said=(
+            "Engine 36 and Truck 6. The fire is under control. Overhaul is in progress. 400 block "
+            "of Hayes Street, cross of Gough Street."
+        ),
     ),
     RadioCall(
         78.0,
@@ -228,8 +292,18 @@ CALLS: tuple[RadioCall, ...] = (
         _form(
             "fire", "cleared", details=["all_clear"], units=["E5", "E3", "T3", "B3", "E1", "E29"]
         ),
+        said=(
+            "Engine 5, Engine 3, Truck 3, Battalion 3, Engine 1, Engine 29. All clear. You are "
+            "cleared from the fire."
+        ),
     ),
-    RadioCall(90.0, FIRE_DISPATCH, 3.0, _form("fire", "cleared", units=["E36", "T6", "B2"])),
+    RadioCall(
+        90.0,
+        FIRE_DISPATCH,
+        3.0,
+        _form("fire", "cleared", units=["E36", "T6", "B2"]),
+        said="Engine 36, Truck 6, Battalion 2 are cleared from the fire.",
+    ),
 )
 
 

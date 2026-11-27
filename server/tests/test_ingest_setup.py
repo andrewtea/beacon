@@ -266,6 +266,8 @@ def test_a_mock_store_first_opened_shows_a_fire_already_under_way(
     }
     assert ingest.store.state("scenario") == {
         "start": START.isoformat(),
+        # Who does the model's work on this story: a stand-in, unless told otherwise.
+        "teller": "stand_in",
         "played_to": NOON.isoformat(),
         # How each poller's last poll went, for a process that goes on from here.
         "polls": {
@@ -1266,7 +1268,7 @@ def test_stopping_calls_off_a_write_that_is_waiting_and_nothing_is_stored_afterw
     system_time.sleep(0.2)
     after = open_store(env)
     assert after.count_by_source() == {}
-    assert after.state("scenario") == {"start": START.isoformat()}
+    assert after.state("scenario") == {"start": START.isoformat(), "teller": "stand_in"}
     with pytest.raises(EvidenceStoreError, match="is closed and takes no more rows"):
         ingest.store.add([], state=("scenario", {}))
 

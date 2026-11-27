@@ -129,6 +129,8 @@ class NoticeFeed:
         feed_url: str,
         document_hosts: Collection[str] = (),
         wall_clock: Callable[[], datetime] | None = None,
+        scope: str = SCOPE,
+        generated: bool = False,
     ) -> None:
         """`feed_url` is the address of a JSON Feed, over HTTPS. A document is
         fetched from the feed's own host or one of `document_hosts`, and from
@@ -136,7 +138,15 @@ class NoticeFeed:
         real time even while the mock scenario is played on a clock of its own.
 
         `ember` is closed with the poller (`close`), so it is a client of the
-        poller's own."""
+        poller's own. A live one pays under the spending scope labelled `scope`,
+        which is `SCOPE` for the server's poller of a real feed.
+
+        `generated` says that the documents a stand-in for the network answers
+        with were generated to be read by Muse Ember, as the invented story's are
+        when it works on that story (`beacon.telling`): a live Ember is then paid
+        to read them, on purpose, as it is to hear generated speech. Their rows are
+        `mock` ones all the same, which is what the client's answers are and is
+        not set here. It is refused for a client that asks the network."""
         host = _host_of(feed_url)
         if host is None:
             raise ValueError("The notices feed is named by an https address, with no port.")
@@ -147,13 +157,18 @@ class NoticeFeed:
                 "No feed or document is on a service Beacon requests nothing from, or on a "
                 "host that cannot be read."
             )
-        if ember.mode != ("live" if http.origin == "live" else "fake"):
+        if generated and http.origin == "live":
+            raise ValueError("A document a real feed lists was not generated.")
+        readers = ("live",) if http.origin == "live" or generated else ("fake",)
+        if ember.mode not in readers:
             # A real notice is not handed to a stand-in for Ember, whose answer
             # would be an invention about a real order, and a real Ember is not
-            # paid to read a stand-in's document. A client that only replays can
-            # read neither: the call is a sensitive one, and is never recorded.
+            # paid to read a stand-in's document unless it was generated for it to
+            # read. A client that only replays can read none: the call is a
+            # sensitive one, and is never recorded.
             raise ValueError(
-                "A real notice is read by a live Ember, and a stand-in's by a fake one."
+                "A real notice is read by a live Ember, a stand-in's by a fake one, and "
+                "a generated one by the Ember it was generated for."
             )
         if ember.retries:
             # Each try is a paid request, and a document is claimed for one.
@@ -164,7 +179,7 @@ class NoticeFeed:
         self._hosts = frozenset({host, *(named.lower() for named in document_hosts)})
         # What every poller that pays Ember keeps to: `beacon.ingest.paid`.
         self._paid = PaidDesk(
-            ember, poller="notice", items="notices", scope=SCOPE, wall_clock=wall_clock
+            ember, poller="notice", items="notices", scope=scope, wall_clock=wall_clock
         )
         # The items and documents this process has counted as unreadable, the
         # last `_COUNTED_ONCE` of them, oldest first.

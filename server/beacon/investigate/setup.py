@@ -3,6 +3,7 @@
 import logging
 from collections.abc import Mapping
 
+from beacon import telling
 from beacon.ember import EmberClient, SpendScope, Storage
 from beacon.ember.client import default_data_dir
 from beacon.ember.pricing import parse_usd
@@ -22,7 +23,11 @@ class InvestigateConfigError(Exception):
 
 
 def open_investigations(
-    env: Mapping[str, str], engine: Engine, taps: Taps
+    env: Mapping[str, str],
+    engine: Engine,
+    taps: Taps,
+    *,
+    paid: telling.PaidClient | None = None,
 ) -> tuple[Runs, InvestigationDesk | None]:
     """The file the investigations of `taps`' taps are kept in, and the desk that
     makes them against `engine`'s incidents, or None for the desk when taps are not
@@ -34,19 +39,33 @@ def open_investigations(
     are read whether or not more are being made. Whoever opens it closes it
     (`Runs.close`); a desk closes it when it is stopped.
 
-    On the mock store a stand-in for Ember investigates, which costs nothing. On
-    the live store a live Ember does, under a budget of its own,
-    `BEACON_INVESTIGATE_BUDGET_USD`; with no budget set no tap is investigated,
+    On the mock store a stand-in for Ember investigates, which costs nothing; when
+    Muse Ember works on the invented story (`beacon.telling`), it investigates,
+    under a scope of the telling's own, and each run says who did. `paid` is how
+    that paying client is made, which a test hands in. On the live store a live
+    Ember does, under a budget of its own, `BEACON_INVESTIGATE_BUDGET_USD`; with
+    no budget set no tap is investigated,
     which the log says, because every investigation is paid for.
 
     Raises InvestigateConfigError when a budget is set that is not a dollar amount,
     or is set without a live Ember, and RunsError when the file was begun as the
-    other mode's or is in a shape this Beacon does not know."""
+    other mode's or is in a shape this Beacon does not know, and
+    TellingConfigError as `beacon.telling.paying` does."""
     data_dir = default_data_dir(env)
     if engine.mode == "mock":
-        runs = Runs(data_dir / "investigate" / "mock.sqlite3", "mock")
-        ember = EmberClient.fake(Storage.under(data_dir), stand_in_investigator)
-        return runs, InvestigationDesk(ember, runs, engine, taps)
+        scope = SCOPE
+        if telling.teller_of(env) == "ember":
+            scope = telling.TAPS
+            ember = telling.paying(env, scope, paid)
+        else:
+            ember = EmberClient.fake(Storage.under(data_dir), stand_in_investigator)
+        try:
+            runs = Runs(data_dir / "investigate" / "mock.sqlite3", "mock")
+        except BaseException:
+            # A client that was built is closed when the desk it was for is not.
+            ember.close()
+            raise
+        return runs, InvestigationDesk(ember, runs, engine, taps, scope=scope)
     path = data_dir / "investigate" / "live.sqlite3"
     budget = env.get(BUDGET_VARIABLE, "").strip()
     if not budget:

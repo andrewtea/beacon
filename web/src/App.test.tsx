@@ -94,6 +94,20 @@ test('says, in the server’s sentence, that the invented scenario is told again
   expect(banner).toHaveTextContent(repeats)
 })
 
+test('says, in the server’s sentence, that a model works on the invented scenario', async () => {
+  const teller =
+    'On this server a model, Muse Ember, does the model’s work on the invented story.'
+  serve({
+    'GET /api/health': { ...MOCK_HEALTH, teller: 'ember', teller_text: teller },
+  })
+
+  render(<App />)
+
+  // Beside what says the scenario is invented: the story is made up all the same.
+  const banner = await screen.findByText(INVENTED)
+  expect(banner).toHaveTextContent(teller)
+})
+
 const FRONT =
   'On this server a tap is sent from one of two invented places, not from where you are.'
 const FRONT_MORE = 'The address a tap’s answer is read at holds the tap’s id.'

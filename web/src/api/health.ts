@@ -8,6 +8,15 @@ export type Health = {
   // `mock` when the server runs on the invented scenario. Null when it reads no
   // evidence.
   mode: 'live' | 'mock' | null
+  // On a server on the invented scenario: who does the model's work on it, a
+  // `stand_in` that works by rule or Muse Ember (`ember`). Null on real sources.
+  // Every incident, story, and answer says of itself who made it; the app
+  // words nothing from this.
+  teller: 'stand_in' | 'ember' | null
+  // Where Muse Ember works on the invented scenario: the server's sentence that
+  // says so, and that the story is still made up. Shown with what says the
+  // scenario is invented. Null on every other server.
+  teller_text: string | null
   // On a server that tells the invented scenario again when it is over: the
   // server's sentence that says so, and what becomes of the taps sent before.
   // Shown with what says the scenario is invented. Null on every other server.

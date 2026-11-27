@@ -20,7 +20,9 @@ It is `uvicorn beacon.main:app` with three things a deployment wants:
 
 **What `begin_again` deletes, and what it does not.** The mock evidence store with
 every tap sent to it, the stand-in's investigations of those taps, and the
-stand-in's stories: `MOCK_FILES`. Nothing in them was paid for. It never touches a
+stand-in's stories: `MOCK_FILES`. Nothing in them was paid for: the setting is
+refused where Muse Ember works on the invented story (`beacon.telling`), whose
+store holds the claims on what it was paid for. It never touches a
 live store's files, the Ember ledger, a scale run, or the push subscriptions, which
 are devices' and have their own lifetimes. A tap's photo or clip is left to the
 server's sweep, which deletes one once its hour is over and sooner once its tap
@@ -86,6 +88,7 @@ from beacon.investigate import store as investigations
 from beacon.scenario import DURATION
 from beacon.story import store as stories
 from beacon.taps.media import MediaLockedError, TapMedia
+from beacon.telling import MOCK_EMBER_VARIABLE, TellingConfigError, teller_of
 
 REPEAT_VARIABLE = "BEACON_MOCK_REPEAT"
 INGEST_VARIABLE = "BEACON_INGEST"
@@ -171,8 +174,10 @@ class ServeError(Exception):
 def repeats(env: Mapping[str, str]) -> bool:
     """Whether the invented story is told again when it is over.
 
-    Raises ServeError for a setting that is not 0 or 1, and for 1 on a server that
-    does not play the invented story; IngestConfigError as `live_sources` does."""
+    Raises ServeError for a setting that is not 0 or 1, for 1 on a server that
+    does not play the invented story, and for 1 where Muse Ember works on it
+    (`beacon.telling`); IngestConfigError as `live_sources` does, and
+    TellingConfigError as `teller_of` does."""
     setting = env.get(REPEAT_VARIABLE, "0")
     if setting not in ("0", "1"):
         raise ServeError(f"{REPEAT_VARIABLE} must be 1 or 0.")
@@ -185,6 +190,14 @@ def repeats(env: Mapping[str, str]) -> bool:
         )
     if env.get(INGEST_VARIABLE, "1") != "1":
         raise ServeError(f"{REPEAT_VARIABLE}=1 needs the pollers, which play the story.")
+    if teller_of(env) == "ember":
+        # Every telling by Muse Ember is paid for, and what is deleted between two
+        # tellings would be the claims on what was paid for.
+        raise ServeError(
+            f"{REPEAT_VARIABLE}=1 is for a stand-in's telling, which costs nothing: with "
+            f"{MOCK_EMBER_VARIABLE}=live the story is not told again by itself, and "
+            "nothing of a telling Muse Ember was paid for is deleted."
+        )
     return True
 
 
@@ -579,7 +592,7 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
 
     try:
         return run(env, make_server, leave=_leave)
-    except (ServeError, IngestConfigError, EmberConfigError) as error:
+    except (ServeError, IngestConfigError, EmberConfigError, TellingConfigError) as error:
         print(f"The server was not started. {error}", file=sys.stderr)
         return 2
     except NotTheMockStoresError as error:

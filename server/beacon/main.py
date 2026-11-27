@@ -31,6 +31,7 @@ from beacon.push import Push, SubscriptionsError, open_push
 from beacon.radio import core_dump_problem, forbid_core_dumps
 from beacon.story import StoryDesk, open_stories
 from beacon.taps import Taps, open_taps
+from beacon.telling import MOCK_EMBER_VARIABLE, teller_of
 
 _REQUEST_PARTS = frozenset({"body", "query", "path", "header", "cookie"})
 
@@ -271,6 +272,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 async def _running(app: FastAPI, setting: str) -> AsyncIterator[None]:
     """Everything a server opens and runs, begun in order and ended whatever
     became of the beginning. `_lifespan` holds the stores' lock around it."""
+    if setting == "0" and teller_of(os.environ) == "ember":
+        # Who works on a story is kept with the story by the pollers that play it,
+        # and the story's calls are left for Ember to hear as they play it.
+        raise ServerSetupError(
+            f"{MOCK_EMBER_VARIABLE}=live needs the pollers, which play the "
+            f"invented story: it is refused with {INGEST_VARIABLE}=0."
+        )
     # The pollers first: a setting of theirs that is refused leaves no store behind.
     ingest = build(os.environ) if setting == "1" else None
     taps: Taps | None = None
@@ -298,6 +306,9 @@ async def _running(app: FastAPI, setting: str) -> AsyncIterator[None]:
             # it is not to take a visitor's own through a host nobody has checked.
             raise ServerSetupError(front.NOT_WITH_A_REAL_SOURCE)
         app.state.incidents = engine
+        # Who does the model's work on the invented story, which the server says
+        # of itself (`GET /api/health`) and the words of a notification name.
+        app.state.teller = teller_of(os.environ) if engine.mode == "mock" else None
         # What Ember writes about an incident: a stand-in's on the mock store, and
         # on the live store written only under a budget somebody set.
         stories = open_stories(os.environ, engine)

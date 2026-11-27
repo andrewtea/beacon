@@ -40,7 +40,6 @@ import hashlib
 import json
 import os
 import shutil
-import subprocess
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -52,6 +51,8 @@ from beacon.evidence import Point
 from beacon.incident.places import Blocks
 from beacon.ingest.recordings import GENERATED_MARK
 from beacon.radio.audio import SAMPLE_RATE, AudioError, pcm_to_wav, plain_wav, wav_seconds
+from beacon.radio.speech import can_speak
+from beacon.radio.speech import synthesize as _speech
 from beacon.radio.vocabulary import MAX_UNITS
 from beacon.scale.datasf import Record
 
@@ -79,7 +80,6 @@ BLOCK_REACH_M = 250.0
 _TONE_SECONDS = 2.0
 _TONE_SECONDS_A_UNIT = 0.4
 _MAX_TONE_SECONDS = 8.0
-_SPEECH_TIMEOUT_SECONDS = 30
 
 _UNIT_WORDS = {"E": "Engine", "T": "Truck", "B": "Battalion", "D": "Division", "M": "Medic"}
 _KIND_WORDS = {
@@ -307,20 +307,6 @@ def read_script(root: Path) -> Script:
     raise GenerateError("The directory's script of generated calls cannot be read.")
 
 
-def can_speak() -> bool:
-    """Whether this host's ffmpeg has the `flite` voice."""
-    try:
-        listed = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-filters"],
-            capture_output=True,
-            timeout=_SPEECH_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return listed.returncode == 0 and b" flite " in listed.stdout
-
-
 def _place(
     record: Record, by_street: Mapping[str, list[tuple[int, Point]]]
 ) -> tuple[str, int, str] | None:
@@ -431,43 +417,3 @@ def _tone(index: int, line: Line) -> bytes:
     # the audio of two calls differ whatever their pitch and length.
     samples = index.to_bytes(4, "little") + period * (wanted // len(period) + 1)
     return pcm_to_wav(samples[:wanted])
-
-
-def _speech(root: Path, words: str) -> bytes:
-    """The words as synthesized speech, a WAV file at Beacon's sample rate."""
-    said, out = root / ".words.txt", root / ".speech.wav"
-    try:
-        said.write_text(words, encoding="utf-8")
-        made = subprocess.run(
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                f"flite=textfile={said.name}:voice=slt",
-                "-ar",
-                str(SAMPLE_RATE),
-                "-ac",
-                "1",
-                "-c:a",
-                "pcm_s16le",
-                out.name,
-            ],
-            cwd=root,
-            capture_output=True,
-            timeout=_SPEECH_TIMEOUT_SECONDS,
-            check=False,
-            env={"PATH": os.environ.get("PATH", "")},
-        )
-        if made.returncode != 0:
-            raise OSError("ffmpeg could not synthesize a call")
-        return plain_wav(out.read_bytes())
-    except subprocess.SubprocessError as error:
-        raise OSError("ffmpeg could not synthesize a call") from error
-    finally:
-        said.unlink(missing_ok=True)
-        out.unlink(missing_ok=True)

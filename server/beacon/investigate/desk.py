@@ -75,13 +75,16 @@ class InvestigationDesk:
         workers: int = WORKERS,
         clock: Callable[[], datetime] | None = None,
         wall_clock: Callable[[], datetime] | None = None,
+        scope: str = SCOPE,
     ) -> None:
         """`ember` is the desk's own client and is closed with it. A live one pays
-        under the scope `SCOPE`. `clock` is the time a run is stamped with, and
-        `wall_clock` the time a hold is counted by. With `workers=0` nothing runs
-        by itself, and `investigate` is called by hand."""
+        under the scope labelled `scope`: `SCOPE` on the live store, and a scope of
+        its own when Muse Ember works on the invented story (`beacon.telling`), so
+        that neither is counted against the other. `clock` is the time a run is
+        stamped with, and `wall_clock` the time a hold is counted by. With
+        `workers=0` nothing runs by itself, and `investigate` is called by hand."""
         self._paid = PaidDesk(
-            ember, poller="investigator", items="taps", scope=SCOPE, wall_clock=wall_clock
+            ember, poller="investigator", items="taps", scope=scope, wall_clock=wall_clock
         )
         self._ember = ember
         self._runs = runs
