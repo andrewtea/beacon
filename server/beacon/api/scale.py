@@ -1,4 +1,3 @@
-import math
 from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
@@ -113,7 +112,15 @@ def scale(request: Request) -> Scale:
         if made is None:
             return Scale(about_text=ABOUT, run=None, none_text=NO_RESULTS)
         return Scale(about_text=ABOUT, run=_run(made), none_text=None)
-    except (ScaleError, ValidationError, KeyError, TypeError, ValueError, AttributeError):
+    except (
+        ScaleError,
+        ValidationError,
+        KeyError,
+        TypeError,
+        ValueError,
+        AttributeError,
+        ArithmeticError,
+    ):
         pass
     # Outside the handler, so that nothing of the file is chained under the error.
     raise HTTPException(503, UNREADABLE)
@@ -159,6 +166,10 @@ def _run(made: dict[str, Any]) -> ScaleRun:
     )
 
 
+# No number of a run is anywhere near this: a day has some thousands of calls.
+_MOST = 10**12
+
+
 def _words(said: object) -> bool:
     return isinstance(said, str) and bool(said.strip())
 
@@ -171,7 +182,12 @@ def _number(number: Mapping[str, Any]) -> ScaleNumber:
     Raises TypeError for anything else."""
     value = number["value"]
     if value is not None and (
-        isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value)
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        # The comparison alone: it is false for a NaN and for an infinity, and it
+        # takes a whole number of any size, which a test for a finite number or
+        # the formatting of an amount would trip on.
+        or not -_MOST <= value <= _MOST
     ):
         raise TypeError
     if not all(_words(number[field]) for field in ("key", "label", "unit", "text")):

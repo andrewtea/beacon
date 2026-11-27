@@ -226,6 +226,12 @@ def test_a_count_of_one_is_one_thing_and_a_large_count_is_grouped() -> None:
         {"value": "many"},
         {"value": True},
         {"value": float("inf")},
+        {"value": float("nan")},
+        # Whole numbers no float holds, for a count, a share, and an amount.
+        {"value": 10**400},
+        {"value": -(10**400)},
+        {"unit": "percent", "value": 10**400},
+        {"unit": "USD", "value": 10**400},
         {"unit": "percent", "value": "not numeric"},
         {"text": "   "},
         {"text": None},
