@@ -273,7 +273,10 @@ case "$action" in
     ! running || refuse "Something that is not the filming server's service answers on port $port. Nothing was moved or started."
     # Nothing is deleted: the store's files, the claims on what was paid for among
     # them, are moved under told/ in the data directory. A move that did not
-    # finish ends the script here, with the command's own sentence.
+    # finish ends the script here, with the command's own sentence. One that
+    # finished without the disk's word for its last step is no leave to begin a
+    # story by itself: the server asks the disk again when it takes the stores'
+    # lock, and does not start, and begins no store, until the disk has kept it.
     (cd "$root/server" && env -u BEACON_LIVE_SOURCES BEACON_DATA_DIR="$BEACON_DATA_DIR" \
       uv run --no-sync python -m beacon.serve --set-aside)
     start "$minute"

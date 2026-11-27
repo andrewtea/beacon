@@ -368,6 +368,51 @@ def test_a_client_that_is_on_another_ledger_than_the_one_named_pays_nothing(
     assert elsewhere.api.requests == []
 
 
+@pytest.mark.parametrize("then", ["gone", "empty", "another"])
+def test_a_ledger_that_goes_between_the_look_and_the_client_is_not_begun_anew(
+    env: dict[str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, then: str
+) -> None:
+    # The look before a client is made (`check`) and the making of the client are
+    # two moments. A client begins a ledger where it finds none, and a new, empty
+    # ledger left at the path would be taken for the ledger by the next look that
+    # names none.
+    ledger = tmp_path / "ember" / "ledger.sqlite3"
+    file = _ledger(tmp_path)
+    live = env | {"REPLAY": "0", "MODEL_API_KEY": "test-key", telling.LEDGER_VARIABLE: file}
+    look = telling.check
+    put: list[bytes] = []
+
+    def looked_and_then(env: dict[str, str], make: object = None) -> None:
+        look(env, None)
+        for beside in ledger.parent.glob("ledger.sqlite3*"):
+            beside.rename(tmp_path / f"moved-{beside.name}")
+        if then == "empty":
+            ledger.write_bytes(b"")
+        if then == "another":
+            _ledger(tmp_path)
+        if then != "gone":
+            put.append(ledger.read_bytes())
+
+    monkeypatch.setattr(telling, "check", looked_and_then)
+
+    with pytest.raises(telling.TellingConfigError, match="no ledger was begun") as refused:
+        telling.paying(live, telling.TAPS)
+
+    assert refused.value.__context__ is None
+    # What the sentence says is so: nothing was begun where the ledger was, and
+    # what was put there was not written to.
+    if then == "gone":
+        assert not ledger.exists()
+        assert [path.name for path in ledger.parent.iterdir()] == []
+    else:
+        assert ledger.read_bytes() == put[0]
+    # So a look that names no ledger finds none that a refused client made.
+    if then != "another":
+        assert kept_file(ledger) is None
+        with pytest.raises(telling.TellingConfigError, match="no ledger that was begun"):
+            telling.preflight(env | {"REPLAY": "0", "EMBER_SPENT_BEFORE_USD": "0"})
+
+
 def test_what_can_be_seen_before_a_server_is_started_is_looked_at_and_nothing_is_made(
     env: dict[str, str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

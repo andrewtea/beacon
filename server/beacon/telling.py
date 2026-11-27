@@ -46,9 +46,10 @@ from typing import Literal
 
 from beacon.ember import EmberClient, SpendScope
 from beacon.ember.client import Storage, default_data_dir
-from beacon.ember.errors import EmberConfigError
+from beacon.ember.errors import EmberConfigError, OtherLedgerError
 from beacon.ember.ledger import FILE_NAME, kept_file
 from beacon.ember.pricing import SPENT_BEFORE_VARIABLE, parse_usd, read_stop_settings
+from beacon.errors import raise_bare
 
 MOCK_EMBER_VARIABLE = "BEACON_MOCK_EMBER"
 BUDGET_VARIABLE = "BEACON_MOCK_EMBER_BUDGET_USD"
@@ -243,21 +244,42 @@ def preflight(env: Mapping[str, str]) -> str | None:
 def paying(env: Mapping[str, str], label: str, make: PaidClient | None = None) -> EmberClient:
     """A live Ember client that pays under the scope `label`, one of `SCOPES`.
 
+    **A client that goes on with a named ledger begins none.** With
+    `BEACON_MOCK_EMBER_LEDGER` set, the client is made on that file or not at all
+    (`EmberClient.from_env(only_ledger=...)`): the look `check` takes and the making
+    of the client are two moments, and a ledger that went in between is not begun
+    anew by the client, which would leave a new, empty ledger where the next look
+    finds one. Nor does such a client begin one later, when the file goes from
+    under it. A client a test's `make` made is looked at after it is made.
+
     Raises TellingConfigError when the budget is not one, there is no live Ember,
     or the ledger is not the one `BEACON_MOCK_EMBER_LEDGER` names, and
     EmberConfigError as `EmberClient.from_env` does."""
     scope = scope_of(env, label)
     check(env, make)
-    ember = EmberClient.from_env(env, scope=scope) if make is None else make(scope)
+    named = env.get(LEDGER_VARIABLE)
+    ember = None
     refusal = None
-    if ember.mode != "live":
-        refusal = _NO_LIVE_EMBER
-    elif LEDGER_VARIABLE in env and ember.ledger_file() != env[LEDGER_VARIABLE]:
-        # The file the client is open on, which is the one it pays in from here on.
+    try:
+        ember = (
+            EmberClient.from_env(env, scope=scope, only_ledger=named)
+            if make is None
+            else make(scope)
+        )
+    except OtherLedgerError:
         refusal = OTHER_LEDGER
+    if ember is not None:
+        if ember.mode != "live":
+            refusal = _NO_LIVE_EMBER
+        elif named is not None and ember.ledger_file() != named:
+            # The file the client is open on, which is the one it pays in from here on.
+            refusal = OTHER_LEDGER
+        if refusal is not None:
+            ember.close()
     if refusal is not None:
-        ember.close()
-        raise TellingConfigError(refusal)
+        # Outside the handler, so that nothing is under the sentence.
+        raise_bare(TellingConfigError(refusal))
+    assert ember is not None
     return ember
 
 

@@ -29,6 +29,15 @@ the last. While the note is there the lock is refused to everybody but the comma
 that finishes the move (`HalfAsideError`): a server that started then would begin a
 new story beside what is left of the last one's stories and investigations, and a
 server that tells the story again would delete those.
+
+**And nothing opens a store until the disk has kept what `told/` lists.** The last
+step of a move is the note's going, and a machine that stops before the disk has
+that can start with the note there again. Were a store begun in between, the note
+would then be found beside a store that is not the one that was moved, and nothing
+could finish that move. So everybody who takes the lock, other than the command
+that moves, first has the disk keep `told/` when there is one, and is refused
+(`AsideNotKeptError`) when the disk does not: after it has, a note that is gone is
+gone for good.
 """
 
 import fcntl
@@ -71,6 +80,41 @@ HALF_ASIDE = (
 )
 
 
+class AsideNotKeptError(DataLockedError):
+    """The disk did not confirm that it kept what `told/` lists, the going of a
+    move's note among it: nothing opens a store until it has. The text is fixed."""
+
+
+ASIDE_NOT_KEPT = (
+    f"This data directory has a {ASIDE}/, where a mock store's files go when they "
+    "are set aside, and the disk did not confirm, when it was asked now, that it "
+    f"kept what {ASIDE}/ lists: the taking away of a move's note is the last thing "
+    "written there. Nothing that opens a store runs on this data directory until "
+    "the disk has: a store begun before then could be found beside that note after "
+    "the machine stops, and nothing could then finish the move. Nothing was opened "
+    "or changed. Start this again, which asks the disk again."
+)
+
+
+def aside_kept(data: Path) -> bool:
+    """Have the disk keep what `told/` under the data directory lists, and say
+    whether it did. True as well when there is no such directory: nothing was ever
+    set aside there. Looked at as `aside_pending` looks."""
+    try:
+        listing = os.open(data / ASIDE, os.O_RDONLY | os.O_DIRECTORY)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    try:
+        os.fsync(listing)
+    except OSError:
+        return False
+    finally:
+        os.close(listing)
+    return True
+
+
 def aside_pending(data: Path) -> bool:
     """Whether a move of a mock store's files under `ASIDE` was begun and not
     finished. A note that cannot be looked at is taken to be there."""
@@ -96,7 +140,8 @@ class DataLock:
 
         Raises DataLockedError when it is held in a way that excludes this,
         HalfAsideError when a store under the directory was set aside only in
-        part, and OSError when the directory or the lock's file cannot be made."""
+        part, AsideNotKeptError when the disk did not keep what `told/` lists,
+        and OSError when the directory or the lock's file cannot be made."""
         self.exclusive = not shared
         self.data = data
         self._closing = threading.Lock()
@@ -134,6 +179,13 @@ class DataLock:
             os.close(self._file)
             self._file = -1
             raise_bare(HalfAsideError(HALF_ASIDE))
+        # After the look at the note, and under the lock too: a note that is seen
+        # to be gone is not back after this, whatever becomes of the machine. The
+        # command that moves asks the disk itself, step by step.
+        if not finishing and not aside_kept(data):
+            os.close(self._file)
+            self._file = -1
+            raise_bare(AsideNotKeptError(ASIDE_NOT_KEPT))
 
     @property
     def held(self) -> bool:

@@ -391,10 +391,12 @@ _ASIDE_EARLIER = (
     "command again."
 )
 _ASIDE_UNCONFIRMED = (
-    "The move is finished, and the note of it was taken away, so a server can start. "
-    "The disk did not confirm that it kept that last step: if the machine stops "
-    "before it has, the note can be there again when it starts, no server starts "
-    "while it is, and this command, given again, takes it away."
+    "The move is finished, and the note of it was taken away. The disk did not "
+    "confirm that it kept that last step. Whatever opens a store on this data "
+    "directory next asks the disk again before it does, and does not start until "
+    "the disk has kept it. If the machine stops before then, the note can be there "
+    "again when it starts, with no store begun beside it, and this command, given "
+    "again, takes it away."
 )
 
 
@@ -404,7 +406,8 @@ class SetAside:
 
     where: PurePath
     # False when every file went and the note was taken away, and the disk then
-    # did not confirm that it kept the note's going.
+    # did not confirm that it kept the note's going. Nothing opens a store until
+    # it has (`beacon.datadir.aside_kept`, asked by whoever takes the lock).
     confirmed: bool = True
 
     def __str__(self) -> str:
@@ -572,9 +575,12 @@ def set_aside(env: Mapping[str, str], now: datetime, lock: DataLock) -> SetAside
         except (OSError, sqlite3.Error, _NotForgottenError):
             busy = True
         if finished:
-            # The note is gone, and nothing is kept out. All that can have failed
-            # is the disk's word that it kept the note's going, which is not an
-            # unfinished move and is not said to be one.
+            # The note is gone. All that can have failed is the disk's word that
+            # it kept the note's going, which is not an unfinished move and is not
+            # said to be one. Whoever takes the stores' lock next asks the disk
+            # again and opens no store until it has that word (`DataLock`): a
+            # store begun without it could be found beside the note, come back,
+            # and this command could then not finish the move.
             return SetAside(PurePath(ASIDE) / aside.name, confirmed=not busy)
         if busy and began is None and gone == 0 and _unbegin(data, aside):
             # Not one file went, and nothing is left of the try.

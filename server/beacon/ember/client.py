@@ -309,6 +309,7 @@ class EmberClient:
         stop_nanousd: int | None = None,
         pacer: Pacer | None = None,
         scope: SpendScope | None = None,
+        only_ledger: str | None = None,
     ) -> None:
         """Prefer `from_env`, `replay_only`, `live`, or `fake`."""
         if api_key is not None and responder is not None:
@@ -333,7 +334,9 @@ class EmberClient:
                 f"{str(storage.ledger_db)!r}."
             )
         self._storage = storage
-        self._ledger = Ledger(storage.ledger_db)
+        # Before anything else is made: a client that is refused its ledger leaves
+        # no file.
+        self._ledger = Ledger(storage.ledger_db, only=only_ledger)
         self._cache = ReplayCache(storage.replay_dir)
         # The client builds its own SDK object and takes none from callers, so every
         # live request goes to Meta with retries off.
@@ -370,10 +373,16 @@ class EmberClient:
         storage: Storage | None = None,
         pacer: Pacer | None = None,
         scope: SpendScope | None = None,
+        only_ledger: str | None = None,
     ) -> "EmberClient":
         """Replay-only unless `REPLAY=0`, which needs `MODEL_API_KEY` and
         `EMBER_SPENT_BEFORE_USD`. A live client stops where `EMBER_STOP_USD` says, and
         is the only kind that uses `pacer`.
+
+        `only_ledger` is for work that goes on paying from the ledger that was paid
+        from before: the name of that ledger's file, as `ledger_file` gives it. The
+        client is then made only on that file, and begins no ledger, then or later
+        (`Ledger`).
 
         `env` is where `REPLAY`, `MODEL_API_KEY`, and `BEACON_DATA_DIR` are read, by
         default the process's environment. The two spending settings are always read
@@ -381,7 +390,8 @@ class EmberClient:
         what an operator set.
 
         Raises EmberConfigError when a setting cannot be read, in either mode, and when
-        live mode lacks one it needs."""
+        live mode lacks one it needs, and OtherLedgerError, which is one, with no
+        file made, when the ledger is not the one `only_ledger` names."""
         env = os.environ if env is None else env
         storage = storage or Storage.under(default_data_dir(env))
         # Read in replay mode too, so a mistyped stop is found before the day a key
@@ -389,7 +399,7 @@ class EmberClient:
         read_stop_settings(os.environ)
         replay = env.get("REPLAY", "1")
         if replay == "1":
-            return cls.replay_only(storage, scope=scope)
+            return cls(storage, scope=scope, only_ledger=only_ledger)
         if replay != "0":
             raise EmberConfigError(f"REPLAY must be 1 or 0, not {replay!r}.")
         api_key = env.get("MODEL_API_KEY")
@@ -398,7 +408,7 @@ class EmberClient:
                 "REPLAY=0 asks for live Ember calls, but MODEL_API_KEY is not set. "
                 "Set the key, or use REPLAY=1 to replay recorded responses."
             )
-        return cls.live(storage, api_key=api_key, pacer=pacer, scope=scope)
+        return cls.live(storage, api_key=api_key, pacer=pacer, scope=scope, only_ledger=only_ledger)
 
     @classmethod
     def replay_only(cls, storage: Storage, *, scope: SpendScope | None = None) -> "EmberClient":
@@ -414,6 +424,7 @@ class EmberClient:
         stop_nanousd: int | None = None,
         pacer: Pacer | None = None,
         scope: SpendScope | None = None,
+        only_ledger: str | None = None,
     ) -> "EmberClient":
         """A client that can spend. Its stop is the process environment's, as it is
         for `from_env`: `EMBER_STOP_USD` on top of `EMBER_SPENT_BEFORE_USD`, which must
@@ -423,10 +434,13 @@ class EmberClient:
         `http_client` replaces the HTTP transport, which is how tests stand in for the
         API. `pacer` spaces the requests and has a call tried again after a 429.
         `scope` holds the client's calls to a budget of their own as well.
+        `only_ledger` names the ledger file the client goes on with, as it does for
+        `from_env`.
 
         Raises EmberConfigError when the environment's stop cannot be read,
-        `EMBER_SPENT_BEFORE_USD` is not set, or the ledger's path is relative, and
-        ValueError for a `stop_nanousd` above the environment's stop."""
+        `EMBER_SPENT_BEFORE_USD` is not set, the ledger's path is relative, or the
+        ledger is not the one `only_ledger` names (OtherLedgerError), and ValueError
+        for a `stop_nanousd` above the environment's stop."""
         return cls(
             storage,
             api_key=api_key,
@@ -434,6 +448,7 @@ class EmberClient:
             stop_nanousd=stop_nanousd,
             pacer=pacer,
             scope=scope,
+            only_ledger=only_ledger,
         )
 
     @classmethod

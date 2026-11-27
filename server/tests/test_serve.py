@@ -21,7 +21,14 @@ from fastapi.testclient import TestClient
 
 import beacon.main
 from beacon import serve
-from beacon.datadir import LOCK_FILE, PENDING, DataLock, DataLockedError, HalfAsideError
+from beacon.datadir import (
+    LOCK_FILE,
+    PENDING,
+    AsideNotKeptError,
+    DataLock,
+    DataLockedError,
+    HalfAsideError,
+)
 from beacon.evidence import EvidenceStore, NewEvidence, Point
 from beacon.ingest.setup import MOCK_HEAD_START, IngestConfigError
 from beacon.investigate import Runs
@@ -962,29 +969,117 @@ def test_the_disk_is_asked_to_keep_every_new_name_before_a_name_is_taken_away(
     assert {told / "20261201T183005Z" / kind for kind, _ in serve.MOCK_FILES} <= set(asked)
 
 
+def _told_is_not_kept(monkeypatch: pytest.MonkeyPatch) -> Callable[[], None]:
+    """Have the disk refuse to keep what `told/` lists once the note of a move is
+    gone from it, whoever asks. Answers what mends it."""
+    real = os.fsync
+    told = data_dir() / "told"
+
+    def fsync(descriptor: int) -> None:
+        if (
+            told.is_dir()
+            and os.path.samestat(os.fstat(descriptor), os.stat(told))
+            and not (told / PENDING).exists()
+        ):
+            raise OSError("no")
+        real(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    return lambda: monkeypatch.setattr(os, "fsync", real)
+
+
 def test_a_move_that_is_finished_is_not_said_to_be_unfinished_when_the_disk_does_not_confirm(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     served()
-    keep = serve._kept
     note = data_dir() / "told" / PENDING
+    mend = _told_is_not_kept(monkeypatch)
 
-    def fails_once_the_note_is_gone(directory: Path) -> None:
-        if directory == data_dir() / "told" and not note.exists() and any(directory.iterdir()):
-            raise OSError("no")
-        keep(directory)
-
-    monkeypatch.setattr(serve, "_kept", fails_once_the_note_is_gone)
     assert serve.main(["--set-aside"], plain()) == 0
     said = capsys.readouterr()
     assert "were moved to told/" in said.out
     assert "The disk did not confirm that it kept that last step" in said.out
+    assert "asks the disk again before it does" in said.out
     assert "only in part" not in said.out + said.err
-    # What it says is so: nothing is kept out, and nothing is left to move.
+    # What it says is so: the note is gone, and nothing is left to move.
     assert not note.exists()
+    assert not any(f"{d}/{n}" in files() for d, n in serve.MOCK_FILES)
+    mend()
     with alone():
         pass
-    assert not any(f"{d}/{n}" in files() for d, n in serve.MOCK_FILES)
+
+
+def test_no_store_is_begun_until_the_disk_has_kept_that_a_moves_note_is_gone(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The note's going is the last step of a move. A machine that stops before the
+    # disk has it can start with the note there again, and a store begun in
+    # between would be found beside it: another store than the one that was
+    # moved, with which the command could not finish the move.
+    served()
+    note = data_dir() / "told" / PENDING
+    mend = _told_is_not_kept(monkeypatch)
+    assert serve.main(["--set-aside"], plain()) == 0
+    capsys.readouterr()
+    before = files()
+
+    # So nobody opens a store while the disk does not say it kept `told/`: no
+    # server, with the pollers or without, and no telling again.
+    for shared in (False, True):
+        with pytest.raises(AsideNotKeptError, match="the disk did not confirm") as refused:
+            DataLock(data_dir(), shared=shared)
+        assert refused.value.__context__ is None
+    with pytest.raises(AsideNotKeptError), TestClient(create_app()):
+        pass
+    for started_with in (plain(), env()):
+        assert serve.main([], started_with) == 3
+        assert "the disk did not confirm" in capsys.readouterr().err
+    # No store was begun, and the lock was given back each time.
+    assert files() == before
+    assert not any(f"{d}/{n}" in before for d, n in serve.MOCK_FILES)
+
+    # The machine stops, and the note is there again when it starts. No store is
+    # beside it, so the command, given again, finishes: it takes the note away.
+    (went,) = (path.name for path in (data_dir() / "told").iterdir())
+    note.write_text(went)
+    with pytest.raises(HalfAsideError):
+        DataLock(data_dir(), shared=False)
+    mend()
+    assert serve.main(["--set-aside"], plain()) == 0
+    assert "The disk did not confirm" not in capsys.readouterr().out
+    assert not note.exists()
+    assert [path.name for path in (data_dir() / "told").iterdir()] == [went]
+
+    # Once the disk has kept it, a server begins the story anew.
+    asked: list[bool] = []
+    real = os.fsync
+
+    def fsync(descriptor: int) -> None:
+        asked.append(os.path.samestat(os.fstat(descriptor), os.stat(data_dir() / "told")))
+        real(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    with alone():
+        # Asked of `told/` by whoever takes the lock, before anything is opened.
+        assert asked == [True]
+    with TestClient(create_app()) as client:
+        assert client.get("/api/health").json()["mode"] == "mock"
+    assert (data_dir() / "evidence" / "mock.sqlite3").is_file()
+
+
+def test_a_data_directory_nothing_was_set_aside_in_asks_the_disk_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fsync(descriptor: int) -> None:
+        raise OSError("no")
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    with alone():
+        pass
+    # A `told` that is a file is no place anything was moved to.
+    (data_dir() / "told").write_bytes(b"")
+    with alone():
+        pass
 
 
 @pytest.mark.parametrize("shape", [0, 1])
