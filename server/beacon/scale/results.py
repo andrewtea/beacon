@@ -724,8 +724,9 @@ def _match_numbers(
             + (
                 # Of generated calls the count is said and not explained: `fits`
                 # shows only that no record fits, which a record can bring about
-                # by itself (one whose dispatch is before its call was received
-                # fits no incident opened at its dispatch). And every generated
+                # by itself (one whose dispatch is more than `score.EARLY`, two
+                # minutes, before its call was received fits no incident opened
+                # at its dispatch). And every generated
                 # call is of a record, so none is of a call DataSF does not list.
                 "."
                 if generated
