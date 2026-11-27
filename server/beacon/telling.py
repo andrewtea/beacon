@@ -56,11 +56,15 @@ BUDGET_VARIABLE = "BEACON_MOCK_EMBER_BUDGET_USD"
 # The ledger file a telling by Muse Ember pays from, by the name a client gives the
 # file it is open on (`EmberClient.ledger_file`: generation, device, inode). When
 # it is set, no paying client is made unless the ledger under the data directory
-# is there and is that file, at every start of a server: a client begins a ledger
-# where it finds none, and a ledger begun anew, or a copy put in its place, counts
-# less than was spent. It only refuses. `python -m beacon.telling` prints the name
-# of the ledger that is there, for whoever starts a server to hand it on
-# (`scripts/film`). What it cannot tell is a ledger rolled back in place.
+# is there and is seen to have that generation, device, and inode, at every start
+# of a server: a client begins a ledger where it finds none, and a ledger begun
+# anew, or a copy put in its place, counts less than was spent. It only refuses,
+# and only a mismatch it observes. `python -m beacon.telling` prints the name of
+# the ledger that is there, for whoever starts a server to hand it on
+# (`scripts/film`). What it cannot tell is a ledger rolled back in place, or a
+# copy restored after the ledger was unlinked that was given its inode number:
+# restoring a ledger needs every process that spends stopped first, and the ledger
+# compared with Meta's Usage page (`beacon.ember.ledger`).
 LEDGER_VARIABLE = "BEACON_MOCK_EMBER_LEDGER"
 
 # Who does the model's work on the invented story.

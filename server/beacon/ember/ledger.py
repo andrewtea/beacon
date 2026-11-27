@@ -31,12 +31,24 @@ compare the ledger with Meta's Usage page before starting them again.
 A ledger begins a file where it finds none, which is right for a first call and
 wrong for whoever means to go on paying from the ledger that was paid from before.
 **A ledger opened on a file that was named to it (`only`) never begins one, and
-never reads or writes another**: every connection it makes, when it is opened and
-for as long as it is used, is to that file, seen to be it by device, inode, and
-generation, and makes no file and no table. A file that is not the named one
-refuses it (`OtherLedgerError`), and when the file goes from under it afterwards,
-or another ledger is put at the path, it is a replaced ledger to every reader and
-writer, with nothing put in its place and nothing read from or logged in the other.
+refuses a file whose generation, device, or inode is seen to be another's**: every
+connection it makes, when it is opened and for as long as it is used, makes no file
+and no table, and is used only when what is at the path has the named device and
+inode, looked at before the connection is made and after its generation is read on
+it, and that generation. A mismatch when it is opened refuses it
+(`OtherLedgerError`), and one seen afterwards, with the file gone or another at the
+path, is a replaced ledger to every reader and writer, with nothing put in its
+place.
+
+**That is a comparison of three things that were observed, and no proof that the
+file is the one that was paid from.** A device and an inode name a file only while
+it exists: once a ledger is unlinked, a restored backup can be given the freed inode
+number and holds the generation, and it then passes. The two looks are at the path,
+not at the file SQLite has open, so they catch a replacement that stays at the
+path, and not a path that was switched away and back while the connection was
+made. And nothing here tells a ledger rolled back in place. The rule above is what
+covers those: stop every process that spends before a ledger is restored, by any
+means, and compare it with Meta's Usage page before one is started again.
 """
 
 import json
@@ -196,17 +208,18 @@ class Ledger:
 
         `only` is for whoever goes on with a ledger that was paid from before: the
         name of its file, as `opened_file` and `kept_file` give it. The ledger is
-        then opened only when the file at the path is that one, and **neither now
-        nor later does it begin a file or make a table, or read or write another
-        file**: every connection is to that file (`mode=rw`, its device, inode, and
-        generation seen each time) or is not made. When the file goes from under
-        it, or another is put in its place, a ledger or a copy of this one, what
-        reads it or writes to it raises LedgerReplacedError (`spent_nanousd`,
-        `generation`, `scope_spend`, `reserve`, `record`, `export_trace`), `settle`
-        and `is_opened_file` answer False, and `calls` answers none.
+        then opened only when what is at the path has that generation, device, and
+        inode, and **neither now nor later does it begin a file or make a table**:
+        every connection is `mode=rw`, and is used only when those three are seen
+        to be the named ones (`_connect_existing`, which says what that does not
+        show). When a mismatch is seen, the file gone or another at the path, what
+        reads the ledger or writes to it raises LedgerReplacedError
+        (`spent_nanousd`, `generation`, `scope_spend`, `reserve`, `record`,
+        `export_trace`), `settle` and `is_opened_file` answer False, and `calls`
+        answers none.
 
         Raises OtherLedgerError, having made nothing, when `only` is given and what
-        is at the path is not that file."""
+        is at the path is not seen to have that generation, device, and inode."""
         self._db_path = db_path
         self._only = only is not None
         if only is None:
@@ -320,8 +333,9 @@ class Ledger:
 
     def opened_file(self) -> str:
         """A name for the file this ledger was opened on: its generation, its
-        device, and its inode. Another file, a copy put back by renaming among
-        them, has another name."""
+        device, and its inode. Another file that exists beside it, a copy put back
+        by renaming among them, has another name; a file made after this one was
+        unlinked can be given its inode number."""
         device, inode = self._identity if self._identity is not None else (0, 0)
         return f"{self._opened}:{device}:{inode}"
 
@@ -501,15 +515,25 @@ class Ledger:
     def _connect_existing(self) -> sqlite3.Connection:
         """A connection to the ledger file that was named, for a ledger that begins
         none (`only`): `mode=rw` opens a file and makes none, and no table is made
-        in a file that has none. **It is a connection to the named file or there is
-        none**: the file at the path is seen to be that one, by its device and
-        inode before the connection is made and again after its generation is read
-        on it, and by that generation, so that no reader and no writer is handed
-        another ledger that was put at the path, a copy with the generation
-        included.
+        in a file that has none. **A connection is handed on only when the
+        generation, device, and inode that were named are the ones observed**: the
+        device and inode of what is at the path, looked at before the connection is
+        made and again after its generation is read on it, and that generation. So
+        another ledger that is put at the path and stays there, one with the same
+        generation on another inode included, is handed to no reader and no writer.
 
-        Raises LedgerReplacedError when the named file is not what is at the path:
-        nothing is there, or another file is, a ledger or not."""
+        **What that does not show.** Both looks are at the path, and not at the
+        file SQLite has open: a path switched to another file and back while the
+        connection was made is not seen. A device and an inode name a file only
+        while it exists: a backup restored after the ledger was unlinked can be
+        given the freed inode number, and has the generation. And a ledger rolled
+        back in place is the same file. None of those is refused here; what covers
+        them is the rule in this module's docstring, that every process that
+        spends is stopped before a ledger is restored and the ledger compared with
+        Meta's Usage page before one starts again.
+
+        Raises LedgerReplacedError when a mismatch is seen: nothing is at the path,
+        or what is there has another device, inode, or generation, or none."""
         address = f"file:{quote(str(self._db_path))}?mode=rw"
         db = None
         same = False
@@ -541,8 +565,9 @@ class Ledger:
         return db
 
     def _named_file_is_there(self) -> bool:
-        """Whether what is at the path is the file this ledger was named (`only`):
-        a file of its own, no link, with that device and inode."""
+        """Whether what is at the path now is a file of its own, no link, with the
+        device and inode this ledger was named (`only`). A look at the path at one
+        moment: see `_connect_existing` for what it does not show."""
         try:
             found = os.lstat(self._db_path)
         except OSError:
@@ -591,9 +616,11 @@ def kept_file(path: Path) -> str | None:
     first call and wrong for whoever means to go on paying from the ledger that was
     paid from before: a ledger begun anew counts nothing of what was spent. This is
     how that is asked before anything is made. The name tells a file from a copy of
-    it put in its place, which has the generation and can lack rows. **What it
-    cannot tell** is a ledger rolled back in place, as a copy written over the same
-    file is, or that the ledger is the one its operator means.
+    it that is put in its place while the file still exists, which has the
+    generation, another inode, and can lack rows. **What it cannot tell** is a
+    ledger rolled back in place, as a copy written over the same file is, a copy
+    restored after the file was unlinked that was given its inode number, or that
+    the ledger is the one its operator means.
 
     What it answers matches `FILE_NAME`, whatever the file holds: it is put on a
     command line by whoever asks (`scripts/film`)."""
