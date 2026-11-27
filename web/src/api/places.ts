@@ -1,5 +1,5 @@
 import { fetchJson, MODE_HEADER } from './http.ts'
-import type { Credit, IncidentSummary, Mode } from './incidents.ts'
+import type { IncidentSummary, Mode } from './incidents.ts'
 import { roundToBlock } from '../lib/geo.ts'
 
 // The shape of `POST /api/places/check`, field for field as
@@ -7,9 +7,13 @@ import { roundToBlock } from '../lib/geo.ts'
 
 /** An open incident Beacon has within a kilometre of a place. */
 export type NearPlace = {
+  // When `incident.point_source` is not null, the distance is measured from
+  // that row's point, which is a 511 closure's: its confidence and its credit
+  // are shown beside `text`.
   incident: IncidentSummary
   distance_m: number
-  // The distance in the server's sentence, and nothing else.
+  // The distance in the server's sentence, which says so when it is measured
+  // from a point of 511's, and nothing else.
   text: string
 }
 
@@ -19,8 +23,6 @@ export type PlaceAnswer = {
   near: NearPlace[]
   // The server's sentence when nothing is listed, which says it is no all-clear.
   text: string | null
-  // 511's credit, when a distance is measured from a place of 511's.
-  credit: Credit | null
 }
 
 export type PlacesAnswer = {

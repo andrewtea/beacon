@@ -24,6 +24,32 @@ export function rounded(place: Place): Place {
   }
 }
 
+// The area Beacon covers: San Francisco with Treasure Island, and a margin over
+// the water. It is the server's box (`SAN_FRANCISCO` in
+// `server/beacon/ingest/area.py`), which a test of the server's holds this to
+// (`server/tests/test_places.py`). The server
+// refuses a place outside it; the app looks first, so that a place it would
+// refuse is never saved.
+export const COVERED = {
+  south: 37.7,
+  west: -122.53,
+  north: 37.84,
+  east: -122.35,
+}
+
+/** Whether a place, as it is rounded before it is sent, is in the area Beacon
+ * covers. */
+export function covered(place: { lat: number; lon: number }): boolean {
+  const lat = roundToBlock(place.lat)
+  const lon = roundToBlock(place.lon)
+  return (
+    COVERED.south <= lat &&
+    lat <= COVERED.north &&
+    COVERED.west <= lon &&
+    lon <= COVERED.east
+  )
+}
+
 /** The phone's position now, already rounded to about a block. */
 export function locate(): Promise<Place> {
   return new Promise((resolve, reject) => {

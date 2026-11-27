@@ -1,6 +1,8 @@
 import asyncio
 import json
 import logging
+import re
+import threading
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -14,13 +16,16 @@ from beacon.api import places as api_places
 from beacon.evidence import Point
 from beacon.incident import Engine
 from beacon.incident.build import CREDIT_511
+from beacon.incident.engine import Snapshot
 from beacon.incident.places import NO_BLOCKS
+from beacon.ingest.area import SAN_FRANCISCO
 from beacon.main import create_app
 from beacon.places import (
     MAX_BODY_BYTES,
     MAX_PLACES,
     NOT_AN_AREA,
     NOTHING_NEAR,
+    Admission,
     PlacesError,
     near,
     read_places,
@@ -184,6 +189,24 @@ def test_a_place_outside_san_francisco_is_refused_and_not_repeated() -> None:
     assert (refused.value.__cause__, refused.value.__context__) == (None, None)
 
 
+def test_the_app_saves_places_in_the_area_the_server_answers_for() -> None:
+    # The app looks before it saves, so that a place this route would refuse is
+    # never kept. Its box is written out in the app, and has to be this one.
+    app_side = (Path(__file__).parents[2] / "web/src/lib/geo.ts").read_text(encoding="utf-8")
+    found = re.search(
+        r"COVERED = \{\s*south: ([-\d.]+),\s*west: ([-\d.]+),\s*north: ([-\d.]+),"
+        r"\s*east: ([-\d.]+),?\s*\}",
+        app_side,
+    )
+    assert found is not None
+    assert tuple(float(number) for number in found.groups()) == (
+        SAN_FRANCISCO.south,
+        SAN_FRANCISCO.west,
+        SAN_FRANCISCO.north,
+        SAN_FRANCISCO.east,
+    )
+
+
 # The route.
 
 
@@ -200,10 +223,16 @@ def test_each_place_is_answered_in_the_order_sent_with_what_is_near_and_what_a_d
     assert answer["as_of"] == "2026-11-27T20:06:00Z"
     # A distance is not an area, and every answer says so.
     assert answer["caveat_text"] == NOT_AN_AREA
-    assert "not being inside the area of an official order" in answer["caveat_text"]
+    assert (
+        "does not tell you whether this place is inside or outside the area of an "
+        "official order or alert"
+    ) in answer["caveat_text"]
     nothing, home = answer["places"]
-    # Nothing near is what Beacon's record has, and is said not to be an all-clear.
-    assert nothing == {"near": [], "text": NOTHING_NEAR, "credit": None}
+    # Nothing listed is said as that, and as no all-clear.
+    assert nothing == {"near": [], "text": NOTHING_NEAR}
+    assert nothing["text"].startswith(
+        "Beacon lists no incident within a kilometre of this saved place in this reading."
+    )
     assert "not an official all-clear" in nothing["text"]
     (fire,) = home["near"]
     assert (fire["incident"]["title"], fire["distance_m"]) == (
@@ -211,7 +240,9 @@ def test_each_place_is_answered_in_the_order_sent_with_what_is_near_and_what_a_d
         50,
     )
     assert fire["text"] == "Beacon has this incident about 50 m from this place."
-    assert (home["text"], home["credit"]) == (None, None)
+    assert home["text"] is None
+    # Measured from the block's own point: 511 has no part in it.
+    assert (fire["incident"]["point_from"], fire["incident"]["point_source"]) == ("blocks", None)
     # The incident is as its own route has it: its radio basis, and that it is a
     # stand-in's.
     assert fire["incident"]["radio"]["confidence"] == "medium"
@@ -233,22 +264,53 @@ def test_no_sentence_about_a_place_tells_anybody_what_to_do_or_that_they_are_in_
 
     for word in ("evacuate", "leave", "stay", "safe", "danger", "you are", "affected"):
         assert word not in said
-    assert "inside the area" in said  # only to say that a distance is not that
+    # Only to say that a distance does not tell which.
+    assert "whether this place is inside or outside the area" in said
+    assert "no open incident" not in said
 
 
-def test_a_distance_measured_from_a_place_of_511s_carries_511s_credit(
+def test_a_place_with_only_a_medical_response_near_is_answered_as_one_with_nothing_near(
+    tmp_path: Path, moment: list[datetime]
+) -> None:
+    def answer_of(rows: Rows) -> Any:
+        app = create_app()
+        app.state.incidents = Engine(rows.store, BLOCKS, names=NAMES, clock=lambda: moment[0])
+        point = BLOCKS.points[("Fell St", 400)]
+        response = check(TestClient(app, headers=SHOWN), {"lat": point.lat, "lon": point.lon})
+        return response.json()["places"]
+
+    medical = Rows(mock_store(tmp_path / "medical"))
+    medical.radio(2.5, "medical", units=("M52",), street="Fell St", block=400)
+    engine = Engine(medical.store, BLOCKS, names=NAMES, clock=lambda: moment[0])
+    (response,) = engine.incidents()
+    assert (response.category, response.open) == ("medical response", True)
+    assert response.point == BLOCKS.points[("Fell St", 400)]
+
+    # The same answer as where Beacon has nothing at all: the sentence does not say
+    # that there is no incident, and does not give away that there is a medical one.
+    assert answer_of(medical) == answer_of(Rows(mock_store(tmp_path / "empty")))
+    assert answer_of(medical) == [{"near": [], "text": NOTHING_NEAR}]
+
+
+def test_a_distance_measured_from_a_point_of_511s_says_so_and_carries_511s_credit(
     rows: Rows, moment: list[datetime]
 ) -> None:
     # With no list of blocks the fire is where 511 says its closure is.
     app = create_app()
     app.state.incidents = Engine(rows.store, NO_BLOCKS, names=NAMES, clock=lambda: moment[0])
 
-    answer = check(TestClient(app, headers=SHOWN), HOME, {"lat": FAR.lat, "lon": FAR.lon}).json()
+    answer = check(TestClient(app, headers=SHOWN), HOME).json()
 
-    home, far = answer["places"]
-    assert [item["incident"]["point_from"] for item in home["near"]] == ["closure"]
-    assert home["credit"] == {"text": CREDIT_511.text, "url": CREDIT_511.url}
-    assert far["credit"] is None
+    (fire,) = answer["places"][0]["near"]
+    assert fire["incident"]["point_from"] == "closure"
+    assert fire["text"] == (
+        f"Beacon has this incident about {fire['distance_m']} m from this place, going by "
+        "where 511 lists a road closure on its street."
+    )
+    # The row the point is from, with how far it is trusted and 511's credit.
+    source = fire["incident"]["point_source"]
+    assert (source["source"], source["confidence"]) == ("511", "official")
+    assert source["credit"] == {"text": CREDIT_511.text, "url": CREDIT_511.url}
 
 
 def test_a_check_keeps_nothing_and_logs_nothing(
@@ -362,6 +424,85 @@ def test_a_request_that_does_not_arrive_in_time_is_not_waited_for(
     assert answer == {
         "detail": "A request about places has to arrive within five seconds. Send it again."
     }
+    assert app.state.place_checks.held == 0
+
+
+def test_a_sender_that_goes_away_mid_request_is_answered_and_raises_nothing(
+    engine: Engine,
+) -> None:
+    app = create_app()
+    app.state.incidents = engine
+    pieces = [
+        {"type": "http.disconnect"},
+        {"type": "http.request", "body": b'{"places": ', "more_body": True},
+    ]
+
+    async def leaves() -> dict[str, Any]:
+        return pieces.pop()
+
+    # Nothing is raised out of the app, which is what a server would log.
+    status, answer = post_slowly(app, leaves, path="/api/places/check")
+
+    assert status == 400
+    assert answer == {"detail": "The request ended before all of it had arrived."}
+    assert app.state.place_checks.held == 0
+
+
+class Held(Engine):
+    """An engine whose reading waits until it is let go on."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+        self.reading = threading.Event()
+        self.go_on = threading.Event()
+
+    @property
+    def mode(self) -> Any:
+        return self._engine.mode
+
+    def snapshot(self) -> Snapshot:
+        self.reading.set()
+        assert self.go_on.wait(10)
+        return self._engine.snapshot()
+
+
+def test_only_so_many_checks_are_worked_on_at_once_and_one_more_is_refused_unread(
+    engine: Engine,
+) -> None:
+    held = Held(engine)
+    app = create_app()
+    app.state.incidents = held
+    app.state.place_checks = Admission(most=1)
+    client = TestClient(app, headers=SHOWN)
+    first: list[Any] = []
+    working = threading.Thread(target=lambda: first.append(check(client, HOME)))
+    working.start()
+    try:
+        assert held.reading.wait(10)
+        assert app.state.place_checks.held == 1
+
+        # One more, while the first is being answered. Its body is not read.
+        async def nothing() -> dict[str, Any]:
+            raise AssertionError("The body of a request there was no place for was read.")
+
+        status, answer = post_slowly(app, nothing, path="/api/places/check")
+        assert status == 503
+        assert answer == {
+            "detail": "Beacon is busy with other requests about places. Try again in a moment."
+        }
+        busy = check(client, HOME)
+        assert (busy.status_code, busy.headers["retry-after"]) == (503, "1")
+    finally:
+        held.go_on.set()
+        working.join(10)
+
+    # The first is answered, its place is given back, and the next is taken.
+    assert first[0].status_code == 200
+    assert app.state.place_checks.held == 0
+    assert check(client, HOME).status_code == 200
+    # A request that is refused for what it holds gives its place back too.
+    assert check(client, {**HOME, "name": "Home"}).status_code == 422
+    assert app.state.place_checks.held == 0
 
 
 def test_a_server_that_reads_no_incidents_answers_no_check() -> None:

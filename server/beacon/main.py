@@ -19,6 +19,7 @@ from beacon.incident import Engine, open_engine
 from beacon.ingest import IngestConfigError, build
 from beacon.ingest.setup import PAID_SECONDS, STOP_SECONDS, Ingest
 from beacon.investigate import InvestigationDesk, Runs, RunsError, open_investigations
+from beacon.places import Admission
 from beacon.radio import core_dump_problem, forbid_core_dumps
 from beacon.story import StoryDesk, open_stories
 from beacon.taps import Taps, open_taps
@@ -374,6 +375,8 @@ def create_app() -> FastAPI:
     logging.getLogger("uvicorn.access").addFilter(_NO_PRIVATE_LINES)
     logging.getLogger("uvicorn.asgi").addFilter(_NOTHING)
     logging.getLogger("uvicorn.error").addFilter(_NO_TRACE)
+    # How many requests about saved places are worked on at once.
+    app.state.place_checks = Admission()
     app.include_router(health.router, prefix="/api")
     app.include_router(incidents.router, prefix="/api")
     app.include_router(places.router, prefix="/api")

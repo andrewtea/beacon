@@ -1,8 +1,10 @@
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import App from './App.tsx'
+import type { IncidentSummary, Source } from './api/incidents.ts'
 import type { PlacesAnswer } from './api/places.ts'
 import { PLACES_MS } from './lib/cadence.ts'
+import { covered } from './lib/geo.ts'
 import {
   MOST_PLACES,
   placeName,
@@ -20,17 +22,17 @@ const FIRE = { lat: 37.776, lon: -122.424 }
 const FAR = { lat: 37.8, lon: -122.41 }
 const fire = fireAnswer.incident!
 
+// Sentences of the server's, which the view shows as they are given.
 const CAVEAT =
-  'A distance here is between the block Beacon has for an incident and this place as it was saved.'
+  'A distance does not tell you whether this place is inside or outside the area of an official order or alert.'
 const NOTHING =
-  'Beacon has no open incident with a known place within a kilometre of this place. That is not an official all-clear.'
+  'Beacon lists no incident within a kilometre of this saved place in this reading. That is not an official all-clear.'
 const DISTANCE = 'Beacon has this incident about 50 m from this place.'
 
-const nothing = { near: [], text: NOTHING, credit: null }
+const nothing = { near: [], text: NOTHING }
 const nearFire = {
   near: [{ incident: fire, distance_m: 50, text: DISTANCE }],
   text: null,
-  credit: null,
 }
 const answer = (...places: PlacesAnswer['places']): PlacesAnswer => ({
   mode: 'mock',
@@ -43,7 +45,20 @@ const answer = (...places: PlacesAnswer['places']): PlacesAnswer => ({
 
 const stored = (): unknown =>
   JSON.parse(window.localStorage.getItem(KEY) ?? '[]')
-const click = (element: HTMLElement) => act(() => element.click())
+// A press, and whatever it starts: saving and removing are waited for.
+const click = (element: HTMLElement) => act(async () => element.click())
+
+/** The browser's lock, as tabs of one app share it: one holder at a time, in
+ * the order they asked. */
+function fakeLocks() {
+  let last: Promise<unknown> = Promise.resolve()
+  const request = vi.fn((_name: string, work: () => unknown) => {
+    const turn = last.then(() => work())
+    last = turn.catch(() => undefined)
+    return turn
+  })
+  return { request }
+}
 
 beforeEach(() => {
   window.localStorage.clear()
@@ -52,10 +67,11 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers()
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
 })
 
 test('the button’s page links to the saved places and lists none of them', async () => {
-  savePlace('Home', FIRE)
+  await savePlace('Home', FIRE)
   window.location.hash = ''
   const asked = serve({ 'GET /api/health': MOCK_HEALTH })
 
@@ -89,7 +105,7 @@ test('a place is kept on the device under its name, and only where it is is sent
     )?.set?.call(name, '  My   flat ')
     name.dispatchEvent(new Event('input', { bubbles: true }))
   })
-  click(spot)
+  await click(spot)
 
   // On the device: the name, tidied, and the place.
   expect(stored()).toEqual([
@@ -117,45 +133,79 @@ test('a place is kept on the device under its name, and only where it is is sent
 })
 
 test('a place with nothing near it says so in the server’s sentence, which is no all-clear', async () => {
-  savePlace('Home', FIRE)
-  savePlace('Work', FAR)
+  await savePlace('Home', FIRE)
+  await savePlace('Work', FAR)
   serve({ 'GET /api/health': MOCK_HEALTH, [CHECK]: answer(nearFire, nothing) })
 
   render(<App />)
 
-  const work = (await screen.findByRole('heading', { name: 'Work' })).closest(
-    'section',
-  )!
-  expect(await within(work).findByText(NOTHING)).toBeInTheDocument()
+  const work = (await screen.findByText(NOTHING)).closest('section')!
+  expect(
+    within(work).getByRole('heading', { name: 'Work' }),
+  ).toBeInTheDocument()
   expect(within(work).queryByText(DISTANCE)).not.toBeInTheDocument()
   const home = screen.getByRole('heading', { name: 'Home' }).closest('section')!
   expect(within(home).getByText(DISTANCE)).toBeInTheDocument()
   expect(within(home).queryByText(NOTHING)).not.toBeInTheDocument()
 })
 
-test('511’s credit is shown with a place whose distance is measured from a place of 511’s', async () => {
-  savePlace('Home', FIRE)
-  savePlace('Work', FAR)
+test('a distance measured from where 511 lists a closure shows that row’s confidence and 511’s credit, beside that distance only', async () => {
+  await savePlace('Home', FIRE)
   const credit = { text: 'Data provided by 511.org', url: 'https://511.org' }
+  const closure: Source = {
+    kind: 'traffic',
+    source: '511',
+    label: '511 SF Bay traffic events',
+    confidence: 'official',
+    at: '2026-11-26T23:30:00Z',
+    evidence_id: 12,
+    url: null,
+    stand_in: true,
+    model: null,
+    credit,
+  }
+  // Two incidents near one place: one where its block is, one where 511 lists
+  // a closure on its street.
+  const other: IncidentSummary = {
+    ...fire,
+    id: 'inc-00000000000000aa',
+    title: 'Alarm on Oak St',
+    point_from: 'closure',
+    point_source: closure,
+  }
+  const BY_511 =
+    'Beacon has this incident about 300 m from this place, going by where 511 lists a road closure on its street.'
+  expect(fire.point_source).toBeNull()
   serve({
     'GET /api/health': MOCK_HEALTH,
-    [CHECK]: answer({ ...nearFire, credit }, nothing),
+    [CHECK]: answer({
+      near: [
+        { incident: fire, distance_m: 50, text: DISTANCE },
+        { incident: other, distance_m: 300, text: BY_511 },
+      ],
+      text: null,
+    }),
   })
 
   render(<App />)
 
-  const home = (await screen.findByRole('heading', { name: 'Home' })).closest(
-    'section',
-  )!
+  const by511 = (await screen.findByText(BY_511)).closest('li')!
   expect(
-    await within(home).findByRole('link', { name: credit.text }),
+    within(by511).getByRole('link', { name: credit.text }),
   ).toHaveAttribute('href', credit.url)
-  const work = screen.getByRole('heading', { name: 'Work' }).closest('section')!
-  expect(within(work).queryByText(credit.text)).not.toBeInTheDocument()
+  expect(within(by511).getByText('Official source')).toBeInTheDocument()
+  expect(
+    within(by511).getByText('511 SF Bay traffic events'),
+  ).toBeInTheDocument()
+  // The distance from the block's own point has nothing of 511's beside it.
+  const byBlock = screen.getByText(DISTANCE).closest('li')!
+  expect(within(byBlock).queryByText(credit.text)).not.toBeInTheDocument()
+  expect(within(byBlock).queryByText('Official source')).not.toBeInTheDocument()
+  expect(screen.getAllByRole('link', { name: credit.text })).toHaveLength(1)
 })
 
 test('no place is sent until the server has said which mode it is in', async () => {
-  savePlace('Home', FIRE)
+  await savePlace('Home', FIRE)
   let health: (response: Response) => void = () => undefined
   const asked = serve({
     'GET /api/health': () =>
@@ -186,8 +236,33 @@ test('no place is sent until the server has said which mode it is in', async () 
   expect(screen.queryByText('Invented scenario')).not.toBeInTheDocument()
 })
 
+test('a place can be removed while the server has not said its mode, and is then never sent', async () => {
+  await savePlace('Home', FIRE)
+  let health: (response: Response) => void = () => undefined
+  const asked = serve({
+    'GET /api/health': () =>
+      new Promise<Response>((resolve) => (health = resolve)),
+    [CHECK]: answer(nearFire),
+  })
+  render(<App />)
+
+  await click(
+    await screen.findByRole('button', { name: 'Remove Home from this device' }),
+  )
+
+  expect(stored()).toEqual([])
+  expect(
+    screen.queryByRole('heading', { name: 'Home' }),
+  ).not.toBeInTheDocument()
+  await act(async () => health(Response.json(MOCK_HEALTH)))
+  expect(
+    await screen.findByRole('button', { name: /Save “Near the invented fire/ }),
+  ).toBeInTheDocument()
+  expect(asked.filter((request) => request.key === CHECK)).toEqual([])
+})
+
 test('a server in another mode than is shown answers nothing, and the mode is asked for again at once', async () => {
-  savePlace('Home', FIRE)
+  await savePlace('Home', FIRE)
   const refusal =
     'This server is not in the mode the sender was shown. Nothing of the request was read.'
   // The app is told the invented scenario at its first asking. The server has
@@ -229,8 +304,8 @@ test('a server in another mode than is shown answers nothing, and the mode is as
 })
 
 test('removing a place takes it off the device, and an answer for the old list is shown under nobody', async () => {
-  savePlace('Home', FIRE)
-  savePlace('Work', FAR)
+  await savePlace('Home', FIRE)
+  await savePlace('Work', FAR)
   // The second asking is answered only when it is let.
   let second: (response: Response) => void = () => undefined
   let asks = 0
@@ -244,7 +319,9 @@ test('removing a place takes it off the device, and an answer for the old list i
   render(<App />)
   expect(await screen.findByText(DISTANCE)).toBeInTheDocument()
 
-  click(screen.getByRole('button', { name: 'Remove Home from this device' }))
+  await click(
+    screen.getByRole('button', { name: 'Remove Home from this device' }),
+  )
 
   expect(stored()).toEqual([{ id: expect.any(String), name: 'Work', ...FAR }])
   expect(
@@ -264,7 +341,7 @@ test('removing a place takes it off the device, and an answer for the old list i
 
 test('what is near a place is asked for again while its page is open, and not after', async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true })
-  savePlace('Home', FIRE)
+  await savePlace('Home', FIRE)
   let reply = answer(nothing)
   const asked = serve({
     'GET /api/health': MOCK_HEALTH,
@@ -309,7 +386,7 @@ test('where the phone is now is rounded to about a block before it is kept, and 
     name: 'Save where I am now',
   })
 
-  click(save)
+  await click(save)
   expect(
     await screen.findByRole('button', { name: 'Finding where you are…' }),
   ).toBeDisabled()
@@ -325,7 +402,7 @@ test('where the phone is now is rounded to about a block before it is kept, and 
   expect(JSON.stringify(asked)).not.toContain('776412')
 
   // Pressed again, and the page is left before the phone answers.
-  click(screen.getByRole('button', { name: 'Save where I am now' }))
+  await click(screen.getByRole('button', { name: 'Save where I am now' }))
   await act(async () => {
     window.location.hash = ''
     window.dispatchEvent(new HashChangeEvent('hashchange'))
@@ -348,7 +425,9 @@ test('a phone that will not say where it is saves nothing, and says why', async 
   serve({ 'GET /api/health': MOCK_HEALTH })
   render(<App />)
 
-  click(await screen.findByRole('button', { name: 'Save where I am now' }))
+  await click(
+    await screen.findByRole('button', { name: 'Save where I am now' }),
+  )
 
   expect(await screen.findByRole('alert')).toHaveTextContent(
     /Allow location for this site/,
@@ -365,7 +444,7 @@ test('a browser that will not keep a place says nothing was saved, and one that 
     })
   render(<App />)
 
-  click(
+  await click(
     await screen.findByRole('button', {
       name: 'Save “Across town, North Beach”',
     }),
@@ -376,14 +455,16 @@ test('a browser that will not keep a place says nothing was saved, and one that 
   expect(placesSnapshot()).toEqual([])
 
   refuse.mockRestore()
-  click(screen.getByRole('button', { name: 'Save “Across town, North Beach”' }))
+  await click(
+    screen.getByRole('button', { name: 'Save “Across town, North Beach”' }),
+  )
   expect(await screen.findByText(NOTHING)).toBeInTheDocument()
   expect(screen.queryByRole('alert')).not.toBeInTheDocument()
 
   vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
     throw new DOMException('full', 'QuotaExceededError')
   })
-  click(
+  await click(
     screen.getByRole('button', {
       name: 'Remove Across town, North Beach from this device',
     }),
@@ -394,10 +475,128 @@ test('a browser that will not keep a place says nothing was saved, and one that 
   expect(placesSnapshot()).toHaveLength(1)
 })
 
+test('a phone outside the area Beacon covers saves nothing, and the places already saved go on being answered', async () => {
+  await savePlace('Home', FIRE)
+  // Oakland.
+  vi.stubGlobal('navigator', {
+    ...navigator,
+    geolocation: {
+      getCurrentPosition: (found: PositionCallback) =>
+        found({
+          coords: { latitude: 37.8044, longitude: -122.2712, accuracy: 8 },
+        } as GeolocationPosition),
+    },
+  })
+  const asked = serve({
+    'GET /api/health': MOCK_HEALTH,
+    [CHECK]: answer(nearFire),
+  })
+  render(<App />)
+  expect(await screen.findByText(DISTANCE)).toBeInTheDocument()
+
+  await click(screen.getByRole('button', { name: 'Save where I am now' }))
+
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'Beacon covers San Francisco, and this place is somewhere else. Nothing was saved.',
+  )
+  expect(stored()).toEqual([{ id: expect.any(String), name: 'Home', ...FIRE }])
+  expect(screen.getByText(DISTANCE)).toBeInTheDocument()
+  // Nothing of the place that was refused was sent.
+  const sent = asked.filter((request) => request.key === CHECK)
+  expect(sent.map((request) => request.body)).toEqual(
+    sent.map(() => ({ places: [FIRE] })),
+  )
+  expect(JSON.stringify(asked)).not.toContain('122.27')
+})
+
+test('a place outside the area Beacon covers is not saved, and one in storage is not read', async () => {
+  // The edge is inside, as the server has it, and a block past it is not.
+  expect(covered({ lat: 37.84, lon: -122.35 })).toBe(true)
+  expect(covered({ lat: 37.841, lon: -122.35 })).toBe(false)
+  expect(covered({ lat: 37.84, lon: -122.349 })).toBe(false)
+  expect(covered({ lat: 37.699, lon: -122.53 })).toBe(false)
+  expect(covered({ lat: 37.7, lon: -122.531 })).toBe(false)
+  // As it is rounded before it is sent.
+  expect(covered({ lat: 37.8404, lon: -122.35 })).toBe(true)
+  expect(await savePlace('Oakland', { lat: 37.8044, lon: -122.2712 })).toBe(
+    'elsewhere',
+  )
+  expect(stored()).toEqual([])
+  // A place kept by an earlier version that the server would refuse is not
+  // read: sent with the others, it would have every one of them refused.
+  window.localStorage.setItem(
+    KEY,
+    JSON.stringify([
+      { id: 'a', name: 'Oakland', lat: 37.804, lon: -122.271 },
+      { id: 'b', name: 'Home', ...FIRE },
+    ]),
+  )
+  expect(placesSnapshot().map((place) => place.name)).toEqual(['Home'])
+})
+
+test('a place another tab removed while this one waited to save is not put back', async () => {
+  await savePlace('Home', FIRE)
+  await savePlace('Work', FAR)
+  const names = () =>
+    (stored() as { name: string }[]).map((place) => place.name)
+  const locks = fakeLocks()
+  vi.stubGlobal('navigator', { ...navigator, locks })
+
+  // Another tab has the list to itself, and is about to take Home off it.
+  let holding = false
+  let done: () => void = () => undefined
+  void locks.request(
+    'beacon.places',
+    () =>
+      new Promise<void>((resolve) => {
+        holding = true
+        done = resolve
+      }),
+  )
+  await waitFor(() => expect(holding).toBe(true))
+
+  // This tab saves a place and removes one meanwhile. Neither is done yet.
+  const saving = savePlace('Gym', FAR)
+  const removing = removePlace(placesSnapshot()[1].id)
+  await Promise.resolve()
+  expect(names()).toEqual(['Home', 'Work'])
+  expect(locks.request).toHaveBeenLastCalledWith(
+    'beacon.places',
+    expect.any(Function),
+  )
+
+  // The other tab writes the list without Home, and is done.
+  window.localStorage.setItem(
+    KEY,
+    JSON.stringify(
+      (stored() as { name: string }[]).filter((place) => place.name !== 'Home'),
+    ),
+  )
+  done()
+
+  // Each change is made to the list as it stood at its turn: Home stays
+  // removed, Gym is saved, and Work is removed.
+  expect(await saving).toBe('saved')
+  expect(await removing).toBe(true)
+  expect(names()).toEqual(['Gym'])
+})
+
+test('a browser that will not give the lock changes nothing, and says so', async () => {
+  await savePlace('Home', FIRE)
+  vi.stubGlobal('navigator', {
+    ...navigator,
+    locks: { request: () => Promise.reject(new DOMException('no')) },
+  })
+
+  expect(await savePlace('Work', FAR)).toBe('failed')
+  expect(await removePlace(placesSnapshot()[0].id)).toBe(false)
+  expect(stored()).toEqual([{ id: expect.any(String), name: 'Home', ...FIRE }])
+})
+
 test('no more places are kept than the server checks at once', async () => {
   for (let index = 0; index < MOST_PLACES; index += 1)
-    expect(savePlace(`Place ${index}`, FAR)).toBe('saved')
-  expect(savePlace('One more', FAR)).toBe('full')
+    expect(await savePlace(`Place ${index}`, FAR)).toBe('saved')
+  expect(await savePlace('One more', FAR)).toBe('full')
   serve({
     'GET /api/health': MOCK_HEALTH,
     [CHECK]: answer(...Array.from({ length: MOST_PLACES }, () => nothing)),
@@ -432,7 +631,7 @@ test('what is not a list of places in storage is read as none, and a name is nev
   expect(placeName('x'.repeat(100))).toHaveLength(40)
 })
 
-test('a place saved or removed in another tab is known here', () => {
+test('a place saved or removed in another tab is known here', async () => {
   const heard = vi.fn()
   const stop = subscribePlaces(heard)
   const first = placesSnapshot()
@@ -452,7 +651,7 @@ test('a place saved or removed in another tab is known here', () => {
   window.dispatchEvent(new StorageEvent('storage', { key: 'beacon.taps.v1' }))
   expect(heard).toHaveBeenCalledTimes(1)
 
-  expect(removePlace('a')).toBe(true)
+  expect(await removePlace('a')).toBe(true)
   expect(heard).toHaveBeenCalledTimes(2)
   expect(placesSnapshot()).toEqual([])
   stop()

@@ -10,7 +10,7 @@ import type { Mode } from '../api/incidents.ts'
 import { checkPlaces, type PlaceAnswer } from '../api/places.ts'
 import { Icon } from '../components/Icon.tsx'
 import { IncidentCard } from '../components/IncidentCard.tsx'
-import { CreditLine } from '../components/Provenance.tsx'
+import { ConfidenceLabel, Sources } from '../components/Provenance.tsx'
 import { PLACES_MS } from '../lib/cadence.ts'
 import { locate, LocationError, MOCK_SPOTS } from '../lib/geo.ts'
 import {
@@ -36,22 +36,94 @@ function Near({ answer }: { answer: PlaceAnswer }) {
   if (answer.near.length === 0)
     return answer.text === null ? null : <p>{answer.text}</p>
   return (
-    <>
-      {/* 511's, when a distance below is measured from a place of 511's. */}
-      <CreditLine credit={answer.credit} />
-      <ul className="near-list">
-        {answer.near.map((item) => (
+    <ul className="near-list">
+      {answer.near.map((item) => {
+        // Not null when the distance is measured from where 511 lists a
+        // closure, which the server's sentence says. The row is shown with the
+        // distance it is under: how far it is trusted, and 511's credit. The
+        // card's own confidence is its radio calls'.
+        const from = item.incident.point_source
+        return (
           <li key={item.incident.id}>
             <p className="near-distance">{item.text}</p>
+            {from !== null && (
+              <div className="near-basis">
+                <ConfidenceLabel level={from.confidence} />
+                <Sources sources={[from]} />
+              </div>
+            )}
             <IncidentCard incident={item.incident} heading="h3" link />
           </li>
-        ))}
-      </ul>
+        )
+      })}
+    </ul>
+  )
+}
+
+/** The saved places, each under its name with the control that removes it, and
+ * with what the server said is near it when that is known. It asks the server
+ * nothing itself, so a place can be removed whatever the server is doing. */
+function PlaceList({
+  places,
+  answers,
+  asking,
+}: {
+  places: SavedPlace[]
+  // One for each place, in their order, or null when there is no answer to show.
+  answers: PlaceAnswer[] | null
+  // Whether an answer is on its way.
+  asking: boolean
+}) {
+  // The place this browser would not take off its list, if there is one.
+  const [stuck, setStuck] = useState<string | null>(null)
+  const remove = async (id: string) => {
+    const removed = await removePlace(id)
+    setStuck(removed ? null : id)
+  }
+  return (
+    <>
+      {places.map((place, index) => (
+        <section
+          key={place.id}
+          className="panel place"
+          aria-labelledby={`place-${place.id}`}
+        >
+          <div className="place-head">
+            <h2 id={`place-${place.id}`}>
+              <Icon name="pin" />
+              {place.name}
+            </h2>
+            <button
+              type="button"
+              className="quiet"
+              onClick={() => void remove(place.id)}
+              aria-label={`Remove ${place.name} from this device`}
+            >
+              <Icon name="close" size={16} />
+            </button>
+          </div>
+          {stuck === place.id && (
+            <p className="note problem" role="alert">
+              This browser would not change what it keeps. The place is still
+              saved on this device.
+            </p>
+          )}
+          {answers !== null ? (
+            <Near answer={answers[index]} />
+          ) : (
+            asking && (
+              <p className="meta" role="status">
+                Asking what is near…
+              </p>
+            )
+          )}
+        </section>
+      ))}
     </>
   )
 }
 
-/** The saved places, each with what the server says is near it, asked for again
+/** The saved places with what the server says is near each, asked for again
  * while the view is open. */
 function Checked({
   places,
@@ -82,8 +154,6 @@ function Checked({
   // An answer that does not have one entry for each place is not shown under
   // any of them.
   const fits = answer !== null && answer.places.length === places.length
-  // The place this browser would not take off its list, if there is one.
-  const [stuck, setStuck] = useState<string | null>(null)
   return (
     <>
       {polled.error !== null && (
@@ -99,43 +169,11 @@ function Checked({
           here can be incomplete.
         </p>
       )}
-      {places.map((place, index) => (
-        <section
-          key={place.id}
-          className="panel place"
-          aria-labelledby={`place-${place.id}`}
-        >
-          <div className="place-head">
-            <h2 id={`place-${place.id}`}>
-              <Icon name="pin" />
-              {place.name}
-            </h2>
-            <button
-              type="button"
-              className="quiet"
-              onClick={() => setStuck(removePlace(place.id) ? null : place.id)}
-              aria-label={`Remove ${place.name} from this device`}
-            >
-              <Icon name="close" size={16} />
-            </button>
-          </div>
-          {stuck === place.id && (
-            <p className="note problem" role="alert">
-              This browser would not change what it keeps. The place is still
-              saved on this device.
-            </p>
-          )}
-          {fits ? (
-            <Near answer={answer.places[index]} />
-          ) : (
-            polled.error === null && (
-              <p className="meta" role="status">
-                Asking what is near…
-              </p>
-            )
-          )}
-        </section>
-      ))}
+      <PlaceList
+        places={places}
+        answers={fits ? answer.places : null}
+        asking={polled.error === null}
+      />
     </>
   )
 }
@@ -145,6 +183,9 @@ type Saving =
 
 const NOT_KEPT = 'This browser would not keep the place. Nothing was saved.'
 const FULL = `Beacon keeps up to ${MOST_PLACES} places. Remove one to save another.`
+const ELSEWHERE =
+  'Beacon covers San Francisco, and this place is somewhere else. Nothing was saved.'
+const SAID = { full: FULL, elsewhere: ELSEWHERE, failed: NOT_KEPT }
 
 /** Saving a place: where the phone is now, under a name. On the invented
  * scenario, also a place in it. */
@@ -162,32 +203,38 @@ function AddPlace({ mode, full }: { mode: Mode | null; full: boolean }) {
     }
   }, [])
 
-  const keep = (where: { lat: number; lon: number }, called: string) => {
-    const came = savePlace(called, where)
+  const keep = async (where: { lat: number; lon: number }, called: string) => {
+    const typed = name
+    const came = await savePlace(called, where)
+    // A place that was saved stays saved; nothing more is said once the view
+    // is left.
+    if (!open.current) return
     if (came === 'saved') {
-      setName('')
+      // What was typed since is the next place's name, and is left alone.
+      setName((now) => (now === typed ? '' : now))
       setSaving({ kind: 'idle' })
-    } else
-      // `full` is another tab's doing: this one offers no saving at five.
-      setSaving({ kind: 'failed', message: came === 'full' ? FULL : NOT_KEPT })
+    } else setSaving({ kind: 'failed', message: SAID[came] })
   }
   const saveHere = async (event: FormEvent) => {
     event.preventDefault()
     if (busy || full) return
     setSaving({ kind: 'locating' })
+    let here
     try {
-      const here = await locate()
-      if (open.current) keep(here, name)
+      here = await locate()
     } catch (error) {
-      if (!open.current) return
-      setSaving({
-        kind: 'failed',
-        message:
-          error instanceof LocationError
-            ? error.message
-            : 'Beacon could not save this place. Try again.',
-      })
+      if (open.current)
+        setSaving({
+          kind: 'failed',
+          message:
+            error instanceof LocationError
+              ? error.message
+              : 'Beacon could not save this place. Try again.',
+        })
+      return
     }
+    // A position that arrives after the view was left saves nothing.
+    if (open.current) await keep(here, name)
   }
 
   return (
@@ -227,7 +274,10 @@ function AddPlace({ mode, full }: { mode: Mode | null; full: boolean }) {
                     className="spot"
                     disabled={busy}
                     onClick={() =>
-                      keep(spot.place, name.trim() === '' ? spot.name : name)
+                      void keep(
+                        spot.place,
+                        name.trim() === '' ? spot.name : name,
+                      )
                     }
                   >
                     <Icon name="pin" />
@@ -272,23 +322,17 @@ export function PlacesView({
       </p>
       {places.length > 0 &&
         (mode === null ? (
-          <p className="note" role="status">
-            Beacon asks what is near your places once it has heard from its
-            server.
-          </p>
+          <>
+            <p className="note" role="status">
+              Beacon asks what is near your places once it has heard from its
+              server. Until then nothing of them is sent, and a place can still
+              be removed.
+            </p>
+            <PlaceList places={places} answers={null} asking={false} />
+          </>
         ) : (
           <Checked places={places} mode={mode} onOtherMode={onOtherMode} />
         ))}
-      {places.length > 0 && mode === null && (
-        <ul className="place-names">
-          {places.map((place) => (
-            <li key={place.id}>
-              <Icon name="pin" />
-              {place.name}
-            </li>
-          ))}
-        </ul>
-      )}
       <AddPlace mode={mode} full={places.length >= MOST_PLACES} />
     </div>
   )

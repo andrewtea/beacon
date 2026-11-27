@@ -1,4 +1,4 @@
-import { roundToBlock } from './geo.ts'
+import { covered, roundToBlock } from './geo.ts'
 
 // The places a person saved, such as home. They are kept here, on the device,
 // with the names the person gave them, and nowhere else: Beacon's server has no
@@ -33,7 +33,10 @@ function isSaved(value: unknown): value is SavedPlace {
     typeof place.lat === 'number' &&
     Number.isFinite(place.lat) &&
     typeof place.lon === 'number' &&
-    Number.isFinite(place.lon)
+    Number.isFinite(place.lon) &&
+    // A place the server would refuse is not one of these: sent with the
+    // others, it would have every one of them refused.
+    covered({ lat: place.lat, lon: place.lon })
   )
 }
 
@@ -85,29 +88,63 @@ export function placeName(typed: string): string {
   return name === '' ? 'A saved place' : name
 }
 
+// The name of the lock a change to the list is made under.
+const LOCK = 'beacon.places'
+
+/**
+ * Does `work` while no other tab of the app is changing the list. A change is a
+ * reading of the whole list and a writing of it, and two tabs that did both at
+ * once would each write back what the other had just changed: a place one
+ * removed would be saved again by the other. The browser's lock makes them take
+ * turns, and `work` reads the list only once its turn has come. A browser with
+ * no such lock (it is there on `localhost` and over HTTPS) does the work at once.
+ */
+async function alone<T>(work: () => T): Promise<T> {
+  const locks =
+    typeof navigator === 'undefined'
+      ? undefined
+      : (navigator as { locks?: LockManager }).locks
+  if (locks === undefined) return work()
+  return (await locks.request(LOCK, () => work())) as T
+}
+
 /**
  * Save a place under a name. Where it is is rounded to about a block before it
  * is kept. Answers with what came of it: `saved`, `full` when five are kept
- * already, or `failed` when the browser would not keep it.
+ * already, `elsewhere` when it is outside the area Beacon covers, or `failed`
+ * when the browser would not keep it.
  */
-export function savePlace(
+export async function savePlace(
   typed: string,
   where: { lat: number; lon: number },
-): 'saved' | 'full' | 'failed' {
-  const places = read()
-  if (places.length >= MOST_PLACES) return 'full'
-  const place: SavedPlace = {
-    id: newId(),
-    name: placeName(typed),
-    lat: roundToBlock(where.lat),
-    lon: roundToBlock(where.lon),
+): Promise<'saved' | 'full' | 'elsewhere' | 'failed'> {
+  if (!covered(where)) return 'elsewhere'
+  try {
+    return await alone(() => {
+      // Read now, under the lock: what another tab did a moment ago holds.
+      const places = read()
+      if (places.length >= MOST_PLACES) return 'full'
+      const place: SavedPlace = {
+        id: newId(),
+        name: placeName(typed),
+        lat: roundToBlock(where.lat),
+        lon: roundToBlock(where.lon),
+      }
+      return write([...places, place]) ? 'saved' : 'failed'
+    })
+  } catch {
+    // The browser would not give the lock.
+    return 'failed'
   }
-  return write([...places, place]) ? 'saved' : 'failed'
 }
 
 /** Remove a place from this device. Answers with whether storage took it. */
-export function removePlace(id: string): boolean {
-  return write(read().filter((place) => place.id !== id))
+export async function removePlace(id: string): Promise<boolean> {
+  try {
+    return await alone(() => write(read().filter((place) => place.id !== id)))
+  } catch {
+    return false
+  }
 }
 
 /** Another tab of the app saved or removed a place, or storage was cleared. */
