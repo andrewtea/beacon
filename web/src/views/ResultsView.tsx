@@ -14,7 +14,11 @@ import { clock } from '../lib/time.ts'
 
 function Kind({ run }: { run: ScaleRun }) {
   return (
-    <span className={run.stand_in ? 'tag stand-in' : 'tag'}>
+    <span
+      className={
+        run.stand_in ? 'tag stand-in scale-run-kind' : 'tag scale-run-kind'
+      }
+    >
       {run.kind_text}
     </span>
   )
