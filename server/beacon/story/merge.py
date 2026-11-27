@@ -256,7 +256,8 @@ def merge_incident(ember: EmberClient, incident: Incident) -> Draft:
             }
         },
     )
-    points = _points(answer.output_text)
+    # An answer that was cut short is no form, whatever of it reads as one.
+    points = _points(answer.output_text) if answer.status == "completed" else None
     if points is None:
         raise_bare(StoryError("Ember's answer about an incident is not a filled-in form."))
     claims: dict[tuple[str, tuple[int, ...]], Claim] = {}

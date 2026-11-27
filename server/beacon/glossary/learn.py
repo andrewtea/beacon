@@ -232,7 +232,10 @@ def learn_glossary(
             }
         },
     )
-    glossary = read_form(answer.output_text, codes, model=answer.source)
+    # An answer that was cut short is no form, whatever of it reads as one: it is
+    # no glossary, and is counted as an answer that was not usable.
+    said = answer.output_text if answer.status == "completed" else ""
+    glossary = read_form(said, codes, model=answer.source)
     cost = answer.usage.cost_nanousd if answer.source == "live" else None
     return replace(glossary, cost_nanousd=cost)
 

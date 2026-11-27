@@ -160,7 +160,17 @@ def test_a_run_of_a_sample_is_of_the_days_first_calls_and_says_so_wherever_its_k
         "260620002",
         "260620003",
     ]
-    assert run.read_day_calls(layout) == 6
+    assert run.read_day_calls(layout, run.read_settings(layout)) == 6
+    # On disk the run's audio says it is a sample's, so that a Beacon from before
+    # a run could be one refuses it and does not go on with it as a day's.
+    assert (
+        json.loads(layout.settings.read_text())["audio"]
+        == run.SAMPLED_AUDIO
+        == ("generated-sample")
+    )
+    assert run.read_settings(layout) == run.Settings(
+        day=DAY, audio="generated", voice="tones", hearer="fake", sample=3
+    )
     numbers, texts = numbers_of(env), texts_of(env)
     assert (numbers["records"], numbers["transmissions"]) == (3, 8)
     assert (numbers["found"], numbers["found_share"], numbers["missed"]) == (3, 100.0, 0)
@@ -172,15 +182,31 @@ def test_a_run_of_a_sample_is_of_the_days_first_calls_and_says_so_wherever_its_k
     )
     assert made["sample"] == {"calls": 3, "of": 6}
     assert made["basis_text"].startswith(results.GENERATED_BY_STAND_IN + sample)
-    assert "it is of no whole day" in made["basis_text"]
+    assert "are of that sample and of no whole day" in made["basis_text"]
+    # What among the numbers is not the sample's is named, and each says so itself.
+    assert "Three things below are not the sample's, and each says so" in made["basis_text"]
+    whole_day = " This is of DataSF's answer for the whole day, not of the sample."
+    assert texts["records_unreadable"].endswith(whole_day)
+    assert texts["rows_unreadable"].endswith(whole_day)
+    assert "of the 3 DataSF calls of the sample" in texts["found_share"]
+    assert "midnight" not in json.dumps(made)
     assert said.startswith(made["basis_text"])
     assert "This run is of the first 3 of them." in said
     label, reminder = results.kind(made)
     assert label == "Stand-in, generated calls, sample of 3 calls"
     assert reminder is not None
     assert reminder.endswith(
-        "It is of a sample, the first 3 of the day's 6 calls, and of no whole day."
+        "It is of a sample, the first 3 of the day's 6 calls, and of no whole day: a "
+        "number here is of the sample unless its own sentence says it is of the whole "
+        "day or of a spending scope."
     )
+    # On the terminal the kind is beside every number, as it is on the page.
+    shown = [line for line in results.lines(made) if line and not line.startswith(" ")]
+    numbered = shown[shown.index("DataSF calls in the sample: 3 calls  [" + label + "]") :]
+    assert len(numbered) == len(made["numbers"])
+    assert all(line.endswith("  [" + label + "]") for line in numbered)
+    # Every generated call is of a record: none is called a call DataSF does not list.
+    assert "real call DataSF does not list" not in texts["extra"]
     assert texts["records"].startswith("The first 3 calls the fire department was dispatched to")
     assert "of these and not of the day" in texts["records"]
     assert "fit no DataSF call of the sample" in texts["extra"]
@@ -247,9 +273,79 @@ def test_a_run_begun_before_a_run_could_be_a_sample_is_of_its_whole_day(
     assert run.read_settings(layout) == run.Settings(
         day=DAY, audio="generated", voice="tones", hearer="fake"
     )
-    assert run.read_day_calls(layout) == 6
+    assert run.read_day_calls(layout, run.read_settings(layout)) == 6
     assert command(env, site)[0] == 0
     assert _made(env) == before
+
+
+def test_a_run_whose_files_do_not_agree_about_its_sample_is_not_gone_on_with(
+    env: dict[str, str], site: DataSf
+) -> None:
+    assert command(env, site, "--calls", "3")[0] == 0
+    layout = run.Layout.under(env, "day")
+    settings, records = layout.settings.read_text(), layout.records.read_text()
+    made = layout.results.read_bytes()
+
+    # Settings that say a sample by one of its two words and not by the other, as
+    # a run would whose `sample` a Beacon from before had read past.
+    for change in ({"audio": "generated"}, {"sample": None}):
+        layout.settings.write_text(json.dumps(json.loads(settings) | change))
+        with pytest.raises(run.ScaleError, match=r"run\.json"):
+            run.read_settings(layout)
+        status, said = command(env, site, "--calls", "3")
+        assert (status, layout.results.read_bytes()) == (2, made)
+        assert "The run's settings (run.json) cannot be read." in said
+    layout.settings.write_text(settings)
+
+    # Records that are not the sample's: the whole day's, a day's that is no more
+    # than the sample, more or fewer than the sample holds, and no count of the day.
+    kept = json.loads(records)
+    for change in (
+        {"day_calls": 3},
+        {"day_calls": 2},
+        {"day_calls": None},
+        {"day_calls": True},
+        {"records": kept["records"][:2]},
+    ):
+        layout.records.write_text(json.dumps(kept | change))
+        status, said = command(env, site, "--calls", "3")
+        assert (status, layout.results.read_bytes()) == (2, made)
+        assert "are not what the run's settings say they are" in said
+    without = {key: value for key, value in kept.items() if key != "day_calls"}
+    layout.records.write_text(json.dumps(without))
+    assert command(env, site, "--calls", "3")[0] == 2
+    layout.records.write_text(records)
+    assert command(env, site, "--calls", "3")[0] == 0
+
+    # And a whole day's records that say the day had more calls than were kept.
+    assert command(env, site, name="whole")[0] == 0
+    whole = run.Layout.under(env, "whole")
+    kept = json.loads(whole.records.read_text())
+    whole.records.write_text(json.dumps(kept | {"day_calls": 7}))
+    status, said = command(env, site, name="whole")
+    assert status == 2
+    assert "are not what the run's settings say they are" in said
+
+
+def test_a_sample_is_fewer_calls_than_its_day_wherever_it_is_said(
+    env: dict[str, str], site: DataSf
+) -> None:
+    assert command(env, site, "--calls", "3")[0] == 0
+    made = results.read(run.Layout.under(env, "day"))
+    assert made is not None
+    settings = run.Settings(day=DAY, audio="generated", voice="tones", hearer="fake", sample=3)
+
+    # A result that says its sample is its whole day, in its words too.
+    whole = made | {
+        "sample": {"calls": 6, "of": 6},
+        "basis_text": results.GENERATED_BY_STAND_IN + results._sample_basis(6, 6),
+    }
+    with pytest.raises(ValueError, match="The result's sample is none a run can be of"):
+        results.kind(whole)
+    for day_calls in (3, 2):
+        with pytest.raises(ValueError, match="A sample is fewer calls than the day has"):
+            results.basis(settings, day_calls=day_calls)
+    assert results.basis(settings, day_calls=4).startswith(results.GENERATED_BY_STAND_IN)
 
 
 @pytest.mark.parametrize(
@@ -457,6 +553,8 @@ class Meta:
         self.fail_glossary = False
         # What the next glossary is answered with, in place of the stand-in's form.
         self.glossary_text: str | None = None
+        # How the next glossary's answer ended, as the API says it.
+        self.glossary_status = "completed"
         self.api = MetaApi(input_tokens=1_000, create=self.create)
 
     def create(self, request: httpx2.Request) -> httpx2.Response:
@@ -469,6 +567,7 @@ class Meta:
             answer = dict(stand_in_learner(body))
             if self.glossary_text is not None:
                 answer = dict(fake_response(text=self.glossary_text))
+            answer["status"] = self.glossary_status
         elif form != "transmission":
             self.tap_requests += 1
             if self.before_tap is not None:
@@ -1963,9 +2062,12 @@ def test_the_lines_for_a_terminal_put_what_the_run_is_before_any_number(
     )
     assert first_number > 2
     # Every number is followed by its sentence, and one with no value says "none".
-    assert "Cost of hearing: none" in lines
-    assert lines[lines.index("Cost of hearing: none") + 1].strip().startswith("Not measured:")
-    assert "Share of DataSF calls found: 66.7%" in lines
+    # Beside each number is whose it is: a line copied out by itself still says.
+    whose = "  [" + results.kind(made)[0] + "]"
+    assert whose == "  [Stand-in, generated calls]"
+    cost = "Cost of hearing: none" + whose
+    assert lines[lines.index(cost) + 1].strip().startswith("Not measured:")
+    assert "Share of DataSF calls found: 66.7%" + whose in lines
 
 
 def test_results_of_another_shape_are_not_read(env: dict[str, str], site: DataSf) -> None:

@@ -114,7 +114,8 @@ def main(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="scale_run.py",
-        description="Run a day of dispatch calls through Beacon and score it against DataSF.",
+        description="Run a day of dispatch calls, or with --calls the first calls of one, "
+        "through Beacon and score them against DataSF.",
     )
     parser.add_argument("--name", required=True, help="the run's name, and its directory's")
     parser.add_argument("--day", required=True, help="the day, San Francisco's, as YYYY-MM-DD")
@@ -240,7 +241,7 @@ def _run(
             print(results.basis(settings), file=out)
         prepare(layout, settings, http)
         records, unread = read_day(layout)
-        day_calls = read_day_calls(layout)
+        day_calls = read_day_calls(layout, settings)
         if settings.sample is not None:
             # What a sample is of is known once DataSF's record of the day is read.
             print(results.basis(settings, day_calls=day_calls), file=out)
@@ -380,7 +381,11 @@ def _run(
                 []
                 if learned is None
                 else glossary.numbers(
-                    learned, truth, generated=settings.audio == "generated", live=live
+                    learned,
+                    truth,
+                    generated=settings.audio == "generated",
+                    live=live,
+                    sampled=settings.sample is not None,
                 )
             ),
             glossary_waiting=(

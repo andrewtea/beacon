@@ -679,9 +679,11 @@ def _media_tags(
     limit_nanousd: int | None,
 ) -> tuple[tuple[str, ...] | None, Accounting]:
     """Have Ember say which of `allowed` a tap's clip or photo holds. Only tags
-    from the list are read from its answer. An answer that was cut short or is no
-    form gives None and not `none`: Ember then said nothing of the clip, which is
-    not the same as its saying that none of the sounds is in it."""
+    from the list are read from its answer. An answer that was cut short, is no
+    form, or names nothing that is on the list gives None and not `none`: Ember
+    then said nothing Beacon keeps of the clip, which is not the same as its
+    saying that none of the sounds is in it. `none` is kept only when the answer
+    says `none` and names no tag."""
     answer = ember.respond(
         task=task,
         effort=MEDIA_EFFORT,
@@ -713,8 +715,12 @@ def _media_tags(
     given = said.get(name) if isinstance(said, dict) else None
     if not isinstance(given, list):
         return None, Accounting.of(answer)
-    tags = [tag for tag in allowed if tag in given and tag != "none"]
-    return tuple(tags) or ("none",), Accounting.of(answer)
+    tags = tuple(tag for tag in allowed if tag in given and tag != "none")
+    if tags:
+        return tags, Accounting.of(answer)
+    # `none` is Ember's word and nobody else's: a list that is empty, or holds
+    # only what is on no list, does not say that none of them is there.
+    return (("none",) if "none" in given else None), Accounting.of(answer)
 
 
 _TOOLS: dict[str, Callable[[EmberClient, Scene, Found, Mapping[str, Any], int | None], _Result]] = {

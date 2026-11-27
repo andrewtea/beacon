@@ -116,8 +116,8 @@ _REFUSED = {
     "no_clip": "The tap's clip was no longer kept.",
     "no_photo": "The tap's photo was no longer kept.",
     "no_answer": (
-        "The investigator's answer was cut short or was not the form, so nothing is "
-        "known of what the clip or the photo holds."
+        "The investigator's answer was cut short, was not the form, or named nothing "
+        "on Beacon's list, so nothing is known of what the clip or the photo holds."
     ),
 }
 

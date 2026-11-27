@@ -96,14 +96,19 @@ CLOSED = (
 
 
 def _sample_basis(calls: int, of: int) -> str:
-    """What is added to what a run is when it is of a sample of a day's calls."""
+    """What is added to what a run is when it is of a sample of a day's calls: what
+    is the sample's, and the three things among the numbers that are not."""
     return (
         f" This run is of a sample: the first {calls} calls of the day, in the order "
         f"they were dispatched, of the {of} in DataSF's record of the day that Beacon "
         "could read. Only those were generated and are scored, and replayed taps are "
-        "planned from them alone. Every number below is of those calls and the hours "
-        "they span, which begin at midnight: it is of no whole day, and the first "
-        "hours of a day are no cross-section of it."
+        "planned from them alone, so the counts of calls, incidents, places, and taps "
+        "below are of that sample and of no whole day; a day's first calls need not "
+        "be like the rest of it. Three things below are not the sample's, and each "
+        "says so: what of DataSF's answer for the whole day could not be read, "
+        "DataSF's unit types, which a glossary is compared with and which are the "
+        "whole day's, and a cost of hearing, which is its spending scope's over "
+        "every paid run."
     )
 
 
@@ -112,7 +117,15 @@ def _sample_label(calls: int) -> str:
 
 
 def _sample_reminder(calls: int, of: int) -> str:
-    return f" It is of a sample, the first {calls} of the day's {of} calls, and of no whole day."
+    """What goes under every heading of a sampled run's numbers. A heading can hold
+    a number that is not the sample's (what of DataSF's whole answer could not be
+    read, the whole day's unit types, a scope's cost), so it claims the sample's
+    for none that says otherwise of itself."""
+    return (
+        f" It is of a sample, the first {calls} of the day's {of} calls, and of no "
+        "whole day: a number here is of the sample unless its own sentence says it "
+        "is of the whole day or of a spending scope."
+    )
 
 
 def _sample_of(results: Mapping[str, Any]) -> tuple[int, int] | None:
@@ -125,7 +138,8 @@ def _sample_of(results: Mapping[str, Any]) -> tuple[int, int] | None:
         return None
     calls, of = (said.get("calls"), said.get("of")) if isinstance(said, dict) else (None, None)
     counts = all(isinstance(n, int) and not isinstance(n, bool) for n in (calls, of))
-    if not counts or not 1 <= calls <= of or results.get("audio") != "generated":
+    # A sample is fewer calls than its day has: a run of them all is a day's.
+    if not counts or not 1 <= calls < of or results.get("audio") != "generated":
         raise ValueError("The result's sample is none a run can be of.")
     return calls, of
 
@@ -305,7 +319,9 @@ def basis(settings: Settings, *, day_calls: int | None = None) -> str:
         return said
     if day_calls is None:
         raise ValueError("A sample is said with how many calls the day has.")
-    return said + _sample_basis(min(settings.sample, day_calls), day_calls)
+    if not 1 <= settings.sample < day_calls:
+        raise ValueError("A sample is fewer calls than the day has.")
+    return said + _sample_basis(settings.sample, day_calls)
 
 
 def build(
@@ -351,8 +367,8 @@ def build(
     generated = settings.audio == "generated"
     sample: tuple[int, int] | None = None
     if settings.sample is not None:
-        if day_calls is None or not 1 <= len(records) <= day_calls:
-            raise ValueError("A sample is said with how many calls the day has.")
+        if day_calls is None or not 1 <= len(records) < day_calls:
+            raise ValueError("A sample is fewer calls than the day has, and says how many.")
         sample = (len(records), day_calls)
     sampled = sample is not None
     heard_complete = stopped is None and last_pass is not None and last_pass.unready == 0
@@ -466,8 +482,12 @@ def lines(results: dict[str, Any]) -> list[str]:
     out += [f"Note: {caveat}" for caveat in results["caveats"]]
     out.append(f"Scored against: {results['scored_against']['text']}")
     out.append("")
+    # Whose number it is, beside each number, as the page has it: a line read by
+    # itself, or copied out, still says what kind of run it is of.
+    label, reminder = kind(results)
+    whose = "" if reminder is None else f"  [{label}]"
     for number in results["numbers"]:
-        out.append(f"{number['label']}: {shown(number)}")
+        out.append(f"{number['label']}: {shown(number)}{whose}")
         out.append(f"    {number['text']}")
     return out
 
@@ -500,9 +520,11 @@ def _record_numbers(
             f"The first {sample[0]} calls the fire department was dispatched to on this "
             f"day, in the order they were dispatched, of the {sample[1]} in DataSF's "
             "record that have a number, a type, and the times they were received and "
-            "dispatched. Every count and share below is of these and not of the day. "
-            f"{kept}",
+            "dispatched. The counts and shares of calls below are of these and not "
+            f"of the day. {kept}",
         )
+    # What could not be read is of DataSF's whole answer, whatever the run is of.
+    whole = " This is of DataSF's answer for the whole day, not of the sample." if sample else ""
     return [
         of_day,
         Number(
@@ -513,7 +535,7 @@ def _record_numbers(
             "Calls in DataSF's answer for the day, each with a number of its own, that "
             "lack a type or the time they were received or dispatched. They are in no "
             "count below, so the calls above are not all the calls DataSF lists when "
-            "this is not 0.",
+            f"this is not 0.{whole}",
         ),
         Number(
             "rows_unreadable",
@@ -523,7 +545,7 @@ def _record_numbers(
             "Rows of DataSF's answer, each of which is one unit sent to one call, that "
             "are not shaped as a row or have no call number Beacon reads. Several can "
             "be of one call, so this is a count of rows and not of calls; whatever "
-            "calls they are of may be missing from every count below.",
+            f"calls they are of may be missing from every count below.{whole}",
         ),
     ]
 
@@ -645,7 +667,12 @@ def _match_numbers(
             "Share of DataSF calls found",
             share,
             "percent",
-            f"The calls found, of the DataSF calls Beacon could read. {meaning}",
+            (
+                f"The calls found, of the {len(records)} DataSF calls of the sample. "
+                if sampled
+                else "The calls found, of the DataSF calls Beacon could read. "
+            )
+            + meaning,
         ),
         Number(
             "merged",
@@ -688,8 +715,16 @@ def _match_numbers(
             "incidents",
             "Incidents of Beacon's that fit no DataSF call of "
             + ("the sample" if sampled else "this day")
-            + ". One can be a real call DataSF does not list, or a wrong incident: the "
-            "rule cannot tell.",
+            + (
+                # Every generated call is of a record, so none is of a call DataSF
+                # does not list.
+                ". Every call was generated from a record, so one is an incident "
+                "Beacon made of calls it heard or grouped otherwise than the "
+                "record has them: the rule does not say which."
+                if generated
+                else ". One can be a real call DataSF does not list, or a wrong "
+                "incident: the rule cannot tell."
+            ),
         ),
         Number(
             "other_kind",

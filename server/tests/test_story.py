@@ -493,6 +493,24 @@ def test_an_answer_that_is_no_form_is_an_error_that_says_nothing_of_it(
     assert raised.value.__context__ is None
 
 
+def test_an_answer_that_was_cut_short_is_no_story_whatever_of_it_reads_as_the_form(
+    rows: Rows, storage: Storage
+) -> None:
+    incident = fire(rows)
+    # Points their lines show, which a whole answer would be kept for.
+    said = json.dumps({"points": [{"kind": "status", "cites": [3]}]})
+    assert merge_incident(
+        EmberClient.fake(storage, Script([fake_response(text=said)])), incident
+    ).claims
+    ember = EmberClient.fake(storage, Script([fake_response(text=said, status="incomplete")]))
+
+    with pytest.raises(StoryError) as raised:
+        merge_incident(ember, incident)
+
+    assert str(raised.value) == "Ember's answer about an incident is not a filled-in form."
+    assert raised.value.__context__ is None
+
+
 def test_a_basis_names_the_lines_ember_would_be_given_and_nothing_else(rows: Rows) -> None:
     before = basis_of(fire(rows))
     # Another alert and another notice change no line Ember is given.

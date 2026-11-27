@@ -1939,7 +1939,7 @@ export const quietAnswer: TapAnswer = {
 // made-up calls in `server/tests/scale_day.py`), not of any real day of DataSF's.
 export const scaleAnswer: Scale = {
   about_text:
-    "A scale run puts one day of fire dispatch calls through the code this server runs and compares what Beacon made of them with DataSF's public record of that day. It is made by a command, apart from this server: nothing on this page is about the incidents this server shows, or about any tap it was sent.",
+    "A scale run puts one day of fire dispatch calls, or the first calls of one, through the code this server runs and compares what Beacon made of them with DataSF's public record of those calls. It is made by a command, apart from this server: nothing on this page is about the incidents this server shows, or about any tap it was sent.",
   run: {
     name: 'day',
     day: '2026-03-03',

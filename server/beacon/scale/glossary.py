@@ -477,10 +477,17 @@ def waiting_text(learned: Learned, *, live: bool) -> str | None:
 
 
 def numbers(
-    learned: Learned, truth: Mapping[str, str], *, generated: bool, live: bool
+    learned: Learned,
+    truth: Mapping[str, str],
+    *,
+    generated: bool,
+    live: bool,
+    sampled: bool = False,
 ) -> list[Number]:
     """The glossary's part of a run's results: each number with its sentence.
-    `live` is whether the run asks Muse Ember; without it, a stand-in is asked."""
+    `live` is whether the run asks Muse Ember; without it, a stand-in is asked.
+    `sampled` is whether the run is of a sample of its day's calls: the table is
+    then the sample's, and DataSF's unit types are the whole day's all the same."""
     if learned.state == "nothing":
         return []
     who = _who(live=live)
@@ -517,7 +524,13 @@ def numbers(
             "one kind (BLS and PRIVATE are both an ambulance), and a unit with a type "
             "Beacon has no kind for, or with types of two kinds, counts for none. Only "
             "these codes are compared, and nothing checks DataSF's unit types. The "
-            "learner is never shown them.",
+            "learner is never shown them."
+            + (
+                " The unit types are those of every unit DataSF lists for the whole "
+                "day, not only of the units in the sample's calls."
+                if sampled
+                else ""
+            ),
         ),
         Number(
             "glossary_before",

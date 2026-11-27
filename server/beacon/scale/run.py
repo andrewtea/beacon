@@ -188,7 +188,8 @@ class Settings:
     ems_talkgroups: tuple[int, ...] = (generate.EMS_TALKGROUP,)
     # For generated calls: how many calls a sample holds. Only the first that many
     # of the day's calls, in the order they were dispatched, are generated, heard,
-    # and scored. None for a run of the whole day.
+    # and scored. None for a run of the whole day. On disk a sampled run's audio
+    # is `SAMPLED_AUDIO` (`begin`, `read_settings`).
     sample: int | None = None
 
     @property
@@ -353,6 +354,13 @@ def day_window(day: date) -> tuple[datetime, datetime]:
     return start.astimezone(UTC), end.astimezone(UTC) + AFTER_DAY
 
 
+# What a sampled run's settings say its audio is, on disk only. A Beacon from
+# before a run could be of a sample knows no such audio and refuses the run; it
+# would otherwise read past the `sample` it does not know, take the sample's
+# records for the day's, and go on with the run, and pay, as a whole day's.
+SAMPLED_AUDIO = "generated-sample"
+
+
 def begin(layout: Layout, asked: Settings) -> Settings:
     """Keep what a run is when it is new, and say what it is.
 
@@ -361,6 +369,8 @@ def begin(layout: Layout, asked: Settings) -> Settings:
     if kept is None:
         layout.root.mkdir(parents=True, exist_ok=True)
         said = asdict(asked)
+        if asked.sample is not None:
+            said["audio"] = SAMPLED_AUDIO
         _write(layout.settings, said)
         return asked
     if kept != asked:
@@ -383,15 +393,21 @@ def read_settings(layout: Layout) -> Settings | None:
     except (OSError, ValueError):
         said = None
     try:
+        # A sample is said twice, by the audio and by the count, and a run that
+        # says one without the other is none this Beacon made.
+        sampled = said["audio"] == SAMPLED_AUDIO
+        if sampled != (said.get("sample") is not None):
+            raise ValueError
         settings = Settings(
             day=date.fromisoformat(said["day"]).isoformat(),
-            audio=said["audio"],
+            audio="generated" if sampled else said["audio"],
             voice=said["voice"],
             hearer=said["hearer"],
             system=str(said["system"]),
             talkgroups=tuple(int(number) for number in said["talkgroups"]),
             ems_talkgroups=tuple(int(number) for number in said["ems_talkgroups"]),
-            # A run begun before a run could be of a sample is of its whole day.
+            # A run begun before a run could be of a sample says nothing of one,
+            # and is of its whole day.
             sample=said.get("sample"),
         )
         if (
@@ -442,6 +458,7 @@ def prepare(layout: Layout, settings: Settings, http: SourceHttp) -> list[datasf
                     f"that day has {day_calls} that Beacon can read. Make the run "
                     "without --calls, under another --name."
                 )
+            # `read_records` gives them oldest first by when each was dispatched.
             records = records[: settings.sample]
         _write(
             layout.records,
@@ -453,6 +470,9 @@ def prepare(layout: Layout, settings: Settings, http: SourceHttp) -> list[datasf
             },
         )
     records = read_records(layout)
+    # Before anything is generated, heard, or paid for, at every invocation: the
+    # records kept are what the run's settings say they are.
+    read_day_calls(layout, settings)
     if not (layout.lists / lists.BLOCKS_FILE).exists():
         made = lists.lists_of(lists.fetch_centerlines(http), lists.fetch_roster(http, day))
         if not (made.streets and made.units and made.blocks):
@@ -487,20 +507,31 @@ def read_day(layout: Layout) -> tuple[list[datasf.Record], datasf.Unread]:
     raise ScaleError("The run's records of DataSF's calls (records.json) cannot be read.")
 
 
-def read_day_calls(layout: Layout) -> int:
-    """How many calls of the day Beacon could read in DataSF's record, of which a
-    run of a sample kept the first. A run of the whole day kept them all, and one
-    begun before the number was kept says none: for both it is how many were kept.
+def read_day_calls(layout: Layout, settings: Settings) -> int:
+    """How many calls of the day Beacon could read in DataSF's record. A run of the
+    whole day kept them all, and one begun before the number was kept says none:
+    for both it is how many were kept. A run of a sample kept the first of them,
+    as many as its settings say and fewer than the day has, and says how many the
+    day has: one that does not is not gone on with.
 
-    Raises ScaleError when the run's records cannot be read."""
+    Raises ScaleError when the run's records cannot be read, or are not what its
+    settings say they are."""
     kept = len(read_day(layout)[0])
     try:
-        said = json.loads(layout.records.read_text(encoding="utf-8")).get("day_calls", kept)
-        if isinstance(said, int) and not isinstance(said, bool) and said >= kept:
-            return said
+        said = json.loads(layout.records.read_text(encoding="utf-8")).get("day_calls")
     except (OSError, ValueError, AttributeError):
-        pass
-    raise ScaleError("The run's records of DataSF's calls (records.json) cannot be read.")
+        said = False
+    counted = isinstance(said, int) and not isinstance(said, bool)
+    if settings.sample is None:
+        if said is None or (counted and said == kept):
+            return kept
+    elif counted and kept == settings.sample < said:
+        return said
+    raise ScaleError(
+        "The run's records of DataSF's calls (records.json) are not what the run's "
+        "settings say they are: all of the day's calls, or the first of them that "
+        "its sample holds."
+    )
 
 
 def read_lists(layout: Layout) -> tuple[Known, Blocks]:

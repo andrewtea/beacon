@@ -17,10 +17,11 @@ RUN_VARIABLE = "BEACON_SCALE_RUN"
 # What the page is, said before any run's own words. A scale run is no part of what
 # this server shows of incidents, and the page says so.
 ABOUT = (
-    "A scale run puts one day of fire dispatch calls through the code this server "
-    "runs and compares what Beacon made of them with DataSF's public record of that "
-    "day. It is made by a command, apart from this server: nothing on this page is "
-    "about the incidents this server shows, or about any tap it was sent."
+    "A scale run puts one day of fire dispatch calls, or the first calls of one, "
+    "through the code this server runs and compares what Beacon made of them with "
+    "DataSF's public record of those calls. It is made by a command, apart from "
+    "this server: nothing on this page is about the incidents this server shows, "
+    "or about any tap it was sent."
 )
 NO_RUN = "This server shows no scale run's results."
 NO_RESULTS = "The scale run this server names has no results yet."

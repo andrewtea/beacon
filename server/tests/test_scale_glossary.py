@@ -453,6 +453,32 @@ def test_an_answer_that_is_no_form_is_counted_with_the_taps_and_its_cost_is_stil
     assert "a recording of an earlier call" in by_key["glossary_cost_usd"].text
 
 
+def test_a_glossary_that_was_cut_short_is_no_glossary_though_what_there_is_reads_as_the_form(
+    env: dict[str, str], site: DataSf, speech: None
+) -> None:
+    layout, reading, _ = scored(env, site)
+    meta = Meta(layout)
+    runs = Runs(layout.taps, "mock")
+    (layout.root / glossary.FILE).unlink()
+    runs.save_state({"held_until": None, "unusable_run": 2})
+    # The stand-in's whole form, in an answer the API says did not end.
+    meta.glossary_status = "incomplete"
+    ember = meta.client(env)(SpendScope(glossary.GLOSSARY_SCOPE, 250_000_000))
+
+    learned = glossary.learn(layout, reading.incidents, ember, runs)
+
+    # No entry of it is kept, and it is counted as an answer that was no form:
+    # the third in a row, so the run is held.
+    assert (learned.state, learned.model, learned.whole) == ("made", "live", False)
+    held_until, _ = read_hold(runs.state())
+    assert held_until is not None
+    runs.close()
+    # It was paid for, and is said to have been.
+    by_key = {n.key: n for n in glossary.numbers(learned, {}, generated=True, live=True)}
+    assert by_key["glossary_after"].value is None
+    assert by_key["glossary_cost_usd"].value == pytest.approx(0.00015)
+
+
 def test_an_answer_that_is_the_form_ends_the_runs_count_of_answers_that_were_not(
     env: dict[str, str], site: DataSf, speech: None
 ) -> None:
