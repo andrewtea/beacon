@@ -149,6 +149,15 @@ REPEATS_MEDIA = (
     "server, and the server's sweep then deletes it. The sweep deletes one sooner "
     "once its tap has been deleted."
 )
+# What SQLite keeps beside a database, by what it adds to the file's name: the
+# write-ahead log and its index, and the journal of a file that is not in
+# write-ahead mode.
+_BESIDE = ("-wal", "-shm", "-journal")
+# The tables SQLite makes in a database by itself: the counter of rows' ids, and
+# what `ANALYZE` keeps for its planner. They are in a file of any kind.
+_SQLITES_OWN = frozenset(
+    {"sqlite_sequence", "sqlite_stat1", "sqlite_stat2", "sqlite_stat3", "sqlite_stat4"}
+)
 # How long SQLite is waited for when a file's log is emptied before it is deleted.
 _WAIT_SECONDS = 5.0
 
@@ -260,29 +269,40 @@ def begin_again(env: Mapping[str, str], now: datetime, lock: DataLock) -> bool:
 def _own(data: Path, directory: str, name: str) -> Path | None:
     """The file of one of the mock store's kinds, or None when there is none.
 
-    Raises NotTheMockStoresError when what is there is not a file of its own in a
-    directory of its own: a link, of either kind, can be to another store's file,
-    which would be deleted in this one's place."""
+    Before SQLite opens anything: SQLite reads and writes the files it keeps
+    beside a database as well (`_BESIDE`), and emptying a log writes to the log.
+    So the file and each of those that is there has to be a file of its own, in a
+    directory of its own, and the ones beside it whether or not the file is there:
+    a new file of the name would be opened with them.
+
+    Raises NotTheMockStoresError when one is not: a link, of either kind, can be
+    to another store's file, which would be written to or deleted in this one's
+    place."""
     folder = data / directory
     path = folder / name
     linked = folder.is_symlink()
-    if not linked:
+    there = False
+    for each in (path, *(path.with_name(name + suffix) for suffix in _BESIDE)):
+        if linked:
+            break
         try:
-            found = os.lstat(path)
+            found = os.lstat(each)
         except FileNotFoundError:
-            return None
+            continue
         except NotADirectoryError:
             linked = True
         else:
             linked = not stat.S_ISREG(found.st_mode) or found.st_nlink != 1
+            there = there or each == path
     if linked:
         raise_bare(NotTheMockStoresError(_NOT_THE_FILE.format(directory)))
-    return path
+    return path if there else None
 
 
 def _mock_stores(path: Path) -> None:
     """See that the file is its kind's and the mock store's, in a shape this
-    Beacon knows, or is a file nothing was ever written to. It writes nothing.
+    Beacon knows, or is a file nothing was ever written to. It writes nothing to
+    the file, and is called only for a file `_own` passed.
 
     Its kind is known by its tables, not by what it says: every one of Beacon's
     files says a mode, several in the same table and with the same shape number.
@@ -300,7 +320,8 @@ def _mock_stores(path: Path) -> None:
             said.mode == "mock"
             and said.shape in kind.shapes
             and kind.own in said.tables
-            and said.tables <= kind.tables
+            # No table of another kind's, or of anybody else's.
+            and said.tables - _SQLITES_OWN <= kind.tables
         ):
             return
     raise_bare(NotTheMockStoresError(_NOT_THE_FILE.format(path.parent.name)))
@@ -323,7 +344,7 @@ def _settle(path: Path) -> None:
 
 def _delete(path: Path) -> None:
     """Delete a SQLite file with what SQLite keeps beside it."""
-    for each in (path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")):
+    for each in (path, *(path.with_name(path.name + suffix) for suffix in _BESIDE)):
         each.unlink(missing_ok=True)
 
 
@@ -345,10 +366,9 @@ async def _serve(
     """Serve until the server is told to stop, or, with `repeat`, until the story
     it plays is over, and say whether it ended because the story was over.
 
-    `leave` is called when the server that stopped did not stop whole, here and
-    not after this returns: what runs this then waits for the threads that did not
-    stop, for minutes, before anything else can end the process."""
-    serving = asyncio.ensure_future(server.serve())
+    `leave` is called when the server that ended did not stop whole, by the task
+    that served and before that task is done (`_to_its_end`)."""
+    serving = asyncio.ensure_future(_to_its_end(server, app, leave))
     over = False
     try:
         while not serving.done():
@@ -365,9 +385,27 @@ async def _serve(
         if not serving.done():
             server.should_exit = True
         await serving
-    if leave is not None and _left_running(server, app):
-        leave()
     return over
+
+
+async def _to_its_end(server: _Server, app: FastAPI, leave: Callable[[], object] | None) -> None:
+    """Serve to the server's end, however it ends, and call `leave` when it did
+    not stop whole.
+
+    **Here, in the task that serves, and not after the loop is done**: what runs
+    the loop waits for the threads that did not stop, for up to five minutes,
+    before anything after it can end the process. And for an end that is an
+    error too: uvicorn ends a server that could not start (a startup that failed,
+    an address it could not have) by raising `SystemExit`, after the app's own
+    shutdown has run and said whether everything it had begun ended. That exit is
+    taken here as the server not having started, which `server.started` says, so
+    that it is not raised through the loop, past the look at how it stopped."""
+    try:
+        with suppress(SystemExit):
+            await server.serve()
+    finally:
+        if leave is not None and _left_running(server, app):
+            leave()
 
 
 def _left_running(server: _Server, app: FastAPI) -> bool:
@@ -412,7 +450,8 @@ def run(
     # Held from here to the end of the process, over every telling and every
     # deletion between them: nothing else opens a store of this directory in a gap.
     lock = DataLock(default_data_dir(env), shared=env.get(INGEST_VARIABLE, "1") == "0")
-    whole = True
+    # The server that was begun last, with its app, which says how it stopped.
+    last: tuple[_Server, FastAPI] | None = None
     try:
         while True:
             if repeat:
@@ -434,6 +473,7 @@ def run(
             # The lock this process already holds, which the app does not take again.
             app.state.data_lock = lock
             server = make_server(app)
+            last = (server, app)
             over = asyncio.run(
                 _serve(server, app, repeat=repeat, clock=clock, leave=leave if told_again else None)
             )
@@ -452,7 +492,10 @@ def run(
                 return 0
             logger.info("The invented story is over. It is begun again.")
     finally:
-        if whole:
+        # By what the last server's own shutdown said, read here and not carried
+        # in a variable: this is reached by an error as well, and a server that
+        # ended in one can have left a worker behind like any other.
+        if last is None or not _left_running(*last):
             lock.close()
 
 

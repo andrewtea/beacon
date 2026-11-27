@@ -25,7 +25,7 @@ function View({
 }: {
   route: Route
   mode: 'live' | 'mock' | null
-  input: Input
+  input: Input | null
   repeatsText: string | null
   onOtherMode: () => void
 }) {
@@ -72,10 +72,13 @@ export default function App() {
   // the server that comes back can be another one, on other sources.
   const mode = unreachable ? null : (health.data?.mode ?? null)
   const repeatsText = unreachable ? null : (health.data?.repeats_text ?? null)
-  // What the server takes from a visitor. Nothing is sent while the mode is not
-  // known, so what is taken matters only once the server has said both.
-  const input: Input =
-    !unreachable && health.data?.input === 'invented' ? 'invented' : 'own'
+  // What the server takes from a visitor, when it has said so at the latest
+  // asking, and else not known. Not known is not `own`: until the server says
+  // that it takes where a person is, the phone is not asked for it, and nothing
+  // of a person's own is sent.
+  const said = unreachable ? undefined : health.data?.input
+  const input: Input | null =
+    said === 'own' || said === 'invented' ? said : null
   const frontText = unreachable ? null : (health.data?.front_text ?? null)
   const frontMore = unreachable ? null : (health.data?.front_more_text ?? null)
   // A tap the server no longer answers for is deleted from this device.

@@ -12,6 +12,8 @@ from fastapi.testclient import TestClient
 from beacon import front
 from beacon.evidence import Point
 from beacon.main import ServerSetupError, create_app
+from beacon.push.vapid import VapidError
+from beacon.taps.desk import INVENTED_ONLY
 
 SHOWN = {"Beacon-Mode": "mock"}
 FIRE = {"lat": 37.776, "lon": -122.424}
@@ -19,6 +21,9 @@ ACROSS = {"lat": 37.8, "lon": -122.41}
 # Somebody at a window on Hayes Street, about a block from the invented place. The
 # position is invented.
 OWN = {"lat": 37.7751234, "lon": -122.4198765}
+# A place that is not the invented one and is kept as it: rounded to a block, it
+# is 37.776, -122.424.
+ROUNDS_TO_FIRE = {"lat": 37.7761, "lon": -122.4239}
 PRECISE = ("37.7751234", "122.4198765", "7751234", "4198765", "37.775", "122.42")
 
 
@@ -67,7 +72,7 @@ def test_a_tap_is_taken_only_from_an_invented_place_with_nothing_else() -> None:
         for body in (
             {"location": OWN},
             # A place that would be kept as the invented one is somebody's own.
-            {"location": {"lat": 37.7761, "lon": -122.4239}},
+            {"location": ROUNDS_TO_FIRE},
             {"location": FIRE | {"accuracy_m": 12}},
             {"location": FIRE, "clip": clip},
             {"location": FIRE, "photo": clip},
@@ -84,28 +89,53 @@ def test_a_tap_is_taken_only_from_an_invented_place_with_nothing_else() -> None:
         assert [file.name for file in media.rglob("*") if file.is_file()] in ([], [".lock"])
 
 
-def test_a_tap_an_earlier_server_took_from_where_somebody_was_is_answered_for_by_no_route(
+def test_a_tap_another_server_took_is_answered_for_by_no_route_whatever_its_row_looks_like(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Its id would be asked for at an address the host can write down.
+    # Its id would be asked for at an address the host can write down. What a row
+    # holds does not say where its tap was sent from: a place a block from the
+    # invented one is kept as the invented one. So only a row that says it was
+    # taken under the rule is answered for.
     with TestClient(create_app()) as client:
-        own = client.post("/api/taps", headers=SHOWN, json={"location": OWN}).json()["id"]
-        near = client.post("/api/taps", headers=SHOWN, json={"location": FIRE}).json()["id"]
-        measured = client.post(
-            "/api/taps", headers=SHOWN, json={"location": FIRE | {"accuracy_m": 9}}
-        ).json()["id"]
-        assert client.get(f"/api/taps/{own}").status_code == 200
+        taken = {
+            name: client.post("/api/taps", headers=SHOWN, json={"location": place}).json()["id"]
+            for name, place in (
+                ("own", OWN),
+                # Kept as the invented place, with no accuracy, clip, or photo.
+                ("a block away", ROUNDS_TO_FIRE),
+                ("the place itself", FIRE),
+                ("measured", FIRE | {"accuracy_m": 9}),
+            )
+        }
+        store = client.app.state.taps.store  # type: ignore[attr-defined]
+        rows = {name: store.find("app", tap_id) for name, tap_id in taken.items()}
+        assert rows["a block away"].point == rows["the place itself"].point == front.SPOTS[0]
+        assert rows["a block away"].data == rows["the place itself"].data
+        assert INVENTED_ONLY not in rows["the place itself"].data
+        for tap_id in taken.values():
+            assert client.get(f"/api/taps/{tap_id}").status_code == 200
 
     monkeypatch.setenv(front.VARIABLE, "unverified")
     with TestClient(create_app()) as client:
-        for gone in (own, measured):
-            for route in (f"/api/taps/{gone}", f"/api/taps/{gone}/run"):
+        for tap_id in taken.values():
+            for route in (f"/api/taps/{tap_id}", f"/api/taps/{tap_id}/run"):
                 answer = client.get(route)
                 assert (answer.status_code, answer.json()) == (
                     404,
                     {"detail": "There is no such tap."},
                 )
-        assert client.get(f"/api/taps/{near}").status_code == 200
+        # A tap this server takes says so in its row, and is answered for.
+        mine = client.post("/api/taps", headers=SHOWN, json={"location": FIRE}).json()["id"]
+        row = client.app.state.taps.store.find("app", mine)  # type: ignore[attr-defined]
+        assert row.data[INVENTED_ONLY] is True
+        assert client.get(f"/api/taps/{mine}").status_code == 200
+        assert client.get(f"/api/taps/{mine}/run").status_code == 200
+
+    # And a server that takes a visitor's own answers for all of them again.
+    monkeypatch.setenv(front.VARIABLE, "verified")
+    with TestClient(create_app()) as client:
+        for tap_id in (*taken.values(), mine):
+            assert client.get(f"/api/taps/{tap_id}").status_code == 200
 
 
 @pytest.mark.usefixtures("unverified")
@@ -115,7 +145,9 @@ def test_saved_places_are_checked_only_when_each_is_an_invented_place() -> None:
         assert asked.status_code == 200
         assert len(asked.json()["places"]) == 2
 
-        for places in ([OWN], [FIRE, OWN]):
+        # As each was sent, not as it would be rounded: a place a block from the
+        # invented one is somebody's own.
+        for places in ([OWN], [FIRE, OWN], [ROUNDS_TO_FIRE], [ACROSS, ROUNDS_TO_FIRE]):
             refused = client.post("/api/places/check", headers=SHOWN, json={"places": places})
             assert (refused.status_code, refused.json()) == (
                 403,
@@ -142,6 +174,28 @@ def test_no_notification_address_is_taken_and_one_is_still_deleted() -> None:
             refused = client.post(route, headers=SHOWN, json=body)
             assert (refused.status_code, refused.json()) == (503, {"detail": front.PUSH_OFF})
         # What an earlier server kept is deleted when its device asks, as on any.
+        gone = client.post(
+            "/api/push/unsubscribe",
+            headers=SHOWN,
+            json={"endpoint": "https://fcm.googleapis.com/fcm/send/an-address", "permits": []},
+        )
+        assert gone.status_code == 204
+
+
+def test_a_contact_such_a_server_would_never_use_does_not_keep_it_from_starting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # It sends no push, so it names nobody to a push service. A contact that
+    # cannot be used stops a server that would send, and must not stop this one
+    # from starting: it is what deletes an address when its device asks.
+    monkeypatch.setenv("BEACON_VAPID_SUBJECT", "not a contact at all")
+    with pytest.raises(VapidError), TestClient(create_app()):
+        pass
+
+    monkeypatch.setenv(front.VARIABLE, "unverified")
+    with TestClient(create_app()) as client:
+        push = client.app.state.push  # type: ignore[attr-defined]
+        assert (push.sends, push.off) == (False, front.PUSH_OFF_REASON)
         gone = client.post(
             "/api/push/unsubscribe",
             headers=SHOWN,

@@ -7,6 +7,7 @@ import logging
 import os
 import socket
 import sqlite3
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -310,6 +311,65 @@ def test_a_link_to_another_stores_file_is_not_followed_to_delete_it(how: str) ->
     assert push_file().read_bytes() == subscriptions
     after = {name: held for name, held in kept().items() if not name.startswith("investigate/")}
     assert after == before
+
+
+@pytest.mark.parametrize("beside", ["-wal", "-shm", "-journal"])
+@pytest.mark.parametrize("how", ["a link", "a second name"])
+@pytest.mark.parametrize("there", [True, False])
+def test_what_sqlite_keeps_beside_a_file_is_not_another_stores_under_a_link(
+    beside: str, how: str, there: bool
+) -> None:
+    # SQLite opens the log beside a database, and emptying a log writes to it. A
+    # log that is another store's, under a link, is found before SQLite opens
+    # anything: whether or not the file itself is there, since a new file of the
+    # name would be opened with what is beside it.
+    over = served()
+    theirs = data_dir() / "push" / "kept-beside-the-subscriptions"
+    theirs.write_bytes(b"what another store's log holds" * 50)
+    path = data_dir() / "investigate" / "mock.sqlite3"
+    with closing(sqlite3.connect(path)) as db:
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    for each in ("-wal", "-shm", "-journal"):
+        path.with_name(path.name + each).unlink(missing_ok=True)
+    if not there:
+        path.unlink()
+    linked = path.with_name(path.name + beside)
+    if how == "a link":
+        linked.symlink_to(theirs)
+    else:
+        os.link(theirs, linked)
+    before = kept()
+    made: list[FastAPI] = []
+
+    with pytest.raises(serve.NotTheMockStoresError, match="is a link"):
+        begin_again(over + timedelta(hours=1))
+    with pytest.raises(serve.NotTheMockStoresError):
+        serve.run(env(), lambda app: made.append(app) or Stub(app))  # type: ignore[func-returns-value]
+
+    assert made == []
+    assert theirs.read_bytes() == b"what another store's log holds" * 50
+    assert kept() == before
+    assert linked.is_symlink() or linked.stat().st_nlink == 2
+
+
+def test_the_tables_sqlite_makes_by_itself_do_not_make_a_file_another_kinds() -> None:
+    # `ANALYZE` leaves the planner's statistics in a table of SQLite's own. A file
+    # with it is still its kind's, and the story is begun again.
+    over = served()
+    for directory, name in serve.MOCK_FILES:
+        with closing(sqlite3.connect(data_dir() / directory / name)) as db:
+            db.execute("ANALYZE")
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master")}
+        assert "sqlite_stat1" in tables
+
+    assert begin_again(over) is True
+
+    # A table that is neither the kind's nor SQLite's still makes it nobody's.
+    over = served()
+    with closing(sqlite3.connect(data_dir() / "story" / "mock.sqlite3")) as db, db:
+        db.execute("CREATE TABLE somebody_elses (n)")
+    with pytest.raises(serve.NotTheMockStoresError):
+        begin_again(over)
 
 
 @pytest.mark.parametrize("what", ["the subscriptions", "the stories", "only a view"])
@@ -707,6 +767,80 @@ def test_a_server_that_could_not_start_and_left_something_running_keeps_the_stor
     assert (status, left) == (serve.LEFT_RUNNING, [1])
     with pytest.raises(DataLockedError):
         DataLock(data_dir(), shared=True)
+
+
+class Uvicorns(Stub):
+    """Ends a server that could not start as uvicorn does: the app's shutdown is
+    run, and then the process is asked to exit, by an exception."""
+
+    async def serve(self) -> None:
+        try:
+            await super().serve()
+        except beacon.main.ServerSetupError:
+            sys.exit(3)
+
+
+@pytest.mark.parametrize("repeat", ["1", "0"])
+def test_a_server_uvicorn_ends_with_an_exit_keeps_the_stores_when_it_left_something(
+    monkeypatch: pytest.MonkeyPatch, repeat: str
+) -> None:
+    # uvicorn raises SystemExit after a startup that failed. Raised through the
+    # loop, it would pass the look at how the server stopped, and the lock would
+    # be given up under a worker that is still there.
+    async def not_whole(ingest: object) -> bool:
+        await stop(ingest)  # type: ignore[arg-type]
+        return False
+
+    def fails(*args: object) -> None:
+        raise beacon.main.ServerSetupError("no")
+
+    stop = beacon.main._stop_ingest
+    monkeypatch.setattr(beacon.main, "_stop_ingest", not_whole)
+    monkeypatch.setattr(beacon.main, "open_push", fails)
+    left: list[bool] = []
+
+    def leave() -> None:
+        # Called by the task that served, while its loop still runs.
+        left.append(asyncio.get_running_loop().is_running())
+
+    status = serve.run(env() | {serve.REPEAT_VARIABLE: repeat}, Uvicorns, leave=leave)
+
+    assert (status, left) == ((serve.LEFT_RUNNING, [True]) if repeat == "1" else (3, []))
+    with pytest.raises(DataLockedError):
+        DataLock(data_dir(), shared=True)
+
+
+def test_a_server_uvicorn_ends_with_an_exit_that_left_nothing_gives_the_stores_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fails(*args: object) -> None:
+        raise beacon.main.ServerSetupError("no")
+
+    monkeypatch.setattr(beacon.main, "open_push", fails)
+    left: list[int] = []
+
+    assert serve.run(env(), Uvicorns, leave=lambda: left.append(1)) == 3
+
+    assert left == []
+    DataLock(data_dir(), shared=False).close()
+
+
+def test_a_real_uvicorn_that_cannot_have_its_address_is_a_server_that_did_not_start() -> None:
+    # The exit uvicorn raises for an address somebody else has is taken as that,
+    # not raised through `run`: nothing of the app was left, so the stores are
+    # given up, and the status is the failure to start.
+    with closing(socket.socket()) as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+        port = taken.getsockname()[1]
+
+        status = serve.run(
+            {ENV_KEY: os.environ[ENV_KEY]},
+            lambda app: serve.uvicorn_server(app, "127.0.0.1", port),
+        )
+
+    assert status == 3
+    DataLock(data_dir(), shared=False).close()
 
 
 def test_a_server_that_stopped_says_so_only_when_every_part_of_it_did() -> None:

@@ -168,6 +168,59 @@ test('a server that takes only the invented places is sent no place of a person�
   ).toBeInTheDocument()
 })
 
+test('the phone is not asked where it is until the server has said it takes that, or after it stopped saying', async () => {
+  // On a server that takes only the invented places, a place saved from where
+  // the phone is would be somebody's own. Until the server has said which it
+  // is, and whenever its latest answer failed, it is not known to be the other.
+  await savePlace('The fire', FIRE)
+  const located = vi.fn()
+  vi.stubGlobal('navigator', {
+    ...navigator,
+    geolocation: { getCurrentPosition: located },
+  })
+  let health: (response: Response) => void = () => undefined
+  const asked = serve({
+    'GET /api/health': () =>
+      new Promise<Response>((resolve) => (health = resolve)),
+    [CHECK]: answer(nearFire),
+  })
+  render(<App />)
+
+  // Before the server answers: the saved place is listed and can be removed,
+  // and nothing offers to save where the phone is.
+  expect(await screen.findByText('The fire')).toBeInTheDocument()
+  expect(
+    screen.getByText('A place can be saved once Beacon’s server has answered.'),
+  ).toBeInTheDocument()
+  expect(
+    screen.queryByRole('button', { name: 'Save where I am now' }),
+  ).not.toBeInTheDocument()
+  expect(
+    screen.getByRole('button', { name: 'Remove The fire from this device' }),
+  ).toBeInTheDocument()
+
+  // An answer that does not say what the server takes is not taken for `own`:
+  // nothing is offered, and nothing of a place is sent.
+  const silent: Record<string, unknown> = { ...MOCK_HEALTH }
+  delete silent.input
+  await act(async () => health(Response.json(silent)))
+  await screen.findByText('Invented scenario')
+  expect(
+    screen.queryByRole('button', { name: 'Save where I am now' }),
+  ).not.toBeInTheDocument()
+  expect(asked.filter((request) => request.key === CHECK)).toEqual([])
+  expect(located).not.toHaveBeenCalled()
+})
+
+test('a server that says it takes a visitor’s own place offers to save where the phone is', async () => {
+  serve({ 'GET /api/health': MOCK_HEALTH })
+  render(<App />)
+
+  expect(
+    await screen.findByRole('button', { name: 'Save where I am now' }),
+  ).toBeEnabled()
+})
+
 test('a place with nothing near it says so in the server’s sentence, which is no all-clear', async () => {
   await savePlace('Home', FIRE)
   await savePlace('Work', FAR)

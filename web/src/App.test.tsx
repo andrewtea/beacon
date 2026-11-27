@@ -201,6 +201,39 @@ test('takes no tap until the server has said whether it runs on real sources', a
   expect(button).toBeEnabled()
 })
 
+test('takes no tap, and asks the phone nothing, from a server that has not said what it takes', async () => {
+  // Not said is not `own`: the server may be one that takes only the invented
+  // places, and a tap from where the phone is would be somebody's own.
+  const silent: Record<string, unknown> = { ...MOCK_HEALTH }
+  delete silent.input
+  const asked = serve({ 'GET /api/health': silent })
+  const located = vi.fn()
+  vi.stubGlobal('navigator', {
+    ...navigator,
+    geolocation: { getCurrentPosition: located },
+  })
+  render(<App />)
+
+  await screen.findByText(INVENTED)
+  expect(screen.getByRole('button', { name: ASK })).toBeDisabled()
+  expect(
+    screen.getByRole('button', {
+      name: 'Near the invented fire, Hayes Valley',
+    }),
+  ).toBeDisabled()
+  expect(
+    screen.getByRole('checkbox', { name: '5 seconds of sound' }),
+  ).toBeDisabled()
+  expect(
+    screen.getByText('Beacon takes a tap once it has heard from its server.'),
+  ).toBeInTheDocument()
+  expect(asked.filter((request) => request.key === 'POST /api/taps')).toEqual(
+    [],
+  )
+  expect(located).not.toHaveBeenCalled()
+  vi.unstubAllGlobals()
+})
+
 test('takes no tap from a server that could not say which mode it is in', async () => {
   serve({
     'GET /api/health': () => Response.json({ detail: 'No.' }, { status: 500 }),
@@ -356,7 +389,7 @@ test('a tap that ran out is taken off the list at that moment, though storage wi
     })
   const stop = sweepTaps()
   try {
-    render(<Home mode="mock" />)
+    render(<Home mode="mock" input="own" />)
     const list = screen.getByRole('region', { name: 'Your taps' })
     expect(within(list).getAllByRole('link')).toHaveLength(1)
 

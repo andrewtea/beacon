@@ -41,7 +41,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Collection, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -89,6 +89,9 @@ MAX_TAPS_AT_ONCE = 8
 # How far off a phone may say its position is, in metres, at most.
 _MAX_ACCURACY_M = 100_000.0
 _FIELDS = frozenset({"location", "photo", "clip"})
+# In the row of a tap that a server took under the rule that it takes only the
+# invented scenario's places (`Taps(only=...)`): true. In no other row.
+INVENTED_ONLY = "invented_only"
 _LOCATION_FIELDS = frozenset({"lat", "lon", "accuracy_m"})
 # The most of each mark of JSON's structure a tap's body may hold. A tap has two
 # objects, four commas, and six colons, and base64 has none of these characters, so
@@ -151,7 +154,8 @@ class Taps:
 
         With `only`, a tap is taken only from one of those places, to the digit
         as it was sent, and with nothing else: no accuracy, no clip, no photo
-        (`beacon.front`). `answers_for` then says the same of a row."""
+        (`beacon.front`). Its row says that it was taken so (`INVENTED_ONLY`),
+        and `answers_for` is then true of such a row only."""
         self._store = store
         self._media = media
         self._photos = photos
@@ -170,18 +174,15 @@ class Taps:
 
     def answers_for(self, row: Evidence) -> bool:
         """Whether this server answers for a tap's row: any, or, on a server that
-        takes a tap only from certain places, one that is what such a tap is. A
-        row an earlier server took from where somebody was is answered for by
-        no route of this one, so its id is asked for at no address."""
+        takes a tap only from certain places, one whose row says it was taken
+        under that rule. What a row holds does not say so: a place a block from
+        one of these is kept as that place, so a tap another server took from
+        where somebody was can have a row that looks the same. Such a row, and
+        any other that is not marked, is answered for by no route of this
+        server."""
         if self._only is None:
             return True
-        data = row.data
-        return (
-            row.point in self._only
-            and data.get("accuracy_m") is None
-            and data.get("photo") is None
-            and data.get("clip") is None
-        )
+        return row.data.get(INVENTED_ONLY) is True and row.point in self._only
 
     def admit(self) -> Callable[[], None]:
         """Take one of the `MAX_TAPS_AT_ONCE` places, for as long as a tap is being
@@ -268,7 +269,12 @@ class Taps:
             for kind, cleaned in (("photo", photo), ("clip", clip)):
                 if cleaned is not None:
                     kept_until = self._media.keep(tap_id, kind, cleaned.content, now)  # type: ignore[arg-type]
-            self._store.add([_row(tap_id, now, point, accuracy_m, photo, clip, kept_until)])
+            row = _row(tap_id, now, point, accuracy_m, photo, clip, kept_until)
+            if self._only is not None:
+                # Said of the tap when it is taken, by the server that refused
+                # everything else: nothing kept of a tap shows it afterwards.
+                row = replace(row, data={**row.data, INVENTED_ONLY: True})
+            self._store.add([row])
         except BaseException as error:
             # A tap is taken whole or not at all: no photo without its row.
             try:

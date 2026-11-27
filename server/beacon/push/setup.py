@@ -131,18 +131,19 @@ def open_push(
         raise PushConfigError(f"{PUSH_VARIABLE} must be 1 or 0.")
     if runs.mode != engine.mode:
         raise PushConfigError("The investigations file is not the incident engine's store's.")
+    # A device's address is its own, and is not taken through a host nobody has
+    # checked (`beacon.front`). What an earlier server kept is deleted as on any
+    # server that sends none.
+    takes_none = front.input_of(env) == "invented"
     # Read only by a server that is to send: one that only deletes is not kept
     # from starting, and so from deleting, by a contact it would never use.
-    subject = subject_of(env) if setting == "1" else None
+    subject = subject_of(env) if setting == "1" and not takes_none else None
     mode = engine.mode
     other: Mode = "live" if mode == "mock" else "mock"
     directory = default_data_dir(env) / "push"
     off = TURNED_OFF if setting == "0" else NO_CONTACT if subject is None else None
     said = OFF
-    if front.input_of(env) == "invented":
-        # A device's address is its own, and is not taken through a host nobody
-        # has checked (`beacon.front`). What an earlier server kept is deleted as
-        # on any server that sends none.
+    if takes_none:
         off, said = front.PUSH_OFF_REASON, front.PUSH_OFF
     made = True
     try:

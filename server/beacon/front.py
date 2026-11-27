@@ -8,21 +8,24 @@ a host keeps to that is for its operator to find out, and until somebody has,
 `BEACON_FRONT_END=unverified` says so, and the server then **takes nothing of a
 visitor's own**:
 
-- a tap only from one of the invented scenario's two places (`SPOTS`), with no
-  accuracy, no clip, and no photo, and it answers for no tap that is anything else;
-- a check of saved places only when every place is one of those two;
-- no notification address. It still deletes one when its device asks and when its
-  time is over, as any server does.
+- a tap only from one of the invented scenario's two places (`SPOTS`), to the
+  digit as it was sent, with no accuracy, no clip, and no photo. The row of a tap
+  it takes says so, and it answers only for a tap whose row does: what a row holds
+  cannot show it, since a place a block from one of the two is kept as that place;
+- a check of saved places only when every place is one of those two as it was sent;
+- no notification address, and so it reads no contact. It still deletes an address
+  when its device asks and when its time is over, as any server does.
 
 So what such a host could write down of a request is an id of a tap that holds an
 invented place. That is the invented scenario's server only: one that names a real
 source and is `unverified` does not start.
 
 `verified` is the operator saying they have seen that the host keeps those routes
-out of its records, or have decided to take a visitor's own place through it. With
-the variable not set at all, as on a developer's machine, a server takes a
-visitor's own; set to nothing, it is refused, so that a deployment's default cannot
-be emptied by accident.
+out of its records, and nothing else: to take a visitor's own through a host nobody
+has checked would be a change to the rule, not a use of this setting. With the
+variable not set at all, as on a developer's machine, a server takes a visitor's
+own; set to nothing, it is refused, so that a deployment's default cannot be
+emptied by accident.
 """
 
 from collections.abc import Mapping
@@ -94,8 +97,3 @@ def input_of(env: Mapping[str, str]) -> Input:
     if setting == "unverified":
         return "invented"
     raise FrontError(f"{VARIABLE} is verified or unverified.")
-
-
-def invented(point: Point) -> bool:
-    """Whether a point, as a tap or a check keeps one, is one of the two places."""
-    return point in SPOTS

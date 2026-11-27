@@ -84,13 +84,15 @@ function YourTaps() {
 
 export function Home({
   mode,
-  input = 'own',
+  input,
   onOtherMode,
 }: {
-  // What the server takes from a visitor. When that is only the invented
-  // scenario's two places, the button sends a tap from the first of them, and
-  // where the phone is, a sound, and a photo are neither asked for nor sent.
-  input?: Input
+  // What the server said it takes from a visitor at the latest asking, or null
+  // when that is not known, and then no tap is taken. When it is only the
+  // invented scenario's two places, the button sends a tap from the first of
+  // them, and where the phone is, a sound, and a photo are neither asked for
+  // nor sent. The phone is asked where it is only for `own`.
+  input: Input | null
   // The mode the server said it is in at the latest asking, or null when that
   // is not known.
   mode: Mode | null
@@ -129,11 +131,13 @@ export function Home({
   // Whether the server runs on real sources or on the invented scenario is known
   // before a tap is taken, so that nobody sends where they are, a clip, or a
   // photo to the scenario without having been told that is what it is.
-  const ready = mode !== null
+  // And so is what the server takes: the phone is not asked where it is for a
+  // server that has not said it takes that.
+  const ready = mode !== null && input !== null
   const invented = input === 'invented'
 
   const tap = async (given?: Place) => {
-    if (busy !== null || mode === null) return
+    if (busy !== null || mode === null || input === null) return
     // On a server that takes only the invented places, the button's tap is from
     // the first of them: the phone is not asked where it is.
     const from = given ?? (invented ? MOCK_SPOTS[0].place : undefined)
@@ -321,7 +325,7 @@ export function Home({
                 key={spot.name}
                 type="button"
                 className="spot"
-                disabled={busy !== null}
+                disabled={busy !== null || !ready}
                 onClick={() => void tap(spot.place)}
               >
                 <Icon name="pin" />

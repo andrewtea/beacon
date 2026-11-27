@@ -194,14 +194,17 @@ const SAID = { full: FULL, elsewhere: ELSEWHERE, failed: NOT_KEPT }
 function AddPlace({
   mode,
   full,
-  invented,
+  input,
 }: {
   mode: Mode | null
   full: boolean
-  // Whether the server takes only the invented scenario's two places: where the
-  // phone is is then not asked for, and only those two are offered.
-  invented: boolean
+  // What the server said it takes, or null when that is not known. Where the
+  // phone is is asked for only when it said `own`: saving happens on the device,
+  // but a place saved is a place sent once the server is asked about it. When
+  // it takes only the invented scenario's two places, only those are offered.
+  input: Input | null
 }) {
+  const invented = input === 'invented'
   const [name, setName] = useState('')
   const [saving, setSaving] = useState<Saving>({ kind: 'idle' })
   const busy = saving.kind === 'locating'
@@ -229,7 +232,7 @@ function AddPlace({
   }
   const saveHere = async (event: FormEvent) => {
     event.preventDefault()
-    if (busy || full) return
+    if (busy || full || input !== 'own') return
     setSaving({ kind: 'locating' })
     let here
     try {
@@ -256,7 +259,12 @@ function AddPlace({
         <p className="meta">{FULL}</p>
       ) : (
         <>
-          {!invented && (
+          {input === null && (
+            <p className="meta" role="status">
+              A place can be saved once Beacon’s server has answered.
+            </p>
+          )}
+          {input === 'own' && (
             <form onSubmit={(event) => void saveHere(event)}>
               <label htmlFor="place-name">Its name, for you only</label>
               <input
@@ -274,7 +282,7 @@ function AddPlace({
               </button>
             </form>
           )}
-          {mode === 'mock' && (
+          {mode === 'mock' && input !== null && (
             <>
               <p className="meta">
                 {invented
@@ -315,12 +323,14 @@ function AddPlace({
 
 export function PlacesView({
   mode,
-  input = 'own',
+  input,
   onOtherMode,
 }: {
-  // What the server takes from a visitor. When that is only the invented
-  // scenario's two places, a saved place that is neither is sent nowhere.
-  input?: Input
+  // What the server said it takes from a visitor, or null when that is not
+  // known, and then no place is sent and the phone is not asked where it is.
+  // When it is only the invented scenario's two places, a saved place that is
+  // neither is sent nowhere.
+  input: Input | null
   // The mode the server said it is in at the latest asking, or null when that
   // is not known: no place is sent to a server the person was not told of.
   mode: Mode | null
@@ -346,7 +356,7 @@ export function PlacesView({
           ' With notifications on, Beacon’s server does keep where your places are: Notifications, below, says what it keeps.'}
       </p>
       {places.length > 0 &&
-        (mode === null ? (
+        (mode === null || input === null ? (
           <>
             <p className="note" role="status">
               Beacon asks what is near your places once it has heard from its
@@ -372,11 +382,7 @@ export function PlacesView({
             )}
           </>
         ))}
-      <AddPlace
-        mode={mode}
-        full={places.length >= MOST_PLACES}
-        invented={invented}
-      />
+      <AddPlace mode={mode} full={places.length >= MOST_PLACES} input={input} />
       <Notifications mode={mode} />
     </div>
   )

@@ -152,13 +152,13 @@ def _read_and_answer(request: Request, engine: Engine, body: bytes) -> PlacesAns
     # be sent.
     if sent.keys() != {"places"}:
         raise PlacesError(422, SHAPE)
-    points = read_places(sent["places"])
-    if getattr(request.app.state, "input", "own") == "invented" and not all(
-        front.invented(point) for point in points
-    ):
-        # A server behind a host nobody has checked is asked about no place of a
-        # person's own (`beacon.front`).
-        raise PlacesError(403, front.PLACES_REFUSED)
+    # A server behind a host nobody has checked is asked about no place of a
+    # person's own (`beacon.front`): each has to be one of the invented two as it
+    # was sent, before it is rounded.
+    invented = getattr(request.app.state, "input", "own") == "invented"
+    points = read_places(
+        sent["places"], only=front.SPOTS if invented else None, refusal=front.PLACES_REFUSED
+    )
     # One reading for the whole answer.
     snapshot = engine.snapshot()
     places = []
