@@ -7,6 +7,7 @@ import { href, type Route, useRoute } from './lib/router.ts'
 import { sweepTaps } from './lib/tapStore.ts'
 import { Home } from './views/Home.tsx'
 import { IncidentView } from './views/IncidentView.tsx'
+import { MapView } from './views/MapView.tsx'
 import { PlacesView } from './views/PlacesView.tsx'
 import { TapView } from './views/TapView.tsx'
 import { TraceView } from './views/TraceView.tsx'
@@ -31,6 +32,8 @@ function View({
       return <TraceView key={route.id} id={route.id} />
     case 'incident':
       return <IncidentView key={route.id} id={route.id} />
+    case 'map':
+      return <MapView key={route.id} id={route.id} />
     case 'places':
       return <PlacesView mode={mode} onOtherMode={onOtherMode} />
     case 'unknown':

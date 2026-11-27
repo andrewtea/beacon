@@ -11,6 +11,7 @@ export type Route =
   | { view: 'tap'; id: string }
   | { view: 'trace'; id: string }
   | { view: 'incident'; id: string }
+  | { view: 'map'; id: string }
   | { view: 'places' }
   | { view: 'unknown' }
 
@@ -28,6 +29,8 @@ export function parseRoute(hash: string): Route {
   if (head === 'tap' && tail === 'trace' && parts.length === 3)
     return { view: 'trace', id }
   if (head === 'incident' && parts.length === 2) return { view: 'incident', id }
+  if (head === 'incident' && tail === 'map' && parts.length === 3)
+    return { view: 'map', id }
   return { view: 'unknown' }
 }
 
@@ -36,6 +39,7 @@ export const href = {
   tap: (id: string) => `#/tap/${id}`,
   trace: (id: string) => `#/tap/${id}/trace`,
   incident: (id: string) => `#/incident/${id}`,
+  map: (id: string) => `#/incident/${id}/map`,
   places: '#/places',
 }
 

@@ -184,3 +184,45 @@ export function fetchIncident(
     signal,
   })
 }
+
+/** One thing on the map of an incident: what a source said, and where it is. */
+export type Feature = {
+  // `place` is the point Beacon has for the incident; `traffic_event` a 511
+  // event as its version in force has it; `aircraft` an aircraft of the
+  // timeline's; `alert_area` the area an authority drew for an alert that is in
+  // force for the place.
+  kind: 'place' | 'traffic_event' | 'aircraft' | 'alert_area'
+  // The server's sentence: for all but the place, the timeline's own line.
+  text: string
+  at: string
+  confidence: Confidence
+  sources: Source[]
+  // A place and a traffic event are a point.
+  point: Point | null
+  // An aircraft is the positions it was seen at, oldest first.
+  path: (Point & { at: string })[]
+  // An alert's area is rings of points. A ring inside another is a hole in it.
+  rings: Point[][]
+  // What is not drawn of it, in the server's sentence.
+  note: string | null
+}
+
+export type MapAnswer = {
+  mode: Mode
+  as_of: string
+  partial: boolean
+  incident: IncidentSummary
+  // The place first, when there is one. Empty for an incident with no point.
+  features: Feature[]
+  // Why nothing is drawn, in the server's sentence, when nothing is.
+  text: string | null
+}
+
+export function fetchIncidentMap(
+  id: string,
+  signal?: AbortSignal,
+): Promise<MapAnswer> {
+  return fetchJson<MapAnswer>(`/api/incidents/${encodeURIComponent(id)}/map`, {
+    signal,
+  })
+}

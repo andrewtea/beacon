@@ -1125,3 +1125,173 @@ button.quiet:hover {
 .places-link .action {
   margin-top: 0.25rem;
 }
+
+/* The map of one incident. The street map's tiles are light, so what is drawn
+   over them is dark-edged and numbered: nothing is told by colour alone. */
+
+.map-link {
+  margin-top: 0.75rem;
+}
+
+.map-wrap {
+  margin-top: 1rem;
+}
+
+.map-canvas {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  /* The ground a tile leaves when it does not come, and the whole ground when
+     no street map is drawn. */
+  background: #dfe6ec;
+}
+
+.map-canvas.plain {
+  background:
+    linear-gradient(#c9d3dc 1px, transparent 1px) 0 0 / 100% 33.34%,
+    linear-gradient(90deg, #c9d3dc 1px, transparent 1px) 0 0 / 33.34% 100%,
+    #dfe6ec;
+}
+
+.map-tile {
+  position: absolute;
+  width: 33.34%;
+  height: 33.34%;
+  user-select: none;
+}
+
+.map-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.map-area {
+  fill: rgb(214 69 48 / 18%);
+  stroke: #8f2415;
+  stroke-width: 1.2;
+  stroke-dasharray: 4 2.5;
+  stroke-linejoin: round;
+}
+
+.map-path-casing,
+.map-path {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.map-path-casing {
+  stroke: #fff;
+  stroke-width: 3.4;
+}
+
+.map-path {
+  stroke: #5b2ea6;
+  stroke-width: 1.6;
+}
+
+.map-mark circle {
+  stroke: #0b1f33;
+  stroke-width: 1.4;
+}
+
+.map-mark text {
+  fill: #0b1f33;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.map-mark-place circle,
+.map-key-place {
+  fill: var(--accent);
+  background: var(--accent);
+}
+
+.map-mark-traffic_event circle,
+.map-key-traffic_event {
+  fill: #fff;
+  background: #fff;
+}
+
+.map-mark-aircraft circle,
+.map-key-aircraft {
+  fill: #d9c8ff;
+  background: #d9c8ff;
+}
+
+.map-mark-alert_area circle,
+.map-key-alert_area {
+  fill: #ffc1b3;
+  background: #ffc1b3;
+}
+
+.map-invented {
+  position: absolute;
+  top: 0.5rem;
+  left: 0.5rem;
+  background: var(--bg);
+}
+
+.map-credit {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  padding: 0.15rem 0.45rem;
+  border-top-left-radius: 0.4rem;
+  background: rgb(255 255 255 / 88%);
+  color: #12304d;
+  font-size: 0.78rem;
+}
+
+.map-zoom {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0.6rem 0;
+}
+
+.map-zoom button {
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+}
+
+.map-zoom button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.map-legend {
+  margin: 0.5rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.map-legend-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 0 0.25rem;
+  color: var(--text-soft);
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.map-key {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 1.6rem;
+  height: 1.6rem;
+  border: 2px solid #0b1f33;
+  border-radius: 50%;
+  outline: 1px solid var(--line);
+  color: #0b1f33;
+  font-size: 0.85rem;
+  font-weight: 700;
+}
