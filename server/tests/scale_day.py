@@ -31,6 +31,8 @@ HAYES_OCTAVIA = ("HAYES ST/OCTAVIA ST", -122.4245, 37.7767)
 GEARY_17TH = ("GEARY BLVD/17TH AVE", -122.4756, 37.7804)
 
 ROSTER = ("E36", "T06", "B02", "E05", "M552", "E31", "T12", "SCRT1", "EMS6A")
+# DataSF's unit type for the units of each type code of the invented day.
+UNIT_TYPES = {"E": "ENGINE", "T": "TRUCK", "B": "CHIEF", "M": "MEDIC", "SCRT": "CP", "EMS": "CP"}
 
 
 def centerlines() -> list[dict[str, Any]]:
@@ -97,12 +99,15 @@ def call(
 
 
 class DataSf:
-    """Stands where data.sf.gov is: answers the three questions a scale run asks,
+    """Stands where data.sf.gov is: answers the four questions a scale run asks,
     with the invented day, and keeps what was asked."""
 
     def __init__(self, rows: list[dict[str, Any]], *, roster: tuple[str, ...] = ROSTER) -> None:
         self.rows = rows
         self.roster = roster
+        self.unit_types = dict(UNIT_TYPES)
+        # Rows to answer the question about unit types with, in place of the day's.
+        self.type_rows: list[dict[str, Any]] | None = None
         self.requests: list[httpx2.Request] = []
 
     def __call__(self, request: httpx2.Request) -> httpx2.Response:
@@ -112,6 +117,19 @@ class DataSf:
         asked = request.url.params
         if request.url.path.endswith("/3psu-pn9h.json"):
             listed: list[dict[str, Any]] = centerlines()
+        elif "$group" in asked and "unit_type" in asked["$select"]:
+            # The units of the day's rows, each with its type.
+            if self.type_rows is not None:
+                return httpx2.Response(200, json=self.type_rows)
+            units = sorted({row["unit_id"] for row in self.rows})
+            return httpx2.Response(
+                200,
+                json=[
+                    {"unit_id": unit, "unit_type": self.unit_types[unit.rstrip("0123456789A")]}
+                    for unit in units
+                    if unit.rstrip("0123456789A") in self.unit_types
+                ],
+            )
         elif "$group" in asked:
             return httpx2.Response(200, json=[{"unit_id": unit} for unit in self.roster])
         else:

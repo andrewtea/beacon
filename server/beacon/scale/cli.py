@@ -37,10 +37,12 @@ from typing import TextIO
 from beacon.ember import EmberClient, EmberError, Storage
 from beacon.ember.client import default_data_dir
 from beacon.ember.pricing import parse_usd
+from beacon.glossary import stand_in_learner
 from beacon.ingest.http import SourceError, SourceHttp
 from beacon.ingest.recordings import SOURCE as RADIO_SOURCE
 from beacon.investigate import Runs, RunsError, stand_in_investigator
-from beacon.scale import datasf, generate, results, score, taps
+from beacon.scale import datasf, generate, glossary, results, score, taps
+from beacon.scale.glossary import GLOSSARY_BUDGET_NANOUSD, GLOSSARY_SCOPE
 from beacon.scale.run import (
     LEDGER_REPLACED,
     RADIO_BUDGET_NANOUSD,
@@ -153,6 +155,11 @@ def _parser() -> argparse.ArgumentParser:
         default="0.50",
         help="the most replayed taps may cost over every paid run, in dollars; at most 0.50",
     )
+    parser.add_argument(
+        "--glossary-budget",
+        default="0.25",
+        help="the most learning glossaries may cost over every paid run, in dollars; at most 0.25",
+    )
     return parser
 
 
@@ -167,6 +174,7 @@ def _run(
     try:
         radio_budget = parse_usd(options.radio_budget)
         taps_budget = parse_usd(options.taps_budget)
+        glossary_budget = parse_usd(options.glossary_budget)
     except ValueError:
         raise ScaleError("A budget is a dollar amount, such as 1.25.") from None
     if not 0 <= options.taps <= taps.MAX_TAPS:
@@ -176,10 +184,12 @@ def _run(
         # Both caps, before anything is fetched, heard, or paid for.
         check_budget(hearing_scope(settings), radio_budget, RADIO_BUDGET_NANOUSD)
         check_budget(TAPS_SCOPE, taps_budget, TAPS_BUDGET_NANOUSD)
+        check_budget(GLOSSARY_SCOPE, glossary_budget, GLOSSARY_BUDGET_NANOUSD)
     layout = Layout.under(env, options.name)
     with alone(env), contextlib.ExitStack() as opened:
         radio: EmberClient | None = None
         tap_ember: EmberClient | None = None
+        learner: EmberClient | None = None
         # What the run is, first: a run that was begun as another is refused before
         # a paying client is made for it.
         settings = begin(layout, settings)
@@ -206,6 +216,18 @@ def _run(
                         radio_ember(layout, settings, env, radio_budget, paid, beside=tap_ember)
                     )
                 )
+            learner = opened.enter_context(
+                contextlib.closing(
+                    paid_ember(
+                        env,
+                        GLOSSARY_SCOPE,
+                        glossary_budget,
+                        GLOSSARY_BUDGET_NANOUSD,
+                        paid,
+                        beside=tap_ember,
+                    )
+                )
+            )
         print(results.basis(settings), file=out)
         prepare(layout, settings, http)
         records, unread = read_day(layout)
@@ -214,8 +236,17 @@ def _run(
             file=out,
         )
         known_blocks = read_lists(layout)[1]
-        if tap_ember is None:
-            # The stand-ins: one reads the generated calls' script, one investigates by rule.
+        # DataSF's unit types for the day, which the glossary is compared with and
+        # its learner is never shown: fetched before anything is heard or paid for.
+        truth = glossary.truth_of(glossary.prepare_types(layout, settings, http))
+        if tap_ember is None or learner is None:
+            # The stand-ins: one reads the generated calls' script, one investigates
+            # by rule, and one guesses a glossary by a rule of thumb.
+            learner = opened.enter_context(
+                contextlib.closing(
+                    EmberClient.fake(Storage.under(default_data_dir(env)), stand_in_learner)
+                )
+            )
             if closed is None:
                 radio = opened.enter_context(
                     contextlib.closing(radio_ember(layout, settings, env, radio_budget, None))
@@ -226,13 +257,33 @@ def _run(
                 )
             )
         tap_runs = opened.enter_context(contextlib.closing(Runs(layout.taps, settings.mode)))
+        # What the glossary's call did to the run's hold, when an earlier
+        # invocation wrote it down and did not get it into the file: before the
+        # hold is read, so that nothing is heard or replayed on an older one.
+        glossary.settle(layout, tap_runs)
         held = taps.held_for(tap_runs)
+        replays = taps.plan(records, options.taps)
         if held is not None:
-            # A refusal or a failure on a tap holds the whole run: nothing is heard
-            # either, and what the run came to so far is left as it is.
+            # A refusal or a failure on a tap or on the glossary holds the whole run:
+            # nothing is heard either, and what the run came to so far is left as it
+            # is. A run that is complete, asked for with the plan of taps it was
+            # made with, has nothing left to ask: its result is shown as it was
+            # written, and not made again.
+            before = results.read(layout)
+            if (
+                before is not None
+                and before["complete"]
+                and before.get("taps_plan") == taps.plan_name(replays)
+            ):
+                print("", file=out)
+                for line in results.lines(before):
+                    print(line, file=out)
+                print("", file=out)
+                return 0
             print(
                 f"The run is leaving {results.who(live=live)} alone after a refusal or "
-                f"a failure in the replay of taps. {_hold_left(held)} Nothing was "
+                "a failure in the replay of taps or in learning the glossary. "
+                f"{_hold_left(held)} Nothing was "
                 "asked, and the run's results are as they were. Give the same command "
                 "again after that.",
                 file=out,
@@ -243,7 +294,7 @@ def _run(
         if radio is not None:
             heard = hear(layout, settings, store, radio, env, recordings=options.recordings)
         else:
-            # The replay of taps has begun, so nothing more is heard in this run. What
+            # The hearing is closed, so nothing more is heard in this run. What
             # its hearing cost is read from the ledger the taps' client is on, which
             # is the one the run is pinned to.
             assert closed is not None
@@ -253,15 +304,14 @@ def _run(
             heard.stopped is None and heard.last_pass is not None and heard.last_pass.unready == 0
         )
         ledger_lost = heard.ledger_lost
-        replays = taps.plan(records, options.taps)
         taps_stopped: taps.Stopped | None = None
+        if heard_complete and not ledger_lost and closed is None:
+            # Before the first tap is claimed and the glossary is asked for: from
+            # here on everything made of the whole day is of the evidence as it is now.
+            assert heard.last_pass is not None
+            close_hearing(layout, heard.last_pass)
+            closed = heard.last_pass
         if replays and heard_complete and not ledger_lost:
-            if closed is None:
-                # Before the first tap is claimed: from here on every tap of the
-                # run is answered against the evidence as it is now.
-                assert heard.last_pass is not None
-                close_hearing(layout, heard.last_pass)
-                closed = heard.last_pass
             taps_stopped = taps.replay(replays, tap_ember, store, known_blocks, tap_runs).stopped
         elif replays:
             print("No tap is replayed until every call has been heard.", file=out)
@@ -274,10 +324,19 @@ def _run(
             # Asked of both clients when everything is done, whether or not either
             # had a request left to make: the file at the ledger's path is another.
             ledger_lost = True
+        reading = score.read_incidents(store, known_blocks)
+        learned: glossary.Learned | None = None
+        if heard_complete and not ledger_lost and taps_stopped != "store":
+            # After the taps, which a failure here does not then hold up; while a
+            # hold of theirs is on, nothing is asked for the glossary either. When
+            # the investigations file could not be written, a hold the replay put
+            # on may not be in it: nothing is asked for a glossary then.
+            learned = glossary.learn(layout, reading.incidents, learner, tap_runs)
+            if learned.ledger_lost or (live and learner.ledger_replaced()):
+                ledger_lost = True
         if ledger_lost:
             # Kept, so that the command given again is refused and pays nothing.
             lose_ledger(layout)
-        reading = score.read_incidents(store, known_blocks)
         script = generate.read_script(layout.calls) if settings.audio == "generated" else None
         made = results.build(
             options.name,
@@ -297,6 +356,17 @@ def _run(
             ledger_lost=ledger_lost,
             taps=standing,
             taps_stopped=taps_stopped,
+            taps_plan=taps.plan_name(replays),
+            glossary=(
+                []
+                if learned is None
+                else glossary.numbers(
+                    learned, truth, generated=settings.audio == "generated", live=live
+                )
+            ),
+            glossary_waiting=(
+                None if learned is None else glossary.waiting_text(learned, live=live)
+            ),
         )
         # Published under the lock: a later invocation's results are not written
         # over by an earlier one's.

@@ -20,6 +20,7 @@ import pytest
 
 from beacon.ember import EmberClient, SpendScope, Storage, fake_response
 from beacon.evidence import EvidenceStore, NewEvidence, Point
+from beacon.glossary import stand_in_learner
 from beacon.incident import Engine
 from beacon.ingest.recordings import GENERATED_MARK
 from beacon.investigate import Runs, stand_in_investigator
@@ -308,11 +309,25 @@ class Meta:
         self.tap_requests = 0
         self.fail_tap_on: int | None = None
         self.before_tap: Callable[[], None] | None = None
+        # Requests for a glossary, each with the table it was sent, and whether the
+        # next one fails.
+        self.tables: list[Any] = []
+        self.fail_glossary = False
+        # What the next glossary is answered with, in place of the stand-in's form.
+        self.glossary_text: str | None = None
         self.api = MetaApi(input_tokens=1_000, create=self.create)
 
     def create(self, request: httpx2.Request) -> httpx2.Response:
         body = json.loads(request.content)
-        if body.get("text", {}).get("format", {}).get("name") != "transmission":
+        form = body.get("text", {}).get("format", {}).get("name")
+        if form == "glossary":
+            self.tables.append(json.loads(body["input"]))
+            if self.fail_glossary:
+                return httpx2.Response(500, json={"error": {"message": "It failed."}})
+            answer = dict(stand_in_learner(body))
+            if self.glossary_text is not None:
+                answer = dict(fake_response(text=self.glossary_text))
+        elif form != "transmission":
             self.tap_requests += 1
             if self.before_tap is not None:
                 self.before_tap()
@@ -342,7 +357,8 @@ class Meta:
 
     @property
     def paid(self) -> int:
-        return self.api.paths().count("/v1/responses")
+        """Paid requests for hearing and for taps: every one but the glossary's."""
+        return self.api.paths().count("/v1/responses") - len(self.tables)
 
 
 def hearer(
@@ -571,8 +587,8 @@ def test_a_replay_that_ember_fails_on_leaves_the_run_unfinished_and_counts_no_an
     status, said = command(env, site, *PAID, paid=meta.client(env))
     assert (status, meta.paid) == (1, paid)
     assert (
-        "leaving Muse Ember alone after a refusal or a failure in the replay of taps. "
-        "The hold has about 10 more minutes to run."
+        "leaving Muse Ember alone after a refusal or a failure in the replay of taps "
+        "or in learning the glossary. The hold has about 10 more minutes to run."
     ) in said
     assert layout.results.read_bytes() == kept
 
@@ -1691,7 +1707,7 @@ def test_what_a_paid_run_of_generated_speech_says_of_a_match_is_that_it_is_a_fit
         assert texts["unplaced"].endswith("names units and no place.")
 
 
-def test_once_taps_are_replayed_nothing_more_is_heard_so_every_answer_is_of_one_evidence(
+def test_once_a_hearing_is_complete_nothing_more_is_heard_so_all_made_of_it_is_of_one_evidence(
     env: dict[str, str], site: DataSf, recorder: tuple[Path, dict[str, Any]]
 ) -> None:
     root, by_digest = recorder
@@ -1719,15 +1735,18 @@ def test_once_taps_are_replayed_nothing_more_is_heard_so_every_answer_is_of_one_
     assert numbers_of(env) == first
     assert EvidenceStore(layout.evidence, "live").last_id() == 2
 
-    # A run with no taps is never closed: it hears what turns up.
-    other = Meta(run.Layout.under(env, "open"), heard_by(by_digest))
+    # A run with no taps is closed too, when its glossary is learned from the day.
+    other = Meta(run.Layout.under(env, "untapped"), heard_by(by_digest))
     untapped = (*RECORDED[:-1], "0", "--recordings", str(root))
-    for audio in (3, 3):
-        assert command(allowed, site, *untapped, paid=other.client(env), name="open")[0] == 0
-        assert len(other.audio) == audio
-    made = results.read(run.Layout.under(env, "open"))
+    assert command(allowed, site, *untapped, paid=other.client(env), name="untapped")[0] == 0
+    assert (len(other.audio), len(other.tables)) == (3, 1)
+    later = record(root, 6, datetime(2026, 3, 3, 21, 30, tzinfo=UTC))
+    by_digest[hashlib.sha256(later).hexdigest()] = by_digest[hashlib.sha256(late).hexdigest()]
+    assert command(allowed, site, *untapped, paid=other.client(env), name="untapped")[0] == 0
+    assert (len(other.audio), len(other.tables)) == (3, 1)
+    made = results.read(run.Layout.under(env, "untapped"))
     assert made is not None
-    assert results.CLOSED not in made["caveats"]
+    assert results.CLOSED in made["caveats"]
 
 
 def test_a_run_over_recordings_of_a_day_that_is_hardly_over_fetches_nothing(
