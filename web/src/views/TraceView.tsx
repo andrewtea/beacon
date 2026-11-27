@@ -1,4 +1,5 @@
 import { useEffect } from 'react'
+import type { Credit } from '../api/incidents.ts'
 import {
   type EmberCall,
   fetchTapRun,
@@ -79,6 +80,19 @@ function Kept({ returned }: { returned: Record<string, unknown> }) {
   )
 }
 
+/** Several sources' credits, each on a line of its own: one can be a sentence
+ * long, and two set end to end read as one. */
+function Credits({ credits }: { credits: Credit[] }) {
+  if (credits.length === 0) return null
+  return (
+    <p className="credits">
+      {credits.map((credit) => (
+        <CreditLine key={credit.text} credit={credit} />
+      ))}
+    </p>
+  )
+}
+
 function Call({ call }: { call: ToolCall }) {
   return (
     <li className={call.ok ? 'call' : 'call refused'}>
@@ -91,9 +105,7 @@ function Call({ call }: { call: ToolCall }) {
       )}
       <p className="asked">{call.text}</p>
       <p className="returned">{call.returned_text}</p>
-      {call.credits.map((credit) => (
-        <CreditLine key={credit.text} credit={credit} />
-      ))}
+      <Credits credits={call.credits} />
       <Kept returned={call.returned} />
       {call.ember !== null && (
         <>
@@ -122,6 +134,7 @@ function OutcomePanel({ outcome }: { outcome: Outcome }) {
             ` ${outcome.grounds_dropped} more did not hold and ${outcome.grounds_dropped === 1 ? 'was' : 'were'} dropped.`}
         </p>
       )}
+      <Credits credits={outcome.credits} />
       {outcome.crisis && (
         <div className="crisis-decision">
           <p>

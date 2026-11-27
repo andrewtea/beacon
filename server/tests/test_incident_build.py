@@ -2,12 +2,13 @@
 
 import math
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from beacon.evidence import NewEvidence, Point
 from beacon.incident import NO_BLOCKS, Blocks, Engine, Incident
-from beacon.incident.build import CREDIT_511
+from beacon.incident.build import CREDIT_511, CREDIT_ADSBLOL
 from beacon.ingest import nws, traffic511
 from beacon.redact import Names
 from tests.incident_rows import HAYES, Rows, area, at, mock_store
@@ -461,18 +462,26 @@ def test_a_closure_near_the_point_on_a_road_no_call_named_is_a_signal(rows: Rows
     assert len(incident.signals[0].sources) == 1
 
 
-def test_a_circling_helicopter_is_a_line_and_a_signal_and_a_high_airliner_is_neither(
-    rows: Rows,
-) -> None:
-    fire(rows)
+def circle(rows: Rows, **fields: Any) -> None:
+    """A helicopter that goes round the fire for six minutes."""
     for step in range(13):
         angle = math.tau * step * 30 / 108
         point = Point(
             HAYES.lat + 400 * math.cos(angle) / 111_320,
             HAYES.lon + 400 * math.sin(angle) / (111_320 * math.cos(math.radians(HAYES.lat))),
         )
-        rows.aircraft(1 + step / 2, point, icao24="heli01")
-        rows.aircraft(1 + step / 2, HAYES, icao24="high01", altitude_m=2500, category="large")
+        rows.aircraft(1 + step / 2, point, icao24="heli01", **fields)
+
+
+def test_a_circling_helicopter_is_a_line_and_a_signal_and_a_high_airliner_is_neither(
+    rows: Rows,
+) -> None:
+    fire(rows)
+    circle(rows, origin="live")
+    for step in range(13):
+        rows.aircraft(
+            1 + step / 2, HAYES, icao24="high01", altitude_m=2500, category="large", origin="live"
+        )
 
     (incident,) = incidents(rows, 10)
 
@@ -483,6 +492,52 @@ def test_a_circling_helicopter_is_a_line_and_a_signal_and_a_high_airliner_is_nei
     assert (entry.confidence, len(entry.sources)) == ("high", 2)
     (signal,) = incident.signals
     assert (signal.kind, signal.confidence) == ("aircraft_circling", "high")
+    # Every position is one adsb.lol answered with, so the line and the signal carry
+    # the notice its license asks for wherever something made from its data is shown.
+    sources = (*entry.sources, *signal.sources)
+    assert {source.credit for source in sources} == {CREDIT_ADSBLOL}
+    assert {source.label for source in sources} == {"adsb.lol aircraft positions"}
+    assert CREDIT_ADSBLOL.text == (
+        "Contains information from adsb.lol, which is made available here under the "
+        "Open Database License (ODbL). Beacon's aircraft rows are under the same license: "
+        "what Beacon keeps of adsb.lol's data, and how."
+    )
+    # The database, its license, and how Beacon's rows differ each have a link of
+    # their own, and the words between them have none.
+    assert [(part.text, part.url) for part in CREDIT_ADSBLOL.parts if part.url] == [
+        ("adsb.lol", "https://www.adsb.lol"),
+        ("Open Database License (ODbL)", "https://opendatacommons.org/licenses/odbl/1-0/"),
+        (
+            "what Beacon keeps of adsb.lol's data, and how",
+            "https://github.com/andrewtea/beacon/blob/main/docs/aircraft-data.md",
+        ),
+    ]
+    assert "".join(part.text for part in CREDIT_ADSBLOL.parts) == CREDIT_ADSBLOL.text
+
+
+@pytest.mark.parametrize(
+    ("fields", "label"),
+    [
+        # The invented scenario's positions are in adsb.lol's format and are not its.
+        ({"origin": "mock"}, "Aircraft positions"),
+        # A store from before Beacon asked adsb.lol holds positions under this name.
+        ({"origin": "mock", "source": "opensky"}, "OpenSky Network aircraft positions"),
+        ({"origin": "live", "source": "opensky"}, "OpenSky Network aircraft positions"),
+    ],
+)
+def test_an_aircraft_adsb_lol_did_not_answer_with_is_not_said_to_hold_its_information(
+    rows: Rows, fields: dict[str, Any], label: str
+) -> None:
+    fire(rows)
+    circle(rows, **fields)
+
+    (incident,) = incidents(rows, 10)
+
+    (entry,) = [entry for entry in incident.timeline if entry.kind == "aircraft"]
+    (signal,) = incident.signals
+    sources = (*entry.sources, *signal.sources)
+    assert {(source.credit, source.label) for source in sources} == {(None, label)}
+    assert {source.stand_in for source in sources} == {fields["origin"] == "mock"}
 
 
 def test_a_circling_aircraft_is_trusted_as_little_as_its_weakest_position(rows: Rows) -> None:

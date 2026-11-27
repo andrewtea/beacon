@@ -30,7 +30,7 @@ from beacon.places import (
     near,
     read_places,
 )
-from tests.incident_rows import HAYES, Rows, at, mock_store
+from tests.incident_rows import HAYES, Rows, at, credit_json, mock_store
 from tests.test_incident_aircraft import offset
 from tests.test_investigate import BLOCKS, NAMES, city
 from tests.test_taps import post_slowly
@@ -311,7 +311,7 @@ def test_a_distance_measured_from_a_point_of_511s_says_so_and_carries_511s_credi
     # The row the point is from, with how far it is trusted and 511's credit.
     source = fire["incident"]["point_source"]
     assert (source["source"], source["confidence"]) == ("511", "official")
-    assert source["credit"] == {"text": CREDIT_511.text, "url": CREDIT_511.url}
+    assert source["credit"] == credit_json(CREDIT_511)
     assert "closure" in {signal["kind"] for signal in fire["incident"]["signals"]}
 
     # 511 then lists the road open again. The point is still the earlier version's,

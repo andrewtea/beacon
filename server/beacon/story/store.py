@@ -39,7 +39,7 @@ from typing import Any, Literal
 
 from beacon.errors import raise_bare
 from beacon.files import begin_file
-from beacon.incident import Credit, Source
+from beacon.incident import Credit, CreditPart, Source
 from beacon.story.merge import Claim, Draft
 
 Mode = Literal["live", "mock"]
@@ -56,10 +56,23 @@ _WAIT_SECONDS = 5.0
 # `_EARLIER`: a file
 # of an earlier number then has its stories dropped when it is opened, and keeps its
 # claims. A file of any other number, which a newer Beacon wrote, is refused as it is.
-_FORMAT = 3
-# The earlier ones: 0 is a file that says none (the first shape, and a new file),
-# and 2 held sentences in words that have since changed.
+#
+# A change that leaves the stories of the shape before readable as they are raises
+# the number too, and names that shape in `_READABLE` instead: its stories are
+# kept. The number still goes up, so that an older Beacon refuses the file, where
+# it would have read the new stories without what they gained.
+_FORMAT = 4
+# The earlier ones whose stories are dropped: 0 is a file that says none (the first
+# shape, and a new file), and 2 held sentences in words that have since changed.
 _EARLIER = frozenset({0, 2})
+# The earlier ones whose stories are read as they are. 3 kept a credit as its words
+# and one link; this shape keeps the pieces of a credit that has several links
+# beside them (`_credit_json`), which a story of 3 reads as having none. A story of
+# 3 names each source by the feed, label, and credit its row had when the story was
+# written, and those stay true of the rows it cites: one written when aircraft came
+# in OpenSky's format cites those rows still, and nothing of adsb.lol's. Dropping it
+# would lose a story that was paid for and whose basis is claimed.
+_READABLE = frozenset({3})
 # One statement each: they are run inside the transaction that begins a file.
 _SCHEMA = (
     """
@@ -285,6 +298,7 @@ def _begin(path: Path, mode: Mode) -> None:
         earlier=_EARLIER,
         drop=("UPDATE story SET story = NULL, written_at = NULL WHERE story IS NOT NULL",),
         unknown=_UNKNOWN_SHAPE,
+        readable=_READABLE,
     )
     if refusal is not None:
         raise StoriesError(refusal)
@@ -372,10 +386,18 @@ def _source_json(source: Source) -> dict[str, Any]:
         "url": source.url,
         "stand_in": source.stand_in,
         "model": source.model,
-        "credit": None
-        if source.credit is None
-        else {"text": source.credit.text, "url": source.credit.url},
+        "credit": None if source.credit is None else _credit_json(source.credit),
     }
+
+
+def _credit_json(credit: Credit) -> dict[str, Any]:
+    """A credit as it is kept. One that is a single link is kept as shape 3 kept
+    it, and one whose words are in pieces has them beside it (`parts`), which a
+    story of shape 3 is read as having none of."""
+    kept: dict[str, Any] = {"text": credit.text, "url": credit.url}
+    if credit.parts:
+        kept["parts"] = [{"text": part.text, "url": part.url} for part in credit.parts]
+    return kept
 
 
 def _source_from(kept: dict[str, Any]) -> Source:
@@ -390,5 +412,11 @@ def _source_from(kept: dict[str, Any]) -> Source:
         url=kept["url"],
         stand_in=kept["stand_in"],
         model=kept["model"],
-        credit=None if credit is None else Credit(credit["text"], credit["url"]),
+        credit=None
+        if credit is None
+        else Credit(
+            credit["text"],
+            credit["url"],
+            tuple(CreditPart(part["text"], part["url"]) for part in credit.get("parts", ())),
+        ),
     )

@@ -348,6 +348,8 @@ def test_a_point_taken_from_511_goes_with_511s_credit_in_both_routes(tmp_path: P
         assert shown["point_source"]["credit"] == {
             "text": "data provided by 511.org",
             "url": "https://511.org",
+            # One link, so no pieces.
+            "parts": [],
         }
 
 
@@ -445,6 +447,7 @@ def test_the_routes_list_incidents_and_give_one_with_a_source_on_every_line(stor
     assert closure["sources"][0]["credit"] == {
         "text": "data provided by 511.org",
         "url": "https://511.org",
+        "parts": [],
     }
     order = next(item for item in fire["official"] if item["kind"] == "notice")
     assert (order["type"], order["reading"], order["withheld"]) == (

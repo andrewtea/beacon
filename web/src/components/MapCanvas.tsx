@@ -166,93 +166,96 @@ export function MapCanvas({
   return (
     <div className="map-wrap">
       <div className={tiles === null ? 'map-canvas plain' : 'map-canvas'}>
-        {frame.tiles.map((tile) => (
-          <img
-            key={tile.key}
-            className="map-tile"
-            src={tile.src}
-            alt=""
-            draggable={false}
-            decoding="async"
-            // The tile server asks for a Referer, and gets the site's address
-            // and no more: never the page, and so never a view's fragment.
-            referrerPolicy="strict-origin-when-cross-origin"
-            style={{
-              left: `${tile.left * 100}%`,
-              top: `${tile.top * 100}%`,
-            }}
-            // A tile that does not come leaves the plain ground showing.
-            onError={(event) => {
-              event.currentTarget.style.visibility = 'hidden'
-            }}
-          />
-        ))}
-        <svg
-          className="map-overlay"
-          viewBox={`0 0 ${SIZE} ${SIZE}`}
-          role="img"
-          aria-label="What Beacon places of this incident. Each numbered thing is described in the list below the map."
-        >
-          {features.map((feature, index) => (
-            <Shape key={index} frame={frame} feature={feature} />
+        <div className="map-ground">
+          {frame.tiles.map((tile) => (
+            <img
+              key={tile.key}
+              className="map-tile"
+              src={tile.src}
+              alt=""
+              draggable={false}
+              decoding="async"
+              // The tile server asks for a Referer, and gets the site's address
+              // and no more: never the page, and so never a view's fragment.
+              referrerPolicy="strict-origin-when-cross-origin"
+              style={{
+                left: `${tile.left * 100}%`,
+                top: `${tile.top * 100}%`,
+              }}
+              // A tile that does not come leaves the plain ground showing.
+              onError={(event) => {
+                event.currentTarget.style.visibility = 'hidden'
+              }}
+            />
           ))}
-          {marks.map(
-            (mark, index) =>
-              led(mark) && (
-                <g key={index}>
-                  <line
-                    className="map-leader-casing"
-                    x1={mark.anchor.x.toFixed(2)}
-                    y1={mark.anchor.y.toFixed(2)}
-                    x2={mark.number.x.toFixed(2)}
-                    y2={mark.number.y.toFixed(2)}
+          <svg
+            className="map-overlay"
+            viewBox={`0 0 ${SIZE} ${SIZE}`}
+            role="img"
+            aria-label="What Beacon places of this incident. Each numbered thing is described in the list below the map."
+          >
+            {features.map((feature, index) => (
+              <Shape key={index} frame={frame} feature={feature} />
+            ))}
+            {marks.map(
+              (mark, index) =>
+                led(mark) && (
+                  <g key={index}>
+                    <line
+                      className="map-leader-casing"
+                      x1={mark.anchor.x.toFixed(2)}
+                      y1={mark.anchor.y.toFixed(2)}
+                      x2={mark.number.x.toFixed(2)}
+                      y2={mark.number.y.toFixed(2)}
+                    />
+                    <line
+                      className="map-leader"
+                      x1={mark.anchor.x.toFixed(2)}
+                      y1={mark.anchor.y.toFixed(2)}
+                      x2={mark.number.x.toFixed(2)}
+                      y2={mark.number.y.toFixed(2)}
+                    />
+                  </g>
+                ),
+            )}
+            {marks.map(
+              (mark, index) =>
+                mark !== null &&
+                mark.dot && (
+                  <circle
+                    key={index}
+                    className="map-dot"
+                    cx={mark.anchor.x.toFixed(2)}
+                    cy={mark.anchor.y.toFixed(2)}
+                    r={DOT}
                   />
-                  <line
-                    className="map-leader"
-                    x1={mark.anchor.x.toFixed(2)}
-                    y1={mark.anchor.y.toFixed(2)}
-                    x2={mark.number.x.toFixed(2)}
-                    y2={mark.number.y.toFixed(2)}
-                  />
-                </g>
-              ),
-          )}
-          {marks.map(
-            (mark, index) =>
-              mark !== null &&
-              mark.dot && (
-                <circle
+                ),
+            )}
+            {features.map((feature, index) => {
+              const mark = marks[index]
+              if (mark === null) return null
+              return (
+                <g
                   key={index}
-                  className="map-dot"
-                  cx={mark.anchor.x.toFixed(2)}
-                  cy={mark.anchor.y.toFixed(2)}
-                  r={DOT}
-                />
-              ),
+                  className={`map-mark map-mark-${feature.kind}`}
+                  transform={`translate(${mark.number.x.toFixed(2)} ${mark.number.y.toFixed(2)})`}
+                >
+                  <circle r={DISC} />
+                  <text textAnchor="middle" dy="0.35em">
+                    {index + 1}
+                  </text>
+                </g>
+              )
+            })}
+          </svg>
+          {invented && (
+            <span className="tag stand-in map-invented">Invented scenario</span>
           )}
-          {features.map((feature, index) => {
-            const mark = marks[index]
-            if (mark === null) return null
-            return (
-              <g
-                key={index}
-                className={`map-mark map-mark-${feature.kind}`}
-                transform={`translate(${mark.number.x.toFixed(2)} ${mark.number.y.toFixed(2)})`}
-              >
-                <circle r={DISC} />
-                <text textAnchor="middle" dy="0.35em">
-                  {index + 1}
-                </text>
-              </g>
-            )
-          })}
-        </svg>
-        {invented && (
-          <span className="tag stand-in map-invented">Invented scenario</span>
-        )}
-        {/* The words the tiles' terms and each source's terms ask for, on the
-            picture itself: 511's are here whenever something of 511's is
-            drawn, with a street map under it or not. */}
+        </div>
+        {/* The words the tiles' terms and each source's terms ask for, in the
+            picture's own frame, along its lower edge, where they cover nothing
+            that is drawn: a source's are here whenever something of that
+            source's is drawn, with a street map under it or not. */}
         {(tiles !== null || credits.length > 0) && (
           <p className="map-credits">
             {tiles !== null && (

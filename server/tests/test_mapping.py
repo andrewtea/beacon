@@ -14,7 +14,7 @@ from beacon.incident.places import NO_BLOCKS
 from beacon.main import create_app
 from beacon.mapping import NO_MAP_OF_MEDICAL, NO_POINT, Feature, drawn
 from beacon.mapping import features as mapping
-from tests.incident_rows import HAYES, Rows, at, mock_store
+from tests.incident_rows import HAYES, Rows, at, credit_json, mock_store
 from tests.test_incident_aircraft import circle, offset
 from tests.test_investigate import BLOCKS, NAMES, city
 
@@ -171,7 +171,7 @@ def test_an_aircraft_of_the_timeline_is_drawn_where_it_was_seen_oldest_first(row
     # The line the timeline has for it, with that line's sources and confidence.
     assert aircraft.text == line_of(fire, "aircraft", track.rows[0].id)
     assert aircraft.text.startswith("A helicopter (TEST1) circled nearby")
-    assert {source.source for source in aircraft.sources} == {"opensky"}
+    assert {source.source for source in aircraft.sources} == {"adsblol"}
     assert (aircraft.confidence, aircraft.note) == ("high", None)
 
 
@@ -488,7 +488,7 @@ def test_the_map_of_an_incident_has_each_thing_with_its_words_its_confidence_and
         assert all(source["stand_in"] for source in feature["sources"])
     place, event, aircraft, alert = features
     assert place["point"] == {"lat": 37.7766, "lon": -122.4236}
-    assert event["sources"][0]["credit"] == {"text": CREDIT_511.text, "url": CREDIT_511.url}
+    assert event["sources"][0]["credit"] == credit_json(CREDIT_511)
     assert len(aircraft["path"]) == 9
     assert set(aircraft["path"][0]) == {"lat", "lon", "at"}
     assert [[len(ring) for ring in rings] for rings in alert["polygons"]] == [[5]]

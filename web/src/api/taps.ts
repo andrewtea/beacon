@@ -110,6 +110,8 @@ export type Outcome = {
   text: string
   incident_id: string | null
   grounds: string[]
+  // The credits of the feeds the grounds rested on, each once.
+  credits: Credit[]
   grounds_dropped: number
   confidence: 'medium' | 'low' | null
   crisis: boolean

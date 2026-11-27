@@ -254,6 +254,17 @@ p {
   color: var(--text-soft);
 }
 
+/* A credit in pieces: each link is in the credit's own colour, and underlined,
+   so that where one link ends and the next begins can be seen. */
+.credit a {
+  color: inherit;
+  text-decoration: underline;
+}
+
+.credits .credit {
+  display: block;
+}
+
 /* Actions */
 
 .action {
@@ -1174,19 +1185,25 @@ button.quiet:hover {
   margin-top: 1rem;
 }
 
+/* The picture's frame: the square that is drawn on, and under it, inside the
+   same border, the credits of what is drawn. */
 .map-canvas {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.map-ground {
   position: relative;
   width: 100%;
   aspect-ratio: 1;
   overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
   /* The ground a tile leaves when it does not come, and the whole ground when
      no street map is drawn. */
   background: #dfe6ec;
 }
 
-.map-canvas.plain {
+.map-canvas.plain .map-ground {
   background:
     linear-gradient(#c9d3dc 1px, transparent 1px) 0 0 / 100% 33.34%,
     linear-gradient(90deg, #c9d3dc 1px, transparent 1px) 0 0 / 33.34% 100%,
@@ -1304,20 +1321,20 @@ button.quiet:hover {
   background: var(--bg);
 }
 
+/* A strip along the picture's lower edge, and not laid over it: a credit can
+   be a sentence long, and would cover what is drawn. */
 .map-credits {
-  position: absolute;
-  right: 0;
-  bottom: 0;
   display: flex;
   flex-wrap: wrap;
   justify-content: flex-end;
-  gap: 0 0.75rem;
-  max-width: 100%;
+  gap: 0.1rem 0.75rem;
   margin: 0;
-  padding: 0.15rem 0.45rem;
-  border-top-left-radius: 0.4rem;
-  background: rgb(255 255 255 / 88%);
+  padding: 0.3rem 0.5rem;
+  background: #f4f7fa;
   font-size: 0.78rem;
+  line-height: 1.35;
+  text-align: right;
+  overflow-wrap: anywhere;
 }
 
 .map-credits .credit {

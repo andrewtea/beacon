@@ -7,7 +7,12 @@ export type Confidence = 'official' | 'high' | 'medium' | 'low'
 export type Mode = 'live' | 'mock'
 
 /** Words a source's terms require beside anything shown from it, and their link. */
-export type Credit = { text: string; url: string }
+/** Words a source's terms require beside what is shown from it. `parts` are the
+ * same words in pieces, each with a link of its own or none, for a credit whose
+ * terms ask for several links (adsb.lol's); it is empty for one that is `text`
+ * linked to `url`. */
+export type CreditPart = { text: string; url: string | null }
+export type Credit = { text: string; url: string; parts: CreditPart[] }
 
 export type Source = {
   kind: string

@@ -14,6 +14,10 @@ written once:
 - **A new file, and a file of an earlier shape, are made this shape.** What a file
   of an earlier shape held that this one cannot read is dropped by the statements
   the caller gives, and the rest, which is what was claimed and paid for, stays.
+  An earlier shape whose rows this one reads as they are (`readable`) is given this
+  shape's number and loses nothing. It gets the number all the same: an older
+  Beacon, which would read this one's rows without what they have gained, then
+  refuses the file instead.
 - **A file in any other shape, and a file of the other mode, are refused, and
   nothing of a refused file is written**: no table, no row, no journal mode. A file
   a newer Beacon wrote is the record of what it paid for, and is not this one's to
@@ -41,6 +45,7 @@ def begin_file(
     earlier: Collection[int],
     drop: Sequence[str],
     unknown: str,
+    readable: Collection[int] = (),
 ) -> str | None:
     """Make the file at `path` the `mode` one in `shape`, or say why it is refused.
 
@@ -48,7 +53,9 @@ def begin_file(
     when its table is there. It has a table `meta (key, value)`, in which the file's
     mode is kept. `earlier` are the shapes this one can be made from, with 0 for a
     file that says none, which a new file is too; `drop` is run on a file of one of
-    them. `what` names the file in a refusal (`stories`), and `unknown` is the
+    them. `readable` are the earlier shapes whose rows this one reads as they are:
+    a file of one of them gets this shape's number, and `drop` is not run on it.
+    `what` names the file in a refusal (`stories`), and `unknown` is the
     refusal of a file in a shape that is neither.
 
     Returns None for a file that is now this mode's and this shape's, and else the
@@ -59,14 +66,16 @@ def begin_file(
         db.execute("BEGIN IMMEDIATE")
         try:
             found = db.execute("PRAGMA user_version").fetchone()[0]
-            refusal = _refusal(db, found, mode, what, shape, earlier, unknown)
+            known = {*earlier, *readable}
+            refusal = _refusal(db, found, mode, what, shape, known, unknown)
             if refusal is None:
                 for statement in schema:
                     db.execute(statement)
                 db.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('mode', ?)", (mode,))
                 if found != shape:
-                    for statement in drop:
-                        db.execute(statement)
+                    if found not in readable:
+                        for statement in drop:
+                            db.execute(statement)
                     db.execute(f"PRAGMA user_version = {int(shape)}")
         except BaseException:
             db.execute("ROLLBACK")

@@ -31,17 +31,17 @@ import math
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, get_args
 
 from beacon.errors import raise_bare
 
-# What a row is about. A kind can have more than one source over time: aircraft can
-# come from OpenSky or airplanes.live.
+# What a row is about. A kind can have more than one source over time: aircraft
+# came from OpenSky's format once, and come from adsb.lol's now.
 Kind = Literal["radio", "aircraft", "alert", "traffic", "notice", "tap"]
 # How far to trust what the row says, strongest first. `official` is an authority
 # speaking for itself: a weather alert, a road closure, an evacuation order.
@@ -132,7 +132,7 @@ class NewEvidence:
     """One thing a source said, before it is stored."""
 
     kind: Kind
-    # The feed it came from, such as `nws` or `opensky`.
+    # The feed it came from, such as `nws` or `adsblol`.
     source: str
     # The source's own name for this item: an alert id, a call id, a transponder
     # address with a time. A source and a reference name one row, so a poller can
@@ -342,6 +342,53 @@ class EvidenceStore:
                 raise
         if closed:
             raise_bare(EvidenceStoreError(_CLOSED))
+
+    def reserve(
+        self, name: str, *, clock: Callable[[], datetime], seconds: float, longest: timedelta
+    ) -> datetime | None:
+        """Have a poller promise to leave its source alone for `seconds` from now,
+        unless a promise it made before still stands. Returns None when the promise
+        is made, and the moment of the standing one when it is not: the caller then
+        asks its source nothing.
+
+        `clock` is read once the write transaction has begun, and not before:
+        waiting for the file can take as long as an interval, and a promise counted
+        from before the wait could be over when it is made. The look and the write
+        are that one transaction, so of two processes on one file that both find
+        the time come, one makes the promise and the other is told of it. The
+        promise is kept in the poller's state as `not_before`, beside whatever else
+        the poller saved. One that is further off than `longest` is from a clock
+        that has since been set back: it is written down as `longest` from now,
+        once, and stands until then.
+
+        Raises EvidenceStoreError when the store is closed. Nothing is promised
+        then, and the caller asks its source nothing."""
+        with self._writing() as db:
+            now = clock()
+            saved = _saved_state(db, name)
+            standing = _standing(db, name, saved, now, longest)
+            if standing is not None and now < standing:
+                return standing
+            until = now + min(timedelta(seconds=seconds), longest)
+            _save_not_before(db, name, saved, until, now)
+            return None
+
+    def postpone(
+        self, name: str, *, until: datetime, clock: Callable[[], datetime], longest: timedelta
+    ) -> None:
+        """Move a poller's promise on to `until`, when that is later than the one
+        that stands, and never the other way: a wait a source asked for is not cut
+        short by one that ends sooner. One write transaction, as `reserve` is, with
+        `clock` read inside it, and no further off than `longest` from then.
+
+        Raises EvidenceStoreError when the store is closed."""
+        with self._writing() as db:
+            now = clock()
+            saved = _saved_state(db, name)
+            standing = _standing(db, name, saved, now, longest)
+            moment = min(until, now + longest)
+            if standing is None or moment > standing:
+                _save_not_before(db, name, saved, moment, now)
 
     def state(self, name: str) -> dict[str, Any]:
         """What the poller of that name saved last, or an empty mapping."""
@@ -618,6 +665,46 @@ def _distance_m(lat_a: float, lon_a: float, lat_b: float, lon_b: float) -> float
     half_lon = math.radians(lon_b - lon_a) / 2
     chord = math.sin(half_lat) ** 2 + math.cos(phi_a) * math.cos(phi_b) * math.sin(half_lon) ** 2
     return 2 * _EARTH_RADIUS_M * math.asin(min(1.0, math.sqrt(chord)))
+
+
+def _saved_state(db: sqlite3.Connection, name: str) -> dict[str, Any]:
+    row = db.execute("SELECT state FROM poller_state WHERE name = ?", (name,)).fetchone()
+    saved = {} if row is None else json.loads(row[0])
+    return saved if isinstance(saved, dict) else {}
+
+
+def _standing(
+    db: sqlite3.Connection, name: str, saved: Mapping[str, Any], now: datetime, longest: timedelta
+) -> datetime | None:
+    """The moment a poller promised to leave its source alone until, or None when
+    it wrote none that can be read. One further off than `longest` from now is
+    written down as that, here, so that the longest wait is counted from the first
+    time it is seen and does not begin again at every look."""
+    text = saved.get("not_before")
+    if not isinstance(text, str) or len(text) > 40:
+        return None
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if moment.utcoffset() is None:
+        return None
+    if moment > now + longest:
+        moment = now + longest
+        _save_not_before(db, name, saved, moment, now)
+    return moment
+
+
+def _save_not_before(
+    db: sqlite3.Connection, name: str, saved: Mapping[str, Any], moment: datetime, now: datetime
+) -> None:
+    state = dict(saved) | {"not_before": moment.astimezone(UTC).isoformat()}
+    db.execute(
+        "INSERT INTO poller_state (name, state, updated_ms) VALUES (?, ?, ?) "
+        "ON CONFLICT (name) DO UPDATE SET state = excluded.state, "
+        "updated_ms = excluded.updated_ms",
+        (name, _json(state, "A poller's state"), _to_ms(now)),
+    )
 
 
 def _to_ms(moment: datetime) -> int:

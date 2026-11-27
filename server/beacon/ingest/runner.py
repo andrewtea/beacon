@@ -33,6 +33,12 @@ class PollReport:
     # Whether the source's answer was not read to its end, so that items it lists
     # can be missing from this poll.
     partial: bool = False
+    # Set by a poller that asked its source nothing because it is not yet time to,
+    # as one that keeps to a source's allowance does: the seconds until it is. The
+    # runner then polls it again after that long and not after its interval, and
+    # the poll changes nothing of what is known of the source, since nothing was
+    # learned of it. None for a poll that asked.
+    again_in: float | None = None
 
 
 @dataclass(frozen=True)
@@ -184,6 +190,15 @@ class Runner:
                     # the traffic.
                     logger.error("The %s poller failed (%s).", poller.name, type(error).__name__)
             else:
+                if report.again_in is not None:
+                    # Nothing was asked, so there is nothing to report or to log, and
+                    # the poller's last poll stays its last. The clock is read again:
+                    # the poller counted from when it looked.
+                    results[poller.name] = report
+                    self._due[poller.name] = self._clock.now() + timedelta(
+                        seconds=_seconds(report.again_in) or 1.0
+                    )
+                    continue
                 if report.unreadable:
                     logger.warning(
                         "%s sent %d items Beacon could not read.", poller.name, report.unreadable

@@ -29,7 +29,8 @@ from beacon.ember import (
     fake_response,
 )
 from beacon.evidence import Point
-from beacon.incident import Blocks, Engine, Incident, open_engine
+from beacon.incident import Blocks, Credit, Engine, Incident, Source, open_engine
+from beacon.incident.build import CREDIT_511, CREDIT_ADSBLOL
 from beacon.ingest import Clock, build
 from beacon.ingest.paid import HELD_INTERVAL_SECONDS, UNUSABLE_RUN_LIMIT
 from beacon.ingest.runner import PollerHeldError
@@ -382,8 +383,10 @@ def test_the_words_of_a_story_are_not_changed_without_the_files_number() -> None
     # sentence changed, raise `_FORMAT` in story/store.py and add the old number to
     # `_EARLIER`, so that kept stories in the old words are dropped; then put the
     # new number and digest here.
-    assert (store_module._FORMAT, digest) == (3, "df9585d83d76aaa6")
-    assert store_module._FORMAT not in store_module._EARLIER
+    assert (store_module._FORMAT, digest) == (4, "df9585d83d76aaa6")
+    assert store_module._FORMAT not in store_module._EARLIER | store_module._READABLE
+    # The words did not change from 3 to 4, so the stories of 3 are kept.
+    assert {3} == store_module._READABLE
 
 
 def test_an_event_that_left_511s_list_and_came_back_is_not_told_as_gone(
@@ -617,6 +620,33 @@ OLD_STORIES = {
         "latency_ms": 1,
     },
 }
+# A story of the shape before this one, from before Beacon asked adsb.lol: an
+# aircraft's line that cites a row in OpenSky's format, under that feed's name and
+# label, with a credit kept as its words and one link.
+BEFORE_ADSBLOL = OLD_STORIES[2] | {
+    "claims": [
+        {
+            "kind": "aircraft",
+            "text": "A helicopter (MOCKH1) circled nearby for about 6 min, as low as 300 m.",
+            "at": "2026-11-27T20:00:20+00:00",
+            "confidence": "high",
+            "sources": [
+                {
+                    "kind": "aircraft",
+                    "source": "opensky",
+                    "label": "OpenSky Network aircraft positions",
+                    "confidence": "high",
+                    "at": "2026-11-27T20:00:20+00:00",
+                    "evidence_id": 7,
+                    "url": None,
+                    "stand_in": True,
+                    "model": None,
+                    "credit": None,
+                }
+            ],
+        }
+    ]
+}
 SCHEMA = """
 CREATE TABLE story (incident_id TEXT NOT NULL, basis TEXT NOT NULL, claimed_at TEXT NOT NULL,
     written_at TEXT, story TEXT, PRIMARY KEY (incident_id, basis));
@@ -633,7 +663,7 @@ def old_file(tmp_path: Path, shape: int, journal: str = "wal") -> Path:
     one story, and one claim with no story."""
     path = tmp_path / "story" / "mock.sqlite3"
     path.parent.mkdir(parents=True)
-    story = json.dumps(OLD_STORIES.get(shape, OLD_STORIES[2]))
+    story = json.dumps(BEFORE_ADSBLOL if shape == 3 else OLD_STORIES.get(shape, OLD_STORIES[2]))
     db = sqlite3.connect(path, isolation_level=None)
     db.execute(f"PRAGMA journal_mode = {journal}")
     db.executescript(SCHEMA.replace(":story", "'" + story.replace("'", "''") + "'"))
@@ -676,6 +706,54 @@ def test_a_file_of_an_earlier_shape_keeps_its_claims_and_none_of_its_stories(
     assert opened.claim("inc-a", "three", at(5), timedelta(0))
     written = opened.write("inc-a", "three", draft_of(rows, storage), stand_in=True, now=at(6))
     assert stories(tmp_path).latest("inc-a") == written
+
+
+def test_a_file_of_the_shape_before_keeps_its_stories_and_gets_this_shapes_number(
+    tmp_path: Path,
+) -> None:
+    path = old_file(tmp_path, 3)
+    before = file_rows(path)
+
+    opened = stories(tmp_path)
+
+    # The story was paid for and its basis is claimed, so it could not be made
+    # again. It cites a row in OpenSky's format and says so, as it did: nothing of
+    # it is put under adsb.lol's name, and it has no notice of adsb.lol's.
+    story = opened.latest("inc-a")
+    assert story is not None
+    (claim,) = story.claims
+    (source,) = claim.sources
+    assert (source.source, source.label) == ("opensky", "OpenSky Network aircraft positions")
+    assert (source.stand_in, source.credit) == (True, None)
+    # Nothing of the file changed but its number, which is this shape's now: a
+    # Beacon of before, which would read a credit of this shape without its
+    # pieces, refuses the file from here on.
+    assert file_rows(path) == [store_module._FORMAT, *before[1:]]
+    assert before[0] == 3
+    assert not opened.claim("inc-a", "one", at(5), timedelta(0))
+
+
+def test_a_credit_in_pieces_is_kept_with_its_pieces_and_one_link_as_it_always_was() -> None:
+    def source(credit: Credit) -> Source:
+        return Source(
+            kind="aircraft",
+            source="adsblol",
+            label="adsb.lol aircraft positions",
+            confidence="high",
+            at=at(1),
+            evidence_id=7,
+            url=None,
+            stand_in=False,
+            credit=credit,
+        )
+
+    kept = store_module._source_json(source(CREDIT_ADSBLOL))
+    assert store_module._source_from(json.loads(json.dumps(kept))).credit == CREDIT_ADSBLOL
+    # 511's is one link, and is kept in the two fields the shape before had for a
+    # credit, which is how a story of that shape is read.
+    kept = store_module._source_json(source(CREDIT_511))
+    assert kept["credit"] == {"text": "data provided by 511.org", "url": "https://511.org"}
+    assert store_module._source_from(kept).credit == CREDIT_511
 
 
 @pytest.mark.parametrize("journal", ["delete", "wal"])

@@ -4,13 +4,14 @@ In mock mode the pollers are the real ones, and this stands where the network wo
 be: it answers a request to a source's address with what the scenario says that
 source would have answered at the clock's moment. It is strict about what it is
 asked, so a poller that would be refused by the real source is refused here: NWS
-needs a User-Agent, 511 a token, OpenSky its bounding box, and OpenMHz a time and
-the talkgroups to list. The notices feed is on a host of the story's own.
+needs a User-Agent, 511 a token, adsb.lol a point and a radius it answers for, and
+OpenMHz a time and the talkgroups to list. The notices feed is on a host of the story's own.
 
 A request to any other address gets a 404, and nothing here opens a connection.
 """
 
 import json
+import re
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any
@@ -20,7 +21,8 @@ import httpx2
 from beacon.scenario import notices, radio
 from beacon.scenario.fire import Scenario
 
-_OPENSKY_BOX = ("lamin", "lomin", "lamax", "lomax")
+# `/v2/point/{lat}/{lon}/{radius}`, with the radius in whole nautical miles.
+_ADSBLOL_POINT = re.compile(r"/v2/point/(-?\d+(?:\.\d+)?)/(-?\d+(?:\.\d+)?)/(\d+)")
 
 
 def scenario_transport(scenario: Scenario, now: Callable[[], datetime]) -> httpx2.MockTransport:
@@ -33,10 +35,15 @@ def scenario_transport(scenario: Scenario, now: Callable[[], datetime]) -> httpx
             if not request.headers.get("user-agent", "").startswith("Beacon"):
                 return httpx2.Response(403, json={"title": "Forbidden"})
             return _json(scenario.nws_alerts(now()), "application/geo+json")
-        if place == ("GET", "opensky-network.org", "/api/states/all"):
-            if any(name not in url.params for name in _OPENSKY_BOX):
-                return httpx2.Response(400, text="A bounding box is required.")
-            return _json(scenario.opensky_states(now()))
+        if (request.method, url.host) == ("GET", "api.adsb.lol"):
+            asked = _ADSBLOL_POINT.fullmatch(url.path)
+            if asked is None:
+                return httpx2.Response(404, json={"detail": "Not Found"})
+            if not (
+                abs(float(asked[1])) <= 90 and abs(float(asked[2])) <= 180 and int(asked[3]) <= 250
+            ):
+                return httpx2.Response(422, json={"detail": "A point and up to 250 nm."})
+            return _json(scenario.adsblol_point(now()))
         if place == ("GET", "api.511.org", "/traffic/events"):
             if not url.params.get("api_key"):
                 return httpx2.Response(401, text="Unauthorized")

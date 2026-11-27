@@ -1,6 +1,8 @@
 """Aircraft over a place: positions put together into tracks, and whether one circles.
 
-OpenSky gives one row for each position of each aircraft, about every thirty seconds.
+The aircraft poller (`beacon.ingest.adsblol`) gives one row for each position of each
+aircraft it was shown: about every thirty seconds in the mock scenario, and for real
+as often as adsb.lol's allowance lets it ask, which with no key is every three minutes.
 A `Track` is one aircraft's positions near a place over a span of time, and what
 plain arithmetic says about it: how long it stayed, how near and how low it came, and
 whether it went round. Deciding that an aircraft is circling is done here, in code
@@ -10,13 +12,16 @@ An aircraft is **circling** when it stayed near the place for `CIRCLING_MINUTES`
 went round: seen from the middle of its own positions, it was in at least six of the
 eight parts of the compass, at a distance that is a circle and not a hover
 (`_MIN_RADIUS_M`). Six and not all eight, because a position every thirty seconds
-catches a turn of a minute or two at only a few points. One that passed straight
+catches a turn of a minute or two at only a few points. Positions three minutes apart
+fall wherever on the circle the aircraft happens to be, so an aircraft that circles
+is seen to only after six of them or more: a quarter of an hour at the least, where
+half a minute apart it takes three. One that passed straight
 over was on two sides of that middle. The middle is the track's own
 and not the place, so an aircraft that circles something beside the place is still
 seen to circle.
 
-What this cannot say: whose aircraft it is. A row has a callsign and OpenSky's
-category (`rotorcraft`), and Beacon has no list of fire, police, or news aircraft.
+What this cannot say: whose aircraft it is. A row has a callsign and the category
+the aircraft broadcasts (`rotorcraft`), and Beacon has no list of fire, police, or news aircraft.
 """
 
 import math
@@ -46,7 +51,7 @@ class Track:
 
     icao24: str
     callsign: str | None
-    # OpenSky's category, such as `rotorcraft`, or None.
+    # The category the aircraft broadcasts, such as `rotorcraft`, or None.
     category: str | None
     first_seen: datetime
     last_seen: datetime

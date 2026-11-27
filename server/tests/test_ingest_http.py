@@ -17,9 +17,9 @@ import httpx2
 import pytest
 
 from beacon.ingest import http as source_http
+from beacon.ingest.adsblol import parse_aircraft
 from beacon.ingest.http import SourceError, SourceHttp, fetch, read_json
 from beacon.ingest.nws import parse_alerts
-from beacon.ingest.opensky import parse_states
 from beacon.ingest.traffic511 import parse_events
 
 TOKEN = "secret-token-123"
@@ -189,7 +189,7 @@ def test_a_reply_packed_another_way_is_refused(server: Server) -> None:
             600.0,
         ),
         ({"Retry_After": "Sun Nov 6 09:49:37 1994", "Date": "Sun, 06 Nov 1994 08:49:37 GMT"}, None),
-        # OpenSky's own header is a number and nothing else.
+        # The header some APIs send in its place is a number and nothing else.
         ({"X_Rate_Limit_Retry_After_Seconds": "Fri, 27 Nov 2099 20:30:00 GMT"}, None),
         ({"Retry_After": "inf"}, None),
         ({"Retry_After": "nan"}, None),
@@ -260,7 +260,7 @@ def test_a_failure_keeps_nothing_of_an_error_the_caller_was_handling(server: Ser
         # What reads the JSON raises the same way.
         lambda: parse_alerts({"title": "Jane Doe"}, "mock"),
         lambda: parse_events(["Jane Doe"], "mock"),
-        lambda: parse_states({"message": "Jane Doe"}, "mock"),
+        lambda: parse_aircraft({"message": "Jane Doe"}, "mock"),
     ):
         with pytest.raises(SourceError) as failure:
             _while_handling(ValueError("Jane Doe"), reading)

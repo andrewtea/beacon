@@ -11,9 +11,9 @@ A source needs no code change to go live, only its name in that list and what it
 
     nws       nothing
     511       BEACON_511_API_KEY
-    opensky   BEACON_OPENSKY_PERMITTED=1, which says OpenSky has given Beacon the
-              written license its terms require, and optionally OPENSKY_CLIENT_ID
-              and OPENSKY_CLIENT_SECRET for a larger quota
+    adsblol   nothing; optionally BEACON_ADSBLOL_API_KEY, a key of adsb.lol's, and
+              with it BEACON_ADSBLOL_REQUESTS_PER_DAY, what the key allows, without
+              which a key is taken to allow the 500 a day that no key does
     openmhz   BEACON_OPENMHZ_PERMITTED=1, which says OpenMHz has given Beacon
               permission to use its audio; BEACON_OPENMHZ_TALKGROUPS, the channels
               to hear; BEACON_OPENMHZ_BUDGET_USD, the most hearing them may cost;
@@ -53,6 +53,7 @@ from beacon.ember import EmberClient, SpendScope, Storage
 from beacon.ember.client import REQUEST_TIMEOUT_SECONDS, default_data_dir
 from beacon.ember.pricing import parse_usd
 from beacon.evidence import EvidenceStore, Mode
+from beacon.ingest.adsblol import MAX_REQUESTS_PER_DAY, MOCK_INTERVAL_SECONDS, AdsbLolAircraft
 from beacon.ingest.http import SourceHttp
 from beacon.ingest.notices import SCOPE as NOTICES_SCOPE
 from beacon.ingest.notices import NoticeFeed
@@ -60,7 +61,6 @@ from beacon.ingest.nws import NwsAlerts
 from beacon.ingest.openmhz import PAGE_SIZE as OPENMHZ_PAGE_SIZE
 from beacon.ingest.openmhz import SCOPE as RADIO_SCOPE
 from beacon.ingest.openmhz import OpenMhzRadio
-from beacon.ingest.opensky import SIGNED_IN_INTERVAL_SECONDS, OpenSkyAircraft
 from beacon.ingest.runner import Clock, PaidWork, Poller, PollerStatus, Runner
 from beacon.ingest.traffic511 import Traffic511
 from beacon.radio import Ffmpeg, Known, core_dump_problem, forbid_core_dumps
@@ -70,13 +70,12 @@ from beacon.scenario import notices as scenario_notices
 from beacon.scenario import radio as scenario_radio
 
 # The sources that can be named in BEACON_LIVE_SOURCES.
-SOURCES = ("nws", "opensky", "511", "openmhz", "notices")
+SOURCES = ("nws", "adsblol", "511", "openmhz", "notices")
 
 LIVE_SOURCES_VARIABLE = "BEACON_LIVE_SOURCES"
 KEY_511_VARIABLE = "BEACON_511_API_KEY"
-OPENSKY_PERMITTED_VARIABLE = "BEACON_OPENSKY_PERMITTED"
-OPENSKY_ID_VARIABLE = "OPENSKY_CLIENT_ID"
-OPENSKY_SECRET_VARIABLE = "OPENSKY_CLIENT_SECRET"
+ADSBLOL_KEY_VARIABLE = "BEACON_ADSBLOL_API_KEY"
+ADSBLOL_REQUESTS_VARIABLE = "BEACON_ADSBLOL_REQUESTS_PER_DAY"
 OPENMHZ_PERMITTED_VARIABLE = "BEACON_OPENMHZ_PERMITTED"
 OPENMHZ_TALKGROUPS_VARIABLE = "BEACON_OPENMHZ_TALKGROUPS"
 OPENMHZ_EMS_TALKGROUPS_VARIABLE = "BEACON_OPENMHZ_EMS_TALKGROUPS"
@@ -337,7 +336,7 @@ def build(env: Mapping[str, str], clock: Clock | None = None) -> Ingest:
     )
     pollers = [
         NwsAlerts(http),
-        OpenSkyAircraft(http, interval_seconds=SIGNED_IN_INTERVAL_SECONDS),
+        AdsbLolAircraft(http, interval_seconds=MOCK_INTERVAL_SECONDS),
         Traffic511(http, api_key="mock"),
         radio,
         notices,
@@ -360,23 +359,8 @@ def source_pollers(
     pollers: list[Poller] = []
     if "nws" in sources:
         pollers.append(NwsAlerts(http))
-    if "opensky" in sources:
-        if env.get(OPENSKY_PERMITTED_VARIABLE) != "1":
-            raise IngestConfigError(
-                f"{LIVE_SOURCES_VARIABLE} names opensky, and OpenSky's terms of use "
-                "(https://opensky-network.org/about/terms-of-use) require a written "
-                "license for using its REST API in a running service. Ask "
-                f"contact@opensky-network.org, and set {OPENSKY_PERMITTED_VARIABLE}=1 "
-                "once the license is given."
-            )
-        client_id = env.get(OPENSKY_ID_VARIABLE) or None
-        client_secret = env.get(OPENSKY_SECRET_VARIABLE) or None
-        if (client_id is None) != (client_secret is None):
-            raise IngestConfigError(
-                f"{OPENSKY_ID_VARIABLE} and {OPENSKY_SECRET_VARIABLE} are set together, "
-                "or neither is."
-            )
-        pollers.append(OpenSkyAircraft(http, client_id=client_id, client_secret=client_secret))
+    if "adsblol" in sources:
+        pollers.append(_aircraft_poller(env, http))
     if "511" in sources:
         token = env.get(KEY_511_VARIABLE)
         if not token:
@@ -389,6 +373,36 @@ def source_pollers(
     if "notices" in sources:
         pollers.append(_notice_poller(env, http))
     return pollers
+
+
+def _aircraft_poller(env: Mapping[str, str], http: SourceHttp) -> AdsbLolAircraft:
+    """The poller for adsb.lol, which needs no key and takes one.
+
+    Raises IngestConfigError when the key or what it allows is not one."""
+    api_key = env.get(ADSBLOL_KEY_VARIABLE) or None
+    allowed = env.get(ADSBLOL_REQUESTS_VARIABLE, "").strip()
+    requests_per_day = None
+    if allowed:
+        if api_key is None:
+            raise IngestConfigError(
+                f"{ADSBLOL_REQUESTS_VARIABLE} says what a key allows, and {ADSBLOL_KEY_VARIABLE} "
+                "is not set: with no key adsb.lol allows an address 500 requests a day."
+            )
+        if not (allowed.isascii() and allowed.isdigit() and len(allowed) <= 6):
+            raise IngestConfigError(
+                f"{ADSBLOL_REQUESTS_VARIABLE} is how many requests a day the key allows, "
+                f"from 1 to {MAX_REQUESTS_PER_DAY}."
+            )
+        requests_per_day = int(allowed)
+    try:
+        return AdsbLolAircraft(http, api_key=api_key, requests_per_day=requests_per_day)
+    except ValueError:
+        # Not the error itself, which would be chained to a setting.
+        pass
+    raise IngestConfigError(
+        f"{ADSBLOL_KEY_VARIABLE} is not a key of adsb.lol's, or {ADSBLOL_REQUESTS_VARIABLE} is "
+        f"not a number of requests from 1 to {MAX_REQUESTS_PER_DAY}."
+    )
 
 
 def _radio_poller(env: Mapping[str, str], http: SourceHttp) -> OpenMhzRadio:

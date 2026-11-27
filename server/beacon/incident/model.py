@@ -45,11 +45,23 @@ OfficialState = Literal[
 
 
 @dataclass(frozen=True)
+class CreditPart:
+    """A piece of a credit's words, and the address it links to when it is a link."""
+
+    text: str
+    url: str | None = None
+
+
+@dataclass(frozen=True)
 class Credit:
     """Words a source's terms require beside anything shown from it, and their link."""
 
     text: str
     url: str
+    # The same words in pieces, for a credit whose terms ask for more than one link:
+    # the name of a database to one address, and of its license to another. Empty for
+    # a credit that is one link, which is `text` to `url`.
+    parts: tuple[CreditPart, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -58,7 +70,7 @@ class Source:
 
     kind: Kind
     # The feed, as the evidence store names it: `openmhz`, `nws`, `511`, `notices`,
-    # `opensky`, `app`.
+    # `adsblol`, `app`.
     source: str
     # The feed in words, for a person.
     label: str

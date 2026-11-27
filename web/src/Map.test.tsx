@@ -33,7 +33,25 @@ const source = (from: Partial<Source>): Source => ({
   credit: null,
   ...from,
 })
-const CREDIT = { text: 'data provided by 511.org', url: 'https://511.org' }
+const CREDIT = {
+  text: 'data provided by 511.org',
+  url: 'https://511.org',
+  parts: [],
+}
+// The notice adsb.lol's license asks for wherever a position it answered with
+// is shown: its words in pieces, with a link each for the database and its license.
+const SKY_LICENSE = 'https://opendatacommons.org/licenses/odbl/1-0/'
+const SKY_CREDIT = {
+  text: 'Contains information from adsb.lol, which is made available here under the Open Database License (ODbL).',
+  url: 'https://www.adsb.lol',
+  parts: [
+    { text: 'Contains information from ', url: null },
+    { text: 'adsb.lol', url: 'https://www.adsb.lol' },
+    { text: ', which is made available here under the ', url: null },
+    { text: 'Open Database License (ODbL)', url: SKY_LICENSE },
+    { text: '.', url: null },
+  ],
+}
 
 // Sentences of the server's, which the view shows as they are given.
 const PLACE =
@@ -81,10 +99,11 @@ const features: Feature[] = [
     sources: [
       source({
         kind: 'aircraft',
-        source: 'opensky',
-        label: 'OpenSky Network aircraft positions',
+        source: 'adsblol',
+        label: 'adsb.lol aircraft positions',
         confidence: 'high',
         model: null,
+        credit: SKY_CREDIT,
       }),
     ],
     path: [
@@ -371,6 +390,18 @@ test('the street map is OpenStreetMap’s tiles around the incident, with their 
       name: CREDIT.text,
     }),
   ).toHaveAttribute('href', CREDIT.url)
+  // So is adsb.lol's, whose positions the aircraft's path is drawn from, with
+  // the license's name linked to the license.
+  expect(
+    within(credit.closest('.map-canvas') as HTMLElement).getByRole('link', {
+      name: 'adsb.lol',
+    }),
+  ).toHaveAttribute('href', SKY_CREDIT.url)
+  expect(
+    within(credit.closest('.map-canvas') as HTMLElement).getByRole('link', {
+      name: 'Open Database License (ODbL)',
+    }),
+  ).toHaveAttribute('href', SKY_LICENSE)
   // Sixteen tiles at most, all around the incident.
   expect(tiles()).toHaveLength(16)
   expect(tiles()).toContain('https://tile.openstreetmap.org/15/5240/12665.png')
@@ -450,16 +481,24 @@ const projected = (place: { lat: number; lon: number }) => {
   return { x: Number((x * SIZE).toFixed(2)), y: Number((y * SIZE).toFixed(2)) }
 }
 
-test('with no street map, what Beacon places is drawn on a plain ground, no tile is asked for, and 511’s credit is still on the picture', () => {
+test('with no street map, what Beacon places is drawn on a plain ground, no tile is asked for, and the credits of what is drawn are still on the picture', () => {
   canvas(features, true)
 
   expect(tiles()).toEqual([])
   expect(document.querySelectorAll('.map-mark')).toHaveLength(4)
-  // No tiles, so no tiles' credit; and 511's, because its event is drawn.
+  // No tiles, so no tiles' credit; 511's, because its event is drawn, and
+  // adsb.lol's, because an aircraft's path is.
   const picture = document.querySelector('.map-canvas') as HTMLElement
   const links = within(picture).getAllByRole('link')
-  expect(links.map((link) => link.textContent)).toEqual([CREDIT.text])
+  expect(links.map((link) => link.textContent)).toEqual([
+    CREDIT.text,
+    'adsb.lol',
+    'Open Database License (ODbL)',
+  ])
   expect(links[0]).toHaveAttribute('href', CREDIT.url)
+  expect(links[1]).toHaveAttribute('href', SKY_CREDIT.url)
+  expect(links[2]).toHaveAttribute('href', SKY_LICENSE)
+  expect(within(picture).getByText(/made available here/)).toBeInTheDocument()
   // The invented scenario is called that whatever it is drawn on, and is not
   // said to be on a street map that is not there.
   expect(within(picture).getByText('Invented scenario')).toBeInTheDocument()
@@ -467,7 +506,7 @@ test('with no street map, what Beacon places is drawn on a plain ground, no tile
 })
 
 test('a picture with nothing of a credited source on it shows no credit', () => {
-  canvas([features[0], features[2], features[3]])
+  canvas([features[0], features[3]])
 
   expect(screen.queryByRole('link')).toBeNull()
   expect(document.querySelector('.map-credits')).toBeNull()

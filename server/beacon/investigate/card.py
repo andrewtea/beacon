@@ -168,6 +168,31 @@ def found_then(run: Run, incident_id: str | None) -> Mapping[str, Any] | None:
     return None
 
 
+def ground_feeds(ground: str, run: Run) -> list[str]:
+    """The feeds with a credit of their own that a ground of the run's match rested
+    on, by the names in `beacon.incident.build.CREDITS`: 511 for a distance measured
+    from a closure's point, and for an aircraft, or a helicopter made out in a clip
+    or a photo, the feed its positions were from. It is read from what the run's
+    `nearby_incidents` kept then, and never worked out from the kind of ground: a
+    run of the invented scenario rests on no feed's rows, and a run kept before
+    this was written down names none."""
+    then = found_then(run, run.outcome.incident_id) or {}
+    if ground == "near":
+        return ["511"] if then.get("point_from") == "closure" else []
+    if ground == "aircraft_overhead":
+        return _feeds(then.get("aircraft_credits"))
+    made_out = {"heard_in_clip": "heard", "seen_in_photo": "seen"}.get(ground)
+    if made_out is not None and "helicopter" in _tags(run, made_out):
+        # The helicopter fits the incident only by a rotorcraft that was recorded
+        # over it, so the ground rests on that aircraft's positions.
+        return _feeds(then.get("rotorcraft_credits"))
+    return []
+
+
+def _feeds(kept: Any) -> list[str]:
+    return [feed for feed in kept if isinstance(feed, str)] if isinstance(kept, list) else []
+
+
 def ground_text(ground: str, run: Run) -> str:
     """The sentence for one ground a match rests on, from what the run's tools
     returned then. Nothing in it is from how the incident is now: an incident

@@ -30,10 +30,10 @@ from beacon.ingest import (
     open_store,
     source_pollers,
 )
+from beacon.ingest.adsblol import AdsbLolAircraft
 from beacon.ingest.http import SourceHttp, fetch
 from beacon.ingest.listing import listed_again_row, not_listed_row
 from beacon.ingest.nws import NwsAlerts
-from beacon.ingest.opensky import OpenSkyAircraft
 from beacon.ingest.traffic511 import Traffic511
 from beacon.radio import NOTHING_KNOWN, Ffmpeg, Known
 from beacon.scenario import FIRE, INVENTED, Scenario, scenario_transport
@@ -126,7 +126,8 @@ def test_with_no_live_source_the_pollers_play_the_whole_invented_fire(
     by_address: dict[str, list[Evidence]] = {}
     for row in aircraft:
         by_address.setdefault(row.data["icao24"], []).append(row)
-    # The airliner at cruise is never stored. OpenSky is asked every thirty seconds:
+    # The airliner at cruise is never stored. The story's sky is asked for every
+    # thirty seconds:
     # the helicopter is there from minute 5 to 50, the light aircraft from 25 to 29.
     assert {address: len(rows) for address, rows in by_address.items()} == {
         "beac01": 90,
@@ -252,7 +253,7 @@ def test_a_mock_store_first_opened_shows_a_fire_already_under_way(
     assert ingest.store.count_by_source() == {
         "nws": 2,
         "511": 3,
-        "opensky": 31,
+        "adsblol": 31,
         "openmhz": 10,
         "notices": 1,
     }
@@ -262,7 +263,7 @@ def test_a_mock_store_first_opened_shows_a_fire_already_under_way(
         # How each poller's last poll went, for a process that goes on from here.
         "polls": {
             name: {"polled_at": NOON.isoformat(), "ok": True, "partial": False}
-            for name in ("nws", "opensky", "511", "openmhz", "notices")
+            for name in ("nws", "adsblol", "511", "openmhz", "notices")
         },
     }
     # The clock is let go when the story has been played up to now.
@@ -334,16 +335,16 @@ def test_a_step_in_which_a_poll_failed_is_played_again_and_nothing_is_missed(
     env: dict[str, str], time: Time, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     polled: list[tuple[str, datetime]] = []
-    for poller in (NwsAlerts, OpenSkyAircraft, Traffic511):
+    for poller in (NwsAlerts, AdsbLolAircraft, Traffic511):
 
         def poll(
             self: Any, store: EvidenceStore, now: datetime, poll: Any = poller.poll
         ) -> PollReport:
             polled.append((self.name, now))
-            # At minute 6 the helicopter has just begun to circle. OpenSky cannot be
+            # At minute 6 the helicopter has just begun to circle. adsb.lol cannot be
             # read, twice, in the one step in which all three sources are asked.
-            if (self.name, now) == ("opensky", story(6)) and polled.count(polled[-1]) < 3:
-                raise SourceError("opensky", "could not be reached")
+            if (self.name, now) == ("adsblol", story(6)) and polled.count(polled[-1]) < 3:
+                raise SourceError("adsblol", "could not be reached")
             return poll(self, store, now)
 
         monkeypatch.setattr(poller, "poll", poll)
@@ -353,7 +354,7 @@ def test_a_step_in_which_a_poll_failed_is_played_again_and_nothing_is_missed(
     assert ingest.catch_up() is False
     last_played = (story(6) - timedelta(seconds=10)).isoformat()
     assert ingest.store.state("scenario")["played_to"] == last_played
-    assert ingest.runner.status()[1] == PollerStatus("opensky", story(6), False)
+    assert ingest.runner.status()[1] == PollerStatus("adsblol", story(6), False)
     assert ingest.clock.now() == NOON
     # Played again in the same process, it fails again and is still not passed over.
     assert ingest.catch_up() is False
@@ -365,10 +366,10 @@ def test_a_step_in_which_a_poll_failed_is_played_again_and_nothing_is_missed(
     # Only the poller that failed was asked again for that moment.
     assert [name for name, moment in polled if moment == story(6)] == [
         "nws",
-        "opensky",
+        "adsblol",
         "511",
-        "opensky",
-        "opensky",
+        "adsblol",
+        "adsblol",
     ]
     helicopter = [row.occurred_at for row in ingest.store.search(kinds=["aircraft"], limit=1000)]
     assert story(6) in helicopter
@@ -380,15 +381,15 @@ def test_a_step_in_which_a_poll_failed_is_played_again_and_nothing_is_missed(
 def test_a_step_that_failed_is_played_again_by_the_process_that_comes_after(
     env: dict[str, str], time: Time, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    poll = OpenSkyAircraft.poll
+    poll = AdsbLolAircraft.poll
 
     def fail_at_minute_five(self: Any, store: EvidenceStore, now: datetime) -> PollReport:
         if now == story(5):
-            raise SourceError("opensky", "could not be reached")
+            raise SourceError("adsblol", "could not be reached")
         return poll(self, store, now)
 
     with monkeypatch.context() as patched:
-        patched.setattr(OpenSkyAircraft, "poll", fail_at_minute_five)
+        patched.setattr(AdsbLolAircraft, "poll", fail_at_minute_five)
         assert build(env, Clock(time)).catch_up() is False
 
     # The process ends there. The next one is asked about minute 5 again.
@@ -414,7 +415,7 @@ def test_a_restart_after_the_story_has_ended_still_says_how_the_last_polls_went(
     assert second.runner.status() == finished
     assert finished == [
         PollerStatus("nws", story(104), True),
-        PollerStatus("opensky", story(105), True),
+        PollerStatus("adsblol", story(105), True),
         PollerStatus("511", story(104), True),
         PollerStatus("openmhz", story(105), True),
         PollerStatus("notices", story(104), True),
@@ -466,7 +467,7 @@ def test_a_store_left_for_days_is_played_only_to_the_end_of_its_story(
         ("", ()),
         (" , ", ()),
         ("nws", ("nws",)),
-        (" opensky ,nws,, 511", ("nws", "opensky", "511")),
+        (" adsblol ,nws,, 511", ("nws", "adsblol", "511")),
     ],
 )
 def test_the_live_sources_are_the_ones_the_setting_names(
@@ -493,7 +494,7 @@ def test_a_setting_that_names_no_source_is_mock_mode_through_and_through(
     assert ingest.store.count_by_source() == {
         "nws": 2,
         "511": 3,
-        "opensky": 31,
+        "adsblol": 31,
         "openmhz": 10,
         "notices": 1,
     }
@@ -505,33 +506,30 @@ def test_a_name_that_is_not_a_source_is_refused(env: dict[str, str]) -> None:
             make(env | {"BEACON_LIVE_SOURCES": "nws,radio,cnn"})
 
 
-OPENSKY = {"BEACON_LIVE_SOURCES": "opensky", "BEACON_OPENSKY_PERMITTED": "1"}
+ADSBLOL = {"BEACON_LIVE_SOURCES": "adsblol"}
 
 
 @pytest.mark.parametrize(
     ("settings", "message"),
     [
         ({"BEACON_LIVE_SOURCES": "511"}, "names 511, which needs BEACON_511_API_KEY"),
-        # Credentials are not permission: OpenSky's terms ask for a written license.
+        # What a key allows is said only of a key: with none the limit is adsb.lol's.
         (
-            {
-                "BEACON_LIVE_SOURCES": "nws,opensky",
-                "OPENSKY_CLIENT_ID": "beacon-client",
-                "OPENSKY_CLIENT_SECRET": "s3cret",
-            },
-            "require a written license",
+            ADSBLOL | {"BEACON_ADSBLOL_REQUESTS_PER_DAY": "7200"},
+            "BEACON_ADSBLOL_API_KEY is not set",
         ),
         (
-            {"BEACON_LIVE_SOURCES": "opensky", "BEACON_OPENSKY_PERMITTED": "yes"},
-            "set BEACON_OPENSKY_PERMITTED=1 once the license is given",
+            ADSBLOL
+            | {"BEACON_ADSBLOL_API_KEY": "s3cret", "BEACON_ADSBLOL_REQUESTS_PER_DAY": "many"},
+            "how many requests a day the key allows",
         ),
         (
-            OPENSKY | {"OPENSKY_CLIENT_ID": "beacon-client"},
-            "OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET are set together",
+            ADSBLOL | {"BEACON_ADSBLOL_API_KEY": "s3cret", "BEACON_ADSBLOL_REQUESTS_PER_DAY": "0"},
+            "not a number of requests from 1 to 360000",
         ),
         (
-            OPENSKY | {"OPENSKY_CLIENT_SECRET": "s3cret"},
-            "OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET are set together",
+            ADSBLOL | {"BEACON_ADSBLOL_API_KEY": "s3cret\r\nx-other: 1"},
+            "BEACON_ADSBLOL_API_KEY is not a key of adsb.lol's",
         ),
     ],
 )
@@ -549,9 +547,7 @@ def test_naming_a_source_builds_its_poller_on_the_live_store_and_asks_nothing_ye
     env: dict[str, str], time: Time
 ) -> None:
     ingest = build(
-        env
-        | OPENSKY
-        | {"BEACON_LIVE_SOURCES": "nws,opensky,511", "BEACON_511_API_KEY": "key-from-the-env"},
+        env | {"BEACON_LIVE_SOURCES": "nws,adsblol,511", "BEACON_511_API_KEY": "key-from-the-env"},
         Clock(time),
     )
 
@@ -563,7 +559,7 @@ def test_naming_a_source_builds_its_poller_on_the_live_store_and_asks_nothing_ye
     assert (ingest.store.mode, ingest.store.path.name) == ("live", "live.sqlite3")
     assert [(status.name, status.ok) for status in ingest.runner.status()] == [
         ("nws", None),
-        ("opensky", None),
+        ("adsblol", None),
         ("511", None),
     ]
     assert ingest.store.count_by_source() == {}
@@ -587,18 +583,16 @@ def test_each_source_is_asked_with_the_settings_the_environment_holds(
 
     def network(request: httpx2.Request) -> httpx2.Response:
         requests.append(request)
-        if request.url.host == "auth.opensky-network.org":
-            return httpx2.Response(200, json={"access_token": "token-1", "expires_in": 1800})
         return sources.handle_request(request)
 
-    settings = OPENSKY | {
+    settings = {
         "BEACON_511_API_KEY": "key-from-the-env",
-        "OPENSKY_CLIENT_ID": "beacon-client",
-        "OPENSKY_CLIENT_SECRET": "s3cret",
+        "BEACON_ADSBLOL_API_KEY": "s3cret",
+        "BEACON_ADSBLOL_REQUESTS_PER_DAY": "7200",
     }
     store = EvidenceStore(tmp_path / "disposable.sqlite3", "mock")
     pollers = source_pollers(
-        ("nws", "opensky", "511"), settings, SourceHttp(httpx2.MockTransport(network))
+        ("nws", "adsblol", "511"), settings, SourceHttp(httpx2.MockTransport(network))
     )
     runner = Runner(pollers, store, Clock(time))
 
@@ -606,18 +600,19 @@ def test_each_source_is_asked_with_the_settings_the_environment_holds(
 
     assert {name: type(result).__name__ for name, result in results.items()} == {
         "nws": "PollReport",
-        "opensky": "PollReport",
+        "adsblol": "PollReport",
         "511": "PollReport",
     }
     by_host = {request.url.host: request for request in requests}
     assert by_host["api.511.org"].url.params["api_key"] == "key-from-the-env"
-    assert by_host["opensky-network.org"].headers["authorization"] == "Bearer token-1"
-    assert b"client_secret=s3cret" in by_host["auth.opensky-network.org"].content
-    assert store.count_by_source() == {"nws": 2, "opensky": 1, "511": 2}
+    assert by_host["api.adsb.lol"].headers["x-api-key"] == "s3cret"
+    # The key is in a header, and never in the address, which a log could hold.
+    assert "s3cret" not in str(by_host["api.adsb.lol"].url)
+    assert store.count_by_source() == {"nws": 2, "adsblol": 1, "511": 2}
     assert {row.origin for row in store.search()} == {"mock"}
-    # With an account OpenSky is asked every thirty seconds.
-    time.moment = NOON + timedelta(seconds=30)
-    assert list(runner.step()) == ["opensky"]
+    # With a key that allows 7,200 requests a day adsb.lol is asked every 12.5 s.
+    time.moment = NOON + timedelta(seconds=13)
+    assert list(runner.step()) == ["adsblol"]
 
 
 @pytest.fixture(autouse=True)
@@ -837,7 +832,7 @@ def test_what_a_stand_in_answered_cannot_be_stored_as_a_real_sources(
     # the invented scenario where the network would be.
     stand_in = SourceHttp(scenario_transport(Scenario(start=START), time))
     pollers = source_pollers(
-        ("nws", "opensky", "511"), OPENSKY | {"BEACON_511_API_KEY": "key-from-the-env"}, stand_in
+        ("nws", "adsblol", "511"), {"BEACON_511_API_KEY": "key-from-the-env"}, stand_in
     )
     live = EvidenceStore(tmp_path / "live.sqlite3", "live")
 
@@ -1070,7 +1065,7 @@ def test_a_pollers_origin_is_its_clients_and_cannot_be_set() -> None:
 
     for poller in (
         NwsAlerts(stand_in),
-        OpenSkyAircraft(stand_in),
+        AdsbLolAircraft(stand_in),
         Traffic511(stand_in, api_key="token"),
     ):
         assert poller.origin == "mock"
@@ -1200,7 +1195,7 @@ def test_the_mock_and_live_stores_are_kept_apart_in_one_data_directory(
     assert open_store(env).count_by_source() == {
         "nws": 2,
         "511": 3,
-        "opensky": 31,
+        "adsblol": 31,
         "openmhz": 10,
         "notices": 1,
     }

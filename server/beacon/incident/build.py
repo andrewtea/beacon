@@ -61,11 +61,14 @@ The wording here is where the product's rules about words are kept:
 - Where the radio and an official source disagree, the official source holds, and
   the incident says so and why (`Incident.conflicts`): an all-clear on the radio
   does not end an alert or lift an order, and a notice's hazard outranks the radio's.
-- Everything from 511 carries the credit its data agreement requires.
+- Everything from 511 carries the credit its data agreement requires, and every
+  position adsb.lol answered with the notice its license does (`credit_of`). A
+  position of the invented scenario is in adsb.lol's format and holds nothing of
+  adsb.lol's, so it carries no such notice and is not called adsb.lol's.
 """
 
 import hashlib
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -77,6 +80,7 @@ from beacon.incident.model import (
     CONFIDENCE_RANK,
     Conflict,
     Credit,
+    CreditPart,
     Entry,
     Incident,
     Official,
@@ -84,7 +88,7 @@ from beacon.incident.model import (
     Source,
 )
 from beacon.incident.places import Blocks
-from beacon.ingest import nws, traffic511
+from beacon.ingest import adsblol, nws, traffic511
 from beacon.notice import ORDERS, TEXT_TYPES
 from beacon.radio.vocabulary import MEDICAL_EVENT, clean_street, place_in_words
 from beacon.redact import Names, reading
@@ -105,6 +109,17 @@ MANY_UNITS = 8
 MANY_TAPS = 3
 
 CREDIT_511 = Credit("data provided by 511.org", "https://511.org")
+# The notice the Open Database License asks for wherever something made from
+# adsb.lol's data is shown (`beacon.ingest.adsblol`), with a link of its own for the
+# database, for the license, and for how Beacon's rows differ.
+CREDIT_ADSBLOL = Credit(
+    adsblol.CREDIT_TEXT,
+    adsblol.CREDIT_URL,
+    tuple(CreditPart(words, url) for words, url in adsblol.CREDIT_PARTS),
+)
+# The feeds that have a credit, by the name the evidence store has for each. Which
+# rows of a feed carry it is `credit_of`'s to say.
+CREDITS = {"511": CREDIT_511, adsblol.SOURCE: CREDIT_ADSBLOL}
 
 # Hands back the rows of one kind within so many metres of a point, between two
 # moments, and whether there were more of them than it hands back. Taps and aircraft
@@ -118,9 +133,15 @@ _LABELS = {
     "nws": "National Weather Service alert feed",
     "511": "511 SF Bay traffic events",
     "notices": "Official notice, as Ember read it",
+    "adsblol": "adsb.lol aircraft positions",
+    # Rows a store of before Beacon asked adsb.lol holds, under the name they have.
     "opensky": "OpenSky Network aircraft positions",
     "app": "Taps in the Beacon app",
 }
+# What a feed is called for a row of the invented scenario, where the feed's own
+# name would say that the row came from it. The row is in adsb.lol's format and
+# holds nothing of adsb.lol's.
+_INVENTED_LABELS = {"adsblol": "Aircraft positions"}
 # What the two feeds a model writes the rows of are called when a stand-in wrote
 # the row: no Ember heard that call or read that document, so the label does not
 # say one did. That a stand-in did is said beside it, from the row's `stand_in`.
@@ -130,12 +151,33 @@ _STAND_IN_LABELS = {
 }
 
 
-def label_of(source: str, model: str | None) -> str:
+def label_of(source: str, model: str | None, *, invented: bool = False) -> str:
     """What a feed is called beside a claim. A row a fake Ember wrote is not
-    labeled as Ember's."""
+    labeled as Ember's, and a row of the invented scenario (`invented`) is not
+    labeled as the feed's whose format it is in."""
     if model == "fake" and source in _STAND_IN_LABELS:
         return _STAND_IN_LABELS[source]
+    if invented and source in _INVENTED_LABELS:
+        return _INVENTED_LABELS[source]
     return _LABELS.get(source, source)
+
+
+def credit_of(row: Evidence) -> Credit | None:
+    """The credit a row's feed requires beside anything shown from the row, or
+    None. adsb.lol's notice says that what is shown contains information from
+    adsb.lol, which is so only of a row adsb.lol answered: an invented position has
+    none, and neither has a position an earlier feed gave. 511's goes with every
+    row of its feed, as it has since the feed was added."""
+    if row.source == adsblol.SOURCE and row.origin != "live":
+        return None
+    return CREDITS.get(row.source)
+
+
+def credited(rows: Iterable[Evidence]) -> list[str]:
+    """The feeds, among those of `rows`, whose credit goes with something that rests
+    on the rows: names from `CREDITS`, in order. It is what is kept of where a
+    count or a ground came from, by whoever keeps the count and not the rows."""
+    return sorted({row.source for row in rows if credit_of(row) is not None})
 
 
 _CATEGORY_WORDS = {
@@ -408,14 +450,14 @@ def source_of(row: Evidence) -> Source:
     return Source(
         kind=row.kind,
         source=row.source,
-        label=label_of(row.source, row.model),
+        label=label_of(row.source, row.model, invented=row.origin == "mock"),
         confidence=row.confidence,
         at=row.occurred_at,
         evidence_id=row.id,
         url=row.url,
         stand_in=row.stand_in,
         model=row.model,
-        credit=CREDIT_511 if row.source == "511" else None,
+        credit=credit_of(row),
     )
 
 

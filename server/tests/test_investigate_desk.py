@@ -17,6 +17,7 @@ import beacon.investigate.desk as desk_module
 import beacon.main as main_module
 from beacon import taps as beacon_taps
 from beacon.api import taps as api_taps
+from beacon.api.incidents import cited_credit
 from beacon.ember import (
     BudgetExceededError,
     EmberCallError,
@@ -30,7 +31,7 @@ from beacon.ember import (
 )
 from beacon.evidence import EvidenceStore
 from beacon.incident import NO_BLOCKS, Blocks, Engine, open_engine
-from beacon.incident.build import CREDIT_511
+from beacon.incident.build import CREDIT_511, CREDIT_ADSBLOL
 from beacon.ingest import Clock, build
 from beacon.ingest.paid import HELD_INTERVAL_SECONDS, UNUSABLE_RUN_LIMIT, read_hold
 from beacon.investigate import (
@@ -52,8 +53,8 @@ from beacon.investigate import (
 from beacon.investigate import card as words
 from beacon.main import create_app
 from beacon.taps import TapMedia, Taps
-from tests.incident_rows import HAYES, NOON, Rows, at, mock_store
-from tests.test_incident_aircraft import offset
+from tests.incident_rows import HAYES, NOON, Rows, at, credit_json, mock_store
+from tests.test_incident_aircraft import circle, offset
 from tests.test_investigate import BLOCKS, NAMES, TAP, city, form
 from tests.test_taps import PHONE, SHOWN
 
@@ -590,22 +591,27 @@ def test_the_stand_in_takes_a_lead_that_is_near_over_a_farther_one_with_more_sig
     )
 
 
-def test_a_closure_a_decision_rested_on_carries_511s_credit_where_the_decision_is_shown(
-    world: World,
+def test_what_a_decision_rested_on_carries_its_sources_credit_where_the_decision_is_shown(
+    world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     world.rows.tap(6, ref=TAP)
     desk = world.desk(Script([form()]))
     client = world.app(desk)
     fire = fire_id(world)
-    # A decision that rested on a closure, on a row the incident's closure signal
-    # no longer rests on: what the incident shows now carries no credit for it.
+    # A decision that rested on a closure and on a circling aircraft, on rows the
+    # incident's signals no longer rest on: what the incident shows now carries no
+    # credit for them, so the decision kept which feeds they were from.
     outcome = Outcome(
         status="incident",
         incident_id=fire,
         grounds=("near",),
         confidence="low",
         crisis=True,
-        crisis_cited=(Cited("closure", "official", (999,)), Cited("alarm", "medium", (2,))),
+        crisis_cited=(
+            Cited("closure", "official", (999,), ("511",)),
+            Cited("alarm", "medium", (2,)),
+            Cited("aircraft_circling", "high", (998,), ("adsblol",)),
+        ),
     )
     desk.runs.claim(TAP, at(6.5))
     desk.runs.write(
@@ -618,7 +624,11 @@ def test_a_closure_a_decision_rested_on_carries_511s_credit_where_the_decision_i
             stand_in=True,
         )
     )
-    credit = {"text": CREDIT_511.text, "url": CREDIT_511.url}
+    credit = credit_json(CREDIT_511)
+    read: list[int] = []
+    monkeypatch.setattr(
+        type(world.rows.store), "get", lambda _store, evidence_id: read.append(evidence_id)
+    )
 
     crisis = client.get(f"/api/incidents/{fire}").json()["incident"]["crisis"]
     run = client.get(f"/api/taps/{TAP}/run").json()
@@ -627,8 +637,72 @@ def test_a_closure_a_decision_rested_on_carries_511s_credit_where_the_decision_i
         assert [(one["kind"], one["credit"]) for one in cited] == [
             ("closure", credit),
             ("alarm", None),
+            # The positions it rested on were ones adsb.lol answered with.
+            ("aircraft_circling", credit_json(CREDIT_ADSBLOL)),
         ]
     assert crisis["cited"][0]["now"] == "changed"
+    # Showing a decision reads no evidence row, however often it is asked for.
+    assert read == []
+    # The credit is the feed's the decision kept the name of, and is never worked
+    # out from the kind of signal: an aircraft of the invented scenario, or one a
+    # decision of before this was kept rested on, carries no notice of adsb.lol's.
+    assert cited_credit(Cited("aircraft_circling", "high", (998,))) is None
+    assert cited_credit(Cited("aircraft_circling", "high", (998,), ("opensky",))) is None
+    assert cited_credit(Cited("alarm", "medium", (2,))) is None
+    # A closure rests on 511 events and on nothing else, so it carries 511's
+    # credit whether or not the decision kept the feed's name.
+    assert cited_credit(Cited("closure", "official", (999,))).text == CREDIT_511.text  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("origin", ["live", "mock"])
+def test_what_rests_on_an_aircraft_carries_adsb_lols_notice_only_when_adsb_lol_answered_with_it(
+    world: World, origin: str
+) -> None:
+    # A helicopter circles the fire, in reach of a tap 100 m from it. Its positions
+    # are ones adsb.lol answered with, or the invented scenario's.
+    circle(world.rows, HAYES, 300, minutes=5.5, icao24="heli01", origin=origin)
+    world.rows.tap(6, offset(HAYES, 100, 0), ref=TAP)
+    desk = world.desk()
+    client = world.app(desk)
+    notice = credit_json(CREDIT_ADSBLOL) if origin == "live" else None
+    notices = [] if notice is None else [notice]
+
+    desk.investigate(TAP)
+    answer, run = (client.get(f"/api/taps/{TAP}{path}").json() for path in ("", "/run"))
+    fire = fire_id(world)
+
+    # The ground in the answer, and the same grounds where the trace lists them.
+    grounds = {ground["kind"]: ground["credit"] for ground in answer["match"]["grounds"]}
+    assert grounds["aircraft_overhead"] == notice
+    assert {kind for kind, credit in grounds.items() if credit} <= {"aircraft_overhead"}
+    assert "aircraft_overhead" in run["outcome"]["grounds"]
+    assert run["outcome"]["credits"] == notices
+    calls = {call["tool"]: call for round_ in run["rounds"] for call in round_["calls"]}
+    # What `nearby_incidents` kept says an aircraft, and a rotorcraft, was over the
+    # fire in reach of the tap, and the trace shows what was kept: that rests on
+    # the aircraft's positions whether or not a ground came of it.
+    (found,) = [i for i in calls["nearby_incidents"]["returned"]["incidents"] if i["id"] == fire]
+    feeds = ["adsblol"] if origin == "live" else []
+    assert (found["aircraft_credits"], found["rotorcraft_credits"]) == (feeds, feeds)
+    assert calls["nearby_incidents"]["credits"] == notices
+    # A count of aircraft, and a signal the trace names that rests on one.
+    assert calls["get_aircraft"]["returned"]["tracks"] == 1
+    assert calls["get_aircraft"]["credits"] == notices
+    assert "aircraft_circling" in calls["get_official"]["returned"]["signals"]
+    assert calls["get_official"]["credits"] == [credit_json(CREDIT_511), *notices]
+    # The incident's own line says whose the positions are, and carries the same.
+    incident = client.get(f"/api/incidents/{fire_id(world)}").json()["incident"]
+    sources = [
+        source
+        for entry in incident["timeline"]
+        if entry["kind"] == "aircraft"
+        for source in entry["sources"]
+    ]
+    assert {source["label"] for source in sources} == {
+        "adsb.lol aircraft positions" if origin == "live" else "Aircraft positions"
+    }
+    assert [source["credit"] for source in sources] == [notice] * len(sources)
+    assert sources
 
 
 def test_a_tap_that_finds_the_queue_full_is_passed_over_and_costs_nothing(
@@ -849,6 +923,8 @@ def test_a_tap_on_the_mock_scenario_is_answered_with_the_fire_and_every_part_say
                 "text": "An aircraft that was over the incident was also within reach of where "
                 "the tap came from, shortly before the tap.",
                 "basis": "incident_aircraft",
+                # The aircraft is the invented scenario's. Its positions hold
+                # nothing of adsb.lol's, so no notice of adsb.lol's goes with it.
                 "credit": None,
             },
         ],
@@ -932,6 +1008,14 @@ def test_a_tap_on_the_mock_scenario_is_answered_with_the_fire_and_every_part_say
     ]
     assert first["returned_text"] == "Found 2 incidents."
     assert run["rounds"][1]["calls"][0]["lead"] == fire["id"]
+    # The aircraft counted are invented, and carry no notice of adsb.lol's.
+    assert [call["credits"] for call in run["rounds"][1]["calls"]] == [
+        # The count of closures is from 511's events.
+        [credit_json(CREDIT_511)],
+        [],
+        [],
+    ]
+    assert run["outcome"]["credits"] == []
     assert set(run["rounds"][0]["ember"]) == {
         "source",
         "input_tokens",
@@ -948,6 +1032,7 @@ def test_a_tap_on_the_mock_scenario_is_answered_with_the_fire_and_every_part_say
         "text": words.MATCHED,
         "incident_id": fire["id"],
         "grounds": ["near", "going_on", "aircraft_overhead"],
+        "credits": [],
         "grounds_dropped": 0,
         "confidence": "medium",
         "crisis": True,
@@ -1162,7 +1247,7 @@ def test_the_distance_and_the_credit_of_a_match_are_the_runs_and_stay_when_the_i
     world.rows.tap(6, offset(HAYES, 100, 0), ref=TAP)
     desk = world.desk()
     client = world.app(desk)
-    credit = {"text": CREDIT_511.text, "url": CREDIT_511.url}
+    credit = credit_json(CREDIT_511)
     assert credit["url"] == "https://511.org"
 
     desk.investigate(TAP)
@@ -1202,7 +1287,7 @@ def test_what_is_listed_as_near_a_tap_by_a_place_of_511s_carries_511s_credit(
     # With no list of blocks an incident is where 511 says a closure on its street is.
     engine = Engine(world.rows.store, NO_BLOCKS, names=NAMES, clock=lambda: world.now[0])
     world = replace(world, engine=engine)
-    credit = {"text": CREDIT_511.text, "url": CREDIT_511.url}
+    credit = credit_json(CREDIT_511)
     # An alarm a street over from the fire, placed by a closure of its own.
     world.rows.radio(4, "alarm", "on_scene", units=("E21",), street="Fell St", block=300)
     world.rows.traffic(4.5, "511.org/2", road="Fell St", point=offset(HAYES, 0, 150))

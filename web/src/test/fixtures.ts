@@ -308,6 +308,7 @@ export const fireAnswer: TapAnswer = {
             credit: {
               text: 'data provided by 511.org',
               url: 'https://511.org',
+              parts: [],
             },
           },
         ],
@@ -319,8 +320,8 @@ export const fireAnswer: TapAnswer = {
         sources: [
           {
             kind: 'aircraft',
-            source: 'opensky',
-            label: 'OpenSky Network aircraft positions',
+            source: 'adsblol',
+            label: 'Aircraft positions',
             confidence: 'high',
             at: '2026-11-26T22:59:50Z',
             evidence_id: 17,
@@ -331,8 +332,8 @@ export const fireAnswer: TapAnswer = {
           },
           {
             kind: 'aircraft',
-            source: 'opensky',
-            label: 'OpenSky Network aircraft positions',
+            source: 'adsblol',
+            label: 'Aircraft positions',
             confidence: 'high',
             at: '2026-11-26T23:13:20Z',
             evidence_id: 73,
@@ -606,6 +607,8 @@ export const fireRun: TapRun = {
                 id: 'inc-0942f75930378016',
                 distance_m: 100,
                 point_from: 'blocks',
+                aircraft_credits: [],
+                rotorcraft_credits: [],
               },
             ],
             more: false,
@@ -655,6 +658,7 @@ export const fireRun: TapRun = {
               'closure',
               'aircraft_circling',
             ],
+            credits: ['511'],
           },
           returned_text:
             "Found 2 official alerts or notices, 1 of them an alert in force. 1 511 event in force lists a road as closed on a street of the incident's or near it.",
@@ -662,6 +666,7 @@ export const fireRun: TapRun = {
             {
               text: 'data provided by 511.org',
               url: 'https://511.org',
+              parts: [],
             },
           ],
           ember: null,
@@ -683,6 +688,7 @@ export const fireRun: TapRun = {
             circling: 1,
             low: 1,
             more: false,
+            credits: [],
           },
           returned_text: 'Found 1 aircraft: 1 circling, 1 low.',
           credits: [],
@@ -726,6 +732,7 @@ export const fireRun: TapRun = {
     text: "Beacon's investigator took this tap to be about this incident. That is the investigator's reading of the evidence, not something a source said.",
     incident_id: 'inc-0942f75930378016',
     grounds: ['near', 'going_on', 'aircraft_overhead'],
+    credits: [],
     grounds_dropped: 0,
     confidence: 'medium',
     crisis: true,
@@ -1057,6 +1064,7 @@ export const fireIncident: IncidentAnswer = {
             credit: {
               text: 'data provided by 511.org',
               url: 'https://511.org',
+              parts: [],
             },
           },
         ],
@@ -1068,8 +1076,8 @@ export const fireIncident: IncidentAnswer = {
         sources: [
           {
             kind: 'aircraft',
-            source: 'opensky',
-            label: 'OpenSky Network aircraft positions',
+            source: 'adsblol',
+            label: 'Aircraft positions',
             confidence: 'high',
             at: '2026-11-26T22:59:50Z',
             evidence_id: 17,
@@ -1080,8 +1088,8 @@ export const fireIncident: IncidentAnswer = {
           },
           {
             kind: 'aircraft',
-            source: 'opensky',
-            label: 'OpenSky Network aircraft positions',
+            source: 'adsblol',
+            label: 'Aircraft positions',
             confidence: 'high',
             at: '2026-11-26T23:13:20Z',
             evidence_id: 73,
@@ -1371,8 +1379,8 @@ export const fireIncident: IncidentAnswer = {
         sources: [
           {
             kind: 'aircraft',
-            source: 'opensky',
-            label: 'OpenSky Network aircraft positions',
+            source: 'adsblol',
+            label: 'Aircraft positions',
             confidence: 'high',
             at: '2026-11-26T22:59:50Z',
             evidence_id: 17,
@@ -1383,8 +1391,8 @@ export const fireIncident: IncidentAnswer = {
           },
           {
             kind: 'aircraft',
-            source: 'opensky',
-            label: 'OpenSky Network aircraft positions',
+            source: 'adsblol',
+            label: 'Aircraft positions',
             confidence: 'high',
             at: '2026-11-26T23:13:20Z',
             evidence_id: 73,
@@ -1426,6 +1434,7 @@ export const fireIncident: IncidentAnswer = {
             credit: {
               text: 'data provided by 511.org',
               url: 'https://511.org',
+              parts: [],
             },
           },
         ],
@@ -1612,6 +1621,7 @@ export const fireIncident: IncidentAnswer = {
             credit: {
               text: 'data provided by 511.org',
               url: 'https://511.org',
+              parts: [],
             },
           },
         ],
@@ -1831,6 +1841,7 @@ export const fireIncident: IncidentAnswer = {
               credit: {
                 text: 'data provided by 511.org',
                 url: 'https://511.org',
+                parts: [],
               },
             },
           ],
@@ -1843,8 +1854,8 @@ export const fireIncident: IncidentAnswer = {
           sources: [
             {
               kind: 'aircraft',
-              source: 'opensky',
-              label: 'OpenSky Network aircraft positions',
+              source: 'adsblol',
+              label: 'Aircraft positions',
               confidence: 'high',
               at: '2026-11-26T22:59:50Z',
               evidence_id: 17,
@@ -1855,8 +1866,8 @@ export const fireIncident: IncidentAnswer = {
             },
             {
               kind: 'aircraft',
-              source: 'opensky',
-              label: 'OpenSky Network aircraft positions',
+              source: 'adsblol',
+              label: 'Aircraft positions',
               confidence: 'high',
               at: '2026-11-26T23:12:50Z',
               evidence_id: 69,
