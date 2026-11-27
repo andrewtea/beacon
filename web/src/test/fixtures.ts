@@ -2038,25 +2038,25 @@ export const scaleAnswer: Scale = {
           {
             key: 'merged',
             label: "DataSF calls taken to be inside another's incident",
-            value_text: '1 calls',
+            value_text: '1 call',
             text: "DataSF calls with no incident of their own, for which an incident that is another call's own, of the same medical-or-not kind, and names one of their units or lies within 300 m of them has a radio call in their time. That is taken to mean the call is inside another call's incident, where Beacon puts a second call at one block within 45 minutes and a call that names units and no place. Nothing checks that it is: an incident that was only near by at the time is counted the same.",
           },
           {
             key: 'missed',
             label: 'DataSF calls with no incident',
-            value_text: '1 calls',
+            value_text: '1 call',
             text: 'DataSF calls for which Beacon has no incident of their own and none that they are taken to be inside.',
           },
           {
             key: 'not_generated',
             label: 'DataSF calls no call was generated for',
-            value_text: '1 calls',
+            value_text: '1 call',
             text: "DataSF calls that name no unit whose id is shaped as Beacon keeps one (a type code and a number), so the generator made no call for them and nothing was heard of them. 0 of them are counted above as found and 0 as taken to be inside another's incident, which for a call nobody generated is chance: an incident of another call's was near it at the time. That is how loose both counts are.",
           },
           {
             key: 'split',
             label: 'Further incidents of a call already counted',
-            value_text: '1 incidents',
+            value_text: '1 incident',
             text: 'Incidents that fit a DataSF call by the rule and were paired with none, because each call takes one. That is what is left when Beacon makes more than one incident of one call, as it does when a unit is heard from after its incident has been quiet for 45 minutes; an incident that merely fits a call by its time and a unit or its place is counted the same.',
           },
           {
@@ -2160,7 +2160,7 @@ export const scaleAnswer: Scale = {
           {
             key: 'taps_away_unconfirmed',
             label: 'Taps away from every call, answered unconfirmed',
-            value_text: '1 taps',
+            value_text: '1 tap',
             text: 'Of 1 answered taps placed at a place and a moment such that, for every call DataSF lists within a kilometre, the moment is more than an hour before the call was received or more than an hour after the last time DataSF records for it (the latest, over all its units, of a dispatch, a unit on scene, and a unit available again): those answered "unconfirmed". A call can have gone on past the last time recorded for it, and a call DataSF does not list is not known of.',
           },
           {
@@ -2220,7 +2220,7 @@ export const scaleAnswer: Scale = {
             key: 'glossary_overruled',
             label:
               'Proposals for codes a person wrote down that disagree with DataSF',
-            value_text: '1 codes',
+            value_text: '1 code',
             text: "Of 1 proposals for codes among the five a person wrote down: those that are not DataSF's majority kind. They are compared and never applied: what the person wrote stands. A stand-in proposed them, by a rule of thumb over the counts: it is no model, and this says nothing of Muse Ember.",
           },
           {

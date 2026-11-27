@@ -8,9 +8,9 @@ import { clock } from '../lib/time.ts'
 // The results of one scale run: a secondary page, opened from the foot of the
 // app and from nowhere on the way to an answer. Every sentence on it about the
 // run is the server's, and no number is shown without the sentence that says
-// what it is. A run a stand-in had a part in says so at its head, in its tag,
-// and again with every group of numbers, so that a number read by itself is
-// not taken for Beacon's on real radio.
+// what it is. A run a stand-in had a part in says so at its head, with every
+// group of numbers, and beside every value, so that a number read by itself,
+// with the rest scrolled away, is not taken for Beacon's on real radio.
 
 function Kind({ run }: { run: ScaleRun }) {
   return (
@@ -46,7 +46,12 @@ function Section({
             <dd
               className={run.stand_in ? 'scale-value stand-in' : 'scale-value'}
             >
-              {number.value_text}
+              <span className="scale-amount">{number.value_text}</span>
+              {/* A row scrolled to, or captured by itself, still says whose
+                  number it is. */}
+              {run.stand_in && (
+                <span className="scale-kind">{run.kind_text}</span>
+              )}
             </dd>
             <dd className="scale-text">{number.text}</dd>
           </div>

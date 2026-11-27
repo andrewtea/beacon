@@ -207,22 +207,27 @@ def shown(number: Mapping[str, Any]) -> str:
     return "none" if value is None else _shown(value, number["unit"])
 
 
-# What a run is in a few words, for a label beside its numbers, and the sentence
+# What a run is in a few words, for a label beside each of its numbers; the sentence
 # that goes with every group of them wherever they are shown apart from
-# `basis_text`: a number read by itself must not be taken for Beacon's on real radio.
-_KINDS: dict[tuple[str, str], tuple[str, str | None]] = {
+# `basis_text`, so that a number read by itself is not taken for Beacon's on real
+# radio; and the `basis_text` a run of that kind is written with. Like the basis,
+# each is about what the run is set up to do, whatever has been done of it so far.
+_KINDS: dict[tuple[str, str], tuple[str, str | None, str]] = {
     ("generated", "fake"): (
         "Stand-in, generated calls",
         "A stand-in's numbers on calls generated from DataSF's record: a check that "
         "the pipeline keeps what it is given, and no measurement of Beacon's accuracy, "
         "speed, or cost on real radio.",
+        GENERATED_BY_STAND_IN,
     ),
     ("generated", "live"): (
         "Muse Ember, generated speech",
-        "Numbers of Muse Ember hearing speech generated from DataSF's record, scored "
-        "against the record it was generated from: no measurement of Beacon on real radio.",
+        "This run is set up for Muse Ember to hear speech generated from DataSF's "
+        "record, and is scored against the record the speech was generated from: its "
+        "numbers are no measurement of Beacon on real radio.",
+        GENERATED_BY_EMBER,
     ),
-    ("recorded", "live"): ("Muse Ember, recorded radio", None),
+    ("recorded", "live"): ("Muse Ember, recorded radio", None, RECORDED_BY_EMBER),
 }
 
 
@@ -231,8 +236,17 @@ def kind(results: Mapping[str, Any]) -> tuple[str, str | None]:
     every group of its numbers, or None for the one kind of run whose numbers are
     about Beacon on real radio.
 
-    Raises KeyError for a result that is of no kind of run Beacon makes."""
-    return _KINDS[results["audio"], results["hearer"]]
+    Raises KeyError for a result that is of no kind of run Beacon makes, and
+    ValueError for one that does not say of itself what a run of its kind is: its
+    `basis_text` is another kind's, or its `stand_in` is not what its kind makes it.
+    Such a result is not relabeled; it is not shown."""
+    label, reminder, said = _KINDS[results["audio"], results["hearer"]]
+    if results["basis_text"] != said:
+        raise ValueError("The result's basis is not its kind's.")
+    stand_in = results["stand_in"]
+    if not isinstance(stand_in, bool) or stand_in != (reminder is not None):
+        raise ValueError("The result does not say what a stand-in had a part in.")
+    return label, reminder
 
 
 def basis(settings: Settings) -> str:

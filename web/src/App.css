@@ -1435,11 +1435,29 @@ button.quiet:hover {
   margin: 0;
 }
 
+/* The value at the edge, and whose it is before it, on one line. */
 .scale-value {
+  display: flex;
+  flex-direction: row-reverse;
+  align-items: center;
+  gap: 0.5rem;
   color: var(--text-strong);
+}
+
+.scale-amount {
   font-weight: 650;
   font-variant-numeric: tabular-nums;
-  text-align: right;
+  white-space: nowrap;
+}
+
+/* Whose number it is, beside the number: dashed, as what is invented is. */
+.scale-kind {
+  padding: 0 0.4rem;
+  border: 1px dashed var(--invented);
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  line-height: 1.5;
   white-space: nowrap;
 }
 
@@ -1472,7 +1490,8 @@ button.quiet:hover {
   }
 
   .scale-value {
-    text-align: left;
+    flex-direction: row;
+    flex-wrap: wrap;
   }
 }
 

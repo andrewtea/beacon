@@ -1,6 +1,7 @@
 """`GET /api/scale`: a scale run's results as the app shows them, each number with
 its sentence."""
 
+import json
 import os
 from io import StringIO
 from pathlib import Path
@@ -136,20 +137,27 @@ def test_a_setting_that_is_no_runs_name_stops_the_server_from_starting(
 
 
 @pytest.mark.parametrize(
-    ("audio", "hearer", "label", "stand_in"),
+    ("audio", "hearer", "label", "stand_in", "basis"),
     [
-        ("generated", "fake", "Stand-in, generated calls", True),
-        ("generated", "live", "Muse Ember, generated speech", True),
-        ("recorded", "live", "Muse Ember, recorded radio", False),
+        ("generated", "fake", "Stand-in, generated calls", True, results.GENERATED_BY_STAND_IN),
+        ("generated", "live", "Muse Ember, generated speech", True, results.GENERATED_BY_EMBER),
+        ("recorded", "live", "Muse Ember, recorded radio", False, results.RECORDED_BY_EMBER),
     ],
 )
 def test_only_recorded_radio_heard_by_ember_is_shown_with_no_reminder(
-    audio: str, hearer: str, label: str, stand_in: bool, monkeypatch: pytest.MonkeyPatch
+    audio: str,
+    hearer: str,
+    label: str,
+    stand_in: bool,
+    basis: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     layout = make_run()
     made = results.read(layout)
     assert made is not None
-    results.write(layout, made | {"audio": audio, "hearer": hearer, "stand_in": stand_in})
+    # A result as a run of that kind writes it: what it is, and the words that say so.
+    of_kind = {"audio": audio, "hearer": hearer, "stand_in": stand_in, "basis_text": basis}
+    results.write(layout, made | of_kind)
     monkeypatch.setenv("BEACON_SCALE_RUN", "day")
 
     with TestClient(create_app()) as client:
@@ -157,9 +165,13 @@ def test_only_recorded_radio_heard_by_ember_is_shown_with_no_reminder(
 
     assert (shown["kind_text"], shown["stand_in"]) == (label, stand_in)
     assert (shown["reminder_text"] is None) == (not stand_in)
+    assert shown["basis_text"] == basis
     if stand_in:
         assert "no measurement of Beacon" in shown["reminder_text"]
         assert "on real radio" in shown["reminder_text"]
+    # A paid run can have stopped before its first request: the sentence says what
+    # the run is set up to do, and not that Ember heard anything.
+    assert "Numbers of Muse Ember hearing" not in (shown["reminder_text"] or "")
 
 
 @pytest.mark.parametrize(
@@ -171,6 +183,17 @@ def test_only_recorded_radio_heard_by_ember_is_shown_with_no_reminder(
         # A run of no kind Beacon makes: recordings are never heard by a stand-in.
         {"audio": "recorded", "hearer": "fake"},
         {"hearer": "someone"},
+        # A result that calls itself recorded radio heard by Ember while its own
+        # words say no radio was heard and Ember was asked nothing, and the other
+        # way about: it is not shown under either kind's label.
+        {"audio": "recorded", "hearer": "live", "stand_in": False},
+        {"basis_text": results.RECORDED_BY_EMBER},
+        {"basis_text": results.GENERATED_BY_EMBER},
+        {"basis_text": ""},
+        # Whether the run is complete, as a word: the sentence about it is chosen by it.
+        {"complete": "false"},
+        {"complete": 0},
+        {"caveats": ["  "]},
     ],
 )
 def test_results_that_do_not_say_what_a_stand_in_did_are_not_shown_at_all(
@@ -195,3 +218,36 @@ def test_a_count_of_one_is_one_thing_and_a_large_count_is_grouped() -> None:
     assert results.shown({"value": 0, "unit": "taps"}) == "0 taps"
     assert results.shown({"value": 1.0, "unit": "m"}) == "1.0 m"
     assert results.shown({"value": None, "unit": "USD"}) == "none"
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"value": "many"},
+        {"value": True},
+        {"value": float("inf")},
+        {"unit": "percent", "value": "not numeric"},
+        {"text": "   "},
+        {"text": None},
+        {"label": ""},
+        {"unit": ""},
+        {"section": 3},
+    ],
+)
+def test_a_number_that_is_no_number_or_has_no_sentence_is_never_shown(
+    changed: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout = make_run()
+    made = results.read(layout)
+    assert made is not None
+    made["numbers"][4] = made["numbers"][4] | changed
+    # Written as the file would hold it, an infinity included.
+    Path(layout.results).write_text(json.dumps(made))
+    monkeypatch.setenv("BEACON_SCALE_RUN", "day")
+
+    with TestClient(create_app()) as client:
+        response = client.get("/api/scale")
+
+    # The fixed sentence, and nothing of the file: no bare count, no value with a
+    # unit it is not of.
+    assert (response.status_code, response.json()) == (503, {"detail": scale.UNREADABLE})

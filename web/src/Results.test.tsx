@@ -48,6 +48,11 @@ test('shows what a run is before any number, and every number with its sentence'
       const row = label.closest('.scale-number') as HTMLElement
       expect(within(row).getByText(number.value_text)).toBeInTheDocument()
       expect(within(row).getByText(number.text)).toBeInTheDocument()
+      // Whose number it is is in the row itself, beside the value: a row read
+      // with the rest of the page scrolled away still says so.
+      expect(within(row).getByText(run.kind_text).closest('.scale-value')).toBe(
+        within(row).getByText(number.value_text).closest('.scale-value'),
+      )
     }
   }
   expect(document.querySelectorAll('.scale-number')).toHaveLength(
@@ -66,7 +71,13 @@ test('says with every group of numbers that a stand-in’s are no measurement of
   for (const section of run.sections) {
     const region = screen.getByRole('region', { name: section.title })
     expect(within(region).getByText(run.reminder_text!)).toBeInTheDocument()
-    expect(within(region).getByText(run.kind_text)).toHaveClass('stand-in')
+    // The kind beside the heading, and once more beside each value.
+    expect(
+      within(region).getByText(run.kind_text, { selector: '.tag' }),
+    ).toHaveClass('stand-in')
+    expect(
+      within(region).getAllByText(run.kind_text, { selector: '.scale-kind' }),
+    ).toHaveLength(section.numbers.length)
     // A number the run does not have is "none", and never a zero.
     for (const value of region.querySelectorAll('.scale-value'))
       expect(value).toHaveClass('stand-in')
@@ -102,6 +113,7 @@ test('marks nothing as a stand-in’s for a run of recorded radio heard by Muse 
   expect(screen.getAllByText('Muse Ember, recorded radio')).toHaveLength(
     run.sections.length + 1,
   )
+  expect(document.querySelector('.scale-kind')).toBeNull()
 })
 
 test('a server that shows no run says so, and shows no number', async () => {

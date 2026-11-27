@@ -1,3 +1,4 @@
+import math
 from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
@@ -65,7 +66,9 @@ class ScaleRun(BaseModel):
     # Ember, or both. Only recorded radio heard by Muse Ember is neither.
     stand_in: bool
     complete: bool
-    # What the run is in a few words, for a label: "Stand-in, generated calls".
+    # What the run is in a few words: "Stand-in, generated calls". For a run a
+    # stand-in had a part in it is shown with every value, so that a number read
+    # without the rest of the page still says whose it is.
     kind_text: str
     # What the run is, shown before any of its numbers: what its audio was, who
     # heard it, and what its numbers do and do not measure.
@@ -110,7 +113,7 @@ def scale(request: Request) -> Scale:
         if made is None:
             return Scale(about_text=ABOUT, run=None, none_text=NO_RESULTS)
         return Scale(about_text=ABOUT, run=_run(made), none_text=None)
-    except (ScaleError, ValidationError, KeyError, TypeError, AttributeError):
+    except (ScaleError, ValidationError, KeyError, TypeError, ValueError, AttributeError):
         pass
     # Outside the handler, so that nothing of the file is chained under the error.
     raise HTTPException(503, UNREADABLE)
@@ -125,30 +128,27 @@ def _run(made: dict[str, Any]) -> ScaleRun:
         title = number.get("section", "")
         if not isinstance(title, str):
             raise TypeError
-        by_title[title if title in by_title else ""].append(
-            ScaleNumber(
-                key=number["key"],
-                label=number["label"],
-                value_text=results.shown(number),
-                text=number["text"],
-            )
-        )
+        by_title[title if title in by_title else ""].append(_number(number))
+    # What the result says of itself has to be what a run of its kind is: one that
+    # does not is not shown under another kind's words.
     kind_text, reminder_text = results.kind(made)
-    stand_in = made["stand_in"]
-    if not isinstance(stand_in, bool) or stand_in != (reminder_text is not None):
-        # A result that does not say a stand-in had a part in a run that one had a
-        # part in is not shown at all.
+    complete = made["complete"]
+    if not isinstance(complete, bool):
+        # Not a word that would be read as true or false: the sentence about the
+        # run's state is chosen by it.
+        raise TypeError
+    if not all(_words(caveat) for caveat in made["caveats"]):
         raise TypeError
     return ScaleRun(
         name=made["name"],
         day=made["day"],
         made_at=made["made_at"],
-        stand_in=stand_in,
-        complete=made["complete"],
+        stand_in=made["stand_in"],
+        complete=complete,
         kind_text=kind_text,
         basis_text=made["basis_text"],
         reminder_text=reminder_text,
-        state_text=COMPLETE if made["complete"] else UNFINISHED,
+        state_text=COMPLETE if complete else UNFINISHED,
         caveats=made["caveats"],
         scored_against=Credit(**made["scored_against"]),
         sections=[
@@ -156,4 +156,29 @@ def _run(made: dict[str, Any]) -> ScaleRun:
             for title in titles
             if by_title[title]
         ],
+    )
+
+
+def _words(said: object) -> bool:
+    return isinstance(said, str) and bool(said.strip())
+
+
+def _number(number: Mapping[str, Any]) -> ScaleNumber:
+    """A number as it is shown, when it is one: a label, a unit, and a sentence that
+    are words, and a value that is a number or none. No number is shown bare, so one
+    whose sentence is missing or empty is not shown: the results it is in are refused.
+
+    Raises TypeError for anything else."""
+    value = number["value"]
+    if value is not None and (
+        isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value)
+    ):
+        raise TypeError
+    if not all(_words(number[field]) for field in ("key", "label", "unit", "text")):
+        raise TypeError
+    return ScaleNumber(
+        key=number["key"],
+        label=number["label"],
+        value_text=results.shown(number),
+        text=number["text"],
     )
