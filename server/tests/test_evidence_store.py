@@ -653,6 +653,20 @@ def test_what_is_taken_is_what_is_claimed_or_stored(store: EvidenceStore) -> Non
     assert store.taken("recordings", []) == set()
 
 
+def test_claims_that_came_to_no_row_are_counted_for_their_source(store: EvidenceStore) -> None:
+    assert store.claimed_without_row("recordings") == 0
+    for ref in ("kept", "lost", "given-up"):
+        store.claim("recordings", ref)
+    store.claim("notices", "another-sources")
+    store.add([row("kept", source="recordings")])
+    # A row nobody claimed is no claim, and one of another source is not this one's.
+    store.add([row("unclaimed", source="recordings"), row("lost")])
+    store.release("recordings", "given-up")
+
+    assert store.claimed_without_row("recordings") == 1
+    assert store.claimed_without_row("notices") == 1
+
+
 def test_a_closed_store_takes_no_claim_and_gives_none_up(store: EvidenceStore) -> None:
     store.claim("recordings", "call-1")
     store.close()

@@ -246,6 +246,20 @@ class Ledger:
         with closing(self._connect()) as db:
             self._require_opened_file(db)
 
+    def is_opened_file(self) -> bool:
+        """Whether the file at the path now is the one this ledger was opened on.
+        What a read of the path returns (`scope_spend`, `generation`) is of that
+        file only when it is."""
+        with closing(self._connect()) as db:
+            return self._is_opened_file(db)
+
+    def opened_file(self) -> str:
+        """A name for the file this ledger was opened on: its generation, its
+        device, and its inode. Another file, a copy put back by renaming among
+        them, has another name."""
+        device, inode = self._identity if self._identity is not None else (0, 0)
+        return f"{self._opened}:{device}:{inode}"
+
     def _is_opened_file(self, db: sqlite3.Connection) -> bool:
         # The generation tells a file that was begun again. A file put back from an
         # older copy by renaming has the same generation and is another file.

@@ -490,7 +490,9 @@ class RecordedRadio:
         known: Known,
         ems_talkgroups: Collection[int] = (),
         backlog: bool = False,
+        since: datetime | None = None,
         calls_per_poll: int = MAX_CALLS_PER_POLL,
+        scope: str = SCOPE,
         transcoder: Transcoder | None = None,
         wall_clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -500,7 +502,9 @@ class RecordedRadio:
         response, whatever Ember makes of it. `known` lists the units and the
         streets a row may name. `backlog` has the poller make passes over every
         call on the shelf, however old, where it otherwise follows a recorder and
-        passes over what is older than `MAX_AGE`; `calls_per_poll` is the most
+        passes over what is older than `MAX_AGE`, and `since` has such a pass
+        begin with the calls whose files' names say they began then or later, for a
+        backlog of which only a day is wanted; `calls_per_poll` is the most
         calls whose audio one poll reads, whatever comes of them, and so the most
         it has Ember hear.
         `transcoder` decodes a call that is M4A or MP3; without one only a WAV
@@ -509,7 +513,10 @@ class RecordedRadio:
         scenario is played on a clock of its own.
 
         `ember` is closed with the poller (`close`), so it is a client of the
-        poller's own."""
+        poller's own. A live one pays under the spending scope labelled `scope`,
+        which is `SCOPE` for the server's poller; a run over a backlog that has a
+        budget of its own names its own (`beacon.scale`), so that what it spends is
+        not counted against the server's radio, nor the server's against it."""
         if not talkgroups or not all(_is_talkgroup(number) for number in talkgroups):
             raise ValueError("The radio poller needs the numbers of the talkgroups to hear.")
         if not set(ems_talkgroups) <= set(talkgroups):
@@ -537,6 +544,10 @@ class RecordedRadio:
         self._ems_talkgroups = frozenset(ems_talkgroups)
         self._known = known
         self._backlog = backlog
+        # Where a pass over a backlog begins: before every call there can be, or
+        # before the calls that began in the second of `since`, by their files'
+        # names. Every call's name comes after the empty one.
+        self._first: Place = BEGINNING if since is None else (int(since.timestamp()), "")
         self._calls_per_poll = calls_per_poll
         self._transcoder = transcoder
         # How far the pass over the listing that is under way has got, or None
@@ -549,7 +560,7 @@ class RecordedRadio:
         self._last_pass: PassCount | None = None
         # What every poller that pays Ember keeps to: `beacon.ingest.paid`.
         self._paid = PaidDesk(
-            ember, poller="radio", items="calls", scope=SCOPE, wall_clock=wall_clock
+            ember, poller="radio", items="calls", scope=scope, wall_clock=wall_clock
         )
 
     @property
@@ -591,7 +602,7 @@ class RecordedRadio:
         if self._pass_at is not None:
             after = self._pass_at
         elif self._backlog:
-            after = BEGINNING
+            after = self._first
         else:
             # From `OVERLAP` before where the last pass got to. The very first
             # poll, which has nothing behind it to read again, begins where its
