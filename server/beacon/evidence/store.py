@@ -410,6 +410,18 @@ class EvidenceStore:
         with closing(self._connect()) as db:
             return dict(db.execute("SELECT source, COUNT(*) FROM evidence GROUP BY source"))
 
+    def claimed_without_row(self, source: str) -> int:
+        """How many items of a source's are claimed and have no row: work that was
+        begun under a claim and came to nothing that was kept, or is under way. A
+        claim is kept for good, so such an item is not worked on again."""
+        with closing(self._connect()) as db:
+            return db.execute(
+                "SELECT COUNT(*) FROM claims WHERE source = ? AND NOT EXISTS "
+                "(SELECT 1 FROM evidence WHERE evidence.source = claims.source "
+                "AND evidence.ref = claims.ref)",
+                (source,),
+            ).fetchone()[0]
+
     def last_id(self) -> int:
         """The id of the row that was stored last, or 0 for a store with no rows.
         Rows are never changed and never removed, and each new one gets a larger id,

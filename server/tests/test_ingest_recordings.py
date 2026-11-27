@@ -1225,6 +1225,28 @@ def test_a_poller_given_a_backlog_hears_every_call_there_is_oldest_first(
     assert len(radio.asked) == 7
 
 
+def test_a_backlog_of_which_only_a_day_is_wanted_begins_at_that_day(
+    store: EvidenceStore, radio: Radio, storage: Storage
+) -> None:
+    day = NOON - timedelta(days=7)
+    # The second before the day, its first second, and an hour in.
+    radio.call(1, day - timedelta(seconds=1))
+    radio.call(2, day)
+    radio.call(3, day + timedelta(hours=1))
+    poller = build(radio, storage, backlog=True, since=day, calls_per_poll=1)
+
+    # Three polls: a call at each of the first two, and the one that finds no more.
+    reports = [poller.poll(store, NOON) for _ in range(3)]
+
+    # The pass begins at the day each time one is begun, and never before it.
+    assert [report.added for report in reports] == [1, 1, 0]
+    assert refs(store) == [radio.ref(2), radio.ref(3)]
+    assert radio.asked == [tone(2), tone(3)]
+    assert store.taken("recordings", [radio.ref(1)]) == set()
+    poller.poll(store, NOON)
+    assert radio.asked == [tone(2), tone(3)]
+
+
 def test_a_run_that_is_stopped_goes_on_without_paying_for_a_call_twice(
     tmp_path: Path, radio: Radio, storage: Storage
 ) -> None:
@@ -2200,6 +2222,26 @@ def test_a_radio_poller_that_can_spend_pays_under_radios_own_budget(
                 talkgroups=(FIRE,),
                 known=KNOWN,
             )
+
+
+def test_a_run_with_a_budget_of_its_own_pays_under_its_own_scope_and_no_other(
+    calls: Path, storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+    shelf = Directory(calls, SYSTEM)
+
+    # The scale run names its own scope, and is refused the server's radio budget.
+    with pytest.raises(ValueError, match="needs the spending scope scale:radio"):
+        RecordedRadio(
+            shelf, live_ember(storage), talkgroups=(FIRE,), known=KNOWN, scope="scale:radio"
+        )
+    RecordedRadio(
+        shelf,
+        live_ember(storage, "scale:radio"),
+        talkgroups=(FIRE,),
+        known=KNOWN,
+        scope="scale:radio",
+    ).close()
 
 
 def test_generated_calls_in_a_directory_are_heard_and_stored_as_a_stand_ins(
