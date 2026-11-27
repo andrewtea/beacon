@@ -666,3 +666,35 @@ def test_the_command_puts_a_hold_the_glossary_wrote_down_in_before_it_replays_a_
     assert status == 2
     assert "glossary_hold.json" in said
     assert (len(meta.audio), meta.tap_requests, len(meta.tables)) == asked
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        '{"held_until": null, "unusable_run": false}',
+        '{"held_until": null, "unusable_run": 0.0}',
+        '{"held_until": null, "unusable_run": 99}',
+        '{"held_until": "2026-03-03T16:00:00", "unusable_run": 0}',
+        '{"held_until": null, "unusable_run": 0, "more": 1}',
+        "[]",
+        "not json",
+    ],
+)
+def test_a_hold_that_was_written_down_and_is_not_what_beacon_writes_changes_nothing(
+    written: str, env: dict[str, str], site: DataSf
+) -> None:
+    layout, _, _ = scored(env, site)
+    runs = Runs(layout.taps, "mock")
+    until = datetime.now(UTC) + timedelta(minutes=8)
+    on = {"held_until": until.isoformat(), "unusable_run": 2}
+    runs.save_state(on)
+    (layout.root / glossary.HOLD_FILE).write_text(written)
+
+    # It is not taken for "no hold": the hold that is on stays on, and what was
+    # written down stays where it is for a person to look at.
+    with pytest.raises(run.ScaleError, match=r"glossary_hold\.json"):
+        glossary.settle(layout, runs)
+
+    assert runs.state() == on
+    assert (layout.root / glossary.HOLD_FILE).read_text() == written
+    runs.close()

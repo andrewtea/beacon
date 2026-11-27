@@ -247,6 +247,9 @@ def settle(layout: Layout, runs: Runs) -> None:
     if (
         not isinstance(said, dict)
         or set(said) != {"held_until", "unusable_run"}
+        # A whole number and nothing that only equals one: `false` and `0.0` are
+        # read as no count at all, and would pass the comparison below as zero.
+        or type(said["unusable_run"]) is not int
         or Hold(*read_hold(said)).hold_state() != said
     ):
         raise ScaleError(f"The hold the run's glossary put on ({HOLD_FILE}) cannot be read.")
