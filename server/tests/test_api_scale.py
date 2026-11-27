@@ -277,7 +277,7 @@ def test_a_run_of_a_sample_says_so_beside_every_number_or_is_not_shown(
         # The label that is beside every value, the sentence under every heading,
         # and the words before any number all say what the run is of.
         assert shown["kind_text"] == "Stand-in, generated calls, sample of 3 calls"
-        assert "the first 3 of the day's 6 calls" in shown["reminder_text"]
+        assert "the first 3 of the 6 calls Beacon could read for that day" in shown["reminder_text"]
         assert "This run is of a sample: the first 3 calls of the day" in shown["basis_text"]
 
         # A result that says it is of a sample its own words do not name is not

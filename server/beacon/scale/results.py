@@ -79,6 +79,12 @@ RECORDED_BY_EMBER = (
     "paid for each one it is asked to hear; the numbers below say how many that was. "
     "What Beacon makes of them is scored against DataSF's record of the same day."
 )
+# What the matching rule does not check. Of recorded radio it also cannot tell a
+# call DataSF does not list from a wrong incident; generated calls are each of a
+# record, so nothing is said of an unlisted call there.
+NOT_CHECKED_GENERATED = (
+    "A match is by kind, time, and unit or place. Nothing checks what an incident says beyond that."
+)
 NOT_CHECKED = (
     "A match is by kind, time, and unit or place. Nothing checks what an incident "
     "says beyond that, and a call DataSF does not list cannot be told from a wrong "
@@ -122,9 +128,9 @@ def _sample_reminder(calls: int, of: int) -> str:
     read, the whole day's unit types, a scope's cost), so it claims the sample's
     for none that says otherwise of itself."""
     return (
-        f" It is of a sample, the first {calls} of the day's {of} calls, and of no "
-        "whole day: a number here is of the sample unless its own sentence says it "
-        "is of the whole day or of a spending scope."
+        f" It is of a sample, the first {calls} of the {of} calls Beacon could read "
+        "for that day, and of no whole day: a number here is of the sample unless "
+        "its own sentence says it is of the whole day or of a spending scope."
     )
 
 
@@ -385,7 +391,7 @@ def build(
         and glossary_waiting is None
         and not ledger_lost
     )
-    caveats = [NOT_CHECKED]
+    caveats = [NOT_CHECKED_GENERATED if generated else NOT_CHECKED]
     if not heard_complete:
         caveats.insert(0, INCOMPLETE)
     if stopped is not None:
@@ -716,11 +722,12 @@ def _match_numbers(
             "Incidents of Beacon's that fit no DataSF call of "
             + ("the sample" if sampled else "this day")
             + (
-                # Every generated call is of a record, so none is of a call DataSF
-                # does not list.
-                ". Every call was generated from a record, so one is an incident "
-                "Beacon made of calls it heard or grouped otherwise than the "
-                "record has them: the rule does not say which."
+                # Of generated calls the count is said and not explained: `fits`
+                # shows only that no record fits, which a record can bring about
+                # by itself (one whose dispatch is before its call was received
+                # fits no incident opened at its dispatch). And every generated
+                # call is of a record, so none is of a call DataSF does not list.
+                "."
                 if generated
                 else ". One can be a real call DataSF does not list, or a wrong "
                 "incident: the rule cannot tell."
@@ -867,6 +874,9 @@ def _cost_numbers(
         f"run's hearing of {what}, this run's and any other's. A call that was not "
         "answered is counted at the most it can have cost."
     )
+    # Each of the three says of itself that it is its scope's, over every paid run:
+    # a second paid run of the same kind of audio adds to all of them.
+    every = f"every paid run's hearing of {what}, this run's and any other's"
     each = None if not spend.calls else round(to_usd(spend.spent_nanousd) / spend.calls * 1000, 4)
     return [
         Number(
@@ -877,14 +887,17 @@ def _cost_numbers(
             "Paid requests",
             spend.calls,
             "requests",
-            f"Requests to Muse Ember under {scope}, {spend.unanswered} of them not answered.",
+            f"Requests to Muse Ember that the Ember ledger holds under the scope {scope}, "
+            f"over {every}, and not this run's alone. {spend.unanswered} of them were "
+            "not answered.",
         ),
         Number(
             "radio_cost_per_1000_usd",
             "Cost per 1,000 transmissions",
             each,
             "USD",
-            f"That cost for each 1,000 of those requests, for {what}.",
+            f"The cost of hearing above for each 1,000 of those requests: a rate over "
+            f"{every} under the scope {scope}, and not this run's alone.",
         ),
     ]
 

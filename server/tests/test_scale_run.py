@@ -195,18 +195,21 @@ def test_a_run_of_a_sample_is_of_the_days_first_calls_and_says_so_wherever_its_k
     label, reminder = results.kind(made)
     assert label == "Stand-in, generated calls, sample of 3 calls"
     assert reminder is not None
+    # The day's count is of the calls Beacon could read, and is called that.
     assert reminder.endswith(
-        "It is of a sample, the first 3 of the day's 6 calls, and of no whole day: a "
-        "number here is of the sample unless its own sentence says it is of the whole "
-        "day or of a spending scope."
+        "It is of a sample, the first 3 of the 6 calls Beacon could read for that day, "
+        "and of no whole day: a number here is of the sample unless its own sentence "
+        "says it is of the whole day or of a spending scope."
     )
     # On the terminal the kind is beside every number, as it is on the page.
     shown = [line for line in results.lines(made) if line and not line.startswith(" ")]
     numbered = shown[shown.index("DataSF calls in the sample: 3 calls  [" + label + "]") :]
     assert len(numbered) == len(made["numbers"])
     assert all(line.endswith("  [" + label + "]") for line in numbered)
-    # Every generated call is of a record: none is called a call DataSF does not list.
-    assert "real call DataSF does not list" not in texts["extra"]
+    # Why an incident fits no call is not said: the rule shows only that none fits.
+    assert texts["extra"] == "Incidents of Beacon's that fit no DataSF call of the sample."
+    assert results.NOT_CHECKED_GENERATED in made["caveats"]
+    assert results.NOT_CHECKED not in made["caveats"]
     assert texts["records"].startswith("The first 3 calls the fire department was dispatched to")
     assert "of these and not of the day" in texts["records"]
     assert "fit no DataSF call of the sample" in texts["extra"]
@@ -664,7 +667,19 @@ def test_a_paid_run_of_generated_speech_reports_what_the_ledger_holds_and_says_w
     assert numbers["radio_cost_usd"] == pytest.approx(CALLS * 0.00015)
     assert numbers["radio_cost_per_1000_usd"] == pytest.approx(0.15)
     assert "generated speech, not radio" in texts["radio_cost_usd"]
+    # The total, the count, and the rate each say they are their scope's over
+    # every paid run: a second paid run of generated speech adds to all three.
+    every = "every paid run's hearing of generated speech, not radio, this run's and any other's"
+    for key in ("radio_cost_usd", "radio_paid_calls", "radio_cost_per_1000_usd"):
+        assert every in texts[key]
+        assert run.SPEECH_SCOPE in texts[key]
+    for key in ("radio_paid_calls", "radio_cost_per_1000_usd"):
+        assert "and not this run's alone" in texts[key]
     assert "no measure of Beacon on real radio" in texts["found"]
+    # Every generated call is of a record: nothing is said of a call DataSF does
+    # not list, and an incident no call fits is counted and not explained.
+    assert made["caveats"][0] == results.NOT_CHECKED_GENERATED
+    assert texts["extra"] == "Incidents of Beacon's that fit no DataSF call of this day."
     # Generated calls are placed at DataSF's times, paid for or not.
     assert numbers["heard_after_dispatch_s"] is None
     # The taps were investigated by the paid client too, under their own scope.
@@ -1759,6 +1774,12 @@ def test_a_run_over_recordings_is_the_one_whose_numbers_are_about_real_radio(
     numbers, texts = numbers_of(env), texts_of(env)
     # Only the day's two calls were heard: not the evening before, nor the morning after.
     assert (numbers["transmissions"], numbers["radio_paid_calls"]) == (2, 2)
+    # Of real radio, a call DataSF does not list cannot be told from a wrong incident.
+    assert results.NOT_CHECKED in made["caveats"]
+    assert texts["extra"].endswith(
+        "One can be a real call DataSF does not list, or a wrong incident: the rule cannot tell."
+    )
+    assert "every paid run's hearing of recorded radio" in texts["radio_cost_per_1000_usd"]
     assert len(meta.audio) == 2
     assert (numbers["incidents"], numbers["found"], numbers["missed"]) == (1, 1, 5)
     assert "not_generated" not in numbers
