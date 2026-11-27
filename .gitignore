@@ -28,3 +28,6 @@ __pycache__/
 .idea/
 .vscode/
 *.log
+
+# What deploy/build makes for a Box.
+/box/

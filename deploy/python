@@ -1,0 +1,29 @@
+#!/bin/sh
+# Runs the deployment's Python with the settings a deployment has, for the server
+# (`deploy/python -m beacon.serve --host 0.0.0.0`) and for a command given on the
+# Box (`deploy/python scripts/scale_run.py --name demo --day 2026-11-24`).
+#
+# A setting that is already in the environment is left as it is, so a key or a
+# source set on the deployment later needs no change here.
+set -eu
+here=$(cd "$(dirname "$0")/.." && pwd)
+
+# What Beacon keeps is kept where a deployment's data outlasts a deploy.
+export BEACON_DATA_DIR="${BEACON_DATA_DIR:-${AMP_DEPLOYMENT_DATA_DIRECTORY:?Set BEACON_DATA_DIR to where the data is kept.}}"
+export BEACON_WEB_DIR="${BEACON_WEB_DIR:-$here/web/dist}"
+# No Ember is asked anything until a deployment is given a key and told to.
+export REPLAY="${REPLAY:-1}"
+# Whom a push service may write to about this server: the repository's page.
+export BEACON_VAPID_SUBJECT="${BEACON_VAPID_SUBJECT:-https://github.com/andrewtea/beacon}"
+# The scale run whose results the results page shows.
+export BEACON_SCALE_RUN="${BEACON_SCALE_RUN:-demo}"
+# The invented story is told again when it is over, for as long as no real source
+# is named: a visitor days after a deploy finds a story in progress.
+if [ -z "${BEACON_LIVE_SOURCES:-}" ]; then
+  export BEACON_MOCK_REPEAT="${BEACON_MOCK_REPEAT:-1}"
+fi
+
+export PYTHONPATH="$here/box/site"
+# No bytecode is written beside the code: a release is read-only to its service.
+export PYTHONDONTWRITEBYTECODE=1
+exec "$here/box/python/bin/python3.12" "$@"

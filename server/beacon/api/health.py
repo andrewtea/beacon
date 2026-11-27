@@ -15,9 +15,19 @@ class Health(BaseModel):
     # then a stand-in's, and the app says so before anybody taps. Null when this
     # server reads no evidence.
     mode: Literal["live", "mock"] | None = None
+    # On a server that tells the invented scenario again when it is over
+    # (`beacon.serve`, `BEACON_MOCK_REPEAT=1`): a sentence that says so, and what
+    # becomes of the taps sent before. Shown with what says the scenario is
+    # invented. Null on every other server.
+    repeats_text: str | None = None
 
 
 @router.get("/health")
 def health(request: Request) -> Health:
     engine = getattr(request.app.state, "incidents", None)
-    return Health(status="ok", version=__version__, mode=None if engine is None else engine.mode)
+    return Health(
+        status="ok",
+        version=__version__,
+        mode=None if engine is None else engine.mode,
+        repeats_text=getattr(request.app.state, "repeats_text", None),
+    )

@@ -1,0 +1,24 @@
+#!/bin/sh
+# Builds what a deployment runs, into box/ and web/dist: the built app, a Python of
+# its own that can be moved to another machine, and the server with the
+# dependencies its lockfile names. `.amp/box.yaml` runs it where `amp boxes deploy`
+# is given; the Box that serves the result builds nothing.
+set -eu
+cd "$(dirname "$0")/.."
+
+(cd web && pnpm install --frozen-lockfile && pnpm build)
+
+rm -rf box
+mkdir -p box/installed
+# A standalone Python: it runs from wherever its directory is put.
+UV_PYTHON_INSTALL_DIR="$PWD/box/installed" uv python install 3.12
+# uv also leaves a link named for the minor version alone; the directory is the one
+# whose name has the patch version.
+mv box/installed/cpython-3.12.*/ box/python
+rm -rf box/installed
+python="$PWD/box/python/bin/python3.12"
+
+# The server's dependencies as the lockfile has them, and then the server itself.
+uv export --project server --frozen --no-dev --no-emit-project --no-hashes -o box/requirements.txt
+uv pip install --python "$python" --target box/site -r box/requirements.txt
+uv pip install --python "$python" --target box/site --no-deps ./server

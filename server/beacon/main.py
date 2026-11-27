@@ -7,11 +7,15 @@ import os
 from collections.abc import AsyncIterator, MutableMapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.responses import Response
+from starlette.staticfiles import StaticFiles
+from starlette.types import Scope
 
 from beacon import __version__
 from beacon.api import health, incidents, places, push, scale, sources, taps
@@ -28,6 +32,10 @@ from beacon.taps import Taps, open_taps
 _REQUEST_PARTS = frozenset({"body", "query", "path", "header", "cookie"})
 
 INGEST_VARIABLE = "BEACON_INGEST"
+# The setting that names the directory of the built app (`web/dist`), which the
+# server then serves from its own origin, beside `/api`. Unset, it serves the API
+# alone, and something else serves the app.
+WEB_VARIABLE = "BEACON_WEB_DIR"
 # How often the photos and clips whose hour is over are deleted.
 SWEEP_SECONDS = 60.0
 # How often the incidents are looked over for one whose story is due.
@@ -447,6 +455,37 @@ async def _validation_error(_request: Request, error: RequestValidationError) ->
     return JSONResponse({"detail": detail}, status_code=422)
 
 
+class _Web(StaticFiles):
+    """The built app's files. A file under `assets/` has a digest of what it holds
+    in its name and is kept by a browser for good. Every other file (the page, the
+    service workers, the manifest) is asked about each time, so that a browser has
+    the app, and the worker that shows a notification, as they were last deployed."""
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        response = await super().get_response(path, scope)
+        kept = Path(path).parts[:1] == ("assets",) and response.status_code == 200
+        response.headers["Cache-Control"] = (
+            "public, max-age=31536000, immutable" if kept else "no-cache"
+        )
+        return response
+
+
+def _web_directory() -> Path | None:
+    """The directory of the built app that `BEACON_WEB_DIR` names, or None.
+
+    Raises ServerSetupError when it names no built app."""
+    named = os.environ.get(WEB_VARIABLE)
+    if not named:
+        return None
+    directory = Path(named)
+    if not (directory / "index.html").is_file():
+        raise ServerSetupError(
+            f"{WEB_VARIABLE} names no built app: there is no index.html in it. Build "
+            "the app (pnpm build in web/) and name web/dist."
+        )
+    return directory
+
+
 def create_app() -> FastAPI:
     # Every route lives under /api so the built PWA can be served from the same origin.
     app = FastAPI(
@@ -478,6 +517,11 @@ def create_app() -> FastAPI:
     app.include_router(scale.router, prefix="/api")
     app.include_router(sources.router, prefix="/api")
     app.include_router(taps.router, prefix="/api")
+    web = _web_directory()
+    if web is not None:
+        # After every route, so that nothing under /api is ever a file's. The app
+        # names its views in the URL's fragment, so only `/` is its page.
+        app.mount("/", _Web(directory=web, html=True), name="web")
     return app
 
 

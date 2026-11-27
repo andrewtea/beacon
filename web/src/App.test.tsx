@@ -74,6 +74,18 @@ test('says that it runs on an invented scenario before anybody taps', async () =
   expect(screen.getByRole('button', { name: ASK })).toBeEnabled()
 })
 
+test('says, in the server’s sentence, that the invented scenario is told again and what becomes of taps', async () => {
+  const repeats =
+    'On this server the invented scenario is told again from its beginning when it is over.'
+  serve({ 'GET /api/health': { ...MOCK_HEALTH, repeats_text: repeats } })
+
+  render(<App />)
+
+  // Beside what says the scenario is invented, before anybody taps.
+  const banner = await screen.findByText(INVENTED)
+  expect(banner).toHaveTextContent(repeats)
+})
+
 test('takes no tap until the server has said whether it runs on real sources', async () => {
   // The server answers only when it is let: until then nobody has been told
   // whether a tap would go to the invented scenario.

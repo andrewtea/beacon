@@ -65,6 +65,7 @@ export default function App() {
   // failed, the mode is not known: the last answer is not carried over, because
   // the server that comes back can be another one, on other sources.
   const mode = unreachable ? null : (health.data?.mode ?? null)
+  const repeatsText = unreachable ? null : (health.data?.repeats_text ?? null)
   // A tap the server no longer answers for is deleted from this device.
   useEffect(() => sweepTaps(), [])
   const askAgain = useCallback(() => setAsked((count) => count + 1), [])
@@ -88,6 +89,9 @@ export default function App() {
             Beacon is running on an invented scenario, not real sources. The
             incidents, alerts, and notices it shows are made up and are not a
             record of anything that happened.
+            {/* On a server that tells the story again, the server's sentence
+                about that: a tap sent now is gone when it does. */}
+            {repeatsText !== null && <> {repeatsText}</>}
           </p>
         )}
       {unreachable && (

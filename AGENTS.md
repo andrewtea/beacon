@@ -6,6 +6,7 @@ Beacon is a "What's that?" button for San Francisco, built for the Meta Muse Emb
 
 - `web/`: React + Vite + TypeScript PWA. Package manager is pnpm. Tests are Vitest with Testing Library, lint is oxlint, format is Prettier. See [Working on the app](#working-on-the-app).
 - `server/`: Python 3.12 + FastAPI, managed with uv. Tests are pytest, lint and format are ruff (config in the root `ruff.toml`). The package is `beacon`; every route is under `/api`.
+- `deploy/`: what a deployment is built and run with. `build` makes the built app and a Python with the server's locked dependencies (`box/`, ignored by Git), `python` runs that Python with a deployment's settings, each of which the deployment's environment overrides, and `.amp/box.yaml` names both for an Amp Box. See [Working on the deployment](#working-on-the-deployment).
 - `scripts/`: repository scripts. Python scripts import `beacon` and run with `uv run --project server python scripts/<name>.py`. Keep their logic in `server/beacon/` so it is tested; the script is a thin entry point.
 - `data/`: local runtime data (SQLite files, recordings, downloads), ignored by Git. The Ember client writes under `data/ember/`. `BEACON_DATA_DIR` moves it and must be an absolute path (`beacon.ember.client.default_data_dir`); code that stores data must honor it.
 
@@ -29,7 +30,7 @@ Each `server/beacon/` package has one concern, so parallel pull requests stay ap
 - `story/`: the points Ember picks to tell an incident by. `merge` is the Ember call (`merge_incident`), the check of each point against its rows, and the sentences code writes for them; `store` is the file stories are kept in (`Stories`), `desk` when one is paid for (`StoryDesk`), `stand_in` the stand-in that chooses with no key, and `setup` opens the desk (`open_stories`).
 - `taps/`: taking a tap. `desk` checks one, rounds its place, and stores its row (`Taps.take`); `media` has a photo drawn again as a new JPEG and a clip written out again as its samples, and keeps them for an hour (`Taps.media` reads them back).
 
-`beacon/errors.py` is a module beside them, with `raise_bare`: how an error about something private is raised with nothing chained under it. `beacon/api/body.py` has `read_body`, which a route that takes something private reads its body with. So is `beacon/files.py`, with `begin_file`: how a SQLite file that is the mock store's or the live store's, in one shape, is opened or refused.
+`beacon/serve.py` is a module beside them: `python -m beacon.serve`, the server as a deployment runs it, which writes no access log and, with `BEACON_MOCK_REPEAT=1`, tells the invented story again when it is over (`begin_again`, `MOCK_FILES`). `beacon/errors.py` is another, with `raise_bare`: how an error about something private is raised with nothing chained under it. `beacon/api/body.py` has `read_body`, which a route that takes something private reads its body with. So is `beacon/files.py`, with `begin_file`: how a SQLite file that is the mock store's or the live store's, in one shape, is opened or refused.
 
 ## Commands
 

@@ -1,0 +1,15 @@
+# What `amp boxes deploy` builds and a Box runs. README, "Deploy", says how.
+# The build runs where the deploy is given; the Box only unpacks and serves.
+build: deploy/build
+# Only what runs is shipped: no source and no Git history.
+source: false
+artifacts:
+  - box
+  - web/dist
+  - deploy
+  - scripts/scale_run.py
+services:
+  # One process: the API, the built app, and the pollers of the invented story.
+  # Its settings are in deploy/python, each of which the deployment can override.
+  web:
+    command: deploy/python -m beacon.serve --host 0.0.0.0
