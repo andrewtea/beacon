@@ -43,8 +43,10 @@ export function subscribePush(
   endpoint: string,
   places: { lat: number; lon: number }[],
   shown: Mode,
+  signal?: AbortSignal,
 ): Promise<{ mode: Mode; kept_until: string }> {
   return fetchJson('/api/push/subscribe', {
+    signal,
     method: 'POST',
     headers: { 'Content-Type': 'application/json', [MODE_HEADER]: shown },
     body: JSON.stringify({
@@ -64,16 +66,19 @@ export function subscribePush(
  * **Only `204` is the server saying that it does not keep the address**, and
  * only the server of the mode the address was given to can say so: `owner` is
  * that mode, and a server in the other mode refuses with `409`. Anything else
- * (a server that is busy, stopping, or not reached) deleted nothing and is an
- * `ApiError`: the caller keeps the address and asks again.
+ * (a server that is busy, stopping, or not reached, and a request that was
+ * aborted) is not the server saying so, and is an `ApiError`: the caller keeps
+ * the address and asks again.
  */
 export async function unsubscribePush(
   endpoint: string,
   owner: Mode,
+  signal?: AbortSignal,
 ): Promise<void> {
   let response: Response
   try {
     response = await fetch('/api/push/unsubscribe', {
+      signal,
       method: 'POST',
       headers: { 'Content-Type': 'application/json', [MODE_HEADER]: owner },
       body: JSON.stringify({ endpoint }),

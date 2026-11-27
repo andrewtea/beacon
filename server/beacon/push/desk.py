@@ -23,6 +23,15 @@ pass answers with counts.
 
 Sending is best effort (`store`): a push can fail to arrive, and a device can be
 notified twice for one incident.
+
+**A pass has a budget of time, not a hard end.** It begins when the pass does
+(`Push.work`, before anything is swept or read), and it is looked at between
+steps: before each subscription is looked at, before a send is claimed, and again
+after the claim, so that a push service is waited for no longer than the pass has
+left. What is not cut off is a step itself: a write to the subscriptions file
+waits for the file at most five seconds, and the reading of the incidents takes
+what it takes. Looking over the subscriptions is done in memory, over at most
+`MAX_SUBSCRIPTIONS` of them, and takes no time worth a cursor.
 """
 
 import time
@@ -40,13 +49,14 @@ from beacon.push.store import Subscriptions, SubscriptionsError
 from beacon.push.vapid import Vapid
 from beacon.radio.vocabulary import MEDICAL_EVENT
 
-# The most pushes one pass sends, and the longest it lasts, from before it reads
-# anything. What is still due is sent by a later pass: it was not claimed.
+# The most pushes one pass sends, and how long after it began a pass starts no
+# further send. What is still due is sent by a later pass: it was not claimed.
 MAX_SENDS = 200
 PASS_SECONDS = 30.0
 # The longest one push service is waited for, when the pass has that long left.
 SEND_SECONDS = 10.0
-# With less than this left, a pass sends nothing more: seconds.
+# With less than this left, a pass claims nothing more, and a send that was
+# claimed is given this long at the least: seconds.
 _LEAST_SECONDS = 0.5
 # How long a push service keeps a push for a device it cannot reach, in seconds.
 TTL_SECONDS = 3600
@@ -75,8 +85,10 @@ class Pass:
     again: int = 0
     # Sends a push service refused in a way that trying again does not mend.
     failed: int = 0
-    # Whether the pass stopped with more to send.
+    # Whether the pass stopped before it had looked at every subscription.
     more: bool = False
+    # How many subscriptions files could not be swept of what ran out.
+    unswept: int = 0
 
     @property
     def quiet(self) -> bool:
@@ -108,14 +120,19 @@ class Notifier:
         """End a send that is out and make no more."""
         self._http.close()
 
-    def notify(self, snapshot: Snapshot, now: datetime) -> Pass:
-        """Send what is due on this reading of the incidents. Subscriptions whose
-        time is over are deleted first.
+    def deadline(self) -> float:
+        """When a pass that begins now starts no further send, on this
+        notifier's clock."""
+        return self._monotonic() + PASS_SECONDS
+
+    def notify(self, snapshot: Snapshot, now: datetime, *, stop_at: float | None = None) -> Pass:
+        """Send what is due on this reading of the incidents, starting no send
+        after `stop_at` (`deadline()`, taken when the pass began; now, when none
+        is given). It deletes nothing that ran out: `Push.work` does, first.
 
         Raises SubscriptionsError when the subscriptions file is closed."""
-        # From before anything is read: the reading is part of what a pass takes.
-        stop_at = self._monotonic() + PASS_SECONDS
-        self._subscriptions.sweep(now)
+        if stop_at is None:
+            stop_at = self.deadline()
         self._forget_tokens(now)
         due = []
         for incident in snapshot.incidents:
@@ -137,10 +154,12 @@ class Notifier:
         # Read once. A send that needs nothing more is passed over without a
         # write, so the sends a pass is allowed all go to what is still due, and
         # the devices that were kept last are reached however many came before.
-        tried = self._subscriptions.tries()
+        tried = self._subscriptions.tries([incident_id for incident_id, _, _ in due])
         counts = {"sent": 0, "gone": 0, "again": 0, "failed": 0}
         sends = 0
         for subscription in self._subscriptions.all():
+            if stop_at - self._monotonic() < _LEAST_SECONDS:
+                return Pass(**counts, more=True)
             for incident_id, point, decided_at in due:
                 before = tried.get((subscription.endpoint, incident_id))
                 if before is not None and not before.again_at(now):
@@ -163,7 +182,12 @@ class Notifier:
                 if not self._subscriptions.claim(subscription.endpoint, incident_id, place, now):
                     continue
                 sends += 1
-                outcome = self._send(subscription.endpoint, now, min(SEND_SECONDS, left))
+                # What is left is taken again: the claim is a write, and can have
+                # waited for the file. A send that is claimed is always made.
+                left = stop_at - self._monotonic()
+                outcome = self._send(
+                    subscription.endpoint, now, max(_LEAST_SECONDS, min(SEND_SECONDS, left))
+                )
                 counts[outcome] += 1
                 try:
                     if outcome == "gone":

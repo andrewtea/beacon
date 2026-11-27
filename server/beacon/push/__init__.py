@@ -13,11 +13,12 @@ as sends a notification, and says all of it (`ABOUT`):
 - **A subscription is an address and places.** The address is the one the
   browser's push service made for this device and this site (its `endpoint`). The
   places are up to five, each rounded to about a block as a tap's is, with no name
-  and with when it was added. Beside them: when the subscription was last renewed,
-  and for each incident a push was tried for, the incident's id, when, how many
-  tries, and what came of the latest (`store`). No key of the browser's is kept,
-  because nothing is encrypted to it: **a push carries no content**. It wakes a
-  service worker of the app's, which shows a sentence the app already has. So the
+  and with when this server was first told of it. Beside them: when the
+  subscription was last renewed, and for each incident a push was tried for, the
+  incident's id, when, how many tries, and what came of the latest (`store`). No
+  key of the browser's is kept, because nothing is encrypted to it: **a push
+  carries no content**. It wakes a service worker of the app's, which shows a
+  sentence the app already has. So the
   push service, which is the browser maker's, is sent no incident, no place, and
   no text. It does learn that Beacon sent this device a message, and when.
 - **A subscription is kept for `KEPT` after it was last renewed**, which the app

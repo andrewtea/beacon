@@ -1,8 +1,9 @@
 """Opens web push for a server, as the environment asks."""
 
 import os
+import sqlite3
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -61,17 +62,26 @@ class Push:
         return self.notifier is not None
 
     def work(self, snapshot: Callable[[], Snapshot], now: datetime) -> Pass:
-        """One pass: delete what ran out, in every file, and send what is due
-        when this server sends. `snapshot` is asked for a reading of the incidents
-        only then.
+        """One pass: delete what ran out, from each file by itself, and then send
+        what is due when this server sends. The deleting comes first and depends
+        on nothing else: `snapshot`, which is asked for a reading of the incidents
+        only after it and only by a server that sends, can fail without anything
+        that ran out being kept for it. A file that could not be swept is counted
+        (`Pass.unswept`) and does not keep the next from being swept.
 
-        Raises SubscriptionsError when this server's file is closed."""
-        for other in self.others:
-            other.sweep(now)
+        Raises SubscriptionsError when a file is closed, and whatever `snapshot`
+        raises."""
+        # The budget of the pass begins here, before anything is swept or read.
+        stop_at = None if self.notifier is None else self.notifier.deadline()
+        unswept = 0
+        for kept in (self.subscriptions, *self.others):
+            try:
+                kept.sweep(now)
+            except sqlite3.Error:
+                unswept += 1
         if self.notifier is None:
-            self.subscriptions.sweep(now)
-            return Pass()
-        return self.notifier.notify(snapshot(), now)
+            return Pass(unswept=unswept)
+        return replace(self.notifier.notify(snapshot(), now, stop_at=stop_at), unswept=unswept)
 
     def close(self) -> None:
         """End a send that is out, make no more, and write nothing more."""
@@ -106,15 +116,17 @@ def open_push(
     there is no file of either mode: nothing is kept, and nothing is made.
 
     Raises PushConfigError for a setting that is not 1 or 0 and for a directory
-    that cannot be made, VapidError for a contact that cannot be used and a key
-    that cannot be had, and SubscriptionsError for a subscriptions file of this
-    mode that is the other mode's or in another shape."""
+    that cannot be made, VapidError for a contact that cannot be used by a server
+    that is to send and for a key that cannot be had, and SubscriptionsError for a
+    subscriptions file of this mode that is the other mode's or in another shape."""
     setting = env.get(PUSH_VARIABLE, "1").strip()
     if setting not in ("0", "1"):
         raise PushConfigError(f"{PUSH_VARIABLE} must be 1 or 0.")
     if runs.mode != engine.mode:
         raise PushConfigError("The investigations file is not the incident engine's store's.")
-    subject = subject_of(env)
+    # Read only by a server that is to send: one that only deletes is not kept
+    # from starting, and so from deleting, by a contact it would never use.
+    subject = subject_of(env) if setting == "1" else None
     mode = engine.mode
     other: Mode = "live" if mode == "mock" else "mock"
     directory = default_data_dir(env) / "push"

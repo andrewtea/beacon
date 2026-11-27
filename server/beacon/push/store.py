@@ -5,8 +5,8 @@ they turn notifications on (`notice.ABOUT`):
 
 - **A subscription** (`subscription`): the address the push service made for one
   device and this site; the places the device asked to be notified about, each
-  rounded to about a block, with no name, and with when it was added; and when the
-  subscription was last renewed. No key of the browser's, no address a request
+  rounded to about a block, with no name, and with when this file was first told
+  of it; and when the subscription was last renewed. No key of the browser's, no address a request
   came from, no browser's name.
 - **What was sent to it** (`sent`): for each incident a push was tried for, the
   incident's id beside the address, when the latest try was claimed, how many
@@ -22,9 +22,11 @@ How long:
 
 Sending:
 
-- **A place has the time it was added**, which a renewal keeps for a place that
-  is still named: a push is for crisis mode turned on near a place the device had
-  already named, so adding a place brings no push about a decision made before.
+- **A place has the time this file was first told of it**, which a renewal keeps
+  for a place that is still named: a push is for crisis mode turned on near a
+  place the device had already named, so adding a place brings no push about a
+  decision made before. A new address has new times, whatever address the device
+  had before: the file does not know one device's addresses from another's.
 - **A send is claimed before it is made** (`claim`), under the subscription's
   address and the incident's id, and only while the subscription still names the
   place the send is for. The claim is settled when the push service has answered
@@ -36,13 +38,18 @@ Sending:
   answer was lost is asked again, and the device is then notified twice.
 - At most `MAX_SUBSCRIPTIONS` are kept. One more is refused.
 - A file is the mock store's or the live store's for life, in one shape
-  (`beacon.files.begin_file`).
+  (`beacon.files.begin_file`). **Shape 1** kept a place without the time it was
+  added, and is no shape this code can read or write: a file in it has its
+  subscriptions and what was sent to them deleted when it is opened (`_EXPIRE`),
+  which is the one thing that can be done with them on time. A device whose
+  subscription went that way gives the server its address again when its app is
+  next opened, with places that are added then.
 """
 
 import json
 import sqlite3
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -54,7 +61,7 @@ from beacon.evidence import Point
 from beacon.files import Mode, begin_file
 
 # How long a subscription is kept after it was last renewed. The app renews it
-# when it is opened with notifications on.
+# when it is opened with notifications on, and when a place is saved or removed.
 KEPT = timedelta(days=30)
 # The most subscriptions one file holds.
 MAX_SUBSCRIPTIONS = 2_000
@@ -71,9 +78,10 @@ SENT_KEPT = timedelta(hours=48)
 Outcome = Literal["sent", "again", "failed"]
 
 _WAIT_SECONDS = 5.0
-_FORMAT = 1
-# 0 is a file that says no shape, which a new file is too.
-_EARLIER = frozenset({0})
+_FORMAT = 2
+# 0 is a file that says no shape, which a new file is too. 1 kept places as pairs
+# and a time a subscription was made.
+_EARLIER = frozenset({0, 1})
 _SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS subscription (
@@ -94,6 +102,15 @@ _SCHEMA = (
     """,
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 )
+# Run on a file of an earlier shape, after `_SCHEMA`: its subscriptions and what
+# was sent to them go, and the two tables are made anew in this shape. The file's
+# mode stays.
+_EXPIRE = (
+    "DROP TABLE IF EXISTS sent",
+    "DROP TABLE IF EXISTS subscription",
+    _SCHEMA[0],
+    _SCHEMA[1],
+)
 _UNKNOWN_SHAPE = (
     "The push subscriptions file is in a shape this Beacon does not know: a newer "
     "one wrote it. It is left as it is. Run a Beacon that knows the shape."
@@ -110,7 +127,8 @@ class Place:
 
     # Rounded to about a block.
     point: Point
-    # When the device first named it, since it last named it without a break.
+    # When this file was first told of it, since the device last named it
+    # without a break. A device can have saved the place long before.
     added_at: datetime
 
 
@@ -157,7 +175,7 @@ class Subscriptions:
             schema=_SCHEMA,
             shape=_FORMAT,
             earlier=_EARLIER,
-            drop=(),
+            drop=_EXPIRE,
             unknown=_UNKNOWN_SHAPE,
         )
         if refusal is not None:
@@ -236,13 +254,18 @@ class Subscriptions:
         with closing(self._connect()) as db:
             return db.execute("SELECT count(*) FROM subscription").fetchone()[0]
 
-    def tries(self) -> dict[tuple[str, str], Try]:
-        """What is kept of every send, under its address and its incident's id.
-        A pass reads it once, to pass over what needs no send without a write."""
+    def tries(self, incident_ids: Collection[str] | None = None) -> dict[tuple[str, str], Try]:
+        """What is kept of the sends about these incidents, under each send's
+        address and its incident's id; of every send when none are named. A pass
+        reads it once for the incidents it has a push due for, to pass over what
+        needs no send without a write."""
+        query = "SELECT endpoint, incident_id, tries, state, claimed_at FROM sent"
+        named: tuple[str, ...] = ()
+        if incident_ids is not None:
+            named = tuple(dict.fromkeys(incident_ids))
+            query += f" WHERE incident_id IN ({', '.join('?' * len(named))})"
         with closing(self._connect()) as db:
-            rows = db.execute(
-                "SELECT endpoint, incident_id, tries, state, claimed_at FROM sent"
-            ).fetchall()
+            rows = db.execute(query, named).fetchall() if incident_ids is None or named else []
         return {
             (endpoint, incident_id): Try(tries, state, _moment(claimed_at))
             for endpoint, incident_id, tries, state, claimed_at in rows

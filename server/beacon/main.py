@@ -178,6 +178,12 @@ async def _send_pushes(sending: Push, engine: Engine, stop: asyncio.Event) -> No
         except Exception as error:
             logger.error("The pushes that are due could not be sent (%s).", type(error).__name__)
         else:
+            if done.unswept:
+                logger.warning(
+                    "%d push subscriptions files could not be swept of what ran out. "
+                    "The next pass tries again.",
+                    done.unswept,
+                )
             if not done.quiet:
                 # A refusal is the operator's to look at (a contact a push
                 # service does not take, say), so it is a warning, which is
@@ -190,7 +196,9 @@ async def _send_pushes(sending: Push, engine: Engine, stop: asyncio.Event) -> No
                     done.gone,
                     done.again,
                     done.failed,
-                    ", and more are due" if done.more else "",
+                    ", and it stopped before it had looked at every subscription"
+                    if done.more
+                    else "",
                 )
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), PUSH_SECONDS)

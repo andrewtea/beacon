@@ -21,8 +21,8 @@ import { Icon } from './Icon.tsx'
 //
 // **Notifications can be turned off whatever the server is doing**: the control
 // is there whenever they are on, with the server unreachable, in another mode,
-// or sending none. And nothing here says that a deletion happened before the
-// server answered that it did.
+// sending none, or not answering a request that is under way. And nothing here
+// says that a deletion happened before the server answered that it did.
 
 const INFO_MS = 10 * 60_000
 
@@ -34,13 +34,20 @@ const NO_WORKER =
   'This copy of Beacon could not start the service worker that receives a notification. It needs HTTPS, or localhost.'
 const NOT_KEPT =
   'This browser would not keep the change. Notifications are as they were.'
-const SAID = { blocked: BLOCKED, 'no-worker': NO_WORKER, failed: NOT_KEPT }
+const OVERTAKEN =
+  'Notifications were turned off on this device while this was under way. They are off.'
+const SAID = {
+  blocked: BLOCKED,
+  'no-worker': NO_WORKER,
+  overtaken: OVERTAKEN,
+  failed: NOT_KEPT,
+}
 const NO_WORDS =
   'This device has no words for a notification yet. They are kept once Beacon’s server has been told.'
 const NOT_SHOWN =
   'This browser would not show a notification just now. Whether one from Beacon would be shown is the browser’s to say: look at its settings for this site.'
 const HELD =
-  'This browser would not let go of its subscription. A notification can reach this device through it only while Beacon’s server has this device’s address. Beacon tries again while it is open.'
+  'This browser has not let go of a subscription that is no longer wanted, or has not said whether it holds one. A notification can be sent to this device through it only while Beacon’s server has this device’s address, and one that was already sent can still arrive. Beacon tries again while it is open.'
 // What a server of each mode is called.
 const SERVER = { mock: 'the invented scenario', live: 'real sources' }
 

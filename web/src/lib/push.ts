@@ -15,9 +15,10 @@ import { placesSnapshot } from './placeStore.ts'
 // - On this device (`KEY`): the mode notifications were turned on for; the
 //   address the server of that mode was last given (`told`); and the addresses
 //   a server has yet to answer that it deleted, each with the mode of the server
-//   that has it (`forget`). Beside that, the words a notification shows (a cache
-//   the service worker reads, `public/push-sw.js`) and the browser's own
-//   subscription.
+//   that has it (`forget`). Beside it (`OFF_KEY`), a mark of the latest time
+//   notifications were turned off, which `KEY` says it has taken note of
+//   (`seen`). Beside those, the words a notification shows (a cache the service
+//   worker reads, `public/push-sw.js`) and the browser's own subscription.
 // - On Beacon's server: what its own words say (`about_text`): the address,
 //   where the saved places are, and what it sent. Nothing when no place is saved.
 //
@@ -31,7 +32,9 @@ import { placesSnapshot } from './placeStore.ts'
 // **An address is deleted when its server says so, and not before.** `told` is
 // written before the server is given an address, and an address leaves `forget`
 // only when the server of its mode answered `204`. A server that is busy, in
-// another mode, or not reached has deleted nothing, and is asked again.
+// another mode, or not reached has deleted nothing, and is asked again. No
+// address is dropped from `forget` to make room: with `FORGET_MOST` of them
+// unanswered, the server is given no new address until one has been answered.
 //
 // There is one way the server is told anything: `syncPush`, which reads what is
 // wanted now and makes the server's copy match it. Turning notifications on or
@@ -40,8 +43,32 @@ import { placesSnapshot } from './placeStore.ts'
 // across the app's tabs, under the browser's lock. A sync tells the server every
 // time, and keeps no memory of an earlier telling: another tab may have told it
 // something else since.
+//
+// **Turning notifications off waits for no server and for no telling.** It
+// writes the mark (`OFF_KEY`), a new one each time, which is one write that no
+// other write can undo: nothing ever takes a mark away, and what is kept only
+// notes which mark it has taken in (`seen`). From that write on, every reading
+// here says they are off and that the address the server was given is one to
+// delete (`read`), in every tab. A telling that was under way reads it after
+// each thing it waited for (`fence` in `tell`) and gives the server nothing
+// more; it then runs again as one for notifications that are off, and asks the
+// server to delete. A turning on that was waiting its turn sees that the mark
+// is another than when it began, and turns nothing on. Everything else that is
+// kept (`KEY`) is written only under the lock.
+//
+// **One telling waits for nothing longer than `SYNC_MS` in all**: a server that
+// does not answer, or a browser that does not, ends it, and it is tried again
+// later. What cannot be had is certainty about a request that was cut off: it
+// may still reach the server, after the server has answered that it deleted the
+// address too. The address is then one the browser has let go of, which the
+// push service delivers nothing to and the server deletes when a push to it is
+// refused, or when its time is over.
 
 const KEY = 'beacon.push.v2'
+// Written anew each time notifications are turned off, and never taken away.
+// Nothing reads it and writes it back, so two tabs cannot undo one another's
+// writes of it.
+export const OFF_KEY = 'beacon.push.off.v1'
 // The same names as in `public/push-sw.js`.
 export const NOTICE_CACHE = 'beacon-push-v2'
 export const NOTICE_URL = '/__beacon/push-notice/'
@@ -49,9 +76,14 @@ export const WORKER = '/push-sw.js'
 const LOCK = 'beacon.push'
 // How long after a telling that failed the server is told again.
 export const RETRY_MS = 30_000
-// The most addresses kept to have a server delete. One more pushes the oldest
-// out, which the server then deletes when its time is over, as its words say.
-const FORGET_MOST = 10
+// The longest one telling waits, for the server and the browser together.
+export const SYNC_MS = 20_000
+// The longest the browser is waited for when it is asked what it holds, or to
+// let go, outside a telling.
+export const BROWSER_MS = 5_000
+// The most addresses kept for a server to delete before the server is given
+// no new one. None is ever dropped to make room.
+export const FORGET_MOST = 10
 const MODES: Mode[] = ['mock', 'live']
 
 /** The scope of the service worker registration that receives a mode's pushes. */
@@ -98,14 +130,23 @@ const listeners = new Set<Listener>()
 // not one of these: a listener that told the server again for it would never
 // stop.
 const wantedListeners = new Set<Listener>()
-let cache: { raw: string | null; wanted: Wanted } | null = null
+// What was last read: what `KEY` holds (`blob`, and the mark it has taken note
+// of, `seen`), the mark, and what is wanted, which is what `KEY` holds unless a
+// mark it has not taken note of says they were turned off since.
+type Read = {
+  raw: string | null
+  mark: string | null
+  seen: string | null
+  wanted: Wanted
+}
+let cache: Read | null = null
 // The `on` that was last read, to tell a change of it from any other change.
 let seenOn: Mode | null = null
 const NOT_YET = { told: 'not-yet', problem: null, places: 0 } as const
 let told: Pick<PushStatus, 'told' | 'problem' | 'places'> = NOT_YET
 let held = false
 let deleted = false
-let status: { raw: string | null; shown: PushStatus } | null = null
+let status: { from: Read; shown: PushStatus } | null = null
 
 const NOTHING_WANTED: Wanted = { on: null, told: null, forget: [] }
 
@@ -121,36 +162,56 @@ function addressOf(value: unknown): Address | null {
     : null
 }
 
-function readWanted(): Wanted {
+function parsed(raw: string | null): { blob: Wanted; seen: string | null } {
+  try {
+    const kept: unknown = raw === null ? null : JSON.parse(raw)
+    if (typeof kept !== 'object' || kept === null)
+      return { blob: NOTHING_WANTED, seen: null }
+    const { on, told, forget, seen } = kept as Record<string, unknown>
+    return {
+      blob: {
+        on: isMode(on) ? on : null,
+        told: addressOf(told),
+        // Every one of them: an address is dropped only when its server
+        // answered.
+        forget: Array.isArray(forget)
+          ? forget.map(addressOf).filter((address) => address !== null)
+          : [],
+      },
+      seen: typeof seen === 'string' ? seen : null,
+    }
+  } catch {
+    return { blob: NOTHING_WANTED, seen: null }
+  }
+}
+
+function read(): Read {
   let raw: string | null = null
+  let mark: string | null = null
   try {
     raw = window.localStorage.getItem(KEY)
+    mark = window.localStorage.getItem(OFF_KEY)
   } catch {
     // Storage that is switched off keeps nothing, and notifications stay off.
   }
-  if (cache !== null && cache.raw === raw) return cache.wanted
-  let wanted = NOTHING_WANTED
-  try {
-    const parsed: unknown = raw === null ? null : JSON.parse(raw)
-    if (typeof parsed === 'object' && parsed !== null) {
-      const kept = parsed as Record<string, unknown>
-      wanted = {
-        on: isMode(kept.on) ? kept.on : null,
-        told: addressOf(kept.told),
-        forget: Array.isArray(kept.forget)
-          ? kept.forget
-              .map(addressOf)
-              .filter((address) => address !== null)
-              .slice(-FORGET_MOST)
-          : [],
-      }
-    }
-  } catch {
-    wanted = NOTHING_WANTED
+  if (cache !== null && cache.raw === raw && cache.mark === mark) return cache
+  const { blob, seen } = parsed(raw)
+  // Turned off since what is kept was written, whatever it says: the address
+  // the server was given is one for it to delete.
+  const off = mark !== null && mark !== seen
+  cache = {
+    raw,
+    mark,
+    seen,
+    wanted: off ? untold({ ...blob, on: null }) : blob,
   }
-  cache = { raw, wanted }
-  seenOn = wanted.on
-  return wanted
+  seenOn = cache.wanted.on
+  return cache
+}
+
+/** What is wanted now, in every tab: read anew each time it is asked. */
+function readWanted(): Wanted {
+  return read().wanted
 }
 
 function changed(what: 'wanted' | 'shown'): void {
@@ -159,26 +220,37 @@ function changed(what: 'wanted' | 'shown'): void {
   if (what === 'wanted') for (const listener of wantedListeners) listener()
 }
 
-/** Keep `next` in place of what is kept. Answers with whether it is kept. */
-function writeWanted(next: Wanted): boolean {
-  const before = readWanted()
-  const raw = JSON.stringify(next)
-  if (raw === JSON.stringify(before)) return true
+/** Change what is kept, from what is wanted now, and note the mark that what
+ * is wanted now was read with. Answers with whether it is kept. Called under
+ * the lock only. */
+function writeWanted(change: (now: Wanted) => Wanted): boolean {
+  const now = read()
+  const raw = JSON.stringify({ ...change(now.wanted), seen: now.mark })
+  // Nothing is written that says what is there already, and so nothing at
+  // all on a device that never turned notifications on.
+  const { blob, seen } = parsed(now.raw)
+  if (raw === JSON.stringify({ ...blob, seen })) return true
   try {
     window.localStorage.setItem(KEY, raw)
   } catch {
     return false
   }
   cache = null
-  changed(before.on !== next.on ? 'wanted' : 'shown')
+  changed(now.wanted.on !== readWanted().on ? 'wanted' : 'shown')
   return true
 }
 
 /** Change what is kept, or throw: a telling that could not note down what it
- * is about to do does not do it. */
+ * is about to do does not do it. Called under the lock only. */
 function keep(change: (now: Wanted) => Wanted): void {
-  if (!writeWanted(change(readWanted())))
+  if (!writeWanted(change))
     throw new Error('The browser would not keep the change.')
+}
+
+/** Write what a turning off means into what is kept, when it is not there
+ * yet. Called under the lock only. */
+function settle(): void {
+  keep((now) => now)
 }
 
 const same = (one: Address, other: Address) =>
@@ -189,11 +261,18 @@ const queued =
   (address: Address) =>
   (now: Wanted): Wanted => ({
     ...now,
-    forget: [
-      ...now.forget.filter((kept) => !same(kept, address)),
-      address,
-    ].slice(-FORGET_MOST),
+    forget: [...now.forget.filter((kept) => !same(kept, address)), address],
   })
+
+/** Whether an address is one this device has a note of: the one a server was
+ * given, or one a server is to delete. */
+function noted(address: Address): boolean {
+  const now = readWanted()
+  return (
+    (now.told !== null && same(now.told, address)) ||
+    now.forget.some((kept) => same(kept, address))
+  )
+}
 
 /** With the address a server was given among those it is to delete. */
 function untold(now: Wanted): Wanted {
@@ -221,7 +300,7 @@ function setTold(next: typeof told): void {
 }
 
 function onStorage(event: StorageEvent): void {
-  if (event.key !== null && event.key !== KEY) return
+  if (event.key !== null && event.key !== KEY && event.key !== OFF_KEY) return
   const before = seenOn
   cache = null
   changed(readWanted().on !== before ? 'wanted' : 'shown')
@@ -251,11 +330,11 @@ export function onPushWanted(listener: Listener): () => void {
 
 /** For `useSyncExternalStore`: the same object while nothing changed. */
 export function pushSnapshot(): PushStatus {
-  const wanted = readWanted()
-  const raw = cache?.raw ?? null
-  if (status === null || status.raw !== raw)
+  const from = read()
+  const wanted = from.wanted
+  if (status === null || status.from !== from)
     status = {
-      raw,
+      from,
       shown: {
         on: wanted.on,
         ...told,
@@ -391,17 +470,47 @@ function alone<T>(work: () => Promise<T>): Promise<T> {
   return locks.request(LOCK, work) as Promise<T>
 }
 
+/** Something was waited for as long as it may be. */
+class TookTooLong extends Error {}
+
+/** `work`, for `ms` at the most: then its signal is aborted and this rejects
+ * with `TookTooLong`, whatever `work` goes on to do. */
+function within<T>(
+  ms: number,
+  work: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  if (ms <= 0) return Promise.reject(new TookTooLong())
+  const control = new AbortController()
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      control.abort()
+      reject(new TookTooLong())
+    }, ms)
+    const ended = () => clearTimeout(timer)
+    try {
+      // Begun at once: nothing is waited for between a caller's reading of
+      // what to send and the sending.
+      work(control.signal).then(resolve, reject).finally(ended)
+    } catch (error) {
+      ended()
+      reject(error instanceof Error ? error : new Error('It could not begin.'))
+    }
+  })
+}
+
 /**
  * Turn notifications on for this device, for the `mode` the app is showing: ask
  * the browser's leave, and note that they are wanted. The server is told by the
  * sync that follows. Answers with what came of it: `on`; `blocked` when the
  * browser does not allow notifications from this site; `no-worker` when this
  * copy of the app cannot have a service worker to receive one; `failed` when
- * the browser cannot do this or would not keep the change.
+ * the browser cannot do this or would not keep the change; `overtaken` when
+ * notifications were turned off, in this tab or another, while this waited its
+ * turn, and are off.
  */
 export async function turnOn(
   mode: Mode,
-): Promise<'on' | 'blocked' | 'no-worker' | 'failed'> {
+): Promise<'on' | 'blocked' | 'no-worker' | 'overtaken' | 'failed'> {
   if (!pushSupported()) return 'failed'
   let allowed: NotificationPermission
   try {
@@ -415,9 +524,17 @@ export async function turnOn(
   } catch {
     return 'no-worker'
   }
+  // The latest turning off there was when the turn was asked for.
+  const before = read().mark
   try {
     return await alone(async () => {
-      if (!writeWanted(retired({ ...readWanted(), on: mode }))) return 'failed'
+      if (read().mark !== before) {
+        // Turned off, in this tab or another, while this waited its turn: the
+        // later press holds.
+        settle()
+        return 'overtaken'
+      }
+      if (!writeWanted((now) => retired({ ...now, on: mode }))) return 'failed'
       show(() => {
         const was = deleted
         deleted = false
@@ -432,31 +549,55 @@ export async function turnOn(
 
 /**
  * Has the browser let go of every subscription that is not wanted: the other
- * mode's, and this one's once notifications are off. Each address is noted for
- * its server to delete first. Answers with whether the browser let go of all of
- * them, which `held` then says too.
+ * mode's, and this one's once notifications are off. Answers with whether it is
+ * known that the browser holds none of them any more, which `held` then says
+ * too: a browser that would not let go, would not say what it holds, or did not
+ * answer in `ms` may hold one still.
+ *
+ * Under the lock (`noting`), each address is noted for its server to delete
+ * before the browser is asked to let go of it. Outside it, where nothing is
+ * written, only an address this device already has a note of is let go of; any
+ * other is left for the telling that follows, and counts as held until then.
  */
-async function letGo(): Promise<boolean> {
+async function letGo(noting: boolean, ms = BROWSER_MS): Promise<boolean> {
   let all = true
   for (const mode of MODES) {
     if (readWanted().on === mode) continue
-    let subscription: PushSubscription | null = null
+    const held = () =>
+      within(ms, async () => {
+        const registration = await registrationOf(mode)
+        return (await registration?.pushManager.getSubscription()) ?? null
+      })
+    let subscription: PushSubscription | null
     try {
-      const registration = await registrationOf(mode)
-      subscription = (await registration?.pushManager.getSubscription()) ?? null
+      subscription = await held()
     } catch {
-      // A browser that cannot say what it holds is not said to hold anything.
+      // A browser that did not say what it holds may hold a subscription.
+      all = false
+      continue
     }
-    if (subscription === null) continue
+    // Turned on for this mode while the browser was asked: it is wanted again.
+    if (subscription === null || readWanted().on === mode) continue
+    const address = { endpoint: subscription.endpoint, mode }
     // Noted for its server to delete before the browser is asked: the address
     // the server was told is noted already (`told`), and this covers one the
     // browser made since, and one this device has no note of at all.
-    keep(queued({ endpoint: subscription.endpoint, mode }))
-    try {
-      if (!(await subscription.unsubscribe())) all = false
-    } catch {
+    if (noting) keep(queued(address))
+    else if (!noted(address)) {
       all = false
+      continue
     }
+    const mine = subscription
+    let gone = false
+    try {
+      gone = await within(ms, () => mine.unsubscribe())
+      // A browser also answers that it did not when the subscription was let
+      // go of already, by another tab, say. What it holds now is what counts.
+      if (!gone) gone = (await held()) === null
+    } catch {
+      // Not known to be gone.
+    }
+    if (!gone) all = false
     await dropNotice(mode)
   }
   show(() => {
@@ -468,35 +609,70 @@ async function letGo(): Promise<boolean> {
 }
 
 /**
- * Turn notifications off for this device. It needs no server and no mode: that
- * they are off is noted first, with the address for its server to delete, which
- * the sync that follows asks for, and asks again until the server has answered.
- * Then the browser is asked to let go of its subscription. Answers `off` when it
- * did, so that nothing can arrive; `held` when notifications are off here and
- * the browser would not let go, so that a push can still arrive until the server
- * has deleted the address; `failed` when the change was not kept.
+ * Turn notifications off for this device. It waits for no server and for no
+ * telling that is under way: that they are off is one write (`OFF_KEY`),
+ * which nothing undoes,
+ * from which on every tab reads them as off and the address the server was
+ * given as one for it to delete. A telling under way gives the server nothing
+ * more once it has read that; the one that follows asks the server to delete,
+ * and asks again until it has answered. Then the browser is asked to let go of
+ * its subscription. Answers `off` when it did, so that the push service has
+ * nowhere to deliver to; `held` when notifications are off here and it is not
+ * known that the browser let go, so that a push can still arrive until the
+ * server has deleted the address; `failed` when the change was not kept.
  */
 export async function turnOff(): Promise<'off' | 'held' | 'failed'> {
   try {
-    return await alone(async () => {
-      if (!writeWanted(untold({ ...readWanted(), on: null }))) return 'failed'
-      return (await letGo()) ? 'off' : 'held'
-    })
+    window.localStorage.setItem(OFF_KEY, `${Date.now()}-${Math.random()}`)
   } catch {
     return 'failed'
+  }
+  cache = null
+  // Told as a change of what is wanted every time, so that a telling follows.
+  changed('wanted')
+  const locks = (navigator as { locks?: LockManager }).locks
+  try {
+    // With no telling under way, in this tab or another, the browser lets go
+    // under the lock, where an address this device has no note of can be noted
+    // first. With one under way, it is not waited for.
+    const came =
+      locks === undefined
+        ? null
+        : ((await locks.request(LOCK, { ifAvailable: true }, async (lock) => {
+            if (lock === null) return null
+            settle()
+            return await letGo(true)
+          })) as boolean | null)
+    if (came !== null) return came ? 'off' : 'held'
+  } catch {
+    // What could not be done under the lock is tried without it.
+  }
+  try {
+    return (await letGo(false)) ? 'off' : 'held'
+  } catch {
+    return 'held'
   }
 }
 
 /** The server is in another mode than the app is showing. */
 export class OtherModeError extends Error {}
 
+/** Notifications were turned off, or on for another mode, under a telling. */
+class Overtaken extends Error {}
+
+/** As many addresses as are kept wait for a server to answer that it deleted
+ * them, so the server is given no new one. */
+class Unanswered extends Error {}
+
+type Step = <T>(work: (signal: AbortSignal) => Promise<T>) => Promise<T>
+
 /** Has the `mode` server delete each address it is to delete. An address is
  * taken off the list only when the server answered that it did. Throws on the
  * first it did not. */
-async function forgetHere(mode: Mode): Promise<void> {
+async function forgetHere(mode: Mode, step: Step): Promise<void> {
   for (const address of readWanted().forget) {
     if (address.mode !== mode) continue
-    await unsubscribePush(address.endpoint, mode)
+    await step((signal) => unsubscribePush(address.endpoint, mode, signal))
     keep((now) => ({
       ...now,
       forget: now.forget.filter((kept) => !same(kept, address)),
@@ -511,35 +687,59 @@ async function forgetHere(mode: Mode): Promise<void> {
 
 const rounded = () => placesSnapshot().map(({ lat, lon }) => ({ lat, lon }))
 
-/** Make the server's copy match what is wanted now. Called under the lock. */
-async function tell(mode: Mode): Promise<void> {
+/** Make the server's copy match what is wanted now, waiting for nothing past
+ * `until`. Called under the lock. Throws `Overtaken` when notifications were
+ * turned off while it waited for something: nothing more was given to the
+ * server, and it is to be called again. */
+async function tell(mode: Mode, until: number): Promise<void> {
+  const step: Step = (work) => within(until - Date.now(), work)
+  // Asked after everything that is waited for on the way to giving the server
+  // an address: whether notifications are still wanted for this mode.
+  const fence = () => {
+    if (readWanted().on !== mode) throw new Overtaken()
+  }
+  settle()
   // A choice made for one mode is not carried to the other.
   keep((now) =>
     retired(now.on !== null && now.on !== mode ? { ...now, on: null } : now),
   )
-  await letGo()
+  await letGo(true, until - Date.now())
   if (readWanted().on !== mode || Notification.permission !== 'granted') {
     // Off, or the browser's leave was taken back, and its subscription with
     // it: the server's copy is to go.
     keep(untold)
-    await forgetHere(mode)
+    await forgetHere(mode, step)
     if (readWanted().on !== mode) setTold(NOT_YET)
     return
   }
-  await forgetHere(mode)
-  const info = await fetchPushInfo()
+  await forgetHere(mode, step)
+  const info = await step((signal) => fetchPushInfo(signal))
   if (info.mode !== mode) throw new OtherModeError()
-  if (!info.enabled || info.public_key === null || info.notice === null) {
+  fence()
+  const key = info.public_key
+  const notice = info.notice
+  if (!info.enabled || key === null || notice === null) {
+    // A server that sends none takes no address and no change of places, so
+    // the copy an earlier one kept can no longer be made to match what is
+    // wanted: a place removed since would stay in it. It is deleted, which
+    // such a server does, and the address is given anew, with the places as
+    // they are then, when a server that sends is next told.
+    keep(untold)
+    await forgetHere(mode, step)
     setTold({ told: 'server-off', problem: null, places: 0 })
     return
   }
-  const registration = await workerFor(mode)
-  let subscription = await registration.pushManager.getSubscription()
-  if (subscription !== null && keyOf(subscription) !== info.public_key) {
+  const registration = await step(() => workerFor(mode))
+  let subscription = await step(() =>
+    registration.pushManager.getSubscription(),
+  )
+  fence()
+  if (subscription !== null && keyOf(subscription) !== key) {
     // Made for another key than this server's: this server cannot wake it. Its
     // address is noted for the server to delete before it is let go of.
     keep(queued({ endpoint: subscription.endpoint, mode }))
-    await subscription.unsubscribe()
+    const old = subscription
+    await step(() => old.unsubscribe())
     subscription = null
   }
   // The server was told an address the browser no longer has: it made another,
@@ -548,15 +748,26 @@ async function tell(mode: Mode): Promise<void> {
   keep((now) =>
     now.told !== null && now.told.endpoint !== has ? untold(now) : now,
   )
-  await forgetHere(mode)
+  await forgetHere(mode, step)
+  fence()
   if (placesSnapshot().length > 0) {
+    // Room for it is seen to before the server is given an address: one day it
+    // is one more for a server to delete, and none is dropped to make room.
+    const now = readWanted()
+    if (now.told === null && now.forget.length >= FORGET_MOST)
+      throw new Unanswered()
     // The words are kept before the server has the address, so that no push
     // can arrive before its words.
-    await keepNotice(mode, info.notice)
-    subscription ??= await registration.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: bytesOf(info.public_key),
-    })
+    await step(() => keepNotice(mode, notice))
+    subscription ??= await step(() =>
+      registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: bytesOf(key),
+      }),
+    )
+    // Turned off while the browser made it: the server is not given it, and
+    // the telling that is run next has the browser let go of it.
+    fence()
     // Noted before the server is given it: were this tab closed before the
     // server answered, the address would still be known here, to be deleted.
     const address = { endpoint: subscription.endpoint, mode }
@@ -570,7 +781,12 @@ async function tell(mode: Mode): Promise<void> {
     // sent. One removed after this is sent by the sync its removal starts.
     const places = rounded()
     if (places.length > 0) {
-      await subscribePush(address.endpoint, places, mode)
+      await step((signal) =>
+        subscribePush(address.endpoint, places, mode, signal),
+      )
+      // Turned off while the server was given it: the address is one for the
+      // server to delete, which the telling that is run next asks for.
+      fence()
       setTold({ told: 'told', problem: null, places: places.length })
       return
     }
@@ -578,19 +794,24 @@ async function tell(mode: Mode): Promise<void> {
   // With no place there is nothing to be notified about, and the server keeps
   // nothing of this device.
   keep(untold)
-  await forgetHere(mode)
+  await forgetHere(mode, step)
   setTold({ told: 'told', problem: null, places: 0 })
 }
 
 const NOT_TOLD =
   'Beacon’s server could not be told of the change to your notifications.'
+const UNANSWERED =
+  'This device is still waiting for Beacon’s servers to answer that they deleted earlier addresses of it, and keeps only so many of those at a time. Beacon’s server is given this device’s address once one of them has answered.'
+// How many times in a row a telling is begun again because notifications were
+// turned off or on under it.
+const OVERTAKEN_MOST = 3
 
 /**
  * Make the server's copy match what is wanted on this device now. Answers with
- * whether it does: false when the server could not be told or the browser would
- * not let go of a subscription, which the status then says, and which is worth
- * trying again. Throws `OtherModeError` when the server is in another mode than
- * `mode`: nothing was kept or deleted by it.
+ * whether it does: false when the server could not be told or it is not known
+ * that the browser let go of a subscription, which the status then says, and
+ * which is worth trying again. Throws `OtherModeError` when the server is in
+ * another mode than `mode`: nothing was kept or deleted by it.
  */
 export async function syncPush(mode: Mode): Promise<boolean> {
   if (!pushSupported()) return true
@@ -598,13 +819,31 @@ export async function syncPush(mode: Mode): Promise<boolean> {
   // a subscription the browser still holds that nothing here has a note of.
   let problem: string | null = null
   try {
-    await alone(() => tell(mode))
+    await alone(async () => {
+      for (let begun = 1; ; begun += 1) {
+        try {
+          // Each has its own time: the one begun after notifications were
+          // turned off is the one that asks the server to delete.
+          return await tell(mode, Date.now() + SYNC_MS)
+        } catch (error) {
+          if (!(error instanceof Overtaken) || begun >= OVERTAKEN_MOST)
+            throw error
+        }
+      }
+    })
   } catch (error) {
     if (error instanceof OtherModeError) throw error
     if (error instanceof ApiError && error.status === OTHER_MODE)
       throw new OtherModeError()
+    // The change that overtook it starts a telling of its own.
+    if (error instanceof Overtaken) return false
     // The server's own sentence when it gave one.
-    problem = error instanceof ApiError ? error.message : NOT_TOLD
+    problem =
+      error instanceof ApiError
+        ? error.message
+        : error instanceof Unanswered
+          ? UNANSWERED
+          : NOT_TOLD
   }
   if (problem === null) return !held
   setTold({ told: 'failed', problem, places: told.places })

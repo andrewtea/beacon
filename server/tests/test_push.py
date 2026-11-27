@@ -27,7 +27,7 @@ import beacon.push.store as store_module
 import beacon.push.vapid as vapid_module
 from beacon import taps as beacon_taps
 from beacon.ember import EmberClient, Storage
-from beacon.incident import Engine
+from beacon.incident import Engine, Snapshot
 from beacon.ingest.http import SourceHttp
 from beacon.investigate import (
     Cited,
@@ -603,6 +603,72 @@ def test_a_subscriptions_file_is_one_modes_and_takes_nothing_once_closed(tmp_pat
     assert [found.endpoint for found in kept.all()] == [FCM]
 
 
+@pytest.mark.parametrize(
+    ("table", "row"),
+    [
+        # The first shape that was written: a place as a pair, and a time made.
+        (
+            "subscription (endpoint TEXT PRIMARY KEY, places TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, renewed_at TEXT NOT NULL)",
+            (
+                FCM,
+                "[[37.776, -122.424]]",
+                "2026-11-01T00:00:00.000000",
+                "2026-11-20T00:00:00.000000",
+            ),
+        ),
+        # The same number, with a place's time and without the time made.
+        (
+            "subscription (endpoint TEXT PRIMARY KEY, places TEXT NOT NULL, "
+            "renewed_at TEXT NOT NULL)",
+            (
+                FCM,
+                '[[37.776, -122.424, "2026-11-01T00:00:00.000000"]]',
+                "2026-11-20T00:00:00.000000",
+            ),
+        ),
+    ],
+)
+def test_a_file_of_the_earlier_shape_has_its_subscriptions_deleted_and_stays_its_modes(
+    tmp_path: Path, table: str, row: tuple[str, ...]
+) -> None:
+    path = tmp_path / "mock.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.execute(f"CREATE TABLE {table}")
+        db.execute(f"INSERT INTO subscription VALUES ({', '.join('?' * len(row))})", row)
+        db.execute(
+            "CREATE TABLE sent (endpoint TEXT NOT NULL, incident_id TEXT NOT NULL, "
+            "claimed_at TEXT NOT NULL, tries INTEGER NOT NULL, state TEXT NOT NULL, "
+            "PRIMARY KEY (endpoint, incident_id))"
+        )
+        db.execute(
+            "INSERT INTO sent VALUES (?, 'inc-1', '2026-11-20T00:00:00.000000', 1, 'sent')", (FCM,)
+        )
+        db.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        db.execute("INSERT INTO meta VALUES ('mode', 'mock')")
+        db.execute("PRAGMA user_version = 1")
+
+    # It is still the mock store's, and is refused as the live one's as it was.
+    before = path.read_bytes()
+    with pytest.raises(SubscriptionsError, match="begun as the mock one"):
+        Subscriptions(path, "live")
+    assert path.read_bytes() == before
+
+    kept = Subscriptions(path, "mock")
+
+    assert (kept.all(), kept.tries()) == ((), {})
+    with sqlite3.connect(path) as db:
+        assert db.execute("PRAGMA user_version").fetchone() == (2,)
+    # It is a file of this shape from then on, and keeps what it is given.
+    kept.put(FCM, [NEAR], at(0))
+    assert kept.claim(FCM, "inc-1", near(0), at(1))
+    kept.close()
+    again = Subscriptions(path, "mock")
+    assert [found.endpoint for found in again.all()] == [FCM]
+    assert len(again.tries()) == 1
+    again.close()
+
+
 # The pass that sends.
 
 
@@ -925,18 +991,13 @@ class _Clock:
         return self.seconds
 
 
-def test_a_pass_lasts_only_so_long_from_before_it_reads_anything(
-    world: World, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    for address in (FCM, MOZ, APPLE):
-        world.push.subscriptions.put(address, [NEAR], at(5))
-    world.decide()
-    clock = _Clock()
+def timed_push(world: World, clock: _Clock, monkeypatch: pytest.MonkeyPatch) -> tuple[Push, Any]:
+    """The world's push with a clock a test moves, over push services that take
+    all the time they are given, and the list of how long each was given."""
     waited: list[float] = []
     fetch = desk_module.fetch
 
     def slow(*args: Any, **named: Any) -> bytes:
-        # A push service that takes all the time it is given.
         waited.append(named["max_seconds"])
         clock.seconds += named["max_seconds"]
         return fetch(*args, **named)
@@ -949,23 +1010,78 @@ def test_a_pass_lasts_only_so_long_from_before_it_reads_anything(
         SourceHttp(httpx2.MockTransport(world.services)),
         monotonic=clock,
     )
-    # Reading what is kept takes most of the pass's time, which counts.
-    sweep = world.push.subscriptions.sweep
+    return replace(world.push, notifier=timed), waited
 
-    def slow_sweep(now: datetime) -> int:
-        clock.seconds += desk_module.PASS_SECONDS - 12.0
-        return sweep(now)
 
-    monkeypatch.setattr(world.push.subscriptions, "sweep", slow_sweep)
+def test_a_pass_starts_no_send_past_its_time_which_runs_from_before_it_reads_anything(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for address in (FCM, MOZ, APPLE):
+        world.push.subscriptions.put(address, [NEAR], at(5))
+    world.decide()
+    clock = _Clock()
+    push, waited = timed_push(world, clock, monkeypatch)
 
-    assert timed.notify(world.engine.snapshot(), at(7)) == Pass(sent=2, more=True)
+    def slow_snapshot() -> Snapshot:
+        # Reading the incidents takes half of the pass's time, which counts.
+        clock.seconds += desk_module.PASS_SECONDS - 16.0
+        return world.engine.snapshot()
 
-    # No push service is waited for longer than a send may take, or than the
-    # pass has left, and the pass ends by its time.
-    assert waited == [desk_module.SEND_SECONDS, 2.0]
+    # A claim is a write, which can wait for the file.
+    claim = world.push.subscriptions.claim
+
+    def slow_claim(*args: Any) -> bool:
+        clock.seconds += 1.5
+        return claim(*args)
+
+    monkeypatch.setattr(world.push.subscriptions, "claim", slow_claim)
+
+    assert push.work(slow_snapshot, at(7)) == Pass(sent=2, more=True)
+
+    # No push service is waited for longer than a send may take, or than the pass
+    # has left once the send is claimed, and the third device is left for later.
+    assert waited == [desk_module.SEND_SECONDS, 3.0]
     assert clock.seconds == desk_module.PASS_SECONDS
     assert desk_module.SEND_SECONDS < desk_module.PASS_SECONDS
-    timed.close()
+    assert set(world.push.subscriptions.tries()) == {
+        (FCM, world.id_of("fire")),
+        (MOZ, world.id_of("fire")),
+    }
+    push.notifier.close()  # type: ignore[union-attr]
+
+
+def test_a_pass_whose_time_is_over_looks_at_no_subscription_and_says_it_stopped(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two devices, with nothing due for either.
+    world.push.subscriptions.put(FCM, [FAR], at(5))
+    world.push.subscriptions.put(MOZ, [FAR], at(5))
+    world.decide()
+    clock = _Clock()
+    push, waited = timed_push(world, clock, monkeypatch)
+
+    def slow_snapshot() -> Snapshot:
+        clock.seconds += desk_module.PASS_SECONDS
+        return world.engine.snapshot()
+
+    # It does not say that nothing is due: it did not look.
+    assert push.work(slow_snapshot, at(7)) == Pass(more=True)
+    assert push.work(world.engine.snapshot, at(7.5)) == Pass()
+    assert (waited, world.push.subscriptions.tries()) == ([], {})
+    push.notifier.close()  # type: ignore[union-attr]
+
+
+def test_a_pass_reads_only_what_was_sent_about_the_incidents_it_has_a_push_due_for(
+    world: World,
+) -> None:
+    kept = world.push.subscriptions
+    kept.put(FCM, [NEAR], at(5))
+    assert kept.claim(FCM, "inc-old", near(), at(5))
+    assert kept.claim(FCM, "inc-older", near(), at(5))
+
+    assert set(kept.tries(["inc-old", "inc-old"])) == {(FCM, "inc-old")}
+    assert kept.tries([]) == {}
+    assert len(kept.tries()) == 2
 
 
 def test_a_push_service_that_does_not_answer_in_time_is_asked_again_later(
@@ -1061,8 +1177,19 @@ def test_the_words_of_a_notification_say_whose_decision_it_is_and_tell_nobody_wh
     assert timedelta(days=2) == SENT_KEPT
     # It names everything the file holds beside an address, and does not say the
     # push service learns nothing.
-    for kept in ("when you added it", "the incident's id", "how many times it tried"):
+    for kept in (
+        "when this server was first told of it",
+        "when this device last renewed all that",
+        "the incident's id",
+        "how many times it tried",
+    ):
         assert kept in ABOUT
+    # It says no more than the server knows: not when a place was saved, not when
+    # the app was opened, and a deletion only once the request for it has come.
+    for more in ("when you added it", "last opened", "when you turn notifications off;"):
+        assert more not in ABOUT
+    assert "deletes all of this when it receives the request your device sends" in ABOUT
+    assert "if this server had been told of the place by then" in ABOUT
     assert "it does learn that Beacon sent this device a message, and when" in ABOUT
     assert "nothing else" not in ABOUT
     # Sending is best effort, and the words do not promise more.
@@ -1380,6 +1507,81 @@ def test_another_modes_file_this_beacon_cannot_open_is_left_and_said(world: Worl
     assert (opened.others, opened.unswept) == ((), True)
     assert path.read_bytes() == before
     opened.close()
+
+
+def with_both_files(world: World) -> Push:
+    """The world's push again, on a data directory that also has a live file with
+    one subscription whose time is over at day 31, as this mode's file has."""
+    live = Subscriptions(world.path / "push" / "live.sqlite3", "live")
+    live.put(MOZ, [NEAR], at(5))
+    live.close()
+    world.push.subscriptions.put(FCM, [NEAR], at(5))
+    world.push.close()
+    both = open_push(
+        {"BEACON_DATA_DIR": str(world.path), SUBJECT_VARIABLE: CONTACT},
+        world.engine,
+        world.runs,
+        transport=httpx2.MockTransport(world.services),
+    )
+    assert both is not None
+    world.push = both
+    return both
+
+
+def test_what_ran_out_is_deleted_from_both_files_though_the_incidents_cannot_be_read(
+    world: World,
+) -> None:
+    both = with_both_files(world)
+    (other,) = both.others
+
+    def broken() -> Snapshot:
+        raise sqlite3.OperationalError("the evidence store is busy")
+
+    with pytest.raises(sqlite3.OperationalError):
+        both.work(broken, at(5 + 31 * 24 * 60))
+
+    assert (both.subscriptions.all(), other.all()) == ((), ())
+    both.close()
+
+
+@pytest.mark.parametrize("failing", ["this", "other"])
+def test_a_file_that_cannot_be_swept_does_not_keep_the_other_from_being_swept(
+    world: World, monkeypatch: pytest.MonkeyPatch, failing: str
+) -> None:
+    both = with_both_files(world)
+    (other,) = both.others
+    stuck, swept = (both.subscriptions, other) if failing == "this" else (other, both.subscriptions)
+
+    def locked(now: datetime) -> int:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(stuck, "sweep", locked)
+
+    assert both.work(world.engine.snapshot, at(5 + 31 * 24 * 60)) == Pass(unswept=1)
+
+    assert swept.all() == ()
+    assert len(stuck.all()) == 1
+    both.close()
+
+
+def test_a_server_told_to_send_none_deletes_what_ran_out_whatever_its_contact_is(
+    world: World,
+) -> None:
+    world.push.subscriptions.put(FCM, [NEAR], at(5))
+    world.push.close()
+    env = {"BEACON_DATA_DIR": str(world.path), PUSH_VARIABLE: "0", SUBJECT_VARIABLE: "nobody"}
+
+    # The contact is one no server could send with, and this one never would.
+    with pytest.raises(VapidError):
+        open_push({**env, PUSH_VARIABLE: "1"}, world.engine, world.runs)
+    quiet = open_push(env, world.engine, world.runs)
+
+    assert quiet is not None
+    assert (quiet.sends, quiet.off) == (False, TURNED_OFF)
+    world.push = quiet
+    assert world.notify(5 + 31 * 24 * 60) == Pass()
+    assert world.kept() == []
+    quiet.close()
 
 
 def test_a_server_that_is_stopping_refuses_in_a_sentence(world: World) -> None:
