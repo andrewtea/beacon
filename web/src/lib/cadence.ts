@@ -10,6 +10,8 @@ export const OVER_MS = 60_000
 export const WATCHING_MS = 15_000
 // What is near a saved place is asked for again while its view is open.
 export const PLACES_MS = 30_000
+// A scale run's results change only when its command is given again.
+export const SCALE_MS = 60_000
 
 export const incidentCadence = (answer: IncidentAnswer): number =>
   answer.incident.open ? OPEN_MS : OVER_MS

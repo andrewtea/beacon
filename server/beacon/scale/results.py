@@ -29,8 +29,8 @@ kind and its place, and anything about calls DataSF does not list.
 
 import json
 import os
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -169,6 +169,8 @@ class Number:
     unit: str
     # What was counted and what the count does not show. Shown beside the number.
     text: str
+    # The heading the number is shown under, which `build` gives it: one of `SECTIONS`.
+    section: str = ""
 
     def as_data(self) -> dict[str, Any]:
         return {
@@ -177,7 +179,60 @@ class Number:
             "value": self.value,
             "unit": self.unit,
             "text": self.text,
+            "section": self.section,
         }
+
+
+# The headings a result's numbers are shown under, in their order. A heading names
+# what its numbers are about and claims nothing.
+RECORD = "DataSF's record of the day"
+HEARD = "Calls heard"
+MATCHED = "Calls matched to DataSF's record"
+PLACE = "Place"
+TIME = "Time"
+COST = "Cost of hearing"
+TAPS = "Replayed taps"
+GLOSSARY = "Glossary"
+SECTIONS = (RECORD, HEARD, MATCHED, PLACE, TIME, COST, TAPS, GLOSSARY)
+
+
+def _under(section: str, numbers: Sequence[Number]) -> list[Number]:
+    return [replace(number, section=section) for number in numbers]
+
+
+def shown(number: Mapping[str, Any]) -> str:
+    """A number's value as it is shown, with its unit: `468 calls`, `85.2%`, or
+    `none` for a number the run does not have, which its sentence then explains."""
+    value = number["value"]
+    return "none" if value is None else _shown(value, number["unit"])
+
+
+# What a run is in a few words, for a label beside its numbers, and the sentence
+# that goes with every group of them wherever they are shown apart from
+# `basis_text`: a number read by itself must not be taken for Beacon's on real radio.
+_KINDS: dict[tuple[str, str], tuple[str, str | None]] = {
+    ("generated", "fake"): (
+        "Stand-in, generated calls",
+        "A stand-in's numbers on calls generated from DataSF's record: a check that "
+        "the pipeline keeps what it is given, and no measurement of Beacon's accuracy, "
+        "speed, or cost on real radio.",
+    ),
+    ("generated", "live"): (
+        "Muse Ember, generated speech",
+        "Numbers of Muse Ember hearing speech generated from DataSF's record, scored "
+        "against the record it was generated from: no measurement of Beacon on real radio.",
+    ),
+    ("recorded", "live"): ("Muse Ember, recorded radio", None),
+}
+
+
+def kind(results: Mapping[str, Any]) -> tuple[str, str | None]:
+    """What a written result's run is, in a few words, and the sentence shown with
+    every group of its numbers, or None for the one kind of run whose numbers are
+    about Beacon on real radio.
+
+    Raises KeyError for a result that is of no kind of run Beacon makes."""
+    return _KINDS[results["audio"], results["hearer"]]
 
 
 def basis(settings: Settings) -> str:
@@ -251,14 +306,14 @@ def build(
     if reading.partial:
         caveats.append(PARTIAL_READING)
     numbers = [
-        *_record_numbers(records, unread or datasf.Unread()),
-        *_hearing_numbers(rows, no_row, listed, last_pass, live=live),
-        *_match_numbers(records, reading, matched, generated=generated, live=live),
-        *_place_numbers(matched, generated=generated, live=live, unplaced=unplaced),
-        *_time_numbers(matched, generated=generated),
-        *_cost_numbers(radio_spend, live=live, generated=generated, lost=ledger_lost),
-        *_tap_numbers(taps, reading, matched, live=live, generated=generated),
-        *glossary,
+        *_under(RECORD, _record_numbers(records, unread or datasf.Unread())),
+        *_under(HEARD, _hearing_numbers(rows, no_row, listed, last_pass, live=live)),
+        *_under(MATCHED, _match_numbers(records, reading, matched, generated=generated, live=live)),
+        *_under(PLACE, _place_numbers(matched, generated=generated, live=live, unplaced=unplaced)),
+        *_under(TIME, _time_numbers(matched, generated=generated)),
+        *_under(COST, _cost_numbers(radio_spend, live=live, generated=generated, lost=ledger_lost)),
+        *_under(TAPS, _tap_numbers(taps, reading, matched, live=live, generated=generated)),
+        *_under(GLOSSARY, glossary),
     ]
     if taps_stopped is not None or waiting:
         caveats.append(
@@ -326,8 +381,7 @@ def lines(results: dict[str, Any]) -> list[str]:
     out.append(f"Scored against: {results['scored_against']['text']}")
     out.append("")
     for number in results["numbers"]:
-        value = "none" if number["value"] is None else _shown(number["value"], number["unit"])
-        out.append(f"{number['label']}: {value}")
+        out.append(f"{number['label']}: {shown(number)}")
         out.append(f"    {number['text']}")
     return out
 
@@ -863,9 +917,22 @@ def _mean(values: Sequence[float], places: int) -> float | None:
     return None if not values else round(sum(values) / len(values), places)
 
 
+# What one of a counted thing is called.
+_ONE = {
+    "calls": "call",
+    "rows": "row",
+    "incidents": "incident",
+    "taps": "tap",
+    "codes": "code",
+    "entries": "entry",
+}
+
+
 def _shown(value: float | int, unit: str) -> str:
     if unit == "USD":
         return f"${value:.4f}"
     if unit == "percent":
         return f"{value}%"
-    return f"{value} {unit}"
+    if value == 1 and unit in _ONE:
+        return f"1 {_ONE[unit]}"
+    return f"{value:,} {unit}"

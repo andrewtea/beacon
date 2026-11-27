@@ -1393,3 +1393,89 @@ button.quiet:hover {
   font-size: 0.85rem;
   font-weight: 700;
 }
+
+/* Scale run results: every number with the sentence that says what it is */
+
+.scale-section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.3rem 0.75rem;
+  margin-bottom: 0.6rem;
+}
+
+.scale-section-head h2 {
+  margin: 0;
+}
+
+.scale-numbers {
+  margin: 0;
+}
+
+.scale-number {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: baseline;
+  gap: 0.15rem 1rem;
+  padding: 0.8rem 0;
+  border-top: 1px solid var(--line);
+}
+
+.scale-section .note + .scale-numbers .scale-number:first-child {
+  border-top: 0;
+}
+
+.scale-number dt {
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
+.scale-number dd {
+  margin: 0;
+}
+
+.scale-value {
+  color: var(--text-strong);
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* A stand-in's number is in the colour of what is invented, wherever it is. */
+.scale-value.stand-in {
+  color: var(--invented);
+}
+
+.scale-text {
+  grid-column: 1 / -1;
+  font-size: 0.9rem;
+  color: var(--text);
+  text-wrap: pretty;
+}
+
+.scale-caveats {
+  margin: 0;
+  padding-left: 1.1rem;
+  font-size: 0.9rem;
+}
+
+.scale-caveats li + li {
+  margin-top: 0.4rem;
+}
+
+/* On a phone the value sits under its label, so a long label is not squeezed. */
+@media (max-width: 30rem) {
+  .scale-number {
+    grid-template-columns: 1fr;
+  }
+
+  .scale-value {
+    text-align: left;
+  }
+}
+
+footer .server a {
+  color: inherit;
+}
