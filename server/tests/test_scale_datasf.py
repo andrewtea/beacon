@@ -36,7 +36,7 @@ def test_a_call_is_read_from_the_rows_of_its_units_with_times_in_utc() -> None:
 
     (record,), unreadable = datasf.read_records(rows)
 
-    assert unreadable == 0
+    assert unreadable == datasf.Unread()
     assert (record.number, record.kind, record.alarms) == ("260620001", "fire", 2)
     # DataSF's times are San Francisco's wall clock, which was eight hours behind.
     assert record.received_at == datetime(2026, 3, 3, 16, 0, 5, tzinfo=UTC)
@@ -131,12 +131,16 @@ def test_what_cannot_be_read_is_counted_and_what_is_not_an_intersection_has_no_s
         {"call_number": "260620005", "unit_id": "E36", "call_type": "Alarms"},
         {"unit_id": "E36", "call_type": "Alarms", "dispatch_dttm": f"{DAY}T08:00:00.000"},
         unit_row("26; DROP", "E36", "Alarms", "08:00:00", HAYES_GOUGH),
+        "no row at all",
+        7,
     ]  # fmt: skip
 
     records, unreadable = datasf.read_records(rows)
 
-    # No time, no number, and a number that is none.
-    assert unreadable == 3
+    # One call with a number and no time. And four rows that are no call's Beacon
+    # can tell: no number, a number that is none, and two that are no rows. Rows
+    # are counted as rows: nothing says how many calls they are of.
+    assert unreadable == datasf.Unread(calls=1, rows=4)
     box, no_place = records
     # A call box's address names a house number, and is not kept as a place.
     assert (box.streets, box.point) == ((), Point(37.78, -122.41))
@@ -156,7 +160,17 @@ def test_a_field_that_only_looks_like_a_number_or_a_time_is_left_out_and_raises_
     records, unreadable = datasf.read_records([*odd, *late, *early, *numbered])
 
     assert [(record.number, record.alarms) for record in records] == [("260620007", None)]
-    assert unreadable == 3
+    assert unreadable == datasf.Unread(calls=2, rows=1)
+
+    # An integer of hundreds of digits is a number JSON can hold and a float cannot.
+    huge = 10**400
+    far = call("260620010", "Alarms", "10:00:00", HAYES_GOUGH, ("E36",))
+    far[0]["case_location"] = {"type": "Point", "coordinates": [huge, 37.77]}
+    (placed,), _ = datasf.read_records(far)
+    assert placed.point is None
+    assert lists._number(huge) is None
+    line = {"type": "LineString", "coordinates": [[-122.42, huge], [-122.42, 37.77]]}
+    assert lists._middle(line) is None
 
 
 def test_the_records_a_run_keeps_are_read_back_as_they_were() -> None:

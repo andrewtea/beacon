@@ -8,6 +8,7 @@ A run lives under `data/scale/<name>/` (`Layout`), which Git ignores:
     lists/            streets.txt, units.txt, blocks.csv (`beacon.scale.lists`)
     calls/            generated calls, marked BEACON-GENERATED (`beacon.scale.generate`)
     evidence.sqlite3  the run's own evidence store: never the server's
+    heard.json        that the hearing is closed, from the first replayed tap on
     taps.sqlite3      the investigations of the replayed taps (`beacon.scale.taps`)
     results.json      what the run came to (`beacon.scale.results`)
 
@@ -32,6 +33,9 @@ under a data directory (`alone`), and because a paid run goes on only in the led
 it began to pay in (`pin_ledger`): both paying clients are made before anything is
 heard, so a ledger that is replaced part of the way stops the taps as it stops the
 hearing, and the run is then not gone on with.
+
+**The hearing is closed when the replay of taps first begins** (`close_hearing`), so
+that every tap of a run is answered against the same evidence.
 
 **Every call, a stand-in's too, is booked in the one Ember ledger** under the data
 directory, as the server's are: a run has no ledger of its own. A stand-in's rows
@@ -122,6 +126,10 @@ class Layout:
     @property
     def ledger(self) -> Path:
         return self.root / "ledger.json"
+
+    @property
+    def closed(self) -> Path:
+        return self.root / "heard.json"
 
     @property
     def records(self) -> Path:
@@ -220,29 +228,31 @@ LEDGER_REPLACED = (
 )
 
 
-def pin_ledger(layout: Layout, generation: str) -> None:
-    """Keep which ledger file a paid run began to pay in, by its generation, when
-    the run is new, and refuse to go on in another. A run's caps are counted in the
-    ledger: in a ledger that was begun again they would be counted from nothing.
-    A ledger put back from an older copy by renaming has the same generation and
-    is not told apart here; the Ember client refuses that while it runs.
+def pin_ledger(layout: Layout, ember: EmberClient) -> None:
+    """Keep which ledger file a paid run began to pay in when the run is new, and
+    refuse to go on in another. A run's caps are counted in the ledger: in one that
+    was begun again, or put back from an older copy, they would be counted from
+    less than was spent. The file is told by its generation, its device, and its
+    inode (`EmberClient.ledger_file`), so a copy put back by renaming is another
+    file. **What this cannot tell** is a ledger rolled back in place, as a copy
+    written over the same file is: the file is the same one and holds less.
 
     Raises ScaleError when the ledger is another, or was seen to be replaced."""
     kept = _pinned(layout)
     if kept is None:
-        _write(layout.ledger, {"generation": generation, "lost": False})
-    elif kept != generation:
+        _write(layout.ledger, {"file": ember.ledger_file(), "lost": False})
+    elif kept != ember.ledger_file():
         raise ScaleError(LEDGER_REPLACED)
 
 
 def lose_ledger(layout: Layout) -> None:
     """Record that the ledger was replaced under a paid run, so that the run is
     not gone on with."""
-    _write(layout.ledger, {"generation": None, "lost": True})
+    _write(layout.ledger, {"file": None, "lost": True})
 
 
 def _pinned(layout: Layout) -> str | None:
-    """The generation of the ledger a run pays in, or None for a run that has not
+    """The name of the ledger file a run pays in, or None for a run that has not
     paid. Raises ScaleError for a run whose ledger was lost."""
     try:
         said = json.loads(layout.ledger.read_text(encoding="utf-8"))
@@ -250,13 +260,49 @@ def _pinned(layout: Layout) -> str | None:
         return None
     except (OSError, ValueError):
         said = None
-    if (
-        not isinstance(said, dict)
-        or said.get("lost")
-        or not isinstance(said.get("generation"), str)
-    ):
+    if not isinstance(said, dict) or said.get("lost") or not isinstance(said.get("file"), str):
         raise ScaleError(LEDGER_REPLACED)
-    return said["generation"]
+    return said["file"]
+
+
+def hearing_spend(settings: Settings, ember: EmberClient) -> tuple[ScopeSpend | None, bool]:
+    """What the ledger a paying client was made on holds under the run's hearing
+    scope, and whether that ledger was replaced, in which case nothing is known of
+    the spend: what the file at its path holds now is another file's."""
+    if ember.ledger_replaced():
+        return None, True
+    spend = ember.scope_spend(hearing_scope(settings))
+    # Once more, after the read: the file can have been replaced between the two.
+    return (None, True) if ember.ledger_replaced() else (spend, False)
+
+
+def close_hearing(layout: Layout, last_pass: PassCount) -> None:
+    """Close a run's hearing for good, which is done when the replay of its taps
+    first begins. Every tap is investigated against the run's evidence, and its
+    answer is kept for good: were calls heard after some taps were answered, the
+    answers would be of two different days' evidence, and a result would put the
+    old answers beside the new incidents. So from the first claim of a tap on,
+    nothing more is heard in this run; calls that turn up later want a new run."""
+    _write(layout.closed, asdict(last_pass))
+
+
+def closed_hearing(layout: Layout) -> PassCount | None:
+    """The last pass of a run whose hearing was closed, or None while it is open.
+
+    Raises ScaleError when the record of it cannot be read."""
+    try:
+        said = json.loads(layout.closed.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        said = None
+    try:
+        counts = {key: said[key] for key in ("stored", "unready", "unusable")}
+        if all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in counts.values()):
+            return PassCount(**counts)
+    except (KeyError, TypeError):
+        pass
+    raise ScaleError("The run's record of its closed hearing (heard.json) cannot be read.")
 
 
 def day_window(day: date) -> tuple[datetime, datetime]:
@@ -328,12 +374,16 @@ def prepare(layout: Layout, settings: Settings, http: SourceHttp) -> list[datasf
     no calls, the lists come out empty, or the calls cannot be written."""
     day = date.fromisoformat(settings.day)
     if not layout.records.exists():
-        records, unreadable = datasf.read_records(datasf.fetch_day(http, day))
+        records, unread = datasf.read_records(datasf.fetch_day(http, day))
         if not records:
             raise ScaleError("DataSF lists no call for that day that Beacon can read.")
         _write(
             layout.records,
-            {"unreadable": unreadable, "records": [record.as_data() for record in records]},
+            {
+                "unreadable_calls": unread.calls,
+                "unreadable_rows": unread.rows,
+                "records": [record.as_data() for record in records],
+            },
         )
     records = read_records(layout)
     if not (layout.lists / lists.BLOCKS_FILE).exists():
@@ -356,15 +406,15 @@ def read_records(layout: Layout) -> list[datasf.Record]:
     return read_day(layout)[0]
 
 
-def read_day(layout: Layout) -> tuple[list[datasf.Record], int]:
-    """The records a run kept, and how many calls of DataSF's answer could not be
-    read as one and so are in no count. Raises ScaleError when they cannot be read."""
+def read_day(layout: Layout) -> tuple[list[datasf.Record], datasf.Unread]:
+    """The records a run kept, and what of DataSF's answer could not be read as a
+    call and so is in no count. Raises ScaleError when they cannot be read."""
     try:
         said = json.loads(layout.records.read_text(encoding="utf-8"))
-        unreadable = said["unreadable"]
-        if isinstance(unreadable, bool) or not isinstance(unreadable, int) or unreadable < 0:
+        counts = (said["unreadable_calls"], said["unreadable_rows"])
+        if not all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in counts):
             raise ValueError
-        return datasf.records_from_data(said["records"]), unreadable
+        return datasf.records_from_data(said["records"]), datasf.Unread(*counts)
     except (OSError, ValueError, KeyError, TypeError):
         pass
     raise ScaleError("The run's records of DataSF's calls (records.json) cannot be read.")
@@ -543,9 +593,8 @@ def hear(
             raise ScaleError(str(error)) from None
         heard = _passes(poller, store, now)
         if ember.mode == "live":
-            spend = ember.scope_spend(hearing_scope(settings))
-            pinned = _pinned(layout)
-            if heard.stopped == "ledger_replaced" or pinned not in (None, spend.generation):
+            spend, lost = hearing_spend(settings, ember)
+            if heard.stopped == "ledger_replaced" or lost:
                 # What the file at the ledger's path holds now is not what was spent.
                 heard = replace(heard, ledger_lost=True)
             else:

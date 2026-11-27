@@ -52,24 +52,30 @@ from beacon.scale.taps import Replay, Standing
 
 FORMAT = 1
 
+# What a run is, said before any of its numbers. Each is about what the run is set up
+# to do, whatever has been done of it so far: a run that has heard nothing yet, on
+# an empty shelf or at its first refusal, begins with the same sentence, and the
+# numbers below it say how many calls were heard and what was paid.
 GENERATED_BY_STAND_IN = (
-    "Stand-in run on generated calls. The calls were generated from DataSF's own "
-    'records of this day and "heard" by a stand-in that looks each call up in the '
-    "generator's script. No radio was heard and Muse Ember was asked nothing. "
+    "Stand-in run on generated calls. The calls are generated from DataSF's own "
+    'records of this day, and a stand-in "hears" each by looking it up in the '
+    "generator's script. No radio is heard and Muse Ember is asked nothing. "
     "Nothing below measures Beacon's accuracy, speed, or cost on real radio: it shows "
     "only that the pipeline keeps what it is given."
 )
 GENERATED_BY_EMBER = (
-    "Generated speech, heard by Muse Ember. The calls are synthesized speech "
-    "generated from DataSF's own records of this day, and Muse Ember was paid to hear "
-    "them. They are scored against the records they were generated from, so a match "
-    "says Ember made out clean synthetic speech of those records. It does not measure "
-    "Beacon on real radio, which is noisy, clipped, and says things no record holds."
+    "Generated speech, for Muse Ember to hear. The calls are synthesized speech "
+    "generated from DataSF's own records of this day, and Muse Ember is paid for each "
+    "one it is asked to hear; the numbers below say how many that was. They are scored "
+    "against the records they were generated from, so a match says Ember made out "
+    "clean synthetic speech of those records. It does not measure Beacon on real "
+    "radio, which is noisy, clipped, and says things no record holds."
 )
 RECORDED_BY_EMBER = (
-    "Recorded radio, heard by Muse Ember. The calls are recordings of dispatch radio "
-    "that the run's operator said they have the right to use, heard by Muse Ember and "
-    "scored against DataSF's record of the same day."
+    "Recorded radio, for Muse Ember to hear. The calls are recordings of dispatch "
+    "radio that the run's operator said they have the right to use. Muse Ember is "
+    "paid for each one it is asked to hear; the numbers below say how many that was. "
+    "What Beacon makes of them is scored against DataSF's record of the same day."
 )
 NOT_CHECKED = (
     "A match is by kind, time, and unit or place. Nothing checks what an incident "
@@ -77,47 +83,65 @@ NOT_CHECKED = (
     "incident."
 )
 INCOMPLETE = (
-    "The run is not complete: calls are still unheard or were not ready. The numbers "
-    "below are of what was heard so far."
+    "The hearing is not complete: calls are waiting to be heard, or were not ready. "
+    "The numbers below are of what was heard so far."
+)
+CLOSED = (
+    "The hearing was closed when the replay of taps began, so that every tap is "
+    "answered against the same evidence: a call put among the run's calls after that "
+    "is not heard in this run."
 )
 LEDGER_LOST = (
     "The Ember ledger was replaced while the run was under way, so what the run "
     "spent is not known from it and no cost of hearing is reported. Compare Meta's "
     "Usage page with the ledger before any more paid work."
 )
-_TAPS_STOPPED = {
-    "held": (
-        "It is leaving Ember alone after a refusal or a failure: ten minutes, or as "
-        "long as Ember asked. Give the same command again after that."
-    ),
-    "unusable": (
-        "Ember's answers were not the form, several times in a row, each of them "
-        "paid for. It is leaving Ember alone for ten minutes."
-    ),
-    "budget": (
-        "Its spending scope has less left than one tap may cost, or the spending "
-        "stop refused. The taps that were not begun are not claimed."
-    ),
-    "ledger_replaced": "The Ember ledger was replaced under it.",
-    "ember": "A call to Ember failed. It is leaving Ember alone for ten minutes.",
-    "store": "The investigations file could not be written.",
-}
+
+
+def _taps_stopped(stopped: str | None, *, live: bool) -> str:
+    """Why a replay stopped, in words that name who was asked: Muse Ember, which
+    is paid, or the stand-in, which is not."""
+    who = "Muse Ember" if live else "the stand-in for Ember"
+    paid = ", each of them paid for" if live else ""
+    return {
+        "held": (
+            f"It is leaving {who} alone after a refusal or a failure: ten minutes, or "
+            "as long as was asked. Give the same command again after that."
+        ),
+        "unusable": (
+            f"Answers of {who}'s were not the form, several times in a row{paid}. It "
+            "is asking nothing more for ten minutes."
+        ),
+        "budget": (
+            "Its spending scope has less left than one tap may cost, or the spending "
+            "stop refused. The taps that were not begun are not claimed."
+        ),
+        "ledger_replaced": "The Ember ledger was replaced under it.",
+        "ember": f"A call to {who} failed. It is asking nothing more for ten minutes.",
+        "store": "The investigations file could not be written.",
+    }.get(stopped or "", "The replay stopped early.")
+
+
 PARTIAL_READING = "The incident engine left rows out of a reading, so an incident can lack calls."
 
-_STOPPED = {
-    "budget": "The run stopped at its spending cap or the spending stop.",
-    "held": (
-        "The run stopped because it is leaving Ember alone for ten minutes after a "
-        "refusal or a failure. Give the same command again after that."
-    ),
-    "ledger_replaced": (
-        "The run stopped because the Ember ledger was replaced under it. Compare "
-        "Meta's Usage page with the ledger before anything more is paid for."
-    ),
-    "ember": "The run stopped because a call to Ember failed.",
-    "source": "The run stopped because the directory of calls could not be read.",
-    "store": "The run stopped because its evidence store could not be written.",
-}
+
+def _stopped(stopped: str, *, live: bool) -> str:
+    """Why a hearing stopped, in words that name who was asked."""
+    who = "Muse Ember" if live else "the stand-in for Ember"
+    return {
+        "budget": "The run stopped at its spending cap or the spending stop.",
+        "held": (
+            f"The run stopped because it is leaving {who} alone for ten minutes after "
+            "a refusal or a failure. Give the same command again after that."
+        ),
+        "ledger_replaced": (
+            "The run stopped because the Ember ledger was replaced under it. Compare "
+            "Meta's Usage page with the ledger before anything more is paid for."
+        ),
+        "ember": f"The run stopped because a call to {who} failed.",
+        "source": "The run stopped because the directory of calls could not be read.",
+        "store": "The run stopped because its evidence store could not be written.",
+    }.get(stopped, "The run stopped early.")
 
 
 @dataclass(frozen=True)
@@ -155,13 +179,14 @@ def build(
     settings: Settings,
     records: Sequence[datasf.Record],
     *,
-    unreadable: int = 0,
+    unread: datasf.Unread | None = None,
     rows: int,
     no_row: int,
     listed: int | None,
     unplaced: int | None = None,
     last_pass: PassCount | None,
     stopped: str | None,
+    closed: bool = False,
     reading: Reading,
     matched: Matched,
     radio_spend: ScopeSpend | None,
@@ -174,28 +199,34 @@ def build(
     rows the run's store holds, `no_row` how many calls are claimed there with no
     row, and `listed` how many calls there are to hear, when that is known;
     `unplaced` is how many records the generator found no block for;
-    `last_pass` and `stopped` are how the latest hearing ended, `unreadable` how
-    many calls of DataSF's answer could not be read, and `ledger_lost` whether the
-    Ember ledger was replaced under the run. `taps` is every planned tap with how it
-    stands, or nothing while the hearing is not complete."""
+    `last_pass` and `stopped` are how the latest hearing ended, `closed` whether
+    the hearing was closed for the replay, `unread` what of DataSF's answer could
+    not be read, and `ledger_lost` whether the Ember ledger was replaced under the
+    run. `taps` is every planned tap with how it stands, or nothing while the hearing
+    is not complete."""
     live = settings.hearer == "live"
     generated = settings.audio == "generated"
     heard_complete = stopped is None and last_pass is not None and last_pass.unready == 0
     waiting = sum(state == "waiting" for _, state, _ in taps)
-    # A run is complete when every call was heard and every planned tap was put to
-    # the investigator: a replay that stopped is not, whatever the hearing came to.
+    # A run is complete when nothing is left that the same command would still do:
+    # a pass over the calls ended with none of them unready, the replay did not
+    # stop, and no planned tap is waiting. It does not say that every call has a
+    # row or every tap an answer: a call or a tap that was claimed and came to
+    # nothing is counted in its own number, and is not done again.
     complete = heard_complete and taps_stopped is None and waiting == 0 and not ledger_lost
     caveats = [NOT_CHECKED]
     if not heard_complete:
         caveats.insert(0, INCOMPLETE)
     if stopped is not None:
-        caveats.insert(1, _STOPPED.get(stopped, "The run stopped early."))
+        caveats.insert(1, _stopped(stopped, live=live))
+    if closed:
+        caveats.append(CLOSED)
     if ledger_lost:
         caveats.append(LEDGER_LOST)
     if reading.partial:
         caveats.append(PARTIAL_READING)
     numbers = [
-        *_record_numbers(records, unreadable),
+        *_record_numbers(records, unread or datasf.Unread()),
         *_hearing_numbers(rows, no_row, listed, last_pass, live=live),
         *_match_numbers(records, reading, matched, generated=generated, live=live),
         *_place_numbers(matched, generated=generated, live=live, unplaced=unplaced),
@@ -206,8 +237,7 @@ def build(
     if taps_stopped is not None or waiting:
         caveats.append(
             f"The replay of taps is not complete: {waiting} planned taps have not been "
-            "put to the investigator. "
-            + _TAPS_STOPPED.get(taps_stopped or "", "The replay stopped early.")
+            "put to the investigator. " + _taps_stopped(taps_stopped, live=live)
         )
     return {
         "format": FORMAT,
@@ -220,8 +250,9 @@ def build(
         # Whether a stand-in had a part in the numbers: generated audio, a stand-in
         # for Ember, or both. Only recorded radio heard by Muse Ember is neither.
         "stand_in": generated or not live,
-        # Every call heard, and then the whole run: every planned tap put to the
-        # investigator as well, and the ledger the one the run began in.
+        # Whether a pass over the calls ended with none unready, and then whether
+        # nothing is left for the same command to do: no planned tap waiting, the
+        # replay not stopped, and the ledger the one the run began in.
         "heard_complete": heard_complete,
         "complete": complete,
         "basis_text": basis(settings),
@@ -270,7 +301,7 @@ def lines(results: dict[str, Any]) -> list[str]:
     return out
 
 
-def _record_numbers(records: Sequence[datasf.Record], unreadable: int) -> list[Number]:
+def _record_numbers(records: Sequence[datasf.Record], unread: datasf.Unread) -> list[Number]:
     medical = sum(record.medical for record in records)
     return [
         Number(
@@ -287,11 +318,22 @@ def _record_numbers(records: Sequence[datasf.Record], unreadable: int) -> list[N
         Number(
             "records_unreadable",
             "DataSF calls Beacon could not read",
-            unreadable,
+            unread.calls,
             "calls",
-            "Calls in DataSF's answer for the day that lack a number, a type, or the "
-            "time they were received or dispatched. They are in no count below, so "
-            "the calls above are not all the calls DataSF lists when this is not 0.",
+            "Calls in DataSF's answer for the day, each with a number of its own, that "
+            "lack a type or the time they were received or dispatched. They are in no "
+            "count below, so the calls above are not all the calls DataSF lists when "
+            "this is not 0.",
+        ),
+        Number(
+            "rows_unreadable",
+            "DataSF rows of no call Beacon can tell",
+            unread.rows,
+            "rows",
+            "Rows of DataSF's answer, each of which is one unit sent to one call, that "
+            "are not shaped as a row or have no call number Beacon reads. Several can "
+            "be of one call, so this is a count of rows and not of calls; whatever "
+            "calls they are of may be missing from every count below.",
         ),
     ]
 
@@ -411,7 +453,7 @@ def _match_numbers(
             "Share of DataSF calls found",
             share,
             "percent",
-            f"The calls found, of the calls DataSF lists. {meaning}",
+            f"The calls found, of the DataSF calls Beacon could read. {meaning}",
         ),
         Number(
             "merged",
@@ -471,22 +513,25 @@ def _place_numbers(
 ) -> list[Number]:
     away = sorted(pair.away_m for pair in matched.found if pair.away_m is not None)
     measured = (
-        "From the point of the incident a call was paired with to DataSF's point for "
-        "the call, over the pairs that have both."
+        "The distance between two points: the one the incident a call was paired with "
+        "has, and DataSF's for the call, over the pairs that have both."
+    )
+    dispatch = (
+        "A generated dispatch names the listed block nearest DataSF's point when one "
+        f"is within {BLOCK_REACH_M:.0f} m, and an arrival or a clearing names no place; "
+        "an incident's point is of a block some call grouped into it named"
     )
     if generated and not live:
         meaning = (
-            f"{measured} Each generated call names the listed block nearest DataSF's "
-            "point, so for a pair that is right this is how far that block's middle is "
-            "from the intersection, and for one that is not it is the distance to "
-            "another call's block: a check of the list of blocks and of the pairing, "
-            "not a location error of Beacon's hearing."
+            f"{measured} {dispatch}. So for a pair that is right and whose point is its "
+            "own dispatch's, this is how far that block's middle is from the "
+            "intersection; nothing checks that a pair is either. It is a check of the "
+            "list of blocks and of the pairing, not a location error of Beacon's hearing."
         )
     elif generated:
         meaning = (
-            f"{measured} Each call was generated to name the listed block nearest "
-            "DataSF's point, and the incident's point is of the block Muse Ember made "
-            "out, in a pair nothing checks. It is no location error on real radio."
+            f"{measured} {dispatch}, as Muse Ember made it out. Nothing checks that a "
+            "pair is right. It is no location error on real radio."
         )
     else:
         meaning = (
@@ -504,8 +549,9 @@ def _place_numbers(
                 "calls",
                 "DataSF calls for which neither street of the intersection has a "
                 f"listed block within {BLOCK_REACH_M:.0f} m of DataSF's point, so the "
-                "generated call names units and no place, and its incident has no "
-                "point to compare.",
+                "dispatch generated for them names units and no place. The incident "
+                "such a call is paired with has a point only when another call "
+                "grouped into it named a block.",
             )
         ]
     return [

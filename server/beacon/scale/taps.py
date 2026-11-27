@@ -234,6 +234,19 @@ def replay(
     return Replayed(made=made, stopped=stopped)
 
 
+def held_for(runs: Runs, wall_clock: Callable[[], datetime] | None = None) -> float | None:
+    """How many seconds the replay's hold on Ember still has to run, or None when
+    none is on. The hold is the run's, not the replay's alone: the command asks
+    before it has anything heard as well, so that a failure on a tap is not followed
+    by a paid request for a call."""
+    held_until, _ = read_hold(runs.state())
+    if held_until is None:
+        return None
+    now = datetime.now(UTC) if wall_clock is None else wall_clock()
+    left = (held_until - now).total_seconds()
+    return left if left > 0 else None
+
+
 def _ended_by(failure: EmberError) -> Stopped:
     if isinstance(failure, LedgerReplacedError):
         return "ledger_replaced"

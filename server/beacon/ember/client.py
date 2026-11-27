@@ -517,8 +517,21 @@ class EmberClient:
         and begun again, and everything the old file held of spend is then gone."""
         return self._ledger.generation()
 
+    def ledger_replaced(self) -> bool:
+        """Whether the ledger file at the path now is another than the one this
+        client was made on: begun again, or put back from a copy. What
+        `scope_spend` and `spent_usd` read is then not what this client spent."""
+        return not self._ledger.is_opened_file()
+
+    def ledger_file(self) -> str:
+        """A name for the ledger file this client was made on, which no other file
+        has: for work that goes on over several processes to tell that it is still
+        counted in the same ledger."""
+        return self._ledger.opened_file()
+
     def scope_spend(self, label: str) -> ScopeSpend:
-        """What the live calls made under a scope came to, in the ledger file now."""
+        """What the live calls made under a scope came to, in the ledger file now.
+        Ask `ledger_replaced` as well when the answer has to be this client's file's."""
         return self._ledger.scope_spend(label)
 
     def export_trace(self) -> tuple[Path, int]:

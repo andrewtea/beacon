@@ -192,9 +192,12 @@ def _blocks(row: Mapping[str, Any]) -> list[int]:
 
 
 def _number(said: object) -> int | None:
+    if isinstance(said, bool):
+        return None
     try:
+        # An integer of hundreds of digits is a number JSON can hold and a float cannot.
         number = float(said)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return int(number) if math.isfinite(number) and 0 <= number < 100_000 else None
 
@@ -212,10 +215,11 @@ def _middle(line: object) -> tuple[float, float] | None:
             return None
         lon, lat = position[0], position[1]
         if not all(
-            isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
-            for value in (lon, lat)
+            isinstance(value, int | float) and not isinstance(value, bool) for value in (lon, lat)
         ):
             return None
+        # The bounds, which no infinity, no NaN, and no integer too large for a
+        # float is within.
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             return None
         points.append((float(lat), float(lon)))

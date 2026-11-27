@@ -6,6 +6,8 @@ import base64
 import fcntl
 import hashlib
 import json
+import os
+import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from io import StringIO
@@ -21,7 +23,7 @@ from beacon.ingest.recordings import GENERATED_MARK
 from beacon.investigate import Runs, stand_in_investigator
 from beacon.radio import Ffmpeg
 from beacon.radio.audio import pcm_to_wav, plain_wav
-from beacon.scale import datasf, generate, results, run, score, taps
+from beacon.scale import cli, datasf, generate, results, run, score, taps
 from beacon.scale.cli import main
 from tests.scale_day import (
     DAY,
@@ -368,8 +370,11 @@ def test_a_paid_run_of_generated_speech_reports_what_the_ledger_holds_and_says_w
     assert status == 0
     made = results.read(layout)
     assert made is not None
-    # Paid, and still not radio: a stand-in had a part in every number.
+    # Paid, and still not radio: a stand-in had a part in every number. What the
+    # run is says what Ember is paid for, and the numbers say what it was paid.
     assert said.startswith(results.GENERATED_BY_EMBER)
+    assert "is paid for each one it is asked to hear" in results.GENERATED_BY_EMBER
+    assert "was paid" not in results.GENERATED_BY_EMBER + results.RECORDED_BY_EMBER
     assert (made["basis_text"], made["stand_in"], made["hearer"]) == (
         results.GENERATED_BY_EMBER,
         True,
@@ -437,7 +442,7 @@ def test_a_run_that_stops_at_its_cap_says_so_and_pays_for_nothing_past_it(
     status, said = command(env, site, *PAID, "--radio-budget", "0.001", paid=meta.client(env))
     assert status == 1
     assert meta.paid == heard
-    assert "leaving Ember alone for ten minutes" in said
+    assert "leaving Muse Ember alone for ten minutes" in said
 
 
 def test_a_run_that_failed_goes_on_without_paying_for_a_call_twice(
@@ -527,13 +532,16 @@ def test_a_replay_that_ember_fails_on_leaves_the_run_unfinished_and_counts_no_an
     )
     paid = meta.paid
 
-    # Given again at once, the replay is leaving Ember alone: no tap is claimed.
-    status, _ = command(env, site, *PAID, paid=meta.client(env))
+    assert any("A call to Muse Ember failed" in caveat for caveat in made["caveats"])
+    kept = layout.results.read_bytes()
+
+    # Given again at once, the whole run is leaving Ember alone: the hold of the
+    # replay is asked about before anything is heard, nothing is asked of Ember for
+    # a call or for a tap, and what the run came to is left as it was.
+    status, said = command(env, site, *PAID, paid=meta.client(env))
     assert (status, meta.paid) == (1, paid)
-    made = results.read(layout)
-    assert made is not None
-    assert any("leaving Ember alone after a refusal or a failure" in c for c in made["caveats"])
-    assert numbers_of(env)["taps_unanswered"] == 1
+    assert "leaving Ember alone after a refusal or a failure in the replay of taps" in said
+    assert layout.results.read_bytes() == kept
 
 
 def test_a_tap_is_not_begun_when_its_scope_has_less_left_than_a_tap_may_cost(
@@ -617,6 +625,88 @@ def test_a_paid_run_goes_on_only_in_the_ledger_it_began_to_pay_in(
 
     assert (status, meta.paid) == (2, paid)
     assert run.LEDGER_REPLACED in said
+
+
+def test_a_ledger_put_back_from_a_copy_after_the_last_request_is_not_read_as_what_was_spent(
+    env: dict[str, str], site: DataSf, speech: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout = run.Layout.under(env, "day")
+    meta = Meta(layout)
+    ledger = Storage.under(Path(env["BEACON_DATA_DIR"])).ledger_db
+    real_hear = cli.hear
+
+    def hear_then_restore(*args: Any, **options: Any) -> run.Heard:
+        # A copy of the ledger from before anything was heard, of the same
+        # generation, is put back over it when the last call has been paid for and
+        # before the run reads what it spent.
+        copy = ledger.with_name("copy.sqlite3")
+        with sqlite3.connect(ledger) as source, sqlite3.connect(copy) as target:
+            source.backup(target)
+        heard = real_hear(*args, **options)
+        for beside in ("-wal", "-shm"):
+            ledger.with_name(ledger.name + beside).unlink(missing_ok=True)
+        os.replace(copy, ledger)
+        return heard
+
+    monkeypatch.setattr(cli, "hear", hear_then_restore)
+
+    status, said = command(env, site, *PAID, "--taps", "0", paid=meta.client(env))
+
+    # Every call was paid for, and the file at the ledger's path says none was. No
+    # request was left to refuse, and the run still says its ledger is another.
+    assert meta.paid == CALLS
+    assert status == 1
+    assert said.rstrip().endswith(run.LEDGER_REPLACED)
+    made = results.read(layout)
+    assert made is not None
+    assert (made["complete"], results.LEDGER_LOST in made["caveats"]) == (False, True)
+    assert numbers_of(env)["radio_cost_usd"] is None
+    assert "radio_paid_calls" not in numbers_of(env)
+    monkeypatch.setattr(cli, "hear", real_hear)
+    assert command(env, site, *PAID, "--taps", "0", paid=meta.client(env))[0] == 2
+
+
+def test_a_paid_run_is_refused_in_a_copy_of_its_ledger_that_was_put_back(
+    env: dict[str, str], site: DataSf, speech: None
+) -> None:
+    layout = run.Layout.under(env, "day")
+    meta = Meta(layout)
+    assert command(env, site, *PAID, "--radio-budget", "0.001", paid=meta.client(env))[0] == 1
+    paid = meta.paid
+    ledger = Storage.under(Path(env["BEACON_DATA_DIR"])).ledger_db
+    # The same ledger, by its generation and by everything in it, and another file.
+    copy = ledger.with_name("copy.sqlite3")
+    with sqlite3.connect(ledger) as source, sqlite3.connect(copy) as target:
+        source.backup(target)
+    for beside in ("-wal", "-shm"):
+        ledger.with_name(ledger.name + beside).unlink(missing_ok=True)
+    os.replace(copy, ledger)
+
+    status, said = command(env, site, *PAID, paid=meta.client(env))
+
+    assert (status, meta.paid) == (2, paid)
+    assert run.LEDGER_REPLACED in said
+
+
+def test_results_are_published_while_the_run_still_holds_its_lock(
+    env: dict[str, str], site: DataSf, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    held: list[bool] = []
+    write = results.write
+
+    def write_and_ask(layout: run.Layout, made: dict[str, Any]) -> None:
+        with open(layout.root.parent / ".lock", "a", encoding="utf-8") as another:
+            try:
+                fcntl.flock(another, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held.append(False)
+            except OSError:
+                held.append(True)
+        write(layout, made)
+
+    monkeypatch.setattr(results, "write", write_and_ask)
+
+    assert command(env, site)[0] == 0
+    assert held == [True]
 
 
 def test_a_medical_call_of_generated_speech_is_kept_as_medical_whatever_ember_made_of_it(
@@ -705,13 +795,21 @@ def test_a_call_of_datasfs_that_cannot_be_read_is_counted_and_said_to_be_in_no_c
 ) -> None:
     unread = call("260620099", "Alarms", "12:00:00", FELL_GOUGH, ("E36",))
     del unread[0]["dispatch_dttm"]
-    site = DataSf([*ROWS, *unread])
+    # Two units' rows with no call number: of one call or of two, nothing says.
+    nameless = call("260620098", "Alarms", "12:30:00", FELL_GOUGH, ("E36", "T06"))
+    for row in nameless:
+        del row["call_number"]
+    site = DataSf([*ROWS, *unread, *nameless])
 
-    command(env, site, "--taps", "0")
+    _, said = command(env, site, "--taps", "0")
 
+    assert "6 calls in DataSF's record of 2026-03-03 that Beacon could read." in said
     numbers, texts = numbers_of(env), texts_of(env)
     assert (numbers["records"], numbers["records_unreadable"]) == (6, 1)
+    assert numbers["rows_unreadable"] == 2
     assert "They are in no count below" in texts["records_unreadable"]
+    assert "a count of rows and not of calls" in texts["rows_unreadable"]
+    assert "of the DataSF calls Beacon could read" in texts["found_share"]
     assert numbers["found_share"] == 66.7
 
 
@@ -1047,6 +1145,12 @@ def test_paid_answers_that_are_no_form_three_times_running_hold_the_replay(
     assert numbers["taps_away_unconfirmed"].value == 0
     assert "Of 0 answered taps" in numbers["taps_near_matched"].text
     runs.close()
+    # A stand-in's answers are not called Ember's, and nothing is said to be paid.
+    told = results._taps_stopped("unusable", live=False)
+    assert "Answers of the stand-in for Ember's were not the form" in told
+    assert "paid" not in told
+    assert "each of them paid for" in results._taps_stopped("unusable", live=True)
+    assert "the stand-in for Ember failed" in results._stopped("ember", live=False)
 
 
 def test_a_tap_that_was_claimed_and_never_answered_is_not_investigated_again(
@@ -1255,6 +1359,75 @@ def test_the_cost_of_recorded_radio_is_never_mixed_with_generated_speechs_and_th
     assert ledger.scope_spend(run.SPEECH_SCOPE).calls == CALLS
     assert numbers_of(env, "speech")["radio_paid_calls"] == CALLS
     assert "scale:speech" in texts_of(env, "speech")["radio_cost_usd"]
+
+
+def test_once_taps_are_replayed_nothing_more_is_heard_so_every_answer_is_of_one_evidence(
+    env: dict[str, str], site: DataSf, recorder: tuple[Path, dict[str, Any]]
+) -> None:
+    root, by_digest = recorder
+    layout = run.Layout.under(env, "day")
+    meta = Meta(layout, heard_by(by_digest))
+    allowed = env | {"BEACON_RECORDINGS_PERMITTED": "1"}
+    recorded = (*RECORDED, "--recordings", str(root))
+    assert command(allowed, site, *recorded, paid=meta.client(env))[0] == 0
+    first = numbers_of(env)
+    paid = meta.paid
+
+    # A recording of the day turns up after the taps were answered.
+    late = record(root, 5, datetime(2026, 3, 3, 21, 0, tzinfo=UTC))
+    by_digest[hashlib.sha256(late).hexdigest()] = form(
+        "dispatched", category="collision", street="Octavia St", block=300, units=["E5"]
+    )
+    status, _ = command(allowed, site, *recorded, paid=meta.client(env))
+
+    # It is not heard: the taps' answers are kept for good, and are of the evidence
+    # as it was. Nothing is paid, and the result says the hearing is closed.
+    assert (status, meta.paid, len(meta.audio)) == (0, paid, 2)
+    made = results.read(layout)
+    assert made is not None
+    assert results.CLOSED in made["caveats"]
+    assert numbers_of(env) == first
+    assert EvidenceStore(layout.evidence, "live").last_id() == 2
+
+    # A run with no taps is never closed: it hears what turns up.
+    other = Meta(run.Layout.under(env, "open"), heard_by(by_digest))
+    untapped = (*RECORDED[:-1], "0", "--recordings", str(root))
+    for audio in (3, 3):
+        assert command(allowed, site, *untapped, paid=other.client(env), name="open")[0] == 0
+        assert len(other.audio) == audio
+    made = results.read(run.Layout.under(env, "open"))
+    assert made is not None
+    assert results.CLOSED not in made["caveats"]
+
+
+def test_a_run_over_recordings_of_a_day_that_is_hardly_over_fetches_nothing(
+    env: dict[str, str],
+    site: DataSf,
+    recorder: tuple[Path, dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HalfPastOne(datetime):
+        """Half past one in the morning after the day, by San Francisco's clock."""
+
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:
+            return datetime(2026, 3, 4, 9, 30, tzinfo=UTC).astimezone(tz)
+
+    monkeypatch.setattr(cli, "datetime", HalfPastOne)
+    root, by_digest = recorder
+    meta = Meta(run.Layout.under(env, "day"), heard_by(by_digest))
+    allowed = env | {"BEACON_RECORDINGS_PERMITTED": "1"}
+
+    status, said = command(
+        allowed, site, *RECORDED, "--recordings", str(root), paid=meta.client(env)
+    )
+
+    # Refused before DataSF's record of the day is fetched and kept: a record
+    # fetched this early would be kept for every later invocation of the run.
+    assert status == 2
+    assert "The day's last calls can still be recorded" in said
+    assert site.requests == []
+    assert not run.Layout.under(env, "day").root.exists()
 
 
 def test_recordings_are_not_heard_without_the_operators_word_or_by_a_stand_in(

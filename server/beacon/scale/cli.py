@@ -18,7 +18,10 @@ Taps are replayed only once the hearing is complete: a tap that is investigated
 against half a day's evidence is claimed for good with the answer it got.
 
 One invocation is made at a time under a data directory (`run.alone`), and a paid
-run goes on only in the Ember ledger it began to pay in (`run.pin_ledger`).
+run goes on only in the Ember ledger it began to pay in (`run.pin_ledger`). A hold
+after a refusal or a failure is the whole run's: while the replay's is on, nothing
+is heard either. When the replay of taps first begins the hearing is closed for
+good (`run.close_hearing`), so every tap of a run is answered against one evidence.
 """
 
 import argparse
@@ -42,6 +45,7 @@ from beacon.scale.run import (
     RADIO_BUDGET_NANOUSD,
     TAPS_BUDGET_NANOUSD,
     TAPS_SCOPE,
+    Heard,
     Layout,
     PaidClient,
     ScaleError,
@@ -49,8 +53,12 @@ from beacon.scale.run import (
     alone,
     begin,
     check_budget,
+    close_hearing,
+    closed_hearing,
+    day_window,
     hear,
     hearing_scope,
+    hearing_spend,
     lose_ledger,
     open_store,
     paid_ember,
@@ -170,7 +178,6 @@ def _run(
     with alone(env), contextlib.ExitStack() as opened:
         radio: EmberClient | None = None
         tap_ember: EmberClient | None = None
-        generation: str | None = None
         # What the run is, first: a run that was begun as another is refused before
         # a paying client is made for it.
         settings = begin(layout, settings)
@@ -187,12 +194,14 @@ def _run(
                     paid_ember(env, TAPS_SCOPE, taps_budget, TAPS_BUDGET_NANOUSD, paid)
                 )
             )
-            generation = radio.ledger_generation()
-            pin_ledger(layout, generation)
+            pin_ledger(layout, radio)
         print(results.basis(settings), file=out)
-        records = prepare(layout, settings, http)
-        records, unreadable = read_day(layout)
-        print(f"{len(records)} calls in DataSF's record of {settings.day}.", file=out)
+        prepare(layout, settings, http)
+        records, unread = read_day(layout)
+        print(
+            f"{len(records)} calls in DataSF's record of {settings.day} that Beacon could read.",
+            file=out,
+        )
         known_blocks = read_lists(layout)[1]
         if radio is None or tap_ember is None:
             # The stand-ins: one reads the generated calls' script, one investigates by rule.
@@ -204,58 +213,81 @@ def _run(
                     EmberClient.fake(Storage.under(default_data_dir(env)), stand_in_investigator)
                 )
             )
+        tap_runs = opened.enter_context(contextlib.closing(Runs(layout.taps, settings.mode)))
+        held = taps.held_for(tap_runs)
+        if held is not None:
+            # A refusal or a failure on a tap holds the whole run: nothing is heard
+            # either, and what the run came to so far is left as it is.
+            print(
+                "The run is leaving Ember alone after a refusal or a failure in the "
+                f"replay of taps, for about {held / 60:.0f} more minutes. Nothing was "
+                "asked, and the run's results are as they were. Give the same command "
+                "again after that.",
+                file=out,
+            )
+            return 1
         store = open_store(layout, settings)
-        try:
+        opened.callback(store.close)
+        closed = closed_hearing(layout)
+        if closed is None:
             heard = hear(layout, settings, store, radio, env, recordings=options.recordings)
-            heard_complete = (
-                heard.stopped is None
-                and heard.last_pass is not None
-                and heard.last_pass.unready == 0
-            )
-            ledger_lost = heard.ledger_lost
-            replays = taps.plan(records, options.taps)
-            tap_runs = Runs(layout.taps, settings.mode)
-            taps_stopped: taps.Stopped | None = None
-            try:
-                if replays and heard_complete and not ledger_lost:
-                    taps_stopped = taps.replay(
-                        replays, tap_ember, store, known_blocks, tap_runs
-                    ).stopped
-                elif replays:
-                    print("No tap is replayed until every call has been heard.", file=out)
-                standing = taps.kept(replays, tap_runs) if heard_complete else []
-            finally:
-                tap_runs.close()
-            if generation is not None and (
-                taps_stopped == "ledger_replaced" or tap_ember.ledger_generation() != generation
-            ):
-                ledger_lost = True
-            if ledger_lost:
-                # Kept, so that the command given again is refused and pays nothing.
-                lose_ledger(layout)
-            reading = score.read_incidents(store, known_blocks, records)
-            script = generate.read_script(layout.calls) if settings.audio == "generated" else None
-            made = results.build(
-                options.name,
-                settings,
-                records,
-                unreadable=unreadable,
-                rows=store.count_by_source().get(RADIO_SOURCE, 0),
-                no_row=store.claimed_without_row(RADIO_SOURCE),
-                listed=None if script is None else script.calls,
-                unplaced=None if script is None else script.unplaced,
-                last_pass=heard.last_pass,
-                stopped=heard.stopped,
-                reading=reading,
-                matched=score.match(records, reading.incidents),
-                radio_spend=heard.spend,
-                ledger_lost=ledger_lost,
-                taps=standing,
-                taps_stopped=taps_stopped,
-            )
-        finally:
-            store.close()
-    results.write(layout, made)
+        else:
+            # The replay of taps has begun, so nothing more is heard in this run.
+            radio.close()
+            spend, lost = hearing_spend(settings, radio) if live else (None, False)
+            heard = Heard(last_pass=closed, stopped=None, spend=spend, ledger_lost=lost)
+        heard_complete = (
+            heard.stopped is None and heard.last_pass is not None and heard.last_pass.unready == 0
+        )
+        ledger_lost = heard.ledger_lost
+        replays = taps.plan(records, options.taps)
+        taps_stopped: taps.Stopped | None = None
+        if replays and heard_complete and not ledger_lost:
+            if closed is None:
+                # Before the first tap is claimed: from here on every tap of the
+                # run is answered against the evidence as it is now.
+                assert heard.last_pass is not None
+                close_hearing(layout, heard.last_pass)
+                closed = heard.last_pass
+            taps_stopped = taps.replay(replays, tap_ember, store, known_blocks, tap_runs).stopped
+        elif replays:
+            print("No tap is replayed until every call has been heard.", file=out)
+        standing = taps.kept(replays, tap_runs) if heard_complete else []
+        if live and (
+            taps_stopped == "ledger_replaced"
+            or radio.ledger_replaced()
+            or tap_ember.ledger_replaced()
+        ):
+            # Asked of both clients when everything is done, whether or not either
+            # had a request left to make: the file at the ledger's path is another.
+            ledger_lost = True
+        if ledger_lost:
+            # Kept, so that the command given again is refused and pays nothing.
+            lose_ledger(layout)
+        reading = score.read_incidents(store, known_blocks, records)
+        script = generate.read_script(layout.calls) if settings.audio == "generated" else None
+        made = results.build(
+            options.name,
+            settings,
+            records,
+            unread=unread,
+            rows=store.count_by_source().get(RADIO_SOURCE, 0),
+            no_row=store.claimed_without_row(RADIO_SOURCE),
+            listed=None if script is None else script.calls,
+            unplaced=None if script is None else script.unplaced,
+            last_pass=heard.last_pass,
+            stopped=heard.stopped,
+            closed=closed is not None,
+            reading=reading,
+            matched=score.match(records, reading.incidents),
+            radio_spend=None if ledger_lost else heard.spend,
+            ledger_lost=ledger_lost,
+            taps=standing,
+            taps_stopped=taps_stopped,
+        )
+        # Published under the lock: a later invocation's results are not written
+        # over by an earlier one's.
+        results.write(layout, made)
     print("", file=out)
     for line in results.lines(made):
         print(line, file=out)
@@ -300,6 +332,13 @@ def _settings(options: argparse.Namespace, env: Mapping[str, str]) -> Settings:
             "when the recordings are your own, or you have the permission of whoever "
             "made them. Beacon does not use OpenMHz's recordings, and has no license "
             "from Broadcastify."
+        )
+    if datetime.now(datasf.UTC) < day_window(day)[1]:
+        # Before anything of the day is fetched or kept: DataSF's record of a day
+        # that is hardly over is not whole either.
+        raise ScaleError(
+            "The day's last calls can still be recorded: a run over recordings is made "
+            "from two hours after the end of San Francisco's day."
         )
     talkgroups = _numbers(options.talkgroups)
     ems = _numbers(options.ems_talkgroups)

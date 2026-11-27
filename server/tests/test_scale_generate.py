@@ -47,7 +47,7 @@ MEDICAL = call(
 
 def records_of(*calls: list[dict[str, Any]]) -> list[datasf.Record]:
     records, unreadable = datasf.read_records([row for rows in calls for row in rows])
-    assert unreadable == 0
+    assert unreadable == datasf.Unread()
     return records
 
 

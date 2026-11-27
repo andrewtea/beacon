@@ -23,7 +23,6 @@ DataSF does not publish is added. A record is kept in a run's own directory unde
 Times in the dataset have no zone: they are San Francisco's wall clock (`LOCAL`).
 """
 
-import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -131,12 +130,12 @@ class Record:
         }
 
 
-def fetch_day(http: SourceHttp, day: date) -> list[Mapping[str, Any]]:
+def fetch_day(http: SourceHttp, day: date) -> list[object]:
     """DataSF's rows for the calls received on `day`, San Francisco's day, with
     the columns in `COLUMNS` and no others.
 
     Raises SourceError when DataSF cannot be read, or lists more than a day has."""
-    rows: list[Mapping[str, Any]] = []
+    rows: list[object] = []
     for page in range(MAX_PAGES):
         body = fetch(
             http,
@@ -155,33 +154,47 @@ def fetch_day(http: SourceHttp, day: date) -> list[Mapping[str, Any]]:
         listed = read_json(body, SOURCE)
         if not isinstance(listed, list):
             raise_bare(SourceError(SOURCE, "sent a reply that is not a list of rows"))
-        rows += [row for row in listed if isinstance(row, dict)]
+        # Every row, one that is no object too: `read_records` counts those.
+        rows += listed
         if len(listed) < PAGE_ROWS:
             return rows
     raise_bare(SourceError(SOURCE, "lists more rows for one day than Beacon reads"))
 
 
-def read_records(rows: Iterable[Mapping[str, Any]]) -> tuple[list[Record], int]:
+@dataclass(frozen=True)
+class Unread:
+    """What of a day's rows could not be read as a call."""
+
+    # Calls, each with a number of its own, that lack a type that is text or the
+    # time they were received or dispatched.
+    calls: int = 0
+    # Rows that cannot be told to be any call's: one that is no object, or has no
+    # call number Beacon reads. Several of them can be of one call, so this is a
+    # count of rows and not of calls.
+    rows: int = 0
+
+
+def read_records(rows: Iterable[object]) -> tuple[list[Record], Unread]:
     """The calls a day's rows are of, oldest first by when each was dispatched, and
-    how many calls could not be read: one with no number, no time it was received
-    or dispatched, or a type that is no text."""
+    what could not be read (`Unread`)."""
     by_number: dict[str, list[Mapping[str, Any]]] = {}
-    unreadable = 0
+    lost_rows = 0
     for row in rows:
-        number = row.get("call_number")
-        if isinstance(number, str) and _digits(number, 12):
+        number = row.get("call_number") if isinstance(row, Mapping) else None
+        if isinstance(row, Mapping) and isinstance(number, str) and _digits(number, 12):
             by_number.setdefault(number, []).append(row)
         else:
-            unreadable += 1
+            lost_rows += 1
     records: list[Record] = []
+    lost_calls = 0
     for number, of_call in by_number.items():
         record = _record(number, of_call)
         if record is None:
-            unreadable += 1
+            lost_calls += 1
         else:
             records.append(record)
     records.sort(key=lambda record: (record.dispatched_at, record.number))
-    return records, unreadable
+    return records, Unread(calls=lost_calls, rows=lost_rows)
 
 
 def records_from_data(listed: object) -> list[Record]:
@@ -273,7 +286,9 @@ def _point(location: object) -> Point | None:
         isinstance(value, int | float) and not isinstance(value, bool) for value in (lon, lat)
     ):
         return None
-    if not (math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180):
+    # The bounds first, which no infinity and no NaN is within: an integer of
+    # hundreds of digits is a number JSON can hold and a float cannot.
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
         return None
     return Point(float(lat), float(lon))
 
