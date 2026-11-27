@@ -5,6 +5,7 @@
 // from them unnoticed.
 
 import type { IncidentAnswer } from '../api/incidents.ts'
+import type { Scale } from '../api/scale.ts'
 import type { TapAnswer, TapRun } from '../api/taps.ts'
 
 export const FIRE_TAP = 'tapFire000000001'
@@ -1932,4 +1933,317 @@ export const quietAnswer: TapAnswer = {
   ember_calls: 3,
   cost_incomplete: false,
   cost_text: null,
+}
+
+// `GET /api/scale` for a stand-in run of the server tests' invented day (six
+// made-up calls in `server/tests/scale_day.py`), not of any real day of DataSF's.
+export const scaleAnswer: Scale = {
+  about_text:
+    "A scale run puts one day of fire dispatch calls through the code this server runs and compares what Beacon made of them with DataSF's public record of that day. It is made by a command, apart from this server: nothing on this page is about the incidents this server shows, or about any tap it was sent.",
+  run: {
+    name: 'day',
+    day: '2026-03-03',
+    made_at: '2026-03-05T18:00:00Z',
+    stand_in: true,
+    complete: true,
+    kind_text: 'Stand-in, generated calls',
+    basis_text:
+      "Stand-in run on generated calls. The calls are generated from DataSF's own records of this day, and a stand-in \"hears\" each by looking it up in the generator's script. No radio is heard and Muse Ember is asked nothing. Nothing below measures Beacon's accuracy, speed, or cost on real radio: it shows only that the pipeline keeps what it is given.",
+    reminder_text:
+      "A stand-in's numbers on calls generated from DataSF's record: a check that the pipeline keeps what it is given, and no measurement of Beacon's accuracy, speed, or cost on real radio.",
+    state_text:
+      'The run is complete, which means nothing is left for its command to do. It does not mean every call has a row or every tap an answer: the numbers below say what came of each.',
+    caveats: [
+      'A match is by kind, time, and unit or place. Nothing checks what an incident says beyond that, and a call DataSF does not list cannot be told from a wrong incident.',
+      "The hearing was closed when it was first complete, so that whatever is made of the whole day (answers to replayed taps, a glossary) is of the same evidence: a call put among the run's calls after that is not heard in this run.",
+    ],
+    scored_against: {
+      text: 'Fire Department and Emergency Medical Services Dispatched Calls for Service, City and County of San Francisco, DataSF (Open Data Commons Public Domain Dedication and License)',
+      url: 'https://data.sf.gov/d/nuek-vuh3',
+    },
+    sections: [
+      {
+        title: "DataSF's record of the day",
+        numbers: [
+          {
+            key: 'records',
+            label: 'DataSF calls Beacon could read',
+            value_text: '6 calls',
+            text: "Calls the fire department was dispatched to on this day, by DataSF's record, that have a number, a type, and the times they were received and dispatched. Every count and share below is of these. 1 of them are medical, of which Beacon keeps DataSF's number for the call, the crews, the intersection, and the times, and nothing else.",
+          },
+          {
+            key: 'records_unreadable',
+            label: 'DataSF calls Beacon could not read',
+            value_text: '0 calls',
+            text: "Calls in DataSF's answer for the day, each with a number of its own, that lack a type or the time they were received or dispatched. They are in no count below, so the calls above are not all the calls DataSF lists when this is not 0.",
+          },
+          {
+            key: 'rows_unreadable',
+            label: 'DataSF rows of no call Beacon can tell',
+            value_text: '0 rows',
+            text: "Rows of DataSF's answer, each of which is one unit sent to one call, that are not shaped as a row or have no call number Beacon reads. Several can be of one call, so this is a count of rows and not of calls; whatever calls they are of may be missing from every count below.",
+          },
+        ],
+      },
+      {
+        title: 'Calls heard',
+        numbers: [
+          {
+            key: 'transmissions',
+            label: 'Transmissions heard',
+            value_text: '13 calls',
+            text: 'Radio calls that the stand-in heard and Beacon kept a row for, over every invocation of this run, of 13 there are to hear. Each is heard once.',
+          },
+          {
+            key: 'no_row',
+            label: 'Calls claimed with no row kept',
+            value_text: '0 calls',
+            text: 'Calls that were claimed for the stand-in to hear and that Beacon has no row for: the answer was no form, the request failed after it may have been sent, or the run was stopped between the claim and the row. A claim is for good, so none of them is asked about, or paid for, again.',
+          },
+          {
+            key: 'unready',
+            label: 'Calls not ready',
+            value_text: '0 calls',
+            text: 'Calls whose files could not be used as they were in the last pass. Nobody claimed them, nothing was paid, and the next pass looks again.',
+          },
+          {
+            key: 'unusable',
+            label: 'Calls that came to nothing',
+            value_text: '0 calls',
+            text: 'Calls in the last pass that the stand-in was asked about and whose answer was no form. They are not asked about again.',
+          },
+        ],
+      },
+      {
+        title: "Calls matched to DataSF's record",
+        numbers: [
+          {
+            key: 'incidents',
+            label: 'Incidents Beacon made',
+            value_text: '5 incidents',
+            text: "Incidents the incident engine made of the run's radio rows.",
+          },
+          {
+            key: 'found',
+            label: 'DataSF calls found',
+            value_text: '4 calls',
+            text: "DataSF calls that were paired with an incident of Beacon's, one to one: of the same medical-or-not kind, opened within the call's time, and naming one of its units or placed within 300 m of it. A pair is a fit by that rule, and nothing checks that it is right. The calls were generated from these records and a stand-in read them back, so this is a check of the pipeline, not a measure of accuracy.",
+          },
+          {
+            key: 'found_share',
+            label: 'Share of DataSF calls found',
+            value_text: '66.7%',
+            text: 'The calls found, of the DataSF calls Beacon could read. The calls were generated from these records and a stand-in read them back, so this is a check of the pipeline, not a measure of accuracy.',
+          },
+          {
+            key: 'merged',
+            label: "DataSF calls taken to be inside another's incident",
+            value_text: '1 call',
+            text: "DataSF calls with no incident of their own, for which an incident that is another call's own, of the same medical-or-not kind, and names one of their units or lies within 300 m of them has a radio call in their time. That is taken to mean the call is inside another call's incident, where Beacon puts a second call at one block within 45 minutes and a call that names units and no place. Nothing checks that it is: an incident that was only near by at the time is counted the same.",
+          },
+          {
+            key: 'missed',
+            label: 'DataSF calls with no incident',
+            value_text: '1 call',
+            text: 'DataSF calls for which Beacon has no incident of their own and none that they are taken to be inside.',
+          },
+          {
+            key: 'not_generated',
+            label: 'DataSF calls no call was generated for',
+            value_text: '1 call',
+            text: "DataSF calls that name no unit whose id is shaped as Beacon keeps one (a type code and a number), so the generator made no call for them and nothing was heard of them. 0 of them are counted above as found and 0 as taken to be inside another's incident, which for a call nobody generated is chance: an incident of another call's was near it at the time. That is how loose both counts are.",
+          },
+          {
+            key: 'split',
+            label: 'Further incidents of a call already counted',
+            value_text: '1 incident',
+            text: 'Incidents that fit a DataSF call by the rule and were paired with none, because each call takes one. That is what is left when Beacon makes more than one incident of one call, as it does when a unit is heard from after its incident has been quiet for 45 minutes; an incident that merely fits a call by its time and a unit or its place is counted the same.',
+          },
+          {
+            key: 'extra',
+            label: 'Incidents no DataSF call fits',
+            value_text: '0 incidents',
+            text: "Incidents of Beacon's that fit no DataSF call of this day. One can be a real call DataSF does not list, or a wrong incident: the rule cannot tell.",
+          },
+          {
+            key: 'other_kind',
+            label: 'Found under another category',
+            value_text: '0 calls',
+            text: "Calls found whose incident has another category than DataSF's call type maps to. A medical call is never matched to anything but a medical response.",
+          },
+        ],
+      },
+      {
+        title: 'Place',
+        numbers: [
+          {
+            key: 'unplaced',
+            label: 'Calls generated with no block',
+            value_text: '0 calls',
+            text: "DataSF calls for which neither street of the intersection has a listed block within 250 m of DataSF's point, so the dispatch generated for them names units and no place.",
+          },
+          {
+            key: 'placed',
+            label: 'Found calls with a place to compare',
+            value_text: '4 calls',
+            text: 'Pairs in which the incident has a point and the DataSF record has one.',
+          },
+          {
+            key: 'place_median_m',
+            label: "Distance to DataSF's point, median",
+            value_text: '50.2 m',
+            text: "The distance between two points: the one the incident a call was paired with has, and DataSF's for the call, over the pairs that have both. A generated dispatch names the listed block nearest DataSF's point when one is within 250 m, and an arrival or a clearing names no place; an incident's point is of a block some call grouped into it was heard to name. So for a pair that is right and whose point is its own dispatch's, this is how far that block's middle is from the intersection; nothing checks that a pair is either. It is a check of the list of blocks and of the pairing, not a location error of Beacon's hearing.",
+          },
+          {
+            key: 'place_p90_m',
+            label: "Distance to DataSF's point, 90th percentile",
+            value_text: '50.2 m',
+            text: "The distance between two points: the one the incident a call was paired with has, and DataSF's for the call, over the pairs that have both. A generated dispatch names the listed block nearest DataSF's point when one is within 250 m, and an arrival or a clearing names no place; an incident's point is of a block some call grouped into it was heard to name. So for a pair that is right and whose point is its own dispatch's, this is how far that block's middle is from the intersection; nothing checks that a pair is either. It is a check of the list of blocks and of the pairing, not a location error of Beacon's hearing.",
+          },
+        ],
+      },
+      {
+        title: 'Time',
+        numbers: [
+          {
+            key: 'heard_after_dispatch_s',
+            label: 'From dispatch to the first call heard',
+            value_text: 'none',
+            text: 'Not measured: each generated call is placed at the time DataSF gives, so how soon the radio tells of a call is not something this run can show.',
+          },
+        ],
+      },
+      {
+        title: 'Cost of hearing',
+        numbers: [
+          {
+            key: 'radio_cost_usd',
+            label: 'Cost of hearing',
+            value_text: 'none',
+            text: "Not measured: a stand-in heard the calls, nothing was paid, and no cost of Muse Ember's is known from this run.",
+          },
+          {
+            key: 'radio_cost_per_1000_usd',
+            label: 'Cost per 1,000 transmissions',
+            value_text: 'none',
+            text: "Not measured: a stand-in heard the calls, nothing was paid, and no cost of Muse Ember's is known from this run.",
+          },
+        ],
+      },
+      {
+        title: 'Replayed taps',
+        numbers: [
+          {
+            key: 'taps',
+            label: 'Replayed taps answered',
+            value_text: '5 taps',
+            text: "Of 5 planned: those whose investigation ran to an answer that was the form. A replayed tap is a place and a moment of the day put to the investigator by a script, investigated by a stand-in for Ember, by rule against the run's evidence as it stood then. No person tapped, and none is stored as a tap.",
+          },
+          {
+            key: 'taps_unanswered',
+            label: 'Replayed taps with no answer',
+            value_text: '0 taps',
+            text: 'Taps whose investigation was cut short, was refused before anything was asked, or ended in an answer that was not the form. They are kept as "unconfirmed", are in none of the counts of answers below, and are not investigated again.',
+          },
+          {
+            key: 'taps_lost',
+            label: 'Replayed taps claimed with no run kept',
+            value_text: '0 taps',
+            text: "Taps that were claimed and have no run: the process ended between the claim and the run. They are not investigated again, and what was paid for them, if anything, is not known from the run's files.",
+          },
+          {
+            key: 'taps_near_matched',
+            label: 'Taps at a call, answered with its incident',
+            value_text: '3 taps',
+            text: 'Of 4 answered taps placed at a DataSF call\'s point three minutes after its dispatch: those the investigator matched to the incident that call was paired with, or the one it is taken to be inside, on generated calls. A tap that was answered "unconfirmed" is not counted, whether or not that was the careful answer.',
+          },
+          {
+            key: 'taps_away_unconfirmed',
+            label: 'Taps away from every call, answered unconfirmed',
+            value_text: '1 tap',
+            text: 'Of 1 answered taps placed at a place and a moment such that, for every call DataSF lists within a kilometre, the moment is more than an hour before the call was received or more than an hour after the last time DataSF records for it (the latest, over all its units, of a dispatch, a unit on scene, and a unit available again): those answered "unconfirmed". A call can have gone on past the last time recorded for it, and a call DataSF does not list is not known of.',
+          },
+          {
+            key: 'tap_cost_usd',
+            label: 'Cost per investigation',
+            value_text: 'none',
+            text: "Not measured: a stand-in investigated, nothing was paid, and no cost or speed of Muse Ember's is known from this run.",
+          },
+          {
+            key: 'tap_seconds_p95',
+            label: 'Time per investigation, 95th percentile',
+            value_text: 'none',
+            text: "Not measured: a stand-in investigated, nothing was paid, and no cost or speed of Muse Ember's is known from this run.",
+          },
+        ],
+      },
+      {
+        title: 'Glossary',
+        numbers: [
+          {
+            key: 'glossary_codes',
+            label: "Unit type codes in the run's incidents",
+            value_text: '4 codes',
+            text: "Different unit type codes (the letters of E36) among the units the run's incidents name: the codes of the table a glossary is asked for with. 0 more were named and are not in the table. The table counts the incidents Beacon made of generated calls, as those calls were heard and grouped. The calls were generated from DataSF's own record of which units were sent to what, so the counts follow that record and are of nothing heard on a radio.",
+          },
+          {
+            key: 'glossary_checked',
+            label: 'Codes with a majority kind of unit in DataSF',
+            value_text: '4 codes',
+            text: "Of those codes: the ones for which more than half of all the units DataSF lists for the day under the code have unit types of one kind of unit, which is taken for the kind the code names. Two of DataSF's types can be one kind (BLS and PRIVATE are both an ambulance), and a unit with a type Beacon has no kind for, or with types of two kinds, counts for none. Only these codes are compared, and nothing checks DataSF's unit types. The learner is never shown them.",
+          },
+          {
+            key: 'glossary_before',
+            label: 'Codes Beacon had the kind of, before',
+            value_text: '4 codes',
+            text: "Of those 4: the codes among the five a person wrote down (E, T, B, D, M) whose kind agrees with DataSF's majority kind. This is what Beacon knows with no glossary.",
+          },
+          {
+            key: 'glossary_after',
+            label: 'Codes Beacon has the kind of, after',
+            value_text: '4 codes',
+            text: "Of those 4: the codes whose kind agrees with DataSF's majority kind when the glossary's proposals are applied to the codes no person wrote down. A proposal never replaces one of the five. A stand-in proposed them, by a rule of thumb over the counts: it is no model, and this says nothing of Muse Ember. The table counts the incidents Beacon made of generated calls, as those calls were heard and grouped. The calls were generated from DataSF's own record of which units were sent to what, so the counts follow that record and are of nothing heard on a radio.",
+          },
+          {
+            key: 'glossary_new',
+            label: 'Codes the glossary added, in agreement with DataSF',
+            value_text: '0 codes',
+            text: "Codes that no person wrote down, for which the glossary proposed DataSF's majority kind. A stand-in proposed them, by a rule of thumb over the counts: it is no model, and this says nothing of Muse Ember.",
+          },
+          {
+            key: 'glossary_wrong',
+            label: 'Codes the glossary added, in disagreement with DataSF',
+            value_text: '0 codes',
+            text: "Codes that no person wrote down, for which the glossary proposed a kind that is not DataSF's majority kind. Applied with nothing to compare them with, these would be taken for meanings. A stand-in proposed them, by a rule of thumb over the counts: it is no model, and this says nothing of Muse Ember.",
+          },
+          {
+            key: 'glossary_overruled',
+            label:
+              'Proposals for codes a person wrote down that disagree with DataSF',
+            value_text: '1 code',
+            text: "Of 1 proposals for codes among the five a person wrote down: those that are not DataSF's majority kind. They are compared and never applied: what the person wrote stands. A stand-in proposed them, by a rule of thumb over the counts: it is no model, and this says nothing of Muse Ember.",
+          },
+          {
+            key: 'glossary_unknown',
+            label: 'Codes the glossary gave no kind for',
+            value_text: '3 codes',
+            text: 'Of the codes that are compared: those answered "unknown", or not at all.',
+          },
+          {
+            key: 'glossary_left_out',
+            label: 'Entries of the answer that were not kept',
+            value_text: '0 entries',
+            text: 'Entries for a code that was not asked about, with a role that is not on the list, or a second one for a code. They are left out, never mended.',
+          },
+          {
+            key: 'glossary_cost_usd',
+            label: 'Cost of asking for the glossary',
+            value_text: 'none',
+            text: "Not measured: a stand-in was asked, nothing was paid, and no cost of Muse Ember's is known from this run.",
+          },
+        ],
+      },
+    ],
+  },
+  none_text: null,
 }

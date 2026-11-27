@@ -14,7 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from beacon import __version__
-from beacon.api import health, incidents, places, push, sources, taps
+from beacon.api import health, incidents, places, push, scale, sources, taps
 from beacon.incident import Engine, open_engine
 from beacon.ingest import IngestConfigError, build
 from beacon.ingest.setup import PAID_SECONDS, STOP_SECONDS, Ingest
@@ -248,6 +248,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     stop = asyncio.Event()
     # Whatever of this is begun is ended below, however far the beginning got.
     try:
+        # The scale run whose results this server shows, when it names one. Only
+        # its results are read: the run is made by a command, apart from the server.
+        app.state.scale = scale.open_published(os.environ)
         taps = open_taps(os.environ)
         app.state.taps = taps
         # The incidents are read from the same evidence store the taps go to,
@@ -472,6 +475,7 @@ def create_app() -> FastAPI:
     app.include_router(incidents.router, prefix="/api")
     app.include_router(places.router, prefix="/api")
     app.include_router(push.router, prefix="/api")
+    app.include_router(scale.router, prefix="/api")
     app.include_router(sources.router, prefix="/api")
     app.include_router(taps.router, prefix="/api")
     return app

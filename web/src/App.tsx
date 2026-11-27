@@ -10,6 +10,7 @@ import { Home } from './views/Home.tsx'
 import { IncidentView } from './views/IncidentView.tsx'
 import { MapView } from './views/MapView.tsx'
 import { PlacesView } from './views/PlacesView.tsx'
+import { ResultsView } from './views/ResultsView.tsx'
 import { TapView } from './views/TapView.tsx'
 import { TraceView } from './views/TraceView.tsx'
 
@@ -37,6 +38,8 @@ function View({
       return <MapView key={route.id} id={route.id} />
     case 'places':
       return <PlacesView mode={mode} onOtherMode={onOtherMode} />
+    case 'results':
+      return <ResultsView />
     case 'unknown':
       return (
         <div className="view">
@@ -100,9 +103,17 @@ export default function App() {
           Beacon relays what authorities publish and tells nobody what to do.
           Every line names its source.
         </p>
-        {health.data !== null && !unreachable && (
-          <p className="server">Server v{health.data.version}</p>
-        )}
+        <p className="server">
+          {health.data !== null && !unreachable && (
+            <>
+              <span>Server v{health.data.version}</span>
+              {' · '}
+            </>
+          )}
+          {/* A secondary page, linked from the foot of every view and from
+              nowhere on the way to an answer. */}
+          <a href={href.results}>Scale run results</a>
+        </p>
       </footer>
     </div>
   )
