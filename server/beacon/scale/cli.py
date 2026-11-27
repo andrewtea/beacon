@@ -257,6 +257,10 @@ def _run(
                 )
             )
         tap_runs = opened.enter_context(contextlib.closing(Runs(layout.taps, settings.mode)))
+        # What the glossary's call did to the run's hold, when an earlier
+        # invocation wrote it down and did not get it into the file: before the
+        # hold is read, so that nothing is heard or replayed on an older one.
+        glossary.settle(layout, tap_runs)
         held = taps.held_for(tap_runs)
         replays = taps.plan(records, options.taps)
         if held is not None:

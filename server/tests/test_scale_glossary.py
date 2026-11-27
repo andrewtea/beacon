@@ -11,7 +11,7 @@ import pytest
 from beacon.ember import EmberClient, SpendScope, Storage
 from beacon.glossary import Pattern
 from beacon.ingest.paid import read_hold
-from beacon.investigate import Runs
+from beacon.investigate import Runs, RunsError
 from beacon.scale import generate, glossary, results, run, score, taps
 from tests.scale_day import DataSf
 from tests.test_scale_run import PAID, ROWS, Meta, _clip, command, numbers_of, scored, texts_of
@@ -266,11 +266,20 @@ def test_a_glossary_that_was_refused_before_anything_was_sent_leaves_the_run_unf
     assert made is not None
     assert (made["heard_complete"], made["complete"]) == (True, False)
     assert any(
-        caveat.startswith("No glossary was learned yet: the call was refused before")
+        caveat.startswith(
+            "No glossary was learned yet: the call was refused, so no paid request "
+            "was sent to Muse Ember"
+        )
         and "the run's hold was put on" in caveat
         for caveat in made["caveats"]
     )
-    assert texts_of(env)["glossary_after"].startswith("Not learned yet: nothing was sent")
+    # What was not sent is the paid request: a live client counts tokens at Meta
+    # before that. And the hold is on, so the command given again at once asks nothing.
+    assert texts_of(env)["glossary_after"] == (
+        "Not learned yet: no paid request was sent to Muse Ember and nothing was paid "
+        "for it. The same command, given again after the run's hold has run out, asks."
+    )
+    assert "nothing was sent" not in json.dumps(made)
     # No glossary was learned, and nothing says one was: not the table's sentence,
     # and not the one about the closed hearing.
     assert "learned from" not in texts_of(env)["glossary_codes"]
@@ -421,7 +430,12 @@ def test_an_answer_that_is_no_form_is_counted_with_the_taps_and_its_cost_is_stil
     # It was paid for, and its cost is reported though nothing of it is kept.
     by_key = {n.key: n for n in glossary.numbers(learned, {}, generated=True, live=True)}
     assert by_key["glossary_after"].value is None
-    assert "what Muse Ember answered was not the form" in by_key["glossary_after"].text
+    # No entry of it is a glossary's. The client does keep its recording of the
+    # answer, so the sentence does not say that nothing of it is kept.
+    assert by_key["glossary_after"].text == (
+        "Not learned: what Muse Ember answered was not the form, and no glossary "
+        "entries were kept. It is not asked again."
+    )
     assert by_key["glossary_cost_usd"].value == pytest.approx(0.00015)
     assert "whether or not the answer was the form" in by_key["glossary_cost_usd"].text
 
@@ -473,9 +487,16 @@ def test_a_client_that_was_closed_before_the_call_puts_no_hold_on_and_is_not_cal
     runs.close()
     text = glossary.waiting_text(learned, live=True)
     assert text is not None
-    assert "the client was closed before the call was sent" in text
+    assert "the client was closed, so no paid request was sent to Muse Ember" in text
     assert "hold" not in text
     assert "refused" not in text
+    by_key = {n.key: n for n in glossary.numbers(learned, {}, generated=True, live=True)}
+    assert by_key["glossary_after"].text.endswith("The same command, given again, asks.")
+    # A stand-in is asked nothing and paid nothing, and is not said to be Ember.
+    stand_in = glossary.waiting_text(learned, live=False)
+    assert stand_in is not None
+    assert "the stand-in for Ember was not asked" in stand_in
+    assert "paid" not in stand_in
 
 
 def test_no_glossary_is_asked_for_when_the_replays_hold_could_not_be_kept(
@@ -494,3 +515,154 @@ def test_no_glossary_is_asked_for_when_the_replays_hold_could_not_be_kept(
     assert (status, meta.tables) == (1, [])
     assert not (layout.root / glossary.FILE).exists()
     assert "glossary_codes" not in numbers_of(env)
+
+
+def test_a_run_with_unit_types_of_the_earlier_shape_fetches_them_again_and_keeps_its_glossary(
+    env: dict[str, str], site: DataSf
+) -> None:
+    layout, _, _ = scored(env, site)
+    before = numbers_of(env)
+    # As an earlier Beacon left a run: one type for a unit under the old name, and
+    # nothing under the new one. An empty file of that shape could also have meant
+    # that every unit had a type Beacon has no kind for.
+    (layout.root / glossary.TYPES_FILE).unlink()
+    old = layout.root / "unit_types.json"
+    old.write_text(json.dumps({"E36": "ENGINE"}))
+    kept = (layout.root / glossary.FILE).read_bytes()
+    asked = len(site.requests)
+
+    status, _ = command(env, site, "--taps", "0")
+
+    # The types were asked for once more, and nothing else was: the run's glossary
+    # is the one it had, compared with the whole of DataSF's types.
+    assert status == 0
+    fetched = site.requests[asked:]
+    assert [request.url.params["$select"] for request in fetched] == ["unit_id,unit_type"]
+    assert json.loads((layout.root / glossary.TYPES_FILE).read_text())["E36"] == ["ENGINE"]
+    assert json.loads(old.read_text()) == {"E36": "ENGINE"}
+    assert (layout.root / glossary.FILE).read_bytes() == kept
+    assert numbers_of(env) == before
+
+
+def test_an_answer_is_never_kept_without_the_hold_it_put_on(
+    env: dict[str, str], site: DataSf, speech: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout, reading, _ = scored(env, site)
+    meta = Meta(layout)
+    scope = SpendScope(glossary.GLOSSARY_SCOPE, 250_000_000)
+    runs = Runs(layout.taps, "mock")
+    (layout.root / glossary.FILE).unlink()
+    runs.save_state({"held_until": None, "unusable_run": 2})
+    meta.glossary_text = "The codes are engines and trucks."
+    save = runs.save_state
+
+    def fails(state: Any) -> None:
+        raise RunsError("The investigations file is closed.")
+
+    # The third answer in a row that is no form, and the investigations file
+    # cannot be written when its hold is to be put in.
+    monkeypatch.setattr(runs, "save_state", fails)
+    with pytest.raises(RunsError):
+        glossary.learn(layout, reading.incidents, meta.client(env)(scope), runs)
+    monkeypatch.setattr(runs, "save_state", save)
+
+    # The answer is kept, and so is what it did to the hold, beside it.
+    assert json.loads((layout.root / glossary.FILE).read_text())["state"] == "made"
+    assert read_hold(runs.state()) == (None, 2)
+    assert (layout.root / glossary.HOLD_FILE).exists()
+    # The next invocation puts the hold in before it reads it, as the command does,
+    # and putting it in twice is putting it in once.
+    written = (layout.root / glossary.HOLD_FILE).read_bytes()
+    glossary.settle(layout, runs)
+    held_until, streak = read_hold(runs.state())
+    assert held_until is not None
+    assert held_until > datetime.now(UTC) + timedelta(minutes=9)
+    assert not (layout.root / glossary.HOLD_FILE).exists()
+    (layout.root / glossary.HOLD_FILE).write_bytes(written)
+    glossary.settle(layout, runs)
+    assert read_hold(runs.state()) == (held_until, streak)
+    assert taps.held_for(runs) is not None
+    # Reading the glossary again asks nothing and changes nothing.
+    again = glossary.learn(layout, reading.incidents, meta.client(env)(scope), runs)
+    assert (again.state, again.whole, len(meta.tables)) == ("made", False, 1)
+    assert read_hold(runs.state()) == (held_until, streak)
+    runs.close()
+
+
+def test_a_failure_is_never_kept_without_its_hold_and_a_refusal_gives_its_claim_up_after(
+    env: dict[str, str], site: DataSf, speech: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout, reading, _ = scored(env, site)
+    meta = Meta(layout)
+    scope = SpendScope(glossary.GLOSSARY_SCOPE, 250_000_000)
+    runs = Runs(layout.taps, "mock")
+    (layout.root / glossary.FILE).unlink()
+    save = runs.save_state
+
+    def fails(state: Any) -> None:
+        raise RunsError("The investigations file is closed.")
+
+    # Ember fails after it may have been asked, and the hold cannot be put in.
+    meta.fail_glossary = True
+    monkeypatch.setattr(runs, "save_state", fails)
+    with pytest.raises(RunsError):
+        glossary.learn(layout, reading.incidents, meta.client(env)(scope), runs)
+    monkeypatch.setattr(runs, "save_state", save)
+    assert json.loads((layout.root / glossary.FILE).read_text())["state"] == "claimed"
+    assert read_hold(runs.state()) == (None, 0)
+
+    # The claim is kept, so nothing is asked again, and the hold is put in first.
+    meta.fail_glossary = False
+    claimed = glossary.learn(layout, reading.incidents, meta.client(env)(scope), runs)
+    assert (claimed.state, len(meta.tables)) == ("claimed", 1)
+    assert taps.held_for(runs) is not None
+    assert not (layout.root / glossary.HOLD_FILE).exists()
+
+    # A refusal: the claim is given up, and the hold is written down before that,
+    # so the call that is asked for later is not asked for during the hold.
+    (layout.root / glossary.FILE).unlink()
+    runs.save_state({"held_until": None, "unusable_run": 0})
+    monkeypatch.setattr(runs, "save_state", fails)
+    with pytest.raises(RunsError):
+        glossary.learn(
+            layout, reading.incidents, meta.client(env)(SpendScope(scope.label, 10_000)), runs
+        )
+    monkeypatch.setattr(runs, "save_state", save)
+    assert not (layout.root / glossary.FILE).exists()
+    held = glossary.learn(layout, reading.incidents, meta.client(env)(scope), runs)
+    assert (held.state, len(meta.tables)) == ("held", 1)
+    runs.close()
+
+
+def test_the_command_puts_a_hold_the_glossary_wrote_down_in_before_it_replays_a_tap(
+    env: dict[str, str], site: DataSf, speech: None
+) -> None:
+    layout = run.Layout.under(env, "day")
+    meta = Meta(layout)
+    status, _ = command(env, site, *PAID, "--taps", "0", paid=meta.client(env))
+    assert status == 0
+    asked = (len(meta.audio), meta.tap_requests, len(meta.tables))
+    # As an invocation left it that kept its glossary's answer and then could not
+    # write the investigations file: the hold is written down beside the glossary.
+    until = datetime.now(UTC) + timedelta(minutes=10)
+    (layout.root / glossary.HOLD_FILE).write_text(
+        json.dumps({"held_until": until.isoformat(), "unusable_run": 3})
+    )
+
+    # Given again with taps to replay, which the complete run has none of.
+    status, said = command(env, site, *PAID, "--taps", "5", paid=meta.client(env))
+
+    assert status == 1
+    assert "in the replay of taps or in learning the glossary" in said
+    assert (len(meta.audio), meta.tap_requests, len(meta.tables)) == asked
+    assert not (layout.root / glossary.HOLD_FILE).exists()
+    runs = Runs(layout.taps, "mock")
+    assert read_hold(runs.state()) == (until, 3)
+    runs.close()
+
+    # What was written down and cannot be read stops the run before anything is asked.
+    (layout.root / glossary.HOLD_FILE).write_text('{"held_until": "soon"}')
+    status, said = command(env, site, *PAID, "--taps", "5", paid=meta.client(env))
+    assert status == 2
+    assert "glossary_hold.json" in said
+    assert (len(meta.audio), meta.tap_requests, len(meta.tables)) == asked

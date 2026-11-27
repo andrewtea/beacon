@@ -32,7 +32,6 @@ shown as the glossary's proposal with who proposed it, and never as what a unit 
 """
 
 import json
-import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -246,7 +245,9 @@ def _only_counts(pattern: Pattern) -> bool:
         return False
     if isinstance(mean, bool) or not isinstance(mean, int | float):
         return False
-    if not (math.isfinite(mean) and 0 <= mean <= _MOST):
+    # The comparison alone: it is false for a NaN and for an infinity, and takes
+    # an integer of any size.
+    if not 0 <= mean <= _MOST:
         return False
     by_category = pattern.by_category
     if not isinstance(by_category, tuple) or len(by_category) > len(_CATEGORIES):

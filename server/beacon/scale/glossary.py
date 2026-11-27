@@ -17,10 +17,11 @@ a person wrote down, `beacon.glossary.BUILT_IN`), and how many *after* (those, a
 the codes the glossary proposed a kind for). A proposal for a code a person wrote
 down is compared too, and never replaces what the person wrote.
 
-**What it does not show.** On generated calls the incidents repeat DataSF's own
-record of which units were sent to what, so the pattern is DataSF's dispatch
-pattern and not what Beacon heard on a radio. A stand-in's proposals are a rule of
-thumb's and say nothing of Muse Ember. And a model can know a fire department's
+**What it does not show.** On generated calls the table counts the incidents
+Beacon made of those calls, as they were heard and grouped; the calls were generated
+from DataSF's own record of which units were sent to what, so the counts follow
+that record and are of nothing heard on a radio. A stand-in's proposals are a rule
+of thumb's and say nothing of Muse Ember. And a model can know a fire department's
 codes from elsewhere, so a right proposal is not proof that the counts showed it.
 Each number says which of these hold for it.
 
@@ -36,6 +37,11 @@ paid request is known not to have been sent. A paid run pays under the scope
 the run's**: nothing is asked while the run is leaving Ember alone after a refusal
 or a failure, and a refusal or a failure here puts that hold on, in the run's
 investigations file where the replay of taps keeps it (`beacon.ingest.paid`).
+**What a call did to the hold is written down before the call's outcome is**
+(`glossary_hold.json`, beside the glossary), and is put into the investigations file from
+there: at once, and by `settle` when that did not happen, which the command calls
+before it reads the run's hold. So an answer or a failure is never kept without
+the hold it put on.
 """
 
 import json
@@ -69,7 +75,14 @@ GLOSSARY_SCOPE = "scale:glossary"
 GLOSSARY_BUDGET_NANOUSD = 250_000_000
 FORMAT = 1
 FILE = "glossary.json"
-TYPES_FILE = "unit_types.json"
+# The run's copy of DataSF's unit types: each unit's types, as a list. A run begun
+# by an earlier Beacon has a `unit_types.json` of another shape (one type for a
+# unit, and no unit of an unlisted type), which is left where it is and not read:
+# such a run fetches the types again, under this name.
+TYPES_FILE = "unit_types.2.json"
+# What the glossary's call did to the run's hold, until the run's investigations
+# file has it.
+HOLD_FILE = "glossary_hold.json"
 _MAX_BYTES = 1_000_000
 
 # The kind of unit each of DataSF's unit types is, in the glossary's roles. A type
@@ -209,7 +222,42 @@ def prepare_types(layout: Layout, settings: Settings, http: SourceHttp) -> dict[
             return said
     except (OSError, ValueError):
         pass
-    raise ScaleError("The run's unit types of DataSF's (unit_types.json) cannot be read.")
+    raise ScaleError(f"The run's unit types of DataSF's ({TYPES_FILE}) cannot be read.")
+
+
+def settle(layout: Layout, runs: Runs) -> None:
+    """Put what the glossary's call did to the run's hold into the run's
+    investigations file, when an earlier invocation wrote it down and did not get
+    that far. The command calls it before it reads the hold, so no tap is replayed
+    and no call heard on a hold that is older than the glossary's.
+
+    What is written down is the whole of the hold as it was to be, so putting it
+    in twice is putting it in once: one invocation is made at a time, and nothing
+    else changes the hold between the writing down and here.
+
+    Raises ScaleError when what was written down cannot be read, and RunsError
+    when the investigations file cannot be written."""
+    path = layout.root / HOLD_FILE
+    try:
+        said = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError):
+        said = None
+    if (
+        not isinstance(said, dict)
+        or set(said) != {"held_until", "unusable_run"}
+        or Hold(*read_hold(said)).hold_state() != said
+    ):
+        raise ScaleError(f"The hold the run's glossary put on ({HOLD_FILE}) cannot be read.")
+    runs.save_state(said)
+    path.unlink()
+
+
+def _keep(layout: Layout, hold: Hold) -> None:
+    """Write down the hold as the glossary's call left it, before the call's
+    outcome is kept: `settle` puts it into the investigations file."""
+    _write(layout.root / HOLD_FILE, hold.hold_state())
 
 
 @dataclass(frozen=True)
@@ -260,10 +308,13 @@ def learn(
     `wall_clock` is the time the hold is counted by.
 
     Raises ScaleError when the run's glossary file cannot be read, and RunsError
-    when the hold cannot be kept, which leaves the claim: the call is then not
-    made again."""
+    when the hold cannot be put into the investigations file. What the call did
+    to the hold is by then written down beside the glossary, and `settle` puts it
+    in before the hold is next read."""
     path = layout.root / FILE
     try:
+        # A hold an earlier invocation wrote down and did not get into the file.
+        settle(layout, runs)
         kept = _read(path)
         if kept is not None:
             return kept
@@ -289,12 +340,16 @@ def learn(
         except EmberError as failure:
             held = not isinstance(failure, EmberClosedError)
             if held:
-                # A refusal or a failure: the whole run leaves Ember alone for a while.
+                # A refusal or a failure: the whole run leaves Ember alone for a
+                # while. The hold is written down before the claim is given up.
                 desk.hold_after(failure, hold)
-                runs.save_state(hold.hold_state())
-            if PaidDesk.not_sent(failure):
-                # Nothing was sent and nothing was paid: the claim is given up.
+                _keep(layout, hold)
+            given_up = PaidDesk.not_sent(failure)
+            if given_up:
+                # No paid request was sent, and nothing was paid: the claim is given up.
                 path.unlink(missing_ok=True)
+            settle(layout, runs)
+            if given_up:
                 return Learned(
                     state="refused", patterns=tuple(patterns), codes_left_out=more, hold_set=held
                 )
@@ -304,8 +359,17 @@ def learn(
                 codes_left_out=more,
                 ledger_lost=isinstance(failure, LedgerReplacedError),
             )
-        # The answer is kept first, whatever it was: it was asked for, and paid for
-        # when Muse Ember gave it.
+        if glossary.model != "replay":
+            # The answer is counted with the answers the run's taps got: one that
+            # is no form adds to the run's count of them, which holds the run when
+            # it runs on, and one that is the form ends the count. A recording of
+            # an earlier answer is no news about Ember, and is not counted. What
+            # the count comes to is written down before the answer is, so that
+            # the answer is never kept without it.
+            desk.count_answer(hold, usable=glossary.whole)
+            _keep(layout, hold)
+        # The answer is kept whatever it was: it was asked for, and paid for when
+        # Muse Ember gave it.
         _write(
             path,
             {
@@ -320,13 +384,7 @@ def learn(
                 "cost_nanousd": glossary.cost_nanousd,
             },
         )
-        if glossary.model != "replay":
-            # Then it is counted with the answers the run's taps got: an answer that
-            # is no form adds to the run's count of them, which holds the run when
-            # it runs on, and one that is the form ends the count. A recording of
-            # an earlier answer is no news about Ember, and is not counted.
-            desk.count_answer(hold, usable=glossary.whole)
-            runs.save_state(hold.hold_state())
+        settle(layout, runs)
         kept = _read(path)
         assert kept is not None
         return kept
@@ -382,6 +440,15 @@ def _who(*, live: bool) -> str:
     return "Muse Ember" if live else "the stand-in for Ember"
 
 
+def _unasked(*, live: bool) -> str:
+    """What a refusal means. A live client counts a request's tokens at Meta before
+    it reserves the call's cost, so a refused call can have reached Meta: what was
+    not sent is the paid request."""
+    if live:
+        return "no paid request was sent to Muse Ember and nothing was paid for it"
+    return "the stand-in for Ember was not asked"
+
+
 def waiting_text(learned: Learned, *, live: bool) -> str | None:
     """What a result says of a glossary the same command would still ask for, or
     None when there is nothing left for it to do."""
@@ -396,14 +463,13 @@ def waiting_text(learned: Learned, *, live: bool) -> str | None:
         )
     if not learned.hold_set:
         return (
-            "No glossary was learned yet: the client was closed before the call was "
-            f"sent to {who}, so nothing was asked and nothing paid. Give the same "
-            "command again."
+            f"No glossary was learned yet: the client was closed, so {_unasked(live=live)}. "
+            "Give the same command again."
         )
     return (
-        "No glossary was learned yet: the call was refused before anything was sent "
-        f"to {who}, so nothing was paid for it, and the run's hold was put on. Give "
-        "the same command again after the hold has run out."
+        f"No glossary was learned yet: the call was refused, so {_unasked(live=live)}, "
+        "and the run's hold was put on. Give the same command again after the hold "
+        "has run out."
     )
 
 
@@ -475,14 +541,17 @@ def numbers(
                 "given again after the hold, asks."
             )
         elif learned.state == "refused":
-            why = (
-                f"Not learned yet: nothing was sent to {who}, and nothing was paid. "
-                "The same command, given again, asks."
+            again = (
+                "given again after the run's hold has run out, asks"
+                if learned.hold_set
+                else "given again, asks"
             )
+            unasked = _unasked(live=live)
+            why = f"Not learned yet: {unasked}. The same command, {again}."
         else:
             why = (
-                f"Not learned: what {who} answered was not the form, and none of it "
-                "is kept. It is not asked again."
+                f"Not learned: what {who} answered was not the form, and no glossary "
+                "entries were kept. It is not asked again."
             )
         return [
             *first,

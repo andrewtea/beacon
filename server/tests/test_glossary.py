@@ -159,6 +159,10 @@ def test_codes_that_are_not_ones_to_ask_about_are_refused_before_ember_is_asked(
         {"incidents": -1},
         {"alone": 1.5},
         {"mean_units": float("nan")},
+        {"mean_units": float("inf")},
+        {"mean_units": -1},
+        # An integer no float holds, which a test for a finite number would trip on.
+        {"mean_units": 10**400},
         {"mean_units": "about three"},
     ],
 )

@@ -11,9 +11,11 @@ A run lives under `data/scale/<name>/` (`Layout`), which Git ignores:
     heard.json        that the hearing is closed, from when it was first complete
     taps.sqlite3      the investigations of the replayed taps (`beacon.scale.taps`),
                       and the run's hold on Ember
-    unit_types.json   DataSF's unit type for each unit of the day, which the glossary
+    unit_types.2.json DataSF's unit types for each unit of the day, which the glossary
                       is compared with (`beacon.scale.glossary`)
     glossary.json     the claim on the run's glossary, and the glossary
+    glossary_hold.json  what the glossary's call did to the run's hold, until
+                      taps.sqlite3 has it (`glossary.settle`)
     results.json      what the run came to (`beacon.scale.results`)
 
 **What a run is is decided once and kept** (`run.json`): generated tones heard by a
