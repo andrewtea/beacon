@@ -97,8 +97,9 @@ test('a place is kept on the device under its name, and only where it is is sent
   await click(spot)
 
   // On the device: the name, tidied, and the place.
+  // And that it was saved with the invented place's own button.
   expect(stored()).toEqual([
-    { id: expect.any(String), name: 'My flat', ...FIRE },
+    { id: expect.any(String), name: 'My flat', ...FIRE, spot: true },
   ])
   // To the server: where it is, the mode that is shown, and nothing else.
   const section = (
@@ -125,7 +126,17 @@ test('a server that takes only the invented places is sent no place of a personâ
   // A place saved when another server took it: somebody's own.
   const OWN = { lat: 37.775, lon: -122.42 }
   await savePlace('Home', OWN)
-  await savePlace('The fire', FIRE)
+  // And one saved from where somebody was, a block from the invented fire,
+  // when another server took that: it is kept at the invented place's own
+  // rounded position, and is somebody's own all the same.
+  await savePlace('My flat', { lat: 37.7761, lon: -122.4239 })
+  expect(stored()).toContainEqual({
+    id: expect.any(String),
+    name: 'My flat',
+    ...FIRE,
+  })
+  // Only this one was saved with the invented place's own button.
+  await savePlace('The fire', FIRE, true)
   const asked = serve({
     'GET /api/health': {
       ...MOCK_HEALTH,
@@ -146,17 +157,22 @@ test('a server that takes only the invented places is sent no place of a personâ
   ).closest('section')!
   expect(await within(section).findByText(DISTANCE)).toBeInTheDocument()
   const sent = asked.filter((request) => request.key === CHECK)
+  // One place, once: the flat at the same position is not a second.
   expect(sent.map((request) => request.body)).toEqual([{ places: [FIRE] }])
   expect(JSON.stringify(asked)).not.toContain('37.775')
   // The other stays on the device, is said not to be sent, and can be removed.
   expect(
     screen.getByText(/This server is asked only about the two invented places/),
   ).toHaveTextContent('Nothing of the places below is sent to it.')
-  const home = screen.getByRole('heading', { name: 'Home' }).closest('section')!
-  expect(within(home).queryByText(DISTANCE)).not.toBeInTheDocument()
-  expect(
-    within(home).getByRole('button', { name: 'Remove Home from this device' }),
-  ).toBeInTheDocument()
+  for (const name of ['Home', 'My flat']) {
+    const kept = screen.getByRole('heading', { name }).closest('section')!
+    expect(within(kept).queryByText(DISTANCE)).not.toBeInTheDocument()
+    expect(
+      within(kept).getByRole('button', {
+        name: `Remove ${name} from this device`,
+      }),
+    ).toBeInTheDocument()
+  }
   // Where the phone is cannot be saved here: only the two invented places can.
   expect(
     screen.queryByRole('button', { name: 'Save where I am now' }),

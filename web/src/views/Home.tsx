@@ -177,6 +177,8 @@ export function Home({
         at: receipt.received_at,
         photo: receipt.photo,
         clip: receipt.clip,
+        // As the server said of it, and only when it did.
+        invented: receipt.invented_only === true,
       })
       navigate(href.tap(receipt.id))
     } catch (error) {

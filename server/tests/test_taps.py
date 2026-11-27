@@ -113,6 +113,8 @@ def test_a_tap_becomes_a_row_that_says_where_to_a_block_and_when_by_the_servers_
         "media_kept_until": None,
         # This server has no investigator: the fixture gave it none.
         "investigating": False,
+        # And takes a tap from anywhere it covers.
+        "invented_only": False,
     }
     (row,) = store.search()
     assert (row.kind, row.source, row.ref) == ("tap", "app", receipt["id"])

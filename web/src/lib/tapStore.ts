@@ -18,6 +18,12 @@ export type KeptTap = {
   at: string
   photo: boolean
   clip: boolean
+  // True when the server that took it said it took it under the rule that it
+  // takes only the invented scenario's two places. A server that takes only
+  // those is asked for a tap only when this is true (`isInventedTap`): the id
+  // of any other tap is in no request to it. A tap kept before this was kept
+  // says nothing, and is taken for one sent from where somebody was.
+  invented?: boolean
 }
 
 const KEY = 'beacon.taps.v1'
@@ -44,7 +50,8 @@ function isKept(value: unknown): value is KeptTap {
     typeof tap.id === 'string' &&
     typeof tap.at === 'string' &&
     typeof tap.photo === 'boolean' &&
-    typeof tap.clip === 'boolean'
+    typeof tap.clip === 'boolean' &&
+    (tap.invented === undefined || typeof tap.invented === 'boolean')
   )
 }
 
@@ -93,8 +100,32 @@ export function keptTaps(now: number = Date.now()): KeptTap[] {
 }
 
 export function keepTap(tap: KeptTap, now: number = Date.now()): void {
+  // Known to this page whether or not storage keeps it: with storage switched
+  // off, a tap's answer is still read from the page it was sent from.
+  if (tap.invented === true) sentHere.add(tap.id)
   const others = keptTaps(now).filter((kept) => kept.id !== tap.id)
   write([tap, ...others].slice(0, MOST))
+}
+
+// The taps this page sent that a server took under its invented-only rule.
+const sentHere = new Set<string>()
+
+/** Whether this device knows the tap to be one a server took under the rule
+ * that it takes only the invented scenario's two places: it is kept here so,
+ * or this page sent it. An id from anywhere else, a link somebody opened
+ * included, is not known to be. */
+export function isInventedTap(id: string): boolean {
+  return (
+    sentHere.has(id) ||
+    read().some((tap) => tap.id === id && tap.invented === true)
+  )
+}
+
+/** Forget what this page knows that storage does not. For tests. */
+export function resetTaps(): void {
+  sentHere.clear()
+  cache = null
+  shown = null
 }
 
 /** Delete from storage the taps the server no longer answers for. Answers with
@@ -168,6 +199,7 @@ export function sweepTaps(): () => void {
 
 /** Forget a tap: the person asked to, or the server no longer has it. */
 export function forgetTap(id: string): void {
+  sentHere.delete(id)
   write(read().filter((tap) => tap.id !== id))
 }
 

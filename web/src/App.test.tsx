@@ -13,7 +13,7 @@ import { IncidentCard } from './components/IncidentCard.tsx'
 import { Sources } from './components/Provenance.tsx'
 import { OPEN_MS } from './lib/cadence.ts'
 import { drawPhoto } from './lib/photo.ts'
-import { keepTap, keptTaps, sweepTaps } from './lib/tapStore.ts'
+import { keepTap, keptTaps, resetTaps, sweepTaps } from './lib/tapStore.ts'
 import {
   FIRE_TAP,
   fireAnswer,
@@ -44,7 +44,7 @@ const fireRoutes = {
   [`GET /api/taps/${FIRE_TAP}/run`]: fireRun,
   [`GET /api/incidents/${FIRE_ID}`]: fireIncident,
 }
-const receipt = (id: string) => ({
+const receipt = (id: string, inventedOnly = false) => ({
   id,
   received_at: new Date().toISOString(),
   mode: 'mock',
@@ -52,10 +52,12 @@ const receipt = (id: string) => ({
   clip: false,
   media_kept_until: null,
   investigating: true,
+  invented_only: inventedOnly,
 })
 
 beforeEach(() => {
   window.localStorage.clear()
+  resetTaps()
   window.location.hash = ''
 })
 afterEach(() => vi.useRealTimers())
@@ -114,7 +116,8 @@ test('on a server that takes only the invented places, the button sends one of t
   const asked = serve({
     ...fireRoutes,
     'GET /api/health': INVENTED_ONLY,
-    'POST /api/taps': () => Response.json(receipt(FIRE_TAP), { status: 201 }),
+    'POST /api/taps': () =>
+      Response.json(receipt(FIRE_TAP, true), { status: 201 }),
   })
   // A phone that would say where it is, to the metre, if it were asked.
   const located = vi.fn((found: PositionCallback) =>
@@ -151,7 +154,114 @@ test('on a server that takes only the invented places, the button sends one of t
   // The invented place to the digit, and nothing else: no accuracy, no clip.
   expect(sent[0].body).toEqual({ location: { lat: 37.776, lon: -122.424 } })
   expect(located).not.toHaveBeenCalled()
+  // What the server said of the tap is kept with its id on the device.
+  expect(keptTaps()).toEqual([
+    expect.objectContaining({ id: FIRE_TAP, invented: true }),
+  ])
   vi.unstubAllGlobals()
+})
+
+const hashOf = (view: string, id: string) =>
+  view === 'trace' ? `#/tap/${id}/trace` : `#/tap/${id}`
+const tapRequests = (asked: { key: string }[]) =>
+  asked.filter((request) => request.key.startsWith('GET /api/taps/'))
+
+test.each(['tap', 'trace'])(
+  'a %s is not asked for, and its id not sent, until the server has said what it takes',
+  async (view) => {
+    // Asking names the tap's id in the request's address. A link to an answer
+    // that is opened sends nothing until it is known whether this server is
+    // one the id may be sent to.
+    let health: (response: Response) => void = () => undefined
+    const asked = serve({
+      ...fireRoutes,
+      'GET /api/health': () =>
+        new Promise<Response>((resolve) => (health = resolve)),
+    })
+    window.location.hash = hashOf(view, FIRE_TAP)
+    render(<App />)
+
+    expect(
+      await screen.findByText(
+        'Beacon asks for this tap once it has heard from its server.',
+      ),
+    ).toBeInTheDocument()
+    expect(tapRequests(asked)).toEqual([])
+
+    // A server that does not say what it takes is not taken for one that
+    // takes a visitor's own.
+    const silent: Record<string, unknown> = { ...MOCK_HEALTH }
+    delete silent.input
+    await act(async () => health(Response.json(silent)))
+    await screen.findByText('Invented scenario')
+    expect(tapRequests(asked)).toEqual([])
+    expect(JSON.stringify(asked)).not.toContain(FIRE_TAP)
+  },
+)
+
+test.each(['tap', 'trace'])(
+  'a server that takes only the invented places is asked for no %s this device does not know it took so',
+  async (view) => {
+    // One this device sent from where somebody was, to a server that took
+    // that, and one a link names that this device never sent.
+    keepTap({
+      id: FIRE_TAP,
+      at: new Date().toISOString(),
+      photo: false,
+      clip: false,
+    })
+    const asked = serve({ ...fireRoutes, 'GET /api/health': INVENTED_ONLY })
+    for (const id of [FIRE_TAP, QUIET_TAP]) {
+      window.location.hash = hashOf(view, id)
+      const { unmount } = render(<App />)
+
+      expect(
+        await screen.findByRole('heading', {
+          name: 'This tap is not asked for here',
+        }),
+      ).toBeInTheDocument()
+      expect(screen.getByRole('status')).toHaveTextContent(
+        'Beacon has not asked the server for it, so its id was not sent.',
+      )
+      unmount()
+    }
+    expect(tapRequests(asked)).toEqual([])
+    expect(JSON.stringify(asked)).not.toContain(FIRE_TAP)
+    expect(JSON.stringify(asked)).not.toContain(QUIET_TAP)
+    // The tap is still kept on the device: another server may answer for it.
+    expect(keptTaps().map((tap) => tap.id)).toEqual([FIRE_TAP])
+  },
+)
+
+test('a server that takes only the invented places is asked for a tap this device knows it took so', async () => {
+  keepTap({
+    id: FIRE_TAP,
+    at: new Date().toISOString(),
+    photo: false,
+    clip: false,
+    invented: true,
+  })
+  const asked = serve({ ...fireRoutes, 'GET /api/health': INVENTED_ONLY })
+  window.location.hash = `#/tap/${FIRE_TAP}`
+  render(<App />)
+
+  await screen.findByRole('heading', { level: 1, name: /Fire at/ })
+  expect(tapRequests(asked).map((request) => request.key)).toContain(
+    `GET /api/taps/${FIRE_TAP}`,
+  )
+})
+
+test('a server that takes a visitor’s own is asked for any tap, once it has said so', async () => {
+  const asked = serve(fireRoutes)
+  window.location.hash = `#/tap/${FIRE_TAP}`
+  render(<App />)
+
+  await screen.findByRole('heading', { level: 1, name: /Fire at/ })
+  // The health was asked before the tap was.
+  const keys = asked.map((request) => request.key)
+  expect(keys.indexOf('GET /api/health')).toBeLessThan(
+    keys.indexOf(`GET /api/taps/${FIRE_TAP}`),
+  )
 })
 
 test('a tap that is gone says the most an answer is kept, and on a server that tells its story again, that', async () => {

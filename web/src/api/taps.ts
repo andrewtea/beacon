@@ -19,6 +19,10 @@ export type TapReceipt = {
   clip: boolean
   media_kept_until: string | null
   investigating: boolean
+  // Whether the server took it under the rule that it takes only the invented
+  // scenario's two places. Kept with the tap's id (`tapStore`): a server that
+  // takes only those is asked for no other tap.
+  invented_only: boolean
 }
 
 export type Ground = {

@@ -1,4 +1,5 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useLayoutEffect, useRef } from 'react'
+import type { Input } from '../api/health.ts'
 import type { Mode } from '../api/incidents.ts'
 import { subscribePlaces } from './placeStore.ts'
 import { onPushWanted, OtherModeError, RETRY_MS, syncPush } from './push.ts'
@@ -12,9 +13,25 @@ import { onPushWanted, OtherModeError, RETRY_MS, syncPush } from './push.ts'
  *
  * Nothing is told while the server's mode is not known, and a server in another
  * mode than is shown is told nothing: `onOtherMode` is called instead.
+ *
+ * **The server is given an address and places only while it says it takes a
+ * visitor's own** (`input` is `own`). While it says anything else or nothing, a
+ * sync still asks it to delete what is to be deleted, and gives it nothing. A
+ * telling that is under way when `input` changes reads the change before it
+ * gives the server anything (`takes`), and a new one is begun.
  */
-export function usePushSync(mode: Mode | null, onOtherMode: () => void): void {
+export function usePushSync(
+  mode: Mode | null,
+  input: Input | null,
+  onOtherMode: () => void,
+): void {
   const otherMode = useRef(onOtherMode)
+  // Read by a telling at the moment it is about to give the server something.
+  // Set as the change is drawn, not a frame after.
+  const taken = useRef(input)
+  useLayoutEffect(() => {
+    taken.current = input
+  }, [input])
   useEffect(() => {
     otherMode.current = onOtherMode
   })
@@ -36,7 +53,7 @@ export function usePushSync(mode: Mode | null, onOtherMode: () => void): void {
       clearTimeout(timer)
       let done = true
       try {
-        done = await syncPush(mode)
+        done = await syncPush(mode, () => taken.current)
       } catch (error) {
         if (error instanceof OtherModeError) otherMode.current()
         else done = false
@@ -57,5 +74,7 @@ export function usePushSync(mode: Mode | null, onOtherMode: () => void): void {
       offPlaces()
       offPush()
     }
-  }, [mode])
+    // Begun anew when what the server takes changes: the telling before reads
+    // the change itself, and this one makes the server's copy what it now is.
+  }, [mode, input])
 }

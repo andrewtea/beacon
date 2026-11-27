@@ -133,6 +133,9 @@ class Tap:
     clip: bool
     # Until when its photo or clip is kept. None for a tap that sent neither.
     media_kept_until: datetime | None
+    # Whether it was taken by a server that takes only the invented scenario's
+    # places, whose row says so (`INVENTED_ONLY`).
+    invented_only: bool = False
 
 
 class Taps:
@@ -297,6 +300,7 @@ class Taps:
                 photo=photo is not None,
                 clip=clip is not None,
                 media_kept_until=kept_until,
+                invented_only=self._only is not None,
             )
         raise_bare(refusal)
 

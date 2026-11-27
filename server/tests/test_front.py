@@ -97,6 +97,8 @@ def test_a_tap_another_server_took_is_answered_for_by_no_route_whatever_its_row_
     # invented one is kept as the invented one. So only a row that says it was
     # taken under the rule is answered for.
     with TestClient(create_app()) as client:
+        plain = client.post("/api/taps", headers=SHOWN, json={"location": FIRE}).json()
+        assert plain["invented_only"] is False
         taken = {
             name: client.post("/api/taps", headers=SHOWN, json={"location": place}).json()["id"]
             for name, place in (
@@ -124,8 +126,11 @@ def test_a_tap_another_server_took_is_answered_for_by_no_route_whatever_its_row_
                     404,
                     {"detail": "There is no such tap."},
                 )
-        # A tap this server takes says so in its row, and is answered for.
-        mine = client.post("/api/taps", headers=SHOWN, json={"location": FIRE}).json()["id"]
+        # A tap this server takes says so in its row and in its receipt, which
+        # is how the app knows the taps it may ask this server for.
+        receipt = client.post("/api/taps", headers=SHOWN, json={"location": FIRE}).json()
+        assert receipt["invented_only"] is True
+        mine = receipt["id"]
         row = client.app.state.taps.store.find("app", mine)  # type: ignore[attr-defined]
         assert row.data[INVENTED_ONLY] is True
         assert client.get(f"/api/taps/{mine}").status_code == 200

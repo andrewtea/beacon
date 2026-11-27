@@ -66,6 +66,11 @@ class TapReceipt(BaseModel):
     # Whether the tap was handed to the investigator. Read the answer at
     # `GET /api/taps/{id}`: it is `pending` until the investigator has it.
     investigating: bool = False
+    # Whether the tap was taken under the rule that this server takes only the
+    # invented scenario's two places (`beacon.front`). The app keeps it with the
+    # tap's id: a server that takes only those is asked for no other tap, so
+    # that the id of a tap sent from where somebody was is in no request to it.
+    invented_only: bool = False
 
 
 class TapOut(BaseModel):
@@ -351,6 +356,7 @@ async def tap(request: Request) -> TapReceipt:
             clip=taken.clip,
             media_kept_until=taken.media_kept_until,
             investigating=investigating,
+            invented_only=taken.invented_only,
         )
     headers = None if refused.retry_after is None else {"Retry-After": str(refused.retry_after)}
     raise HTTPException(refused.status, str(refused), headers=headers)

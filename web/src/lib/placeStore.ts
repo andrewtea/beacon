@@ -13,6 +13,12 @@ export type SavedPlace = {
   // Rounded to about a block when it was saved.
   lat: number
   lon: number
+  // True when it was saved with one of the invented scenario's own buttons,
+  // and so is a place of nobody's. Where it is does not say that: a place
+  // somebody saved from where they were, a block from an invented one, is
+  // kept at the same rounded position. A server that takes only the invented
+  // places is sent a place only when this is true.
+  spot?: boolean
 }
 
 const KEY = 'beacon.places.v1'
@@ -34,6 +40,7 @@ function isSaved(value: unknown): value is SavedPlace {
     Number.isFinite(place.lat) &&
     typeof place.lon === 'number' &&
     Number.isFinite(place.lon) &&
+    (place.spot === undefined || typeof place.spot === 'boolean') &&
     // A place the server would refuse is not one of these: sent with the
     // others, it would have every one of them refused.
     covered({ lat: place.lat, lon: place.lon })
@@ -117,13 +124,15 @@ async function alone<T>(work: () => T): Promise<T> {
 
 /**
  * Save a place under a name. Where it is is rounded to about a block before it
- * is kept. Answers with what came of it: `saved`, `full` when five are kept
- * already, `elsewhere` when it is outside the area Beacon covers, or `failed`
- * when the browser would not keep it.
+ * is kept. `spot` says it is one of the invented scenario's places, chosen
+ * with its button. Answers with what came of it: `saved`, `full` when five are
+ * kept already, `elsewhere` when it is outside the area Beacon covers, or
+ * `failed` when the browser would not keep it.
  */
 export async function savePlace(
   typed: string,
   where: { lat: number; lon: number },
+  spot = false,
 ): Promise<'saved' | 'full' | 'elsewhere' | 'failed'> {
   if (!covered(where)) return 'elsewhere'
   try {
@@ -136,6 +145,7 @@ export async function savePlace(
         name: placeName(typed),
         lat: roundToBlock(where.lat),
         lon: roundToBlock(where.lon),
+        ...(spot ? { spot: true } : {}),
       }
       return write([...places, place]) ? 'saved' : 'failed'
     })

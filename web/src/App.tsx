@@ -1,11 +1,17 @@
-import { useCallback, useEffect, useState } from 'react'
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useState,
+  useSyncExternalStore,
+} from 'react'
 import './App.css'
 import { fetchHealth, type Input } from './api/health.ts'
 import { Icon } from './components/Icon.tsx'
 import { usePolled } from './lib/poll.ts'
 import { usePushSync } from './lib/pushSync.ts'
 import { href, type Route, useRoute } from './lib/router.ts'
-import { sweepTaps } from './lib/tapStore.ts'
+import { isInventedTap, subscribeTaps, sweepTaps } from './lib/tapStore.ts'
 import { Home } from './views/Home.tsx'
 import { IncidentView } from './views/IncidentView.tsx'
 import { MapView } from './views/MapView.tsx'
@@ -15,6 +21,51 @@ import { TapView } from './views/TapView.tsx'
 import { TraceView } from './views/TraceView.tsx'
 
 const HEALTH_MS = 30_000
+
+/**
+ * A tap's views, shown only once the tap may be asked for. Asking names the
+ * tap's id in the request's address, which whatever the server is reached
+ * through can write down, and with the id its holder reads the tap's answer.
+ * So nothing is asked until the server has said what it takes, and a server
+ * that takes only the invented places is asked only for a tap this device
+ * knows it took under that rule: never for one sent from where somebody was,
+ * by this device at another time or by whoever a link came from. The server
+ * would answer that it has no such tap, after the id was sent.
+ */
+function AskedFor({
+  id,
+  input,
+  children,
+}: {
+  id: string
+  input: Input | null
+  children: ReactNode
+}) {
+  const invented = useSyncExternalStore(subscribeTaps, () => isInventedTap(id))
+  if (input === 'own' || (input === 'invented' && invented)) return children
+  return (
+    <div className="view tap-view">
+      {input === null ? (
+        <p className="meta" role="status">
+          Beacon asks for this tap once it has heard from its server.
+        </p>
+      ) : (
+        <>
+          <h1>This tap is not asked for here</h1>
+          <p role="status">
+            This server answers only for taps sent from its two invented places,
+            and this device does not know this tap to be one of them. Beacon has
+            not asked the server for it, so its id was not sent.
+          </p>
+        </>
+      )}
+      <a className="action" href={href.home}>
+        <Icon name="back" size={16} />
+        Back to the button
+      </a>
+    </div>
+  )
+}
 
 function View({
   route,
@@ -33,10 +84,16 @@ function View({
     case 'home':
       return <Home mode={mode} input={input} onOtherMode={onOtherMode} />
     case 'tap':
-      return <TapView key={route.id} id={route.id} repeatsText={repeatsText} />
+      return (
+        <AskedFor key={route.id} id={route.id} input={input}>
+          <TapView id={route.id} repeatsText={repeatsText} />
+        </AskedFor>
+      )
     case 'trace':
       return (
-        <TraceView key={route.id} id={route.id} repeatsText={repeatsText} />
+        <AskedFor key={route.id} id={route.id} input={input}>
+          <TraceView id={route.id} repeatsText={repeatsText} />
+        </AskedFor>
       )
     case 'incident':
       return <IncidentView key={route.id} id={route.id} />
@@ -84,8 +141,9 @@ export default function App() {
   // A tap the server no longer answers for is deleted from this device.
   useEffect(() => sweepTaps(), [])
   const askAgain = useCallback(() => setAsked((count) => count + 1), [])
-  // The server is kept told of what this device wants of notifications.
-  usePushSync(mode, askAgain)
+  // The server is kept told of what this device wants of notifications, as far
+  // as it has said it takes that.
+  usePushSync(mode, input, askAgain)
 
   return (
     <div className="app">

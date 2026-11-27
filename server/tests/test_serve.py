@@ -352,6 +352,40 @@ def test_what_sqlite_keeps_beside_a_file_is_not_another_stores_under_a_link(
     assert linked.is_symlink() or linked.stat().st_nlink == 2
 
 
+@pytest.mark.parametrize(
+    "failing", ["evidence", "investigate/mock.sqlite3-wal", "story/mock.sqlite3"]
+)
+@pytest.mark.parametrize("error", [PermissionError(13, "no"), OSError(5, "the disk")])
+def test_a_file_that_could_not_be_looked_at_was_not_seen_to_be_the_mock_stores(
+    monkeypatch: pytest.MonkeyPatch, failing: str, error: OSError
+) -> None:
+    # An error from looking is not "the file could not be deleted just now",
+    # after which the server goes on: nothing was established about the file, so
+    # no app is made on it.
+    over = served()
+    lstat = os.lstat
+
+    def fails(path: os.PathLike[str] | str, *args: object, **more: object) -> os.stat_result:
+        if str(path).endswith(failing):
+            raise error
+        return lstat(path, *args, **more)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(serve.os, "lstat", fails)
+    before = kept()
+    made: list[FastAPI] = []
+
+    with pytest.raises(serve.NotTheMockStoresError, match="Nothing was deleted"):
+        begin_again(over + timedelta(hours=1))
+    with pytest.raises(serve.NotTheMockStoresError):
+        serve.run(env(), lambda app: made.append(app) or Stub(app))  # type: ignore[func-returns-value]
+
+    assert made == []
+    assert kept() == before
+    # The stores are given up: nothing of a server was begun.
+    monkeypatch.setattr(serve.os, "lstat", lstat)
+    DataLock(data_dir(), shared=False).close()
+
+
 def test_the_tables_sqlite_makes_by_itself_do_not_make_a_file_another_kinds() -> None:
     # `ANALYZE` leaves the planner's statistics in a table of SQLite's own. A file
     # with it is still its kind's, and the story is begun again.

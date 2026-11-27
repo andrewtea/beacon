@@ -1,4 +1,5 @@
 import { useState, useSyncExternalStore } from 'react'
+import type { Input } from '../api/health.ts'
 import type { Mode } from '../api/incidents.ts'
 import { fetchPushInfo } from '../api/push.ts'
 import { usePolled } from '../lib/poll.ts'
@@ -57,9 +58,15 @@ function permission(): NotificationPermission | null {
 
 export function Notifications({
   mode,
+  input,
 }: {
   // The mode the server said it is in, or null when that is not known.
   mode: Mode | null
+  // What the server said it takes from a visitor, or null when it has not
+  // said. Notifications are turned on only for a server that said `own`: the
+  // server is given this device's address and where its places are. Turning
+  // them off needs nothing of the server.
+  input: Input | null
 }) {
   const status = useSyncExternalStore(onPushChange, pushSnapshot)
   // What a press met, with whether notifications were on when it did: it is
@@ -87,6 +94,9 @@ export function Notifications({
   }
   const on = (shown: Mode) =>
     press(async () => {
+      // The control is not offered otherwise; a press that outran a change
+      // turns nothing on.
+      if (input !== 'own') return null
       const came = await turnOn(shown)
       return came === 'on' ? null : SAID[came]
     })
@@ -122,7 +132,7 @@ export function Notifications({
       </h2>
       {!supported ? (
         <p className="meta">{UNSUPPORTED}</p>
-      ) : mode === null || info === null ? (
+      ) : mode === null || input === null || info === null ? (
         <p className="meta" role="status">
           Beacon says what it keeps for notifications once it has heard from its
           server.
@@ -178,19 +188,23 @@ export function Notifications({
         </>
       ) : (
         <>
-          {supported && mode !== null && info !== null && info.enabled && (
-            <div className="notify-actions">
-              <button
-                type="button"
-                className="action"
-                disabled={busy}
-                onClick={() => void on(mode)}
-              >
-                <Icon name="bell" />
-                Turn notifications on
-              </button>
-            </div>
-          )}
+          {supported &&
+            mode !== null &&
+            input === 'own' &&
+            info !== null &&
+            info.enabled && (
+              <div className="notify-actions">
+                <button
+                  type="button"
+                  className="action"
+                  disabled={busy}
+                  onClick={() => void on(mode)}
+                >
+                  <Icon name="bell" />
+                  Turn notifications on
+                </button>
+              </div>
+            )}
           {here > 0 ? (
             <p className="note problem" role="status">
               Notifications are off on this device. Beacon’s server has not yet

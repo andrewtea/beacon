@@ -218,9 +218,14 @@ function AddPlace({
     }
   }, [])
 
-  const keep = async (where: { lat: number; lon: number }, called: string) => {
+  const keep = async (
+    where: { lat: number; lon: number },
+    called: string,
+    // Whether it is one of the invented scenario's places, chosen by its button.
+    spot = false,
+  ) => {
     const typed = name
-    const came = await savePlace(called, where)
+    const came = await savePlace(called, where, spot)
     // A place that was saved stays saved; nothing more is said once the view
     // is left.
     if (!open.current) return
@@ -300,6 +305,7 @@ function AddPlace({
                       void keep(
                         spot.place,
                         name.trim() === '' ? spot.name : name,
+                        true,
                       )
                     }
                   >
@@ -338,9 +344,13 @@ export function PlacesView({
 }) {
   const places = useSyncExternalStore(subscribePlaces, placesSnapshot)
   const invented = input === 'invented'
-  // The places this server is asked about, and the ones it is not.
-  const asked = invented ? places.filter(isMockSpot) : places
-  const unasked = invented ? places.filter((place) => !isMockSpot(place)) : []
+  // The places this server is asked about, and the ones it is not. One that
+  // takes only the invented places is asked about a place only when it was
+  // saved with an invented place's own button: where a place is does not say
+  // so, because one saved from where somebody was is kept rounded too.
+  const isSpot = (place: SavedPlace) => place.spot === true && isMockSpot(place)
+  const asked = invented ? places.filter(isSpot) : places
+  const unasked = invented ? places.filter((place) => !isSpot(place)) : []
   return (
     <div className="view places-view">
       <a className="action back" href={href.home}>
@@ -373,9 +383,9 @@ export function PlacesView({
             {unasked.length > 0 && (
               <>
                 <p className="note" role="status">
-                  This server is asked only about the two invented places.
-                  Nothing of the places below is sent to it. They stay saved on
-                  this device, and can be removed.
+                  This server is asked only about the two invented places, saved
+                  with their own buttons. Nothing of the places below is sent to
+                  it. They stay saved on this device, and can be removed.
                 </p>
                 <PlaceList places={unasked} answers={null} asking={false} />
               </>
@@ -383,7 +393,7 @@ export function PlacesView({
           </>
         ))}
       <AddPlace mode={mode} full={places.length >= MOST_PLACES} input={input} />
-      <Notifications mode={mode} />
+      <Notifications mode={mode} input={input} />
     </div>
   )
 }

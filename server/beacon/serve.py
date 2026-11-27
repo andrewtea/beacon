@@ -275,12 +275,18 @@ def _own(data: Path, directory: str, name: str) -> Path | None:
     directory of its own, and the ones beside it whether or not the file is there:
     a new file of the name would be opened with them.
 
-    Raises NotTheMockStoresError when one is not: a link, of either kind, can be
-    to another store's file, which would be written to or deleted in this one's
-    place."""
+    Raises NotTheMockStoresError when one is not, and when one could not be
+    looked at: a link, of either kind, can be to another store's file, which
+    would be written to or deleted in this one's place."""
     folder = data / directory
     path = folder / name
-    linked = folder.is_symlink()
+    try:
+        # `Path.is_symlink` answers False for a directory it could not look at.
+        linked = stat.S_ISLNK(os.lstat(folder).st_mode)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        linked = True
     there = False
     for each in (path, *(path.with_name(name + suffix) for suffix in _BESIDE)):
         if linked:
@@ -289,7 +295,11 @@ def _own(data: Path, directory: str, name: str) -> Path | None:
             found = os.lstat(each)
         except FileNotFoundError:
             continue
-        except NotADirectoryError:
+        except OSError:
+            # It could not be looked at (no leave to, an error of the disk, a
+            # directory that is a file): it was not seen to be this store's own,
+            # which is all this answers. Not left as an OSError, which `run`
+            # takes for a file that was seen to be and could not be deleted.
             linked = True
         else:
             linked = not stat.S_ISREG(found.st_mode) or found.st_nlink != 1
