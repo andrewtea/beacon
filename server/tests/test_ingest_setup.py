@@ -186,7 +186,7 @@ def test_the_radio_of_the_mock_scenario_tells_the_fire_through_a_stand_in_for_em
         f"call_{number}" for number in range(20) if number != 4
     ]
     first = calls[0]
-    assert first.ref == f"invented/9101-{int(story(0).timestamp())}_851000000-call_0"
+    assert first.ref == f"invented/9101-{int(story(0).timestamp())}.000_851000000-call_0"
     assert (first.data["system"], first.data["talkgroup"]) == ("invented", 9101)
     assert {(row.source, row.origin, row.model, row.point) for row in calls} == {
         ("recordings", "mock", "fake", None)
@@ -637,6 +637,7 @@ def an_ffmpeg_that_can_be_confined(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
 
 RADIO = {
     "BEACON_LIVE_SOURCES": "recordings",
+    "BEACON_RECORDINGS_SYSTEM": "sfd",
     "BEACON_RECORDINGS_PERMITTED": "1",
     "BEACON_RECORDINGS_TALKGROUPS": "1201, 1203,1301",
     "BEACON_RECORDINGS_EMS_TALKGROUPS": "1301",
@@ -653,6 +654,9 @@ RADIO = {
         ({"BEACON_RECORDINGS_DIR": ""}, "needs BEACON_RECORDINGS_DIR"),
         ({"BEACON_RECORDINGS_DIR": "recorded-calls"}, "needs BEACON_RECORDINGS_DIR"),
         ({"BEACON_RECORDINGS_DIR": "/nowhere/at/all"}, "needs BEACON_RECORDINGS_DIR"),
+        # Of one system, by its short name: talkgroup numbers are a system's own.
+        ({"BEACON_RECORDINGS_SYSTEM": ""}, "and BEACON_RECORDINGS_SYSTEM: the short name"),
+        ({"BEACON_RECORDINGS_SYSTEM": "../sfd"}, "and BEACON_RECORDINGS_SYSTEM: the short name"),
         # Having a recording is not the right to use it.
         ({"BEACON_RECORDINGS_PERMITTED": ""}, "used only with the right to"),
         ({"BEACON_RECORDINGS_PERMITTED": "yes"}, "set BEACON_RECORDINGS_PERMITTED=1 when"),
@@ -694,6 +698,46 @@ def test_a_directory_of_generated_audio_is_no_live_source(
         build(env | RADIO)
 
     # Refused before a client that can spend was built, or a store was opened.
+    assert not (Path(env["BEACON_DATA_DIR"]) / "ember").exists()
+    assert not (Path(env["BEACON_DATA_DIR"]) / "evidence").exists()
+
+
+def test_a_directory_whose_mark_cannot_be_told_and_a_link_to_a_directory_are_refused(
+    env: dict[str, str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+    calls = Path(RADIO["BEACON_RECORDINGS_DIR"])
+    link = tmp_path / "link-to-calls"
+    link.symlink_to(calls)
+
+    with pytest.raises(IngestConfigError, match="not a link to it"):
+        build(env | RADIO | {"BEACON_RECORDINGS_DIR": str(link)})
+    # Something of the mark's name that is no file says nothing either way.
+    (calls / GENERATED_MARK).mkdir()
+    with pytest.raises(IngestConfigError, match="anything else of that name is refused"):
+        build(env | RADIO)
+
+    assert not (Path(env["BEACON_DATA_DIR"]) / "ember").exists()
+    assert not (Path(env["BEACON_DATA_DIR"]) / "evidence").exists()
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"BEACON_NOTICES_FEED_URL": "https://api.openmhz.com/sfp25/feed.json"},
+        {"BEACON_NOTICES_FEED_URL": "https://OpenMHz.com./feed.json"},
+        {"BEACON_NOTICES_HOSTS": "media.openmhz.com"},
+        {"BEACON_NOTICES_HOSTS": "files.example.org, s3.Broadcastify.com"},
+    ],
+)
+def test_no_feed_of_notices_is_on_a_service_beacon_requests_nothing_from(
+    env: dict[str, str], monkeypatch: pytest.MonkeyPatch, settings: dict[str, str]
+) -> None:
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+
+    with pytest.raises(IngestConfigError, match="a service Beacon requests nothing from"):
+        build(env | NOTICES | settings)
+
     assert not (Path(env["BEACON_DATA_DIR"]) / "ember").exists()
     assert not (Path(env["BEACON_DATA_DIR"]) / "evidence").exists()
 

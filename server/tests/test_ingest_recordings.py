@@ -36,20 +36,23 @@ from beacon.ingest import Clock, Ingest, Runner, SourceError
 from beacon.ingest import recordings as recordings_module
 from beacon.ingest.http import SourceHttp
 from beacon.ingest.recordings import (
+    BEGINNING,
     GENERATED_MARK,
     HELD_INTERVAL_SECONDS,
     MAX_AGE,
     MAX_CALLS_PER_POLL,
     MAX_LISTED,
+    MAX_START_AFTER_NAME,
     OVERLAP,
     UNUSABLE_RUN_LIMIT,
     Directory,
     Filed,
+    Place,
     RecordedRadio,
     filed_as,
     parse_details,
 )
-from beacon.ingest.runner import PollerHeldError
+from beacon.ingest.runner import PollerHeldError, PollReport
 from beacon.radio import (
     NOTHING_KNOWN,
     AudioError,
@@ -76,10 +79,10 @@ def seconds(count: float) -> datetime:
     return NOON + timedelta(seconds=count)
 
 
-def tone(number: int) -> bytes:
-    """A WAV file no other call has, a second long. Nothing in these tests is a
-    recording."""
-    return pcm_to_wav(number.to_bytes(2, "little") * 16_000)
+def tone(number: int, length: float = 1.0) -> bytes:
+    """A WAV file no other call has, a second long unless it is said how long.
+    Nothing in these tests is a recording."""
+    return pcm_to_wav(number.to_bytes(2, "little") * round(16_000 * length))
 
 
 def form(**changes: Any) -> dict[str, Any]:
@@ -98,29 +101,33 @@ def form(**changes: Any) -> dict[str, Any]:
 
 
 def filed_at(number: int, at: datetime, talkgroup: int = FIRE) -> Filed:
-    """A call's files as trunk-recorder names them: by talkgroup, start, frequency,
-    and the recorder's count of calls."""
+    """A call's files as trunk-recorder names them since v5: by talkgroup, start
+    with its milliseconds, frequency, and the recorder's count of calls."""
     start_s = int(at.timestamp())
     return Filed(
         system=SYSTEM,
         day=(str(at.year), str(at.month), str(at.day)),
-        stem=f"{talkgroup}-{start_s}_{FREQUENCY}-call_{number}",
+        stem=f"{talkgroup}-{start_s}.{at.microsecond // 1000:03d}_{FREQUENCY}-call_{number}",
         talkgroup=talkgroup,
         start_s=start_s,
     )
 
 
-def details_of(filed: Filed, length: float = 4.0, **changes: Any) -> bytes:
-    """The JSON file trunk-recorder writes for a call, with the radio that
-    transmitted in it, which Beacon does not keep."""
+def details_of(filed: Filed, length: float = 1.0, **changes: Any) -> bytes:
+    """The JSON file trunk-recorder v5 writes for a call, with the radio that
+    transmitted in it, which Beacon does not keep. The tests' tones play a second."""
+    start_ms = round(float(filed.stem.split("-")[1].split("_")[0]) * 1000)
     return json.dumps(
         {
             "freq": FREQUENCY,
             "start_time": filed.start_s,
             "stop_time": filed.start_s + int(length) + 1,
+            "start_time_ms": start_ms,
+            "stop_time_ms": start_ms + round(length * 1000) + 1000,
             "emergency": 0,
             "encrypted": 0,
-            "call_length": length,
+            "call_length": round(length),
+            "call_length_ms": round(length * 1000),
             "talkgroup": filed.talkgroup,
             "talkgroup_tag": "Fire Dispatch",
             "audio_type": "digital",
@@ -145,8 +152,9 @@ class Radio:
         self.clips: dict[str, bytes | Exception] = {}
         self.numbers: dict[int, str] = {}
         self.heard: dict[bytes, Any] = {}
-        # What was asked of the shelf: each listing, and the audio files read.
-        self.listings: list[tuple[int, int]] = []
+        # What was asked of the shelf: each listing, by the place it was to come
+        # after and the second it was to reach, and the audio files read.
+        self.listings: list[tuple[Place, int]] = []
         self.downloads: list[str] = []
         self.read_details: list[str] = []
         # The Ember requests, by the audio each carried.
@@ -163,7 +171,7 @@ class Radio:
         heard: Any = None,
         *,
         talkgroup: int = FIRE,
-        length: float = 4.0,
+        length: float = 1.0,
         audio: bytes | Exception | None = None,
         **changes: Any,
     ) -> str:
@@ -186,18 +194,18 @@ class Radio:
         return [*self.listings, *self.read_details, *self.downloads]
 
     def listed(
-        self, after_s: int, upto_s: int, talkgroups: Collection[int], limit: int
+        self, after: Place, upto_s: int, talkgroups: Collection[int], limit: int
     ) -> tuple[list[Filed], bool]:
-        self.listings.append((after_s, upto_s))
+        self.listings.append((after, upto_s))
         if self.down is not None:
             raise self.down
         found = sorted(
             (
                 filed
                 for filed in self.filed.values()
-                if after_s < filed.start_s <= upto_s and filed.talkgroup in talkgroups
+                if filed.place > after and filed.start_s <= upto_s and filed.talkgroup in talkgroups
             ),
-            key=lambda filed: (filed.start_s, filed.stem),
+            key=lambda filed: filed.place,
         )
         return found[:limit], len(found) > limit
 
@@ -288,7 +296,13 @@ def no_network() -> SourceHttp:
 def test_a_call_becomes_a_row_of_what_ember_heard_in_it_and_nothing_it_said(
     store: EvidenceStore, radio: Radio, poller: RecordedRadio
 ) -> None:
-    ref = radio.call(1, seconds(-30), form(details=["working_fire"], alarm=2), length=6.5)
+    ref = radio.call(
+        1,
+        seconds(-30),
+        form(details=["working_fire"], alarm=2),
+        length=6.5,
+        audio=tone(1, 6.5),
+    )
 
     report = poller.poll(store, NOON)
 
@@ -322,7 +336,7 @@ def test_a_call_becomes_a_row_of_what_ember_heard_in_it_and_nothing_it_said(
         "seconds": 6.5,
         "emergency": False,
     }
-    assert radio.asked == [tone(1)]
+    assert radio.asked == [tone(1, 6.5)]
 
 
 def test_what_a_call_named_reaches_no_row_no_file_and_no_log(
@@ -493,22 +507,73 @@ def three_minutes() -> bytes:
     return out.getvalue()
 
 
-def test_a_call_is_measured_by_its_audio_and_not_by_what_its_listing_says(
+def test_a_call_is_measured_by_its_audio_and_not_by_what_its_json_says(
     store: EvidenceStore, radio: Radio, poller: RecordedRadio
 ) -> None:
-    # Listed as four seconds each. One plays for three minutes, and one for a
+    # Each a second long by its JSON. One plays for three minutes, and one for a
     # twentieth of a second.
-    radio.call(1, seconds(-30), audio=three_minutes())
-    radio.call(2, seconds(-20), audio=pcm_to_wav(b"\x02\x00" * 800))
+    long = radio.call(1, seconds(-30), audio=three_minutes())
+    short = radio.call(2, seconds(-20), audio=pcm_to_wav(b"\x02\x00" * 800))
     radio.call(3, seconds(-10))
 
     report = poller.poll(store, NOON)
 
     assert (report.added, report.unreadable) == (1, 2)
     assert radio.asked == [tone(3)]
-    # Neither is fetched again.
-    poller.poll(store, seconds(30))
-    assert radio.downloads == [radio.ref(1), radio.ref(2), radio.ref(3)]
+    # Neither is claimed or paid for: its audio is not the call its JSON describes.
+    assert store.taken("recordings", [long, short]) == set()
+
+
+@pytest.mark.parametrize(
+    ("said", "played", "ready"),
+    [
+        # To the millisecond: half a second and a fiftieth of the length.
+        ({"call_length_ms": 10_000}, 10.6, True),
+        ({"call_length_ms": 10_000}, 9.4, True),
+        ({"call_length_ms": 10_000}, 9.2, False),
+        ({"call_length_ms": 10_000}, 10.8, False),
+        # In whole seconds, as before v5: a second more.
+        ({"call_length_ms": None, "call_length": 10}, 8.4, True),
+        ({"call_length_ms": None, "call_length": 10}, 11.6, True),
+        ({"call_length_ms": None, "call_length": 10}, 8.2, False),
+        ({"call_length_ms": None, "call_length": 10}, 11.8, False),
+    ],
+)
+def test_a_call_is_ready_when_its_audio_plays_about_as_long_as_its_json_says(
+    store: EvidenceStore, radio: Radio, poller: RecordedRadio, said: Any, played: float, ready: bool
+) -> None:
+    ref = radio.call(1, seconds(-30), audio=tone(1, played), **said)
+
+    report = poller.poll(store, NOON)
+
+    assert (report.added, report.unreadable) == ((1, 0) if ready else (0, 1))
+    assert store.taken("recordings", [ref]) == ({ref} if ready else set())
+
+
+def test_a_call_whose_audio_is_still_being_written_is_not_claimed_and_is_heard_when_it_is_whole(
+    store: EvidenceStore, radio: Radio, poller: RecordedRadio
+) -> None:
+    # trunk-recorder writes a call's JSON before its audio is all there.
+    growing = radio.call(1, seconds(-30), length=6.0, audio=tone(1, 2.0))
+    absent = radio.call(2, seconds(-25), audio=GONE)
+    cut = radio.call(3, seconds(-20), length=4.0, audio=tone(3, 4.0)[:-64_000])
+    radio.call(4, seconds(-10))
+
+    report = poller.poll(store, NOON)
+
+    # None of the three is claimed or sent, and none keeps the fourth from being heard.
+    assert (report.added, report.unreadable, report.partial) == (1, 3, False)
+    assert radio.asked == [tone(4)]
+    assert store.taken("recordings", [growing, absent, cut]) == set()
+
+    for number, ref, length in ((1, growing, 6.0), (2, absent, 1.0), (3, cut, 4.0)):
+        radio.clips[ref] = tone(number, length)
+        radio.heard[tone(number, length)] = form()
+    report = poller.poll(store, seconds(30))
+
+    assert (report.added, report.unreadable) == (3, 0)
+    assert radio.asked == [tone(4), tone(1, 6.0), tone(2), tone(3, 4.0)]
+    assert refs(store) == [growing, absent, cut, radio.ref(4)]
 
 
 def test_ember_is_sent_the_samples_of_a_wav_call_and_nothing_else_the_file_carried(
@@ -1089,7 +1154,7 @@ def test_the_first_poll_looks_at_the_last_five_minutes_of_the_talkgroups_it_hear
     report = poller.poll(store, NOON)
 
     start = int(NOON.timestamp())
-    assert radio.listings == [(start - 300, start)]
+    assert radio.listings == [((start - 300, ""), start)]
     assert (report.added, report.unreadable, report.partial) == (1, 0, False)
     # Only the call it may hear is read at all: not the older one, and not the one
     # on a talkgroup nobody asked for.
@@ -1114,9 +1179,9 @@ def test_a_call_is_heard_once_however_often_it_is_listed(
     # and a call it has taken is told by its name: not even its JSON is read again.
     start = int(NOON.timestamp())
     assert radio.listings == [
-        (start - 300, start),
-        (start - 300, start + 30),
-        (start - 270, start + 60),
+        ((start - 300, ""), start),
+        ((start - 300, ""), start + 30),
+        ((start - 270, ""), start + 60),
     ]
     assert radio.read_details == [radio.ref(1), radio.ref(2), radio.ref(3)]
 
@@ -1132,10 +1197,10 @@ def test_calls_that_grew_old_while_the_poller_was_held_are_not_bought_as_a_backl
 
     report = poller.poll(store, seconds(180 * 60))
 
-    # Only the last fifteen minutes are looked at.
-    assert radio.listings[1][0] == int((seconds(180 * 60) - MAX_AGE).timestamp())
-    assert report.added == 15
-    assert refs(store)[1] == radio.ref(167)
+    # Only the last fifteen minutes are looked at: the calls of sixteen minutes.
+    assert radio.listings[1][0] == (int((seconds(180 * 60) - MAX_AGE).timestamp()), "")
+    assert report.added == 16
+    assert refs(store)[1] == radio.ref(166)
 
 
 def test_a_poller_given_a_backlog_hears_every_call_there_is_oldest_first(
@@ -1186,24 +1251,99 @@ def test_more_calls_than_a_poll_looks_at_are_left_for_the_next_and_none_is_skipp
     store: EvidenceStore, radio: Radio, storage: Storage, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(recordings_module, "MAX_LISTED", 4)
+    monkeypatch.setattr(recordings_module, "MAX_PAGES", 1)
     # Too short to be heard, so each is passed over: ten of them, and one call.
     for number in range(1, 11):
         radio.call(number, seconds(-200 + number), length=0.2)
     radio.call(11, seconds(-100))
     poller = build(radio, storage, calls_per_poll=4)
 
-    reports = [poller.poll(store, NOON) for _ in range(4)]
+    reports = [poller.poll(store, NOON) for _ in range(3)]
 
-    # Every poll gets further, though the calls it passed over are listed again
-    # inside the five minutes it reads again, and take a poll's whole look.
+    # Every poll gets further: it goes on from the place the one before reached,
+    # though nothing of those calls was claimed.
     assert [(report.added, report.partial) for report in reports] == [
-        (0, True),
         (0, True),
         (0, True),
         (1, False),
     ]
+    assert [after for after, _ in radio.listings] == [
+        (int(seconds(-300).timestamp()), ""),
+        radio.filed[radio.ref(4)].place,
+        radio.filed[radio.ref(8)].place,
+    ]
     assert radio.asked == [tone(11)]
     assert poller.poll(store, NOON).added == 0
+
+
+def test_a_poll_reads_page_after_page_until_it_has_its_share_of_calls(
+    store: EvidenceStore, radio: Radio, storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(recordings_module, "MAX_LISTED", 4)
+    for number in range(1, 11):
+        radio.call(number, seconds(-200 + number), length=0.2)
+    radio.call(11, seconds(-100))
+    poller = build(radio, storage, calls_per_poll=4)
+
+    report = poller.poll(store, NOON)
+
+    # Three pages of four, in one poll: what was passed over took none of its share.
+    assert (report.added, report.partial, len(radio.listings)) == (1, False, 3)
+
+
+def test_calls_that_began_in_the_same_second_do_not_hide_one_another(
+    store: EvidenceStore, radio: Radio, storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(recordings_module, "MAX_LISTED", 4)
+    day = NOON - timedelta(days=7)
+    # More calls in one second than a page holds, and than a poll hears.
+    for number in range(1, 12):
+        radio.call(number, day, talkgroup=FIRE if number % 2 else TACTICAL)
+    radio.call(12, day + timedelta(seconds=1))
+    poller = build(radio, storage, backlog=True, calls_per_poll=4)
+
+    reports = [poller.poll(store, NOON) for _ in range(3)]
+
+    assert [(report.added, report.partial) for report in reports] == [
+        (4, True),
+        (4, True),
+        (4, False),
+    ]
+    assert len(set(refs(store))) == len(radio.asked) == 12
+    # A new process, with every call taken, reads to the end all the same.
+    again = build(radio, storage, backlog=True, calls_per_poll=4)
+    assert again.poll(store, NOON) == PollReport(added=0)
+
+
+def test_a_backlog_is_gone_over_again_and_what_a_pass_could_not_use_is_counted_each_time(
+    store: EvidenceStore, radio: Radio, storage: Storage
+) -> None:
+    day = NOON - timedelta(days=7)
+    broken = radio.call(1, day)
+    whole = radio.json[broken]
+    assert isinstance(whole, bytes)
+    radio.json[broken] = whole[: len(whole) // 2]
+    silent = radio.call(2, day + timedelta(minutes=1), audio=GONE)
+    radio.call(3, day + timedelta(minutes=2))
+    poller = build(radio, storage, backlog=True)
+
+    reports = [poller.poll(store, NOON) for _ in range(2)]
+
+    # Each pass says what it could not use, and claims none of it. Nothing gives a
+    # call up: a run is over when a pass counts nothing unreadable.
+    assert [(report.added, report.unreadable, report.partial) for report in reports] == [
+        (1, 2, False),
+        (0, 2, False),
+    ]
+    assert radio.read_details.count(broken) == 2
+    assert store.taken("recordings", [broken, silent]) == set()
+
+    radio.json[broken] = whole
+    radio.clips[silent] = tone(2)
+    radio.heard[tone(2)] = form()
+    # By the process that saw them unready, or by one that is started later.
+    assert poller.poll(store, NOON) == PollReport(added=2)
+    assert build(radio, storage, backlog=True).poll(store, NOON) == PollReport(added=0)
 
 
 def test_a_call_whose_json_cannot_be_read_yet_is_counted_and_read_when_it_is_whole(
@@ -1236,10 +1376,10 @@ def test_an_encrypted_call_is_passed_over_and_not_paid_for(
     assert (radio.asked, radio.downloads) == ([tone(2)], [radio.ref(2)])
 
 
-def test_audio_that_is_gone_is_passed_over_and_audio_that_failed_is_tried_again(
+def test_audio_that_is_not_there_is_waited_for_and_audio_that_failed_is_tried_again(
     store: EvidenceStore, radio: Radio, poller: RecordedRadio
 ) -> None:
-    radio.call(1, seconds(-30), audio=GONE)
+    absent = radio.call(1, seconds(-30), audio=GONE)
     failing = radio.call(
         2, seconds(-20), audio=SourceError("recordings", "has a call Beacon could not read")
     )
@@ -1253,9 +1393,11 @@ def test_audio_that_is_gone_is_passed_over_and_audio_that_failed_is_tried_again(
     radio.clips[failing] = tone(2)
     radio.heard[tone(2)] = form()
     report = poller.poll(store, seconds(30))
-    assert (report.added, report.unreadable) == (2, 0)
+    # The first is still not there: it is counted again, and nobody has claimed it.
+    assert (report.added, report.unreadable) == (2, 1)
     assert refs(store) == [radio.ref(2), radio.ref(3)]
-    assert radio.downloads == [radio.ref(1), radio.ref(2), radio.ref(2), radio.ref(3)]
+    assert radio.downloads == [absent, failing, absent, failing, radio.ref(3)]
+    assert store.taken("recordings", [absent]) == set()
 
 
 def test_a_shelf_that_cannot_be_listed_is_the_sources_failure_and_nothing_is_heard(
@@ -1311,13 +1453,14 @@ def test_a_call_is_read_from_its_json_file_with_its_time_and_length() -> None:
 
     assert call is not None
     assert (call.ref, call.system, call.talkgroup) == (
-        f"sfd/{TACTICAL}-{int(seconds(-30).timestamp())}_851012500-call_7",
+        f"sfd/{TACTICAL}-{int(seconds(-30).timestamp())}.000_851012500-call_7",
         "sfd",
         TACTICAL,
     )
-    assert (call.time, call.seconds, call.emergency, call.encrypted) == (
+    assert (call.time, call.seconds, call.exact, call.emergency, call.encrypted) == (
         seconds(-30),
         6.5,
+        True,
         True,
         False,
     )
@@ -1326,16 +1469,64 @@ def test_a_call_is_read_from_its_json_file_with_its_time_and_length() -> None:
     assert "Jane" not in repr(call)
 
 
-def test_a_call_with_no_length_of_its_own_is_as_long_as_its_start_and_stop_say() -> None:
-    filed = filed_at(7, seconds(-30))
-    body = json.loads(details_of(filed))
-    del body["call_length"]
-    body["stop_time"] = filed.start_s + 9
+def test_a_call_is_read_as_trunk_recorder_wrote_it_before_it_kept_milliseconds() -> None:
+    at = seconds(-30)
+    # As v4 names and describes a call: whole seconds, in the name and in the JSON.
+    filed = filed_as("sfd", ("2026", "11", "27"), f"{FIRE}-{int(at.timestamp())}_851012500-call_7")
+    assert filed is not None
+    body = json.loads(details_of(filed, 7.0))
+    for key in ("start_time_ms", "stop_time_ms", "call_length_ms"):
+        del body[key]
 
     call = parse_details(json.dumps(body).encode(), filed)
 
     assert call is not None
-    assert call.seconds == 9.0
+    assert (call.time, call.seconds, call.exact) == (at, 7.0, False)
+
+    # With no length of its own, it is as long as its start and stop say.
+    del body["call_length"]
+    body["stop_time"] = filed.start_s + 9
+    call = parse_details(json.dumps(body).encode(), filed)
+    assert call is not None
+    assert (call.seconds, call.exact) == (9.0, False)
+
+
+def test_a_calls_time_is_its_jsons_which_can_be_later_than_its_files_name() -> None:
+    # The name is of the first transmission, at 19:59:30.123. That one was too
+    # short to keep, and the call's JSON begins with the next, 2.4 seconds on.
+    at = seconds(-30) + timedelta(milliseconds=123)
+    filed = filed_at(7, at)
+    assert filed.stem == f"{FIRE}-{int(at.timestamp())}.123_851012500-call_7"
+    later_ms = round(at.timestamp() * 1000) + 2_400
+
+    call = parse_details(
+        details_of(filed, start_time=later_ms // 1000, start_time_ms=later_ms), filed
+    )
+
+    assert call is not None
+    assert call.time == at + timedelta(milliseconds=2_400)
+    # It is still found, ordered, and named by its files' name.
+    assert (call.ref, call.time_s) == (filed.ref, int(at.timestamp()))
+
+
+@pytest.mark.parametrize(
+    ("late_ms", "read"),
+    [
+        (-1_000, True),
+        (-1_001, False),
+        (round(MAX_START_AFTER_NAME.total_seconds() * 1000), True),
+        (round(MAX_START_AFTER_NAME.total_seconds() * 1000) + 1, False),
+    ],
+)
+def test_a_json_whose_start_is_not_near_its_files_name_is_another_calls(
+    late_ms: int, read: bool
+) -> None:
+    filed = filed_at(7, seconds(-30))
+    start_ms = filed.start_s * 1000 + late_ms
+
+    call = parse_details(details_of(filed, start_time_ms=start_ms), filed)
+
+    assert (call is not None) is read
 
 
 @pytest.mark.parametrize(
@@ -1343,12 +1534,13 @@ def test_a_call_with_no_length_of_its_own_is_as_long_as_its_start_and_stop_say()
     [
         {"talkgroup": TACTICAL},
         {"talkgroup": str(FIRE)},
-        {"start_time": 1},
-        {"start_time": None},
-        {"call_length": None, "stop_time": None},
-        {"call_length": "4", "stop_time": "soon"},
-        {"call_length": -1, "stop_time": 0},
-        {"call_length": float("nan"), "stop_time": float("inf")},
+        {"start_time_ms": None, "start_time": 1},
+        {"start_time_ms": None, "start_time": None},
+        {"start_time_ms": 1795809570.5, "start_time": None},
+        {"call_length_ms": None, "call_length": None, "stop_time": None},
+        {"call_length_ms": None, "call_length": "4", "stop_time": "soon"},
+        {"call_length_ms": None, "call_length": -1, "stop_time": 0},
+        {"call_length_ms": None, "call_length": float("nan"), "stop_time": float("inf")},
         {"emergency": "yes"},
         {"encrypted": 2},
     ],
@@ -1371,9 +1563,12 @@ def test_a_file_that_is_no_json_object_is_not_read(body: bytes) -> None:
 @pytest.mark.parametrize(
     "name",
     [
+        # Before v5, and since: milliseconds in the start, and a TDMA slot.
         "1201-1795809570_851012500-call_7",
+        "1201-1795809570.123_851012500-call_7",
+        "1201-1795809570.123_851012500.1-call_7",
         "1201-1795809570_851012500.000000-call_12345",
-        "0-1795809570_1-call_0",
+        "0-1795809570.000_1-call_0",
     ],
 )
 def test_a_call_is_told_by_the_name_trunk_recorder_gives_its_files(name: str) -> None:
@@ -1394,6 +1589,9 @@ def test_a_call_is_told_by_the_name_trunk_recorder_gives_its_files(name: str) ->
         ("sfd", "1201-1795809570_851012500"),
         ("sfd", "1201-1795809570_851012500-call_7.bak"),
         ("sfd", "1201-17_851012500-call_7"),
+        ("sfd", "1201-1795809570._851012500-call_7"),
+        ("sfd", "1201-1795809570.1234_851012500-call_7"),
+        ("sfd", "1201-1795809570.123.4_851012500-call_7"),
         ("sfd", "-1201-1795809570_851012500-call_7"),
         ("sfd", "1201-1795809570_851012500-call_7\n"),
         ("sfd", "Jane Doe-1795809570_851012500-call_7"),
@@ -1437,16 +1635,165 @@ def test_a_directory_lists_the_calls_asked_for_by_their_files_names(calls: Path)
     day = calls / "sfd" / "2026" / "11" / "27"
     (day / "notes.json").write_text("{}")
     (day / f"{FIRE}-{first.start_s}_1-call_9.wav").write_bytes(tone(9))
-    shelf = Directory(calls)
+    shelf = Directory(calls, SYSTEM)
 
     start = int(NOON.timestamp())
-    listed, more = shelf.listed(start - 300, start, {FIRE, TACTICAL}, 10)
+    listed, more = shelf.listed((start - 300, ""), start, {FIRE, TACTICAL}, 10)
 
     assert (listed, more) == ([first, second], False)
     assert shelf.details(first) == details_of(first)
     assert shelf.audio(second) == tone(2)
-    # Oldest first, and no more than was asked for.
-    assert shelf.listed(start - 300, start, {FIRE, TACTICAL}, 1) == ([first], True)
+    # Oldest first, no more than was asked for, and then what comes after a place.
+    assert shelf.listed((start - 300, ""), start, {FIRE, TACTICAL}, 1) == ([first], True)
+    assert shelf.listed(first.place, start, {FIRE, TACTICAL}, 1) == ([second], False)
+    assert shelf.listed(second.place, start, {FIRE, TACTICAL}, 1) == ([], False)
+
+
+def test_a_directory_is_listed_a_page_at_a_time_across_days_and_within_one_second(
+    calls: Path,
+) -> None:
+    # Seven calls that began in one second, one a day before, and one a day after.
+    same = [filed_at(number, seconds(-30), FIRE if number % 2 else TACTICAL) for number in range(7)]
+    before = filed_at(8, seconds(-30) - timedelta(days=1))
+    after = filed_at(9, seconds(-30) + timedelta(days=1))
+    for filed in (*same, before, after):
+        put(calls, filed, tone(1))
+    shelf = Directory(calls, SYSTEM)
+
+    pages, place, more = [], BEGINNING, True
+    while more:
+        page, more = shelf.listed(place, after.start_s, {FIRE, TACTICAL}, 3)
+        pages.append(page)
+        place = page[-1].place
+
+    assert [len(page) for page in pages] == [3, 3, 3]
+    assert [call for page in pages for call in page] == [
+        before,
+        *sorted(same, key=lambda call: call.stem),
+        after,
+    ]
+
+
+def test_a_day_with_more_files_than_are_listed_fails_the_poll_and_is_not_read_in_part(
+    calls: Path,
+    store: EvidenceStore,
+    radio: Radio,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (calls / GENERATED_MARK).write_text("Generated audio. No radio.")
+    for number in (1, 2):
+        put(calls, filed_at(number, seconds(-30 + number)), tone(number))
+        radio.heard[tone(number)] = form()
+    monkeypatch.setattr(recordings_module, "_MAX_DAY_ENTRIES", 3)
+    poller = RecordedRadio(
+        Directory(calls, SYSTEM),
+        EmberClient.fake(storage, radio.ember),
+        talkgroups=(FIRE,),
+        known=KNOWN,
+    )
+
+    with pytest.raises(SourceError) as failure:
+        poller.poll(store, NOON)
+
+    # The calls it did reach are not heard as though they were all there are.
+    assert str(failure.value) == (
+        "recordings has a day with more files than Beacon lists, and is not read in part."
+    )
+    assert (failure.value.__context__, failure.value.__cause__) == (None, None)
+    assert (radio.asked, refs(store)) == ([], [])
+    monkeypatch.setattr(recordings_module, "_MAX_DAY_ENTRIES", 4)
+    assert poller.poll(store, NOON).added == 2
+
+
+def test_a_directory_is_read_for_one_system_and_no_other(calls: Path) -> None:
+    ours = filed_at(1, seconds(-30))
+    # Another system's call on the talkgroup of the same number: another channel.
+    theirs = Filed("sfpd", ours.day, ours.stem, ours.talkgroup, ours.start_s)
+    put(calls, ours, tone(1))
+    put(calls, theirs, tone(2))
+    shelf = Directory(calls, SYSTEM)
+
+    start = int(NOON.timestamp())
+    assert shelf.listed(BEGINNING, start, {FIRE}, 10) == ([ours], False)
+    assert (shelf.details(theirs), shelf.audio(theirs)) == (None, None)
+    assert Directory(calls, "sfpd").listed(BEGINNING, start, {FIRE}, 10) == ([theirs], False)
+    # A system with no directory yet has no calls, which is no failure.
+    assert Directory(calls, "later").listed(BEGINNING, start, {FIRE}, 10) == ([], False)
+
+
+def test_a_directory_put_in_the_place_of_the_one_that_was_opened_is_not_read(
+    calls: Path, tmp_path: Path
+) -> None:
+    first, second = filed_at(1, seconds(-30)), filed_at(2, seconds(-20))
+    put(calls, first, tone(1))
+    shelf = Directory(calls, SYSTEM)
+    # The directory is moved away, and another is at its path: marked as generated,
+    # where the one that was opened is taken for recordings of real radio.
+    calls.rename(tmp_path / "moved")
+    calls.mkdir()
+    (calls / GENERATED_MARK).write_text("Generated audio. No radio.")
+    put(calls, second, tone(2))
+
+    start = int(NOON.timestamp())
+    assert shelf.generated is False
+    assert shelf.listed(BEGINNING, start, {FIRE}, 10) == ([first], False)
+    assert (shelf.audio(first), shelf.audio(second)) == (tone(1), None)
+
+
+def test_a_directory_whose_mark_changes_while_it_is_read_is_read_no_further(
+    calls: Path, store: EvidenceStore, radio: Radio, storage: Storage
+) -> None:
+    mark = calls / GENERATED_MARK
+    mark.write_text("Generated audio. No radio.")
+    put(calls, filed_at(1, seconds(-30)), tone(1))
+    radio.heard[tone(1)] = form()
+    poller = RecordedRadio(
+        Directory(calls, SYSTEM),
+        EmberClient.fake(storage, radio.ember),
+        talkgroups=(FIRE,),
+        known=KNOWN,
+    )
+    unmarked_once = "mark as generated audio has changed since Beacon began to read it"
+
+    # Unmarked now, which would make what a stand-in hears a real call's row; and
+    # then something of the mark's name that says nothing either way.
+    mark.unlink()
+    with pytest.raises(SourceError, match=unmarked_once) as failure:
+        poller.poll(store, NOON)
+    mark.mkdir()
+    with pytest.raises(SourceError, match=unmarked_once):
+        poller.poll(store, NOON)
+
+    assert (failure.value.__context__, failure.value.__cause__) == (None, None)
+    assert (radio.asked, refs(store)) == ([], [])
+    # And the other way: recordings that are marked after a reader began.
+    mark.rmdir()
+    recorded = Directory(calls, SYSTEM)
+    mark.write_text("Generated audio. No radio.")
+    with pytest.raises(SourceError, match=unmarked_once):
+        recorded.listed(BEGINNING, int(NOON.timestamp()), {FIRE}, 10)
+
+
+def test_a_mark_that_cannot_be_looked_at_is_not_taken_for_no_mark(
+    calls: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (calls / GENERATED_MARK).write_text("Generated audio. No radio.")
+    generated = Directory(calls, SYSTEM)
+    looked = os.stat
+
+    def refuse(path: Any, *args: Any, **options: Any) -> Any:
+        if path == GENERATED_MARK:
+            raise PermissionError(13, "Permission denied", str(path))
+        return looked(path, *args, **options)
+
+    monkeypatch.setattr(recordings_module.os, "stat", refuse)
+
+    # Not when a directory is first opened, and not at a later listing.
+    with pytest.raises(ValueError, match="It cannot be told whether the directory is marked"):
+        Directory(calls, SYSTEM)
+    with pytest.raises(SourceError, match="mark as generated audio has changed"):
+        generated.listed(BEGINNING, int(NOON.timestamp()), {FIRE}, 10)
 
 
 def test_a_call_is_found_whatever_day_the_recorders_own_time_put_it_under(calls: Path) -> None:
@@ -1461,15 +1808,15 @@ def test_a_call_is_found_whatever_day_the_recorders_own_time_put_it_under(calls:
     padded.mkdir(parents=True)
     (padded / f"{early.stem}.json").write_bytes(details_of(early))
     (padded / f"{early.stem}.wav").write_bytes(tone(2))
-    shelf = Directory(calls)
+    shelf = Directory(calls, SYSTEM)
 
-    (found,), _ = shelf.listed(late.start_s - 1, late.start_s, {FIRE}, 10)
-    (old,), _ = shelf.listed(early.start_s - 1, early.start_s, {FIRE}, 10)
+    (found,), _ = shelf.listed((late.start_s - 1, ""), late.start_s, {FIRE}, 10)
+    (old,), _ = shelf.listed((early.start_s - 1, ""), early.start_s, {FIRE}, 10)
 
     assert (found, shelf.audio(found)) == (filed_local, tone(1))
     assert (shelf.details(old), shelf.audio(old)) == (details_of(early), tone(2))
     # A whole archive, from the first call there is.
-    everything, _ = shelf.listed(0, int(NOON.timestamp()) + 86_400, {FIRE}, 10)
+    everything, _ = shelf.listed(BEGINNING, int(NOON.timestamp()) + 86_400, {FIRE}, 10)
     assert everything == [old, found]
 
 
@@ -1492,10 +1839,10 @@ def test_a_directory_reads_no_file_through_a_link_and_none_that_is_too_long(
     os.symlink(elsewhere / "sfd", calls / "linked")
     monkeypatch.setattr(recordings_module, "_MAX_AUDIO_BYTES", len(tone(3)))
     (day / f"{long.stem}.wav").write_bytes(tone(2) + b"\0")
-    shelf = Directory(calls)
+    shelf = Directory(calls, SYSTEM)
 
     start = int(NOON.timestamp())
-    listed, _ = shelf.listed(start - 300, start, {FIRE}, 10)
+    listed, _ = shelf.listed((start - 300, ""), start, {FIRE}, 10)
 
     assert listed == [linked, long, plain]
     assert (shelf.audio(linked), shelf.audio(long), shelf.audio(plain)) == (None, None, tone(3))
@@ -1508,14 +1855,14 @@ def test_a_call_in_another_container_is_found_when_there_is_no_wav(calls: Path) 
     filed = filed_at(1, seconds(-30))
     put(calls, filed, m4a(1), suffix=".m4a")
 
-    assert Directory(calls).audio(filed) == m4a(1)
+    assert Directory(calls, SYSTEM).audio(filed) == m4a(1)
 
 
 def test_a_directory_that_cannot_be_listed_fails_with_a_fixed_sentence(
     calls: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     put(calls, filed_at(1, seconds(-30)), tone(1))
-    shelf = Directory(calls)
+    shelf = Directory(calls, SYSTEM)
 
     def refuse(path: Any) -> Any:
         raise PermissionError(13, "Permission denied", str(path))
@@ -1523,7 +1870,7 @@ def test_a_directory_that_cannot_be_listed_fails_with_a_fixed_sentence(
     monkeypatch.setattr(recordings_module.os, "scandir", refuse)
 
     with pytest.raises(SourceError) as failure:
-        shelf.listed(0, int(NOON.timestamp()), {FIRE}, 10)
+        shelf.listed(BEGINNING, int(NOON.timestamp()), {FIRE}, 10)
 
     # Nothing of the path, and nothing under the error.
     assert str(failure.value) == "recordings is a directory Beacon could not list just now."
@@ -1535,7 +1882,7 @@ def test_a_file_that_cannot_be_read_just_now_fails_the_poll_and_names_no_path(
 ) -> None:
     filed = filed_at(1, seconds(-30))
     put(calls, filed, tone(1))
-    shelf = Directory(calls)
+    shelf = Directory(calls, SYSTEM)
     opened = os.open
 
     def refuse(path: Any, *args: Any, **options: Any) -> int:
@@ -1559,7 +1906,20 @@ def test_a_directory_is_named_by_an_absolute_path_that_is_one(tmp_path: Path, wh
     path = Path(where) if where != "missing" else tmp_path / "file"
 
     with pytest.raises(ValueError, match="named by its absolute path"):
-        Directory(path)
+        Directory(path, SYSTEM)
+
+
+def test_a_link_to_a_directory_is_not_opened_and_a_system_is_named_by_its_short_name(
+    calls: Path, tmp_path: Path
+) -> None:
+    link = tmp_path / "link"
+    link.symlink_to(calls)
+
+    with pytest.raises(ValueError, match="named by its absolute path"):
+        Directory(link, SYSTEM)
+    for system in ("", "..", "sfd/2026", "s f d", "x" * 41):
+        with pytest.raises(ValueError, match="named by its short name"):
+            Directory(calls, system)
 
 
 def live_ember(
@@ -1579,7 +1939,7 @@ def test_what_a_shelf_is_decides_whose_its_rows_are_and_who_may_hear_them(
 
     # A directory with no mark is recordings of real radio: live rows, and only a
     # live Ember, which would otherwise invent what a real call said.
-    recorded = Directory(calls)
+    recorded = Directory(calls, SYSTEM)
     assert (
         RecordedRadio(recorded, live_ember(storage), talkgroups=(FIRE,), known=KNOWN).origin
         == "live"
@@ -1597,7 +1957,7 @@ def test_what_a_shelf_is_decides_whose_its_rows_are_and_who_may_hear_them(
     # A directory marked as generated holds no radio: mock rows whoever hears them,
     # and either may. A client that only replays hears nothing at all.
     (calls / GENERATED_MARK).write_text("Generated audio. No radio.")
-    generated = Directory(calls)
+    generated = Directory(calls, SYSTEM)
     for ember in (fake(), live_ember(storage)):
         poller = RecordedRadio(generated, ember, talkgroups=(FIRE,), known=KNOWN)
         assert poller.origin == "mock"
@@ -1605,10 +1965,28 @@ def test_what_a_shelf_is_decides_whose_its_rows_are_and_who_may_hear_them(
             poller.origin = "live"  # type: ignore[misc]
     with pytest.raises(ValueError, match=refused):
         RecordedRadio(generated, replay(), talkgroups=(FIRE,), known=KNOWN)
-    # The mark is a file: a link or a directory of that name marks nothing.
+    # The mark is a file. A directory or a link of that name says nothing either
+    # way, and a directory that cannot be told apart is not read as either.
     (calls / GENERATED_MARK).unlink()
-    (calls / GENERATED_MARK).mkdir()
-    assert Directory(calls).generated is False
+    for unclear in ("directory", "link"):
+        if unclear == "directory":
+            (calls / GENERATED_MARK).mkdir()
+        else:
+            (calls / GENERATED_MARK).rmdir()
+            (calls / GENERATED_MARK).symlink_to(calls / "sfd")
+        with pytest.raises(ValueError, match="cannot be told whether the directory is marked"):
+            Directory(calls, SYSTEM)
+    # Only the reader of a directory itself is one of recordings: a class made
+    # from it is a stand-in, however it reads.
+    (calls / GENERATED_MARK).unlink()
+
+    class Dressed(Directory):
+        generated = False
+
+    dressed = Dressed(calls, SYSTEM)
+    assert RecordedRadio(dressed, fake(), talkgroups=(FIRE,), known=KNOWN).origin == "mock"
+    with pytest.raises(ValueError, match=refused):
+        RecordedRadio(dressed, live_ember(storage), talkgroups=(FIRE,), known=KNOWN)
 
     # A client that tries a call again after a 429 would send a claimed call twice.
     paced = live_ember(storage, pacer=Pacer(3000))
@@ -1625,7 +2003,10 @@ def test_a_radio_poller_that_can_spend_pays_under_radios_own_budget(
     for label in (None, "ingest:notices"):
         with pytest.raises(ValueError, match="needs the spending scope ingest:recordings"):
             RecordedRadio(
-                Directory(calls), live_ember(storage, label), talkgroups=(FIRE,), known=KNOWN
+                Directory(calls, SYSTEM),
+                live_ember(storage, label),
+                talkgroups=(FIRE,),
+                known=KNOWN,
             )
 
 
@@ -1634,10 +2015,10 @@ def test_generated_calls_in_a_directory_are_heard_and_stored_as_a_stand_ins(
 ) -> None:
     (calls / GENERATED_MARK).write_text("Generated audio. No radio.")
     filed = filed_at(1, seconds(-30))
-    put(calls, filed, tone(1), call_length=6.5)
-    radio.heard[tone(1)] = form(alarm=2)
+    put(calls, filed, tone(1, 6.5), length=6.5)
+    radio.heard[tone(1, 6.5)] = form(alarm=2)
     poller = RecordedRadio(
-        Directory(calls),
+        Directory(calls, SYSTEM),
         EmberClient.fake(storage, radio.ember),
         talkgroups=(FIRE,),
         known=KNOWN,
@@ -1656,7 +2037,7 @@ def test_generated_calls_in_a_directory_are_heard_and_stored_as_a_stand_ins(
         f"{filed.stem}.json",
         f"{filed.stem}.wav",
     ]
-    assert (day / f"{filed.stem}.wav").read_bytes() == tone(1)
+    assert (day / f"{filed.stem}.wav").read_bytes() == tone(1, 6.5)
     # And the live store takes none of it.
     live = EvidenceStore(tmp_path / "live.sqlite3", "live")
     with pytest.raises(EvidenceStoreError, match="holds nothing a stand-in produced"):
@@ -1670,7 +2051,7 @@ def test_a_file_is_read_only_under_the_directory_whatever_names_it_is_asked_by(
     elsewhere = filed_at(1, seconds(-30))
     put(outside, elsewhere, tone(1))
     put(calls, filed_at(2, seconds(-20)), tone(2))
-    shelf = Directory(calls)
+    shelf = Directory(calls, SYSTEM)
     # A day that has become a link to a directory outside, since it was listed.
     day = calls / "sfd" / "2026" / "11"
     os.symlink(outside.joinpath("sfd", "2026", "11", "27"), day / "28")

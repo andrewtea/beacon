@@ -2,36 +2,57 @@
 
 **Beacon asks nobody for radio audio.** OpenMHz, which archives public-safety radio,
 was asked whether Beacon may use its API and said not to, so Beacon has no client
-for it and requests nothing from it, its recordings included. Broadcastify's terms
-require its license for any programmatic use, which Beacon does not have, so there
-is no client for it either. What is left is a recording somebody with the right to
-it has put on this machine: a directory of calls as
+for it and requests nothing from it (`beacon.ingest.http.fetch` refuses its
+addresses for every poller). Beacon has no license from Broadcastify, and has no
+client for it either. What is left is a recording somebody with the right to it has
+put on this machine: a directory of calls as
 [trunk-recorder](https://github.com/robotastic/trunk-recorder) leaves them, which is
 what a person who records a trunked system with a software-defined radio has.
 
     <directory>/<system>/<year>/<month>/<day>/<talkgroup>-<start>_<freq>-call_<n>.json
     <directory>/<system>/<year>/<month>/<day>/<talkgroup>-<start>_<freq>-call_<n>.wav
 
-One call is two files: its audio (WAV, or M4A or MP3 where trunk-recorder was set to
-compress) and a JSON file trunk-recorder writes when the call is over. Of the JSON
-Beacon reads `talkgroup`, `start_time` (seconds since 1970), `call_length` (or
-`stop_time`), `emergency`, and `encrypted`, and nothing else: not the radios that
-transmitted (`srcList`), which are never kept. The layout and the fields are read
-from trunk-recorder's source and documentation, and **no recording of real radio has
-been read by this code yet**: the mock scenario's calls and the tests' are generated.
+One call is two files: a JSON file and its audio (WAV, or M4A or MP3 where
+trunk-recorder was set to compress). What is known of them is read from
+trunk-recorder's source (`call_concluder.cc`, v5.2.1), and **no recording of real
+radio has been read by this code yet**: the mock scenario's calls and the tests' are
+generated.
 
-What a directory holds decides what its rows are (`Directory`, `RecordedRadio.origin`):
+- **The name.** `<start>` is the second the call began, with its milliseconds after
+  a dot since v5 (`1795809570.123`) and without before; `<freq>` can be followed by
+  a dot and a TDMA slot. A name says when the first transmission began, and the JSON
+  can say a later start, because transmissions too short to keep are dropped after
+  the name is made. So a call is found, ordered, and named in the evidence store by
+  its files' name, and its time is the JSON's, which has to lie within
+  `MAX_START_AFTER_NAME` of the name's.
+- **The JSON.** Beacon reads `talkgroup`, `start_time` and `start_time_ms`,
+  `call_length_ms` (or the rounded `call_length`), `emergency`, and `encrypted`, and
+  nothing else: not the radios that transmitted (`srcList`), which are never kept.
+- **The JSON is written before the audio.** So a call is ready only when its audio
+  is there, decodes, and plays about as long as its JSON says (`_whole`). Until
+  then it is not claimed and costs nothing, and is looked at again at a later poll.
+  How close "about" has to be is a guess until a real recording has been read.
+- **Talkgroup numbers are a system's own.** A reader is of one system, by the short
+  name its recorder gives it, and reads no other system's directory: the same
+  number is another channel there, and could be heard under the wrong EMS rule.
+
+What a shelf of calls is decides what its rows are (`Directory`, `RecordedRadio.origin`):
 
 - **A directory with no mark is taken to be recordings of real radio.** Its rows are
   `live`, and only a live Ember hears them. `beacon.ingest.setup` builds the poller
   for one only when `BEACON_RECORDINGS_PERMITTED=1` says the operator has the right
-  to use the recordings: made them, or has the permission of whoever did. A download
-  from a service whose terms forbid it is not that.
+  to use the recordings.
 - **A directory with the file `BEACON-GENERATED` at its top holds audio that was
   generated, and no radio.** Its rows are `mock` whoever hears them, so everything
   built on them says it is a stand-in's, and the live evidence store refuses them.
 - **Anything else that lists calls is a stand-in**, as the mock scenario's is, whose
   calls are tones: `mock` rows, heard by a stand-in for Ember and never by a paid one.
+
+A `Directory` is held open from when it is made: every listing and every file is
+reached from that one descriptor, each directory opened from the one above it and
+none through a symbolic link, so a directory put in its place later is not read.
+Whether it is marked is looked at then, and again at every listing; a directory
+whose answer has changed is not read any further.
 
 The poller reads the calls on the talkgroups it was given, has Ember hear each
 (`beacon.radio`), and stores one row for the call. What follows from what the audio is:
@@ -52,11 +73,13 @@ The poller reads the calls on the talkgroups it was given, has Ember hear each
   claimed. The claim is given up only when the request that costs money is known
   not to have been sent. The price of that rule is a call that is paid for and lost
   when the process dies between the answer and the row.
-- **Only what is worth hearing is paid for.** The poller hears the talkgroups it was
-  given and no others, at most `calls_per_poll` calls a poll, and passes over a call
-  that was encrypted, or is shorter than `MIN_CALL_SECONDS` or longer than
-  `MAX_CALL_SECONDS`, by its JSON first and then by how long the audio really
-  plays: every call is decoded before it is sent (`beacon.radio.audio`).
+- **Only what is ready and worth hearing is claimed.** The poller hears the
+  talkgroups it was given and no others, and passes over a call that was
+  encrypted, or is shorter than `MIN_CALL_SECONDS` or longer than
+  `MAX_CALL_SECONDS` by its JSON. A call whose JSON cannot be read, or
+  whose audio is not there, cannot be decoded, or does not play as long as its JSON
+  says, is counted as unreadable and left unclaimed: its files may not all be
+  written yet. Every call is decoded before it is sent (`beacon.radio.audio`).
 - **Trouble with Ember stops the poller, not the server.** When Ember refuses a call
   because of a spending stop, or fails on one, the poll ends there and the poller
   asks nothing for `HELD_INTERVAL_SECONDS`, counted from the failure and kept in the
@@ -65,19 +88,26 @@ The poller reads the calls on the talkgroups it was given, has Ember hear each
   for; after that hold one more such answer holds it again. When the Ember ledger
   was replaced under the process, the poller stops for the life of the process: an
   operator has to compare Meta's Usage page with the ledger first.
-- **A poller that follows a recorder hears what is new, and one that is given a
-  backlog hears all of it.** Following (the default), the first poll begins
+- **The listing is read in passes, a page at a time.** A page is the calls next
+  after a place in the order of start and name, so calls that share a second do not
+  hide one another. A poll reads the audio of no more than `calls_per_poll` calls
+  and reads no more than `MAX_PAGES` pages; one that has not reached the
+  end of the listing by then is `partial`, and the next poll of this process goes
+  on from that place, so every poll gets further. A day's directory with more
+  entries than `_MAX_DAY_ENTRIES` fails the poll and is not read in part.
+- **A poller that follows a recorder hears what is new.** Its first pass begins
   `OVERLAP` ago and a call older than `MAX_AGE` is passed over, so that lifting a
-  spending stop does not buy a backlog. With `backlog=True`, which is how a day of
-  recordings is run through, every call in the directory up to now is heard, oldest
-  first, however old.
-- **A call whose files turn up late is still heard.** trunk-recorder writes a call's
-  JSON when the call is over, and a copy from another machine can be later still,
-  so each poll reads again from `OVERLAP` before the newest call it has finished
-  with. The calls it has already taken are told apart by their names and cost
-  nothing. A call that turns up later than that is missed by a poller that follows.
-  A JSON file that cannot be read is counted and not claimed, so one that was being
-  written is read whole at a later poll.
+  spending stop does not buy a backlog. Each later pass begins `OVERLAP` before the
+  moment the one before ended, because a call's files turn up after the call: the
+  calls it has taken are told apart by their names and cost nothing, and a call
+  that was not ready is looked at again for as long as that reaches it. A call that
+  becomes ready later than that is missed.
+- **A poller that is given a backlog makes passes over everything there is**
+  (`backlog=True`, which is how a day of recordings is run through): oldest first,
+  however old. What a pass could not use it counts as unreadable and leaves
+  unclaimed, and every later pass looks at it again: nothing gives a call up, so a
+  run over a backlog is over when a pass ends that counted nothing unreadable, or
+  when its operator says so.
 - **Shutting down admits nothing new.** `close` closes the poller's Ember client
   and its converter. A call that was being read, converted, or counted is dropped
   unpaid, and waits for the next run. A call that Ember's client had already
@@ -88,12 +118,13 @@ The poller reads the calls on the talkgroups it was given, has Ember hear each
 
 import contextlib
 import errno
+import heapq
 import json
 import logging
 import os
 import re
 import stat
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Iterator
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -141,38 +172,62 @@ OVERLAP = timedelta(minutes=5)
 # tapping about it any more.
 MAX_AGE = timedelta(minutes=15)
 MAX_CALLS_PER_POLL = 20
-# The most calls one poll looks at. A poll with more to look at says it is partial,
-# and the next goes on from where this one got to.
+# The most calls one page of a listing holds, and the most pages one poll reads. A
+# poll that has not reached the end of the listing by then says it is partial, and
+# the next goes on from where this one got to.
 MAX_LISTED = 500
+MAX_PAGES = 20
 # A call shorter than this is a click of the microphone.
 MIN_CALL_SECONDS = 1.0
 MAX_CALL_SECONDS = float(MAX_AUDIO_SECONDS)
-# A decoder gives a clip a few hundredths of a second more or less than its JSON says.
+# How much later than its files' name a call's JSON may say it began: the name is
+# of the first transmission, and the short ones are dropped after it is made.
+MAX_START_AFTER_NAME = timedelta(hours=1)
+# A decoder gives a clip a few hundredths of a second more or less than its length.
 _LENGTH_SLACK_SECONDS = 0.5
+# How far the audio's length may be from the JSON's and still be that call, whole:
+# this much and a fiftieth of the length, and a second more when the JSON gives its
+# length only in whole seconds. Nobody has compared the two on a real recording.
+_ROUNDED_SLACK_SECONDS = 1.0
 
 # A call's JSON lists every radio that transmitted and every frequency used.
 _MAX_DETAILS_BYTES = 500_000
 # Two minutes of M4A is a few hundred kilobytes, and of WAV at 16 kHz, 3.8 MB.
 _MAX_AUDIO_BYTES = 4_000_000
-# The most entries of one day's directory that are looked at: a day of a busy
-# system is some thousands of calls, with two or three files each.
+# The most entries one day's directory may have: a day of a busy system is some
+# thousands of calls, with two or three files each. One with more is not read.
 _MAX_DAY_ENTRIES = 200_000
-# The most directories of days one listing opens.
-_MAX_DAYS = 800
 # trunk-recorder's short name for a system, which is the directory its calls are in.
 _SYSTEM = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,39}")
-# `<talkgroup>-<start>_<freq>-call_<n>`, as trunk-recorder names a call's files.
-_STEM = re.compile(r"(\d{1,8})-(\d{9,11})_(\d{1,12}(?:\.\d{1,6})?)-call_(\d{1,9})")
+# `<talkgroup>-<start>_<freq>-call_<n>`, as trunk-recorder names a call's files:
+# the start in seconds, with milliseconds after a dot since v5, and the frequency
+# in hertz, with a TDMA slot after a dot where there is one.
+_STEM = re.compile(r"(\d{1,8})-(\d{9,11})(?:\.\d{1,3})?_(\d{1,12}(?:\.\d{1,6})?)-call_(\d{1,9})")
 _NUMBER = re.compile(r"\d{1,4}")
 # The kinds of audio file a call can have, in the order they are looked for.
 _AUDIO_SUFFIXES = (".wav", ".m4a", ".mp3")
+# No recorder's own time is further from UTC than this, either way.
+_ZONE_REACH = timedelta(hours=14)
 # How well Ember says it heard a call decides how far the row is trusted. Ember's
 # own judgment of that is not measured yet, so nothing heard is more than `medium`.
 _CONFIDENCE: dict[str, Confidence] = {"clear": "medium", "partial": "low", "unintelligible": "low"}
 
+_UNLISTED = "is a directory Beacon could not list just now"
 _UNREADABLE = "has a recorded call Beacon could not read just now"
+_TOO_MANY = "has a day with more files than Beacon lists, and is not read in part"
+_CHANGED = (
+    "is a directory whose mark as generated audio has changed since Beacon began to "
+    "read it. Start Beacon again"
+)
+# Before every call there can be: the place a listing of everything begins after.
+BEGINNING: "Place" = (0, "")
 
 logger = logging.getLogger("beacon.ingest")
+
+# Where a call stands in a listing: the second it began, by its files' name, and
+# that name. A listing is in this order, and a page of one is asked for by the
+# place it comes after.
+Place = tuple[int, str]
 
 
 @dataclass(frozen=True)
@@ -194,17 +249,23 @@ class Filed:
         """What names the call in the evidence store, with `SOURCE`."""
         return f"{self.system}/{self.stem}"
 
+    @property
+    def place(self) -> Place:
+        return (self.start_s, self.stem)
+
 
 class Shelf(Protocol):
-    """Where recorded calls are: a directory on this machine (`Directory`), or a
-    stand-in for one, as the mock scenario and the tests have."""
+    """Where one system's recorded calls are: a directory on this machine
+    (`Directory`), or a stand-in for one, as the mock scenario and the tests have."""
 
     def listed(
-        self, after_s: int, upto_s: int, talkgroups: Collection[int], limit: int
+        self, after: Place, upto_s: int, talkgroups: Collection[int], limit: int
     ) -> tuple[list[Filed], bool]:
-        """The calls on `talkgroups` that began after `after_s` and no later than
-        `upto_s`, oldest first and at most `limit` of them, and whether there were
-        more than that or more than could be looked at."""
+        """The calls on `talkgroups` whose place is after `after` and that began no
+        later than `upto_s`, in order and at most `limit` of them, and whether
+        there are more.
+
+        Raises SourceError when the calls cannot be listed, or not all of them."""
         ...
 
     def details(self, call: Filed) -> bytes | None:
@@ -217,66 +278,125 @@ class Shelf(Protocol):
 
 
 class Directory:
-    """Recorded calls in a directory on this machine, as trunk-recorder leaves them.
+    """One system's recorded calls in a directory on this machine, as
+    trunk-recorder leaves them.
 
-    Nothing in it is changed. A file is read only when it is a regular file under
-    the directory that is reached through no symbolic link, and only up to a size a
-    call's file has."""
+    Nothing in it is changed. The directory is opened once, here, and held open:
+    everything is read from that descriptor on, each directory from the one above
+    it and none through a symbolic link, and a file only when it is a regular file
+    and no longer than a call's file is."""
 
-    def __init__(self, root: Path) -> None:
-        if not root.is_absolute() or not root.is_dir():
+    def __init__(self, root: Path, system: str) -> None:
+        """`root` is the directory trunk-recorder captures into, and `system` the
+        short name of the one system whose calls are read.
+
+        Raises ValueError when `root` is not the absolute path of a directory that
+        can be opened (a symbolic link to one is not taken), when `system` is no
+        short name, or when it cannot be told whether the directory is marked as
+        generated audio."""
+        if _SYSTEM.fullmatch(system) is None:
+            raise ValueError("A recorder's system is named by its short name.")
+        descriptor = -1
+        if root.is_absolute():
+            with contextlib.suppress(OSError):
+                descriptor = os.open(root, _DIRECTORY)
+        if descriptor < 0:
             raise ValueError("Recorded calls are in a directory, named by its absolute path.")
-        self._root = root
-        # Read once: a directory does not change what it is while it is read.
-        self.generated = _is_file(root / GENERATED_MARK)
+        self._root = descriptor
+        self._system = system
+        marked = _marked(descriptor)
+        if marked is None:
+            os.close(descriptor)
+            self._root = -1
+            raise ValueError(
+                f"It cannot be told whether the directory is marked {GENERATED_MARK}: "
+                "the mark is a regular file at its top, or is not there."
+            )
+        # Whether its audio was generated, and is no radio.
+        self.generated = marked
+
+    def __del__(self) -> None:
+        if getattr(self, "_root", -1) >= 0:
+            with contextlib.suppress(OSError):
+                os.close(self._root)
+
+    @property
+    def system(self) -> str:
+        return self._system
 
     def listed(
-        self, after_s: int, upto_s: int, talkgroups: Collection[int], limit: int
+        self, after: Place, upto_s: int, talkgroups: Collection[int], limit: int
     ) -> tuple[list[Filed], bool]:
-        # A day's directory is named in the recorder's own time zone, which is not
-        # in its name: a call is looked for a day to either side of its own.
-        first = _day_of(after_s) - timedelta(days=1)
-        last = _day_of(upto_s) + timedelta(days=1)
-        calls: list[Filed] = []
-        cut = False
-        opened = 0
+        if _marked(self._root) is not self.generated:
+            # What its rows are was decided by the mark, and is not decided again.
+            raise_bare(SourceError(SOURCE, _CHANGED))
+        problem = _UNLISTED
         try:
-            for system in _directories(self._root, _SYSTEM):
-                for year in _directories(self._root / system, _NUMBER):
-                    if not first.year <= int(year) <= last.year:
-                        continue
-                    for month in _directories(self._root / system / year, _NUMBER):
-                        for day in _directories(self._root / system / year / month, _NUMBER):
-                            when = _date(year, month, day)
-                            if when is None or not first <= when <= last:
-                                continue
-                            opened += 1
-                            if opened > _MAX_DAYS:
-                                cut = True
-                                continue
-                            where = self._root / system / year / month / day
-                            found, whole = _calls_of(
-                                where, system, (year, month, day), after_s, upto_s, talkgroups
-                            )
-                            calls += found
-                            cut = cut or not whole
+            return self._listed(after, upto_s, talkgroups, limit)
+        except _TooMany:
+            problem = _TOO_MANY
         except OSError:
             # Not the error itself, which names a path and would be chained.
             pass
-        else:
-            calls.sort(key=lambda call: (call.start_s, call.system, call.stem))
-            return calls[:limit], cut or len(calls) > limit
-        raise_bare(SourceError(SOURCE, "is a directory Beacon could not list just now"))
+        raise_bare(SourceError(SOURCE, problem))
+
+    def _listed(
+        self, after: Place, upto_s: int, talkgroups: Collection[int], limit: int
+    ) -> tuple[list[Filed], bool]:
+        # A day's directory is named in the recorder's own time zone, which is not
+        # in its name: a call is looked for a day to either side of its own.
+        first = _day_of(after[0]) - timedelta(days=1)
+        last = _day_of(upto_s) + timedelta(days=1)
+        found: list[Filed] = []
+        with _opened(self._root, self._system) as system:
+            if system < 0:
+                return [], False
+            for when, names in _days(system):
+                if not first <= when <= last:
+                    continue
+                if len(found) > limit and _earliest_in(when) > found[-1].start_s:
+                    # Nothing in this day's directory or a later one comes before
+                    # the calls that are already more than a page.
+                    break
+                with _opened(system, *names) as day:
+                    if day < 0:
+                        continue
+                    found += _calls_of(day, self._system, names, after, upto_s, talkgroups)
+                # Kept to a page and one more, whatever a day holds.
+                found = heapq.nsmallest(limit + 1, found, key=lambda call: call.place)
+        return found[:limit], len(found) > limit
 
     def details(self, call: Filed) -> bytes | None:
-        return _read(self._root, call, ".json", _MAX_DETAILS_BYTES)
+        return self._read(call, ".json", _MAX_DETAILS_BYTES)
 
     def audio(self, call: Filed) -> bytes | None:
         for suffix in _AUDIO_SUFFIXES:
-            audio = _read(self._root, call, suffix, _MAX_AUDIO_BYTES)
+            audio = self._read(call, suffix, _MAX_AUDIO_BYTES)
             if audio is not None:
                 return audio
         return None
+
+    def _read(self, call: Filed, suffix: str, most: int) -> bytes | None:
+        """One of a call's files, or None when it is not there, is no regular file,
+        is reached through a symbolic link, or is longer than `most`.
+
+        Raises SourceError when it is there and could not be read, which may pass."""
+        if call.system != self._system or filed_as(call.system, call.day, call.stem) != call:
+            # Not a call a listing of this directory gives.
+            return None
+        failed = False
+        body: bytes | None = None
+        try:
+            with _opened(self._root, call.system, *call.day) as day:
+                if day >= 0:
+                    body = _file(day, f"{call.stem}{suffix}", most)
+        except OSError:
+            # Not the error itself, which names a path: it is not chained, and what
+            # is raised is raised outside this handler.
+            failed = True
+        if failed:
+            raise_bare(SourceError(SOURCE, _UNREADABLE))
+        return body
 
 
 @dataclass(frozen=True)
@@ -286,8 +406,11 @@ class Call:
     ref: str
     system: str
     talkgroup: int
+    # When it began, by its JSON, which can be later than its files' name says.
     time: datetime
     seconds: float
+    # Whether the JSON gave its length to the millisecond, or in whole seconds.
+    exact: bool
     # Whether a radio's emergency button was pressed during it.
     emergency: bool
     # Whether it was encrypted, so that its audio is noise.
@@ -296,6 +419,7 @@ class Call:
 
     @property
     def time_s(self) -> int:
+        """Where it stands in a listing, which is by its files' name."""
         return self.filed.start_s
 
 
@@ -304,7 +428,8 @@ class _Progress(Hold):
     """What the poller remembers between polls, in the evidence store: how it
     stands with Ember (`Hold`), and how far it has got."""
 
-    # The start, in seconds since 1970, of the newest call it has finished with.
+    # The start, in seconds since 1970 and by its files' name, of the newest call a
+    # poller that follows a recorder has finished with.
     after_s: int = 0
 
     def as_state(self) -> dict[str, Any]:
@@ -328,17 +453,18 @@ class RecordedRadio:
         transcoder: Transcoder | None = None,
         wall_clock: Callable[[], datetime] | None = None,
     ) -> None:
-        """`shelf` is where the calls are. `talkgroups` are the channels to hear,
-        by the recorder's numbers, and `ems_talkgroups` the ones among them that
-        carry EMS traffic only: every call on one is kept as a medical response,
-        whatever Ember makes of it. `known` lists the units and the streets a row
-        may name. `backlog` has every call on the shelf heard, however old, where a
-        poller otherwise follows a recorder and passes over what is older than
-        `MAX_AGE`; `calls_per_poll` is the most calls one poll hears. `transcoder`
-        decodes a call that is M4A or MP3; without one only a WAV call is heard, and
-        any other is counted as unreadable. `wall_clock` is the time a hold is
-        counted by, which is the real time even while the mock scenario is played on
-        a clock of its own.
+        """`shelf` is where one system's calls are. `talkgroups` are the channels
+        to hear, by that system's numbers, and `ems_talkgroups` the ones among them
+        that carry EMS traffic only: every call on one is kept as a medical
+        response, whatever Ember makes of it. `known` lists the units and the
+        streets a row may name. `backlog` has the poller make passes over every
+        call on the shelf, however old, where it otherwise follows a recorder and
+        passes over what is older than `MAX_AGE`; `calls_per_poll` is the most
+        calls whose audio one poll reads, and so the most it has Ember hear.
+        `transcoder` decodes a call that is M4A or MP3; without one only a WAV
+        call is heard, and any other is counted as unreadable. `wall_clock` is the
+        time a hold is counted by, which is the real time even while the mock
+        scenario is played on a clock of its own.
 
         `ember` is closed with the poller (`close`), so it is a client of the
         poller's own."""
@@ -349,9 +475,9 @@ class RecordedRadio:
         if isinstance(calls_per_poll, bool) or not 1 <= calls_per_poll <= MAX_LISTED:
             raise ValueError(f"A poll hears from 1 to {MAX_LISTED} calls.")
         self._shelf = shelf
-        self._origin: Origin = _origin_of(shelf)
-        hearers = _HEARERS[_kind_of(shelf)]
-        if ember.mode not in hearers:
+        kind = _kind_of(shelf)
+        self._origin: Origin = "live" if kind == "recorded" else "mock"
+        if ember.mode not in _HEARERS[kind]:
             # Real radio is not handed to a stand-in for Ember, whose answer would
             # be an invention about a real call, and a real Ember is not paid to
             # hear a stand-in's tones. Generated speech can be heard by either: a
@@ -371,6 +497,10 @@ class RecordedRadio:
         self._backlog = backlog
         self._calls_per_poll = calls_per_poll
         self._transcoder = transcoder
+        # How far the pass over the listing that is under way has got, or None
+        # when the next poll begins one. It is not kept: a new process begins a
+        # pass, and what was claimed costs it nothing.
+        self._pass_at: Place | None = None
         # What every poller that pays Ember keeps to: `beacon.ingest.paid`.
         self._paid = PaidDesk(
             ember, poller="radio", items="calls", scope=SCOPE, wall_clock=wall_clock
@@ -379,7 +509,7 @@ class RecordedRadio:
     @property
     def origin(self) -> Origin:
         """Where this poller's rows come from, which is what its shelf is and cannot
-        be set: `live` only for a directory on this machine that is not marked as
+        be set: `live` only for a `Directory` on this machine that is not marked as
         generated."""
         return self._origin
 
@@ -404,84 +534,111 @@ class RecordedRadio:
         progress = self._progress(saved, now)
         self._paid.check(progress)
         now_s = int(now.timestamp())
-        # From `OVERLAP` before the newest call the poller has finished with. The
-        # very first poll, which has nothing behind it to read again, begins at
-        # that moment itself.
-        begin_s = progress.after_s if not saved else progress.after_s - _seconds(OVERLAP)
+        # A pass over the listing goes on where the poll before left it, so that
+        # every poll gets further, and a new one begins when that one has ended.
+        if self._pass_at is not None:
+            after = self._pass_at
+        elif self._backlog:
+            after = BEGINNING
+        else:
+            # From `OVERLAP` before where the last pass got to. The very first
+            # poll, which has nothing behind it to read again, begins where its
+            # progress does.
+            behind = 0 if not saved else _seconds(OVERLAP)
+            after = (progress.after_s - behind, "")
         if not self._backlog:
-            begin_s = max(begin_s, now_s - _seconds(MAX_AGE))
-        filed, more_listed = self._shelf.listed(begin_s, now_s, self._talkgroups, MAX_LISTED)
-        if more_listed and max((call.start_s for call in filed), default=0) <= progress.after_s:
-            # The overlap alone holds more calls than a poll looks at. The rest of
-            # it is not read this time, and the poll goes on from where the poller
-            # had got to, so that it always moves forward: from the second of the
-            # newest call it finished with, which other calls can share.
-            begin_s = progress.after_s - 1
-            filed, more_listed = self._shelf.listed(begin_s, now_s, self._talkgroups, MAX_LISTED)
-        # A stand-in may list what it was not asked for; a call is never heard
-        # before its time or on a talkgroup that is not heard.
-        filed = [
-            call
-            for call in filed
-            if begin_s < call.start_s <= now_s and call.talkgroup in self._talkgroups
-        ]
-        taken = store.taken(SOURCE, [call.ref for call in filed])
-        unreadable = 0
-        waiting: list[Call] = []
-        for one in filed:
-            if one.ref in taken:
-                continue
-            call = self._details(one)
-            if call is None:
-                # Not claimed: a file that was still being written is read whole
-                # at a later poll, for as long as the overlap reaches it.
-                unreadable += 1
-            elif not call.encrypted and MIN_CALL_SECONDS <= call.seconds <= MAX_CALL_SECONDS:
-                # A call that is encrypted, or too short or too long by its JSON,
-                # is passed over here, and takes no place among the calls a poll
-                # may hear.
-                waiting.append(call)
-        added = 0
-        for call in waiting[: self._calls_per_poll]:
-            # Free, and done before the claim: a call whose audio cannot be read
-            # just now is not claimed, and waits for the next poll.
-            audio = self._audio(call)
-            if not store.claim(SOURCE, call.ref, now=now):
-                # Another process took it between the listing and now.
-                continue
-            # From here to the row, a shutdown waits (`drain`). A shutdown that
-            # falls between the claim and here finds a closed Ember, and at worst
-            # the claim cannot be given up: the call is lost, and nothing was paid.
-            with self._paid.working():
-                heard = None
-                if audio is not None:
-                    heard = self._hear(store, call, audio, progress, now)
-                progress.after_s = max(progress.after_s, call.time_s)
-                if heard is None:
-                    unreadable += 1
-                    continue
-                # The row and what the poller remembers are saved together.
-                state = (self.name, progress.as_state())
-                added += len(store.add([self._row(call, heard)], state=state, now=now))
-        more_waiting = len(waiting) > self._calls_per_poll
-        if not more_waiting:
-            # Everything that was looked at is finished with, the calls passed over
-            # included: up to now, or up to the last call listed when there were
-            # more than a poll looks at.
-            reached_s = max((call.start_s for call in filed), default=begin_s)
-            progress.after_s = max(progress.after_s, reached_s if more_listed else now_s)
+            # Never further back than `MAX_AGE`, however long a pass has taken.
+            after = max(after, (now_s - _seconds(MAX_AGE), ""))
+        added = unreadable = worked = 0
+        ended = False
+        for _ in range(MAX_PAGES):
+            page, more = self._shelf.listed(after, now_s, self._talkgroups, MAX_LISTED)
+            # In order, after the place asked about, and nothing else: a stand-in
+            # may list what it was not asked for, and a call is never heard before
+            # its time or on a talkgroup that is not heard.
+            page = sorted(
+                (
+                    call
+                    for call in page
+                    if call.place > after
+                    and call.start_s <= now_s
+                    and call.talkgroup in self._talkgroups
+                ),
+                key=lambda call: call.place,
+            )
+            taken = store.taken(SOURCE, [call.ref for call in page])
+            full = False
+            for filed in page:
+                if filed.ref not in taken:
+                    if worked >= self._calls_per_poll:
+                        # This one and the ones after it wait for the next poll.
+                        full = True
+                        break
+                    outcome = self._take(store, filed, progress, now)
+                    # A call that is passed over by what its JSON says cost a
+                    # small file's reading, and takes no place in the poll.
+                    worked += outcome != "passed"
+                    added += outcome == "stored"
+                    unreadable += outcome in ("not ready", "nothing")
+                after = filed.place
+            if full or not more or not page:
+                ended = not full and not more
+                break
+        # At the end of a pass the next begins again, with what was not ready.
+        self._pass_at = None if ended else after
+        if not self._backlog:
+            # Everything up to here was looked at: up to now, when the listing was
+            # read to its end.
+            progress.after_s = max(progress.after_s, now_s if ended else after[0])
         store.add([], state=(self.name, progress.as_state()), now=now)
-        return PollReport(added=added, unreadable=unreadable, partial=more_waiting or more_listed)
+        return PollReport(added=added, unreadable=unreadable, partial=not ended)
+
+    def _take(self, store: EvidenceStore, filed: Filed, progress: _Progress, now: datetime) -> str:
+        """Look at one call that is not taken, and have Ember hear it when it is
+        ready and worth hearing. Says what came of it: `passed` when nothing was
+        asked of Ember and nothing is wrong (not worth hearing, not yet its time,
+        or another process's), `not ready` when its files cannot be used as they
+        are and it is left unclaimed, and, for a call Ember was asked about,
+        `stored` or `nothing`.
+
+        Raises what `_audio` and `_hear` raise, which ends the poll."""
+        call = self._details(filed)
+        if call is None:
+            return "not ready"
+        if call.encrypted or not MIN_CALL_SECONDS <= call.seconds <= MAX_CALL_SECONDS:
+            return "passed"
+        if call.time > now:
+            return "passed"
+        # Free, and done before the claim: a call whose audio is not whole yet is
+        # not claimed, and is looked at again.
+        audio = self._audio(call)
+        if audio is None:
+            return "not ready"
+        if not store.claim(SOURCE, call.ref, now=now):
+            # Another process took it between the listing and now.
+            return "passed"
+        # From here to the row, a shutdown waits (`drain`). A shutdown that falls
+        # between the claim and here finds a closed Ember, and at worst the claim
+        # cannot be given up: the call is lost, and nothing was paid.
+        with self._paid.working():
+            said = self._hear(store, call, audio, progress, now)
+            progress.after_s = max(progress.after_s, call.time_s)
+            if said is None:
+                return "nothing"
+            # The row and what the poller remembers are saved together.
+            state = (self.name, progress.as_state())
+            store.add([self._row(call, said)], state=state, now=now)
+        return "stored"
 
     def _progress(self, saved: dict[str, Any], now: datetime) -> _Progress:
         """What the poller saved last. With nothing saved, a poller that follows a
         recorder begins `OVERLAP` ago, so the first poll hears the calls of the last
         few minutes and not the archive, and it never goes back further than
-        `MAX_AGE`; one that is given a backlog begins with the oldest call there is."""
+        `MAX_AGE`. A poller with a backlog keeps no place between runs."""
         now_s = int(now.timestamp())
         after_s = saved.get("after_s")
         if isinstance(after_s, bool) or not isinstance(after_s, int) or after_s < 0:
-            after_s = 0 if self._backlog else now_s - _seconds(OVERLAP)
+            after_s = now_s - _seconds(OVERLAP)
         if not self._backlog:
             after_s = max(after_s, now_s - _seconds(MAX_AGE))
         held_until, unusable_run = read_hold(saved)
@@ -493,9 +650,10 @@ class RecordedRadio:
         return None if body is None else parse_details(body, filed)
 
     def _audio(self, call: Call) -> bytes | None:
-        """A call's audio as a WAV file Beacon made, or None for a call that is
-        passed over for good: its audio is not there, is not audio Beacon can
-        decode, or does not play for as long as a call that is worth hearing.
+        """A call's audio as a WAV file Beacon made, or None when it is not there
+        to be heard as it is: its audio is missing, is not audio Beacon can decode,
+        or does not play as long as the call's JSON says, which is so of a file
+        that is still being written.
 
         Raises SourceError when the audio could not be read, or converted on this
         host, for a reason that may pass, and ConversionStopped when the poller was
@@ -520,12 +678,12 @@ class RecordedRadio:
             # The host could not run the converter. That is nothing about the
             # call, which is not passed over: the poll ends, and is made again.
             raise_bare(SourceError(SOURCE, "calls could not be converted on this host just now"))
-        # How long it really plays, whatever its JSON said: that is what is paid for.
+        # How long it really plays: that is what is paid for.
         played = wav_seconds(wav)
         longest = MAX_CALL_SECONDS + _LENGTH_SLACK_SECONDS
         if played is None or not MIN_CALL_SECONDS - _LENGTH_SLACK_SECONDS <= played <= longest:
             return None
-        return wav
+        return wav if _whole(played, call) else None
 
     def _hear(
         self, store: EvidenceStore, call: Call, wav: bytes, progress: _Progress, now: datetime
@@ -621,22 +779,28 @@ class RecordedRadio:
 
 def parse_details(body: bytes, filed: Filed) -> Call | None:
     """The call a JSON file of trunk-recorder's describes, or None when it is not
-    one Beacon can read: no JSON object, no length, or a talkgroup or a start that
-    is not what the file's name says. Nothing of it is kept but what `Call` holds."""
+    one Beacon can read: no JSON object, no length, a talkgroup that is not the one
+    its files' name gives, or a start that is before the name's or more than
+    `MAX_START_AFTER_NAME` after it. Nothing of it is kept but what `Call` holds."""
     try:
         said = json.loads(body)
     except (ValueError, RecursionError):
         return None
     if not isinstance(said, dict):
         return None
-    if said.get("talkgroup") != filed.talkgroup or said.get("start_time") != filed.start_s:
+    talkgroup = said.get("talkgroup")
+    if isinstance(talkgroup, bool) or talkgroup != filed.talkgroup:
         return None
-    if isinstance(said["talkgroup"], bool) or isinstance(said["start_time"], bool):
+    start = _start(said)
+    late = None if start is None else start - filed.start_s
+    # A second of leave before the name's start: the name's is cut to the second.
+    if late is None or not -1 <= late <= MAX_START_AFTER_NAME.total_seconds():
         return None
-    seconds = said.get("call_length")
+    exact = _is_count(said.get("call_length_ms"))
+    seconds = said["call_length_ms"] / 1000 if exact else said.get("call_length")
     if not _is_seconds(seconds):
         stop = said.get("stop_time")
-        seconds = stop - filed.start_s if _is_seconds(stop) else None
+        seconds = stop - start if _is_seconds(stop) else None
     if not _is_seconds(seconds):
         return None
     emergency, encrypted = said.get("emergency", 0), said.get("encrypted", 0)
@@ -646,8 +810,9 @@ def parse_details(body: bytes, filed: Filed) -> Call | None:
         ref=filed.ref,
         system=filed.system,
         talkgroup=filed.talkgroup,
-        time=datetime.fromtimestamp(filed.start_s, UTC),
+        time=datetime.fromtimestamp(start, UTC),
         seconds=float(seconds),
+        exact=exact,
         emergency=bool(emergency),
         encrypted=bool(encrypted),
         filed=filed,
@@ -675,120 +840,174 @@ _HEARERS = {
 
 
 def _kind_of(shelf: Shelf) -> str:
-    if not isinstance(shelf, Directory):
+    """What a shelf's calls are. Only `Directory` itself reads a directory on this
+    machine: anything else, a class made from it included, is a stand-in, whose
+    calls are no recording however they are read, and there is no way to say
+    otherwise."""
+    if type(shelf) is not Directory:
         return "stand-in"
     return "generated" if shelf.generated else "recorded"
 
 
-def _origin_of(shelf: Shelf) -> Origin:
-    """`live` for a directory on this machine that is not marked as generated, and
-    `mock` for everything else: what a stand-in lists is not a recording however it
-    is read, and there is no way to say otherwise."""
-    return "live" if _kind_of(shelf) == "recorded" else "mock"
+def _whole(played: float, call: Call) -> bool:
+    """Whether audio that plays for `played` seconds is the call its JSON
+    describes, all of it."""
+    slack = _LENGTH_SLACK_SECONDS + call.seconds / 50
+    if not call.exact:
+        slack += _ROUNDED_SLACK_SECONDS
+    return abs(played - call.seconds) <= slack
 
 
-def _calls_of(
-    where: Path,
-    system: str,
-    day: tuple[str, str, str],
-    after_s: int,
-    upto_s: int,
-    talkgroups: Collection[int],
-) -> tuple[list[Filed], bool]:
-    """The calls of one day's directory that are asked for, by their JSON files'
-    names, and whether every entry of the directory was looked at."""
-    calls: list[Filed] = []
-    looked = 0
-    with os.scandir(where) as entries:
-        for entry in entries:
-            looked += 1
-            if looked > _MAX_DAY_ENTRIES:
-                return calls, False
-            if not entry.name.endswith(".json"):
-                continue
-            filed = filed_as(system, day, entry.name[:-5])
-            if filed is None or filed.talkgroup not in talkgroups:
-                continue
-            if not after_s < filed.start_s <= upto_s:
-                continue
-            if entry.is_file(follow_symlinks=False):
-                calls.append(filed)
-    return calls, True
+def _start(said: dict[str, Any]) -> float | None:
+    """When a call's JSON says it began, in seconds since 1970: to the millisecond
+    where it says so, and else to the second."""
+    start_ms, start = said.get("start_time_ms"), said.get("start_time")
+    if _is_count(start_ms):
+        return start_ms / 1000
+    return float(start) if _is_count(start) else None
 
 
-def _directories(where: Path, named: re.Pattern[str]) -> list[str]:
-    """The names of the directories in `where` that are named so, and are no
-    symbolic links. Raises OSError when `where` cannot be listed."""
-    with os.scandir(where) as entries:
-        return sorted(
-            entry.name
-            for entry in entries
-            if named.fullmatch(entry.name) and entry.is_dir(follow_symlinks=False)
-        )
+class _TooMany(Exception):
+    """A day's directory has more entries than are looked at."""
 
 
-# What opening a file fails with when it, or a directory on the way to it, is not
+# How a directory is opened: for reading, as a directory, and not through a link.
+_DIRECTORY = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+# What opening fails with when a file, or a directory on the way to it, is not
 # there, is no directory, or is a symbolic link.
 _NOT_THERE = (errno.ENOENT, errno.ENOTDIR, errno.ELOOP)
 
 
-def _read(root: Path, call: Filed, suffix: str, most: int) -> bytes | None:
-    """One of a call's files, or None when it is not there, is no regular file, is
-    reached through a symbolic link, or is longer than `most`: a call with such a
-    file is passed over. Each directory on the way is opened from the one above
-    it, and none through a link, so the file read is under `root`.
+@contextlib.contextmanager
+def _opened(above: int, *names: str) -> Iterator[int]:
+    """A descriptor for the directory `names` lead to from the open directory
+    `above`, each opened from the one before it and none through a symbolic link,
+    or -1 when one of them is not there or is no directory. It is closed after.
 
-    Raises SourceError when it is there and could not be read, which may pass."""
-    if filed_as(call.system, call.day, call.stem) != call:
-        # Not a name a listing of a directory gives.
-        return None
-    failed = False
+    Raises OSError for any other failure."""
     descriptor = -1
-    body: bytes | None = None
     try:
-        descriptor = _open_under(root, (call.system, *call.day), f"{call.stem}{suffix}")
-        # Looked at before it is read: a directory opens, and is no file.
-        if descriptor >= 0 and stat.S_ISREG(os.fstat(descriptor).st_mode):
-            with os.fdopen(descriptor, "rb") as file:
-                descriptor = -1
-                body = file.read(most + 1)
+        for name in names:
+            below = os.open(name, _DIRECTORY, dir_fd=above if descriptor < 0 else descriptor)
+            if descriptor >= 0:
+                os.close(descriptor)
+            descriptor = below
+    except OSError as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        descriptor = -1
+        if error.errno not in _NOT_THERE:
+            raise
+        yield -1
+        return
+    try:
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def _marked(root: int) -> bool | None:
+    """Whether the open directory has the mark of generated audio at its top: True
+    for a regular file of that name, False when nothing has the name, and None
+    when it cannot be told, which is any other thing of that name and any failure
+    to look."""
+    try:
+        found = os.stat(GENERATED_MARK, dir_fd=root, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
     except OSError:
-        # Not the error itself, which names a path: it is not chained, and what is
-        # raised is raised outside this handler.
-        failed = True
+        return None
+    return True if stat.S_ISREG(found.st_mode) else None
+
+
+def _days(system: int) -> list[tuple[date, tuple[str, str, str]]]:
+    """The directories of days under a system's open directory, in the order of
+    their dates, each with the names that lead to it. Raises OSError."""
+    days: list[tuple[date, tuple[str, str, str]]] = []
+    for year in _directories(system):
+        with _opened(system, year) as of_year:
+            for month in _directories(of_year) if of_year >= 0 else []:
+                with _opened(of_year, month) as of_month:
+                    for day in _directories(of_month) if of_month >= 0 else []:
+                        when = _date(year, month, day)
+                        if when is not None:
+                            days.append((when, (year, month, day)))
+    return sorted(days)
+
+
+def _directories(where: int) -> list[str]:
+    """The names of the directories in an open directory that are numbers, and are
+    no symbolic links. Raises OSError when it cannot be listed."""
+    with os.scandir(where) as entries:
+        return [
+            entry.name
+            for entry in entries
+            if _NUMBER.fullmatch(entry.name) and entry.is_dir(follow_symlinks=False)
+        ]
+
+
+def _calls_of(
+    day: int,
+    system: str,
+    names: tuple[str, str, str],
+    after: Place,
+    upto_s: int,
+    talkgroups: Collection[int],
+) -> list[Filed]:
+    """The calls of one day's open directory that are asked for, by their JSON
+    files' names.
+
+    Raises _TooMany when the directory has more entries than are looked at: a part
+    of it is not an answer, and OSError when it cannot be listed."""
+    calls: list[Filed] = []
+    looked = 0
+    with os.scandir(day) as entries:
+        for entry in entries:
+            looked += 1
+            if looked > _MAX_DAY_ENTRIES:
+                raise _TooMany
+            if not entry.name.endswith(".json"):
+                continue
+            filed = filed_as(system, names, entry.name[:-5])
+            if filed is None or filed.talkgroup not in talkgroups:
+                continue
+            if filed.place <= after or filed.start_s > upto_s:
+                continue
+            if entry.is_file(follow_symlinks=False):
+                calls.append(filed)
+    return calls
+
+
+def _file(directory: int, name: str, most: int) -> bytes | None:
+    """The bytes of a file in an open directory, or None when it is not there, is
+    a symbolic link or no regular file, or is longer than `most`. Raises OSError
+    when it is there and cannot be read."""
+    try:
+        descriptor = os.open(
+            name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
+        )
+    except OSError as error:
+        if error.errno in _NOT_THERE:
+            return None
+        raise
+    try:
+        # Looked at before it is read: a directory opens, and is no file.
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        with os.fdopen(descriptor, "rb") as file:
+            descriptor = -1
+            body = file.read(most + 1)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-    if failed:
-        raise_bare(SourceError(SOURCE, _UNREADABLE))
-    return body if body is not None and len(body) <= most else None
+    return body if len(body) <= most else None
 
 
-def _open_under(root: Path, directories: tuple[str, ...], name: str) -> int:
-    """A descriptor for the file `name` in the directories under `root`, or -1 when
-    it or one of them is not there or is a symbolic link. Raises OSError for any
-    other failure."""
-    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
-    where = os.open(root, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
-    try:
-        for directory in directories:
-            below = os.open(directory, flags | os.O_DIRECTORY, dir_fd=where)
-            os.close(where)
-            where = below
-        return os.open(name, flags | os.O_NONBLOCK, dir_fd=where)
-    except OSError as error:
-        if error.errno in _NOT_THERE:
-            return -1
-        raise
-    finally:
-        os.close(where)
-
-
-def _is_file(path: Path) -> bool:
-    try:
-        return stat.S_ISREG(os.lstat(path).st_mode)
-    except OSError:
-        return False
+def _earliest_in(day: date) -> int:
+    """The earliest second a call filed under a day can have begun, wherever its
+    recorder keeps its clock."""
+    midnight = datetime(day.year, day.month, day.day, tzinfo=UTC)
+    return int((midnight - _ZONE_REACH).timestamp())
 
 
 def _date(year: str, month: str, day: str) -> date | None:
@@ -803,6 +1022,10 @@ def _day_of(moment_s: int) -> date:
         return datetime.fromtimestamp(moment_s, UTC).date()
     except (OverflowError, OSError, ValueError):
         return date.max - timedelta(days=1) if moment_s > 0 else date.min + timedelta(days=1)
+
+
+def _is_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 10**14
 
 
 def _is_seconds(value: Any) -> bool:

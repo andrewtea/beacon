@@ -18,7 +18,7 @@ import pytest
 
 from beacon.ingest import http as source_http
 from beacon.ingest.adsblol import parse_aircraft
-from beacon.ingest.http import SourceError, SourceHttp, fetch, read_json
+from beacon.ingest.http import SourceError, SourceHttp, fetch, never_asked, read_json
 from beacon.ingest.nws import parse_alerts
 from beacon.ingest.traffic511 import parse_events
 
@@ -217,6 +217,57 @@ def test_a_redirect_is_reported_and_not_followed(server: Server) -> None:
         get(server)
 
     assert server.paths == [f"/traffic/events?api_key={TOKEN}"]
+
+
+@pytest.mark.parametrize(
+    ("address", "refused"),
+    [
+        ("https://api.openmhz.com/sfp25/calls", True),
+        ("https://openmhz.com", True),
+        ("https://OpenMHz.com./", True),
+        ("https://media.openmhz.com:443/a/b.m4a?x=1", True),
+        ("https://user@s3.broadcastify.com/calls", True),
+        ("api.openmhz.com", True),
+        ("Broadcastify.com", True),
+        # Another service whose name only ends the same way, and one that names it
+        # somewhere that is not its host.
+        ("https://notopenmhz.com/", False),
+        ("https://openmhz.com.example.org/", False),
+        ("https://example.org/openmhz.com", False),
+        ("https://api.weather.gov/alerts", False),
+        ("", False),
+        ("https://[", False),
+    ],
+)
+def test_the_services_beacon_requests_nothing_from_are_told_by_their_names(
+    address: str, refused: bool
+) -> None:
+    assert never_asked(address) is refused
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["https://api.openmhz.com/sfp25/calls", "https://calls.broadcastify.com/api/v1/calls"],
+)
+def test_no_poller_sends_a_request_to_a_service_beacon_requests_nothing_from(address: str) -> None:
+    sent: list[httpx2.Request] = []
+
+    def answer(request: httpx2.Request) -> httpx2.Response:
+        sent.append(request)
+        return httpx2.Response(200, json={})
+
+    http = SourceHttp(httpx2.MockTransport(answer))
+
+    with pytest.raises(SourceError) as failure:
+        fetch(http, "GET", address, source="notices", max_bytes=1_000)
+
+    http.close()
+    # Refused before anything was sent, in a sentence that names no address.
+    assert sent == []
+    assert str(failure.value) == (
+        "notices names an address of a service Beacon requests nothing from, and was not asked."
+    )
+    assert (failure.value.__context__, failure.value.__cause__) == (None, None)
 
 
 def _everything_under(error: BaseException) -> list[BaseException]:

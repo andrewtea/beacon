@@ -36,6 +36,7 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx2
 
@@ -373,11 +374,16 @@ def fetch(
     `read_body=False` the reply's status is the whole answer: a 2xx reply returns
     nothing as soon as its status is read, and its body is not read at all.
 
+    An address of a service Beacon asks nothing (`never_asked`) is refused here,
+    before anything is sent, whichever poller asks and whoever named the address.
+
     Raises SourceError when the source cannot be reached, answers with anything but
     2xx, sends more than `max_bytes`, packs its reply in a way Beacon does not read
     or does not finish it, takes longer than `max_seconds` (`MAX_SECONDS` when none
     is given) over the whole exchange, or when the client is closed, before or
     during the exchange."""
+    if never_asked(url):
+        raise_bare(SourceError(source, _NEVER_ASKED))
     outcome = http._run(
         http._exchange(
             method,
@@ -396,6 +402,27 @@ def fetch(
     if isinstance(outcome, SourceError):
         raise_bare(outcome)
     return outcome
+
+
+# The services Beacon requests nothing from, by domain: OpenMHz, which was asked
+# whether Beacon may use its API and said not to, and Broadcastify, from which Beacon
+# has no license. Every subdomain of one is the service's too.
+NEVER_ASKED_DOMAINS = ("openmhz.com", "broadcastify.com")
+_NEVER_ASKED = "names an address of a service Beacon requests nothing from, and was not asked"
+
+
+def never_asked(address: str) -> bool:
+    """Whether an address, or a bare host name, is of a service Beacon requests
+    nothing from. It goes by the name: a host that is named by a number, or by
+    another name for the same machine, is not known to be one."""
+    try:
+        host = urlsplit(address if "//" in address else f"//{address}").hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    host = host.rstrip(".").lower()
+    return any(host == domain or host.endswith(f".{domain}") for domain in NEVER_ASKED_DOMAINS)
 
 
 def read_json(body: bytes, source: str) -> Any:

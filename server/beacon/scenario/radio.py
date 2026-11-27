@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from beacon.ember import fake_response
-from beacon.ingest.recordings import Filed
+from beacon.ingest.recordings import Filed, Place
 from beacon.radio.vocabulary import Known
 
 # What the story's recorder calls its system: the directory its calls would be in.
@@ -244,7 +244,7 @@ class StoryShelf:
         self._now = now
 
     def listed(
-        self, after_s: int, upto_s: int, talkgroups: Collection[int], limit: int
+        self, after: Place, upto_s: int, talkgroups: Collection[int], limit: int
     ) -> tuple[list[Filed], bool]:
         at = self._now()
         calls = [
@@ -252,9 +252,10 @@ class StoryShelf:
             for index, call in enumerate(CALLS)
             if self._time(index) <= at
             and call.talkgroup in talkgroups
-            and after_s < (filed := self._filed(index)).start_s <= upto_s
+            and (filed := self._filed(index)).place > after
+            and filed.start_s <= upto_s
         ]
-        calls.sort(key=lambda filed: (filed.start_s, filed.stem))
+        calls.sort(key=lambda filed: filed.place)
         return calls[:limit], len(calls) > limit
 
     def details(self, call: Filed) -> bytes | None:
@@ -267,9 +268,12 @@ class StoryShelf:
                 "freq": _FREQUENCY,
                 "start_time": start_s,
                 "stop_time": start_s + math.ceil(made.seconds),
+                "start_time_ms": start_s * 1000,
+                "stop_time_ms": start_s * 1000 + round(made.seconds * 1000),
                 "emergency": 0,
                 "encrypted": 0,
-                "call_length": made.seconds,
+                "call_length": round(made.seconds),
+                "call_length_ms": round(made.seconds * 1000),
                 "talkgroup": made.talkgroup,
                 "talkgroup_tag": "",
                 "audio_type": "digital",
@@ -292,7 +296,7 @@ class StoryShelf:
         return Filed(
             system=SYSTEM,
             day=(str(time.year), str(time.month), str(time.day)),
-            stem=f"{CALLS[index].talkgroup}-{start_s}_{_FREQUENCY}-call_{index}",
+            stem=f"{CALLS[index].talkgroup}-{start_s}.000_{_FREQUENCY}-call_{index}",
             talkgroup=CALLS[index].talkgroup,
             start_s=start_s,
         )
