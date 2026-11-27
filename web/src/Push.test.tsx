@@ -1445,6 +1445,43 @@ test('turning off after turning on took its last look holds too: what is written
   expect(pushSnapshot().on).toBeNull()
 })
 
+test('turning off in another tab as the address is noted down: where the places are is not sent', async () => {
+  await savePlace('Home', FIRE)
+  window.localStorage.setItem(KEY, turnedOn(null))
+  browser({ permission: 'granted' })
+  const asked = serve(routes())
+  // Another tab turns notifications off at the last moment: after this one
+  // asked whether they are still wanted, as it notes down the address it is
+  // about to give the server.
+  const setItem = Storage.prototype.setItem
+  let turnedOffThere = false
+  vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (
+    this: Storage,
+    key: string,
+    value: string,
+  ) {
+    setItem.call(this, key, value)
+    if (key === KEY && !turnedOffThere && value.includes('"told":{')) {
+      turnedOffThere = true
+      setItem.call(this, OFF_KEY, 'turned-off-in-another-tab')
+    }
+  })
+
+  expect(await syncPush('mock')).toBe(true)
+
+  expect(turnedOffThere).toBe(true)
+  // The server was given no address and no place, by this telling or after.
+  expect(of(asked, SUBSCRIBE)).toEqual([])
+  expect(JSON.stringify(asked)).not.toContain(String(FIRE.lat))
+  expect(pushSnapshot().on).toBeNull()
+  // It is asked to delete the address all the same, with the permit that was
+  // to carry it.
+  expect(of(asked, UNSUBSCRIBE).map((request) => request.body)).toEqual([
+    { endpoint: ADDRESS, permits: [permitNo(1)] },
+  ])
+  expect(wanted()).toEqual(OFF)
+})
+
 // A request that was cut off can still reach the server, and puts nothing back.
 
 test('a request to be notified that was never answered has its permit named when the server is asked to delete, and taken away by the next', async () => {

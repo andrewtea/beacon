@@ -84,6 +84,12 @@ self.addEventListener('pushsubscriptionchange', (event) => {
   // closed. Beacon's server is asked to delete the old one. The new one is given
   // to the server when the app is next opened, because where the saved places
   // are is the app's to read, and until then no notification arrives.
+  //
+  // This is best effort, and less than the app's own deletion: a worker cannot
+  // read the permits the app keeps, so it names none, and a request to be
+  // notified that was still on its way to the server can put the old address
+  // back after this was answered. The app has it deleted when it is next opened
+  // (`lib/push.ts`); until then it is kept as any address is.
   const old = event.oldSubscription
   if (MODE === null || !old || typeof old.endpoint !== 'string') return
   event.waitUntil(

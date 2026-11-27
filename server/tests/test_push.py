@@ -1491,9 +1491,6 @@ def test_a_permit_is_given_only_by_a_server_that_sends_in_the_mode_that_is_named
     none = world.app(push=False)
     off = none.post("/api/push/permit", json={"revoke": []}, headers=SHOWN)
     assert (off.status_code, off.json()) == (503, {"detail": OFF})
-    # A deletion that names permits is answered by a server with no file, too.
-    gone = {"endpoint": FCM, "permits": [answer["permit"]]}
-    assert none.post("/api/push/unsubscribe", json=gone, headers=SHOWN).status_code == 204
 
 
 @pytest.mark.parametrize(
@@ -1580,20 +1577,66 @@ def test_a_request_about_notifications_is_bounded_before_it_is_read(
     assert admission.held == 0
 
 
-def test_a_server_with_nothing_kept_and_notifications_off_says_so_and_keeps_nothing(
-    world: World,
+def test_a_server_with_notifications_off_says_so_keeps_nothing_and_looks_before_it_says_deleted(
+    world: World, tmp_path: Path
 ) -> None:
-    client = world.app(push=False)
+    world.push.close()
+    fresh = tmp_path / "fresh"
+    quiet = open_push({"BEACON_DATA_DIR": str(fresh), PUSH_VARIABLE: "0"}, world.engine, world.runs)
+    world.push = quiet
+    client = world.app()
 
     answer = client.get("/api/push").json()
     assert (answer["enabled"], answer["text"]) == (False, OFF)
     assert (answer["public_key"], answer["about_text"], answer["notice"]) == (None, None, None)
     refused = client.post("/api/push/subscribe", json=body_of(), headers=SHOWN)
     assert (refused.status_code, refused.json()) == (503, {"detail": OFF})
-    # It keeps no address, which is what 204 says.
+    # It has this mode's file open, with nothing in it and no key beside it, so
+    # its 204 is the answer of a server that looked.
+    assert quiet.subscriptions.all() == ()
+    assert (fresh / "push" / "mock.sqlite3").exists()
+    assert not (fresh / "push" / "mock.vapid.key").exists()
     gone = client.post("/api/push/unsubscribe", json={"endpoint": FCM}, headers=SHOWN)
     assert gone.status_code == 204
-    assert world.kept() == []
+
+    # A server that has no file open says nothing was deleted, never 204.
+    none = world.app(push=False)
+    for body in ({"endpoint": FCM}, {"endpoint": FCM, "permits": [NO_PERMIT]}):
+        unseen = none.post("/api/push/unsubscribe", json=body, headers=SHOWN)
+        assert unseen.status_code == 503
+        assert "deleted nothing" in unseen.json()["detail"]
+
+
+def test_a_server_that_sends_none_and_started_first_deletes_what_another_kept_since(
+    world: World, tmp_path: Path
+) -> None:
+    world.push.close()
+    shared = {"BEACON_DATA_DIR": str(tmp_path / "shared")}
+    # A server told to send none starts on a data directory with no file.
+    quiet = open_push({**shared, PUSH_VARIABLE: "0"}, world.engine, world.runs)
+    # Another one, which sends, is started on the same directory after it, and
+    # keeps a device's subscription and gives it a permit.
+    sender = open_push(
+        {**shared, SUBJECT_VARIABLE: CONTACT},
+        world.engine,
+        world.runs,
+        transport=httpx2.MockTransport(world.services),
+    )
+    sender.subscriptions.put(FCM, [NEAR], at(5))
+    permit = sender.subscriptions.permit(at(5))
+    assert permit is not None
+
+    # The device's request to delete reaches the first.
+    world.push = quiet
+    gone = world.app().post(
+        "/api/push/unsubscribe", json={"endpoint": FCM, "permits": [permit]}, headers=SHOWN
+    )
+
+    # Its 204 is true: the address is gone from the file, and the permit with it.
+    assert gone.status_code == 204
+    assert sender.subscriptions.all() == ()
+    assert sender.subscriptions.put(FCM, [NEAR], at(5.5), permit=permit) == SPENT
+    sender.close()
 
 
 @pytest.mark.parametrize(
@@ -1867,8 +1910,11 @@ def test_push_is_turned_off_by_a_setting_and_a_wrong_setting_is_refused(
 
     with TestClient(create_app()) as client:
         assert client.get("/api/push").json()["enabled"] is False
-        assert not hasattr(client.app.state, "push")
-    assert not (tmp_path / "off" / "push").exists()
+        push: Push = client.app.state.push  # type: ignore[attr-defined]
+        assert (push.sends, push.off, push.vapid) == (False, TURNED_OFF, None)
+    # The file is there for it to delete from, and no key is made.
+    assert (tmp_path / "off" / "push" / "mock.sqlite3").exists()
+    assert not (tmp_path / "off" / "push" / "mock.vapid.key").exists()
 
     with pytest.raises(PushConfigError, match="must be 1 or 0"):
         open_push({PUSH_VARIABLE: "yes"}, world.engine, world.runs)

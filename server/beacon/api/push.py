@@ -81,6 +81,10 @@ NOT_A_PUSH_SERVICE = (
 )
 FULL = "Beacon keeps as many addresses to notify as it can, and can take no more just now."
 _CLOSED = "This server is stopping, and takes no more requests about notifications."
+_NOT_LOOKED = (
+    "This server has not opened the file notifications' addresses are kept in, so it "
+    "has looked for nothing and deleted nothing. Ask again."
+)
 
 
 class NoticeOut(BaseModel):
@@ -210,7 +214,8 @@ async def unsubscribe(request: Request) -> Response:
     names (`Beacon-Mode`), whose file is another one, and `503` from a server
     that is busy or stopping. The answer is the same whether or not there was a
     subscription, so it tells nobody whether an address is kept. A server that
-    sends no notifications deletes as any other does.
+    sends no notifications deletes as any other does, and one that has not the
+    file open answers `503`: it never says `204` without having looked.
 
     **And the address is not put back by a request that was already on its
     way**, when the sender names that request's permit in `permits`: the permits
@@ -218,6 +223,8 @@ async def unsubscribe(request: Request) -> Response:
     nothing without its permit."""
     _shown(request)
     push: Push | None = getattr(request.app.state, "push", None)
+    if push is None:
+        raise HTTPException(503, _NOT_LOOKED)
     kept = push
     await _admitted(request, lambda body: _unsubscribe(kept, body))
     return Response(status_code=204)
@@ -354,11 +361,10 @@ def _subscribe(push: Push, body: bytes) -> Subscribed:
     return Subscribed(mode=push.mode, kept_until=kept_until)
 
 
-def _unsubscribe(push: Push | None, body: bytes) -> None:
+def _unsubscribe(push: Push, body: bytes) -> None:
     sent = _parse(body, frozenset({"endpoint"}), UNSUBSCRIBE_SHAPE, optional=frozenset({"permits"}))
     permits = _permits(sent.get("permits", []), UNSUBSCRIBE_SHAPE)
-    # An address Beacon would not have kept is not looked for, and a server with
-    # no subscriptions file of this mode keeps none, and has no permit out.
+    # An address Beacon would not have kept is not looked for.
     endpoint = checked(sent["endpoint"])
-    if push is not None and (endpoint is not None or permits):
+    if endpoint is not None or permits:
         push.subscriptions.remove(endpoint, permits)

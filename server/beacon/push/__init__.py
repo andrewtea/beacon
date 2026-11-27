@@ -2,9 +2,10 @@
 
     from beacon.push import open_push
 
-    push = open_push(os.environ, engine, runs)  # None only with BEACON_PUSH=0 and no file
+    push = open_push(os.environ, engine, runs)  # always with this mode's file open
     push.sends  # False with BEACON_PUSH=0, and with no BEACON_VAPID_SUBJECT
-    push.subscriptions.put(endpoint, points, now)  # what POST /api/push/subscribe does
+    permit = push.subscriptions.permit(now)  # what POST /api/push/permit does
+    push.subscriptions.put(endpoint, points, now, permit=permit)  # POST /api/push/subscribe
     push.work(engine.snapshot, now)  # one pass; the server makes one every 15 s
 
 This is the first thing Beacon keeps that is tied to a device, so it keeps as little

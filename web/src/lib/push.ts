@@ -80,6 +80,17 @@ import { placesSnapshot } from './placeStore.ts'
 // after a newer one. The other way round, a request to delete that arrives late
 // deletes an address that was given again since: the server then keeps nothing
 // of this device until the app next tells it, which is the safe way to be wrong.
+//
+// **That holds for a deletion the app asks for, which names the permits. It
+// does not hold for the one the service worker asks for** when the browser
+// replaces an address while the app is closed (`pushsubscriptionchange` in
+// `public/push-sw.js`): a worker reads nothing of what is kept here, so it names
+// no permit, and a request to be notified that was still on its way can put the
+// old address and its places back after the worker was answered. The app mends
+// that when it is next opened: the address it told the server is not the one
+// the browser has, so it has the server delete it, naming the permit. Until
+// then the server keeps the old address as it keeps any: until a push to it is
+// refused as gone, or its time is over.
 
 const KEY = 'beacon.push.v2'
 // Written anew each time notifications are turned off, and never taken away.
@@ -873,6 +884,10 @@ async function tell(mode: Mode, until: number): Promise<void> {
       ],
     }))
     if (places.length > 0) {
+      // Asked once more, with nothing waited for between this and the sending:
+      // another tab can have turned notifications off while that was noted
+      // down, and where the places are is not sent once this one has read so.
+      fence()
       try {
         await step((signal) =>
           subscribePush(address.endpoint, places, mode, permit, signal),

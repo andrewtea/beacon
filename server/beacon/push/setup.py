@@ -100,7 +100,7 @@ def open_push(
     runs: Runs,
     *,
     transport: httpx2.AsyncBaseTransport | None = None,
-) -> Push | None:
+) -> Push:
     """Web push for the store `engine` reads.
 
     The subscriptions are kept in `data/push/mock.sqlite3` or `live.sqlite3`, as
@@ -110,10 +110,13 @@ def open_push(
     With a `transport`, it answers every push and nothing is sent anywhere.
 
     A server sends notifications when `BEACON_PUSH` is not 0 and
-    `BEACON_VAPID_SUBJECT` names a contact. One that does not send still opens
-    the files there are, so that what they hold is deleted on time (`Push`), and
-    makes no key. The answer is None only when notifications are turned off and
-    there is no file of either mode: nothing is kept, and nothing is made.
+    `BEACON_VAPID_SUBJECT` names a contact. One that does not send makes no key,
+    and still opens this mode's file, making it when there is none, and the other
+    mode's when there is one: what they hold is deleted on time (`Push`), and when
+    it answers a device that its address is deleted, it has looked in the file. A
+    server that had no file open could not: another process on the same data
+    directory, which there should not be, or a later one, can have made the file
+    and kept the address since this one started.
 
     Raises PushConfigError for a setting that is not 1 or 0 and for a directory
     that cannot be made, VapidError for a contact that cannot be used by a server
@@ -131,8 +134,6 @@ def open_push(
     other: Mode = "live" if mode == "mock" else "mock"
     directory = default_data_dir(env) / "push"
     off = TURNED_OFF if setting == "0" else NO_CONTACT if subject is None else None
-    if setting == "0" and not any(_file(directory, each).exists() for each in (mode, other)):
-        return None
     made = True
     try:
         directory.mkdir(parents=True, exist_ok=True)

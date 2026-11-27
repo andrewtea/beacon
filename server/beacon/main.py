@@ -273,22 +273,21 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # that was made turned crisis mode on near a place a device named. It reads
         # the decisions and asks Ember nothing.
         sending = open_push(os.environ, engine, runs)
-        if sending is not None:
-            app.state.push = sending
-            if sending.off is not None:
-                logger.warning(
-                    "This server sends no notifications (%s). The subscriptions an "
-                    "earlier one kept are deleted when their devices ask and when "
-                    "their time is over.",
-                    sending.off,
-                )
-            if sending.unswept:
-                logger.warning(
-                    "The other mode's push subscriptions file could not be opened by "
-                    "this Beacon, so what it holds is not deleted when its time is over."
-                )
-            # Run on a server that sends nothing too: it deletes what ran out.
-            pushing = asyncio.create_task(_send_pushes(sending, engine, stop))
+        app.state.push = sending
+        if sending.off is not None:
+            logger.warning(
+                "This server sends no notifications (%s). The subscriptions an "
+                "earlier one kept are deleted when their devices ask and when "
+                "their time is over.",
+                sending.off,
+            )
+        if sending.unswept:
+            logger.warning(
+                "The other mode's push subscriptions file could not be opened by "
+                "this Beacon, so what it holds is not deleted when its time is over."
+            )
+        # Run on a server that sends nothing too: it deletes what ran out.
+        pushing = asyncio.create_task(_send_pushes(sending, engine, stop))
         if ingest is not None:
             app.state.ingest = ingest
             ingest.start()
