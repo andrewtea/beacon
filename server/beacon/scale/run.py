@@ -8,8 +8,12 @@ A run lives under `data/scale/<name>/` (`Layout`), which Git ignores:
     lists/            streets.txt, units.txt, blocks.csv (`beacon.scale.lists`)
     calls/            generated calls, marked BEACON-GENERATED (`beacon.scale.generate`)
     evidence.sqlite3  the run's own evidence store: never the server's
-    heard.json        that the hearing is closed, from the first replayed tap on
-    taps.sqlite3      the investigations of the replayed taps (`beacon.scale.taps`)
+    heard.json        that the hearing is closed, from when it was first complete
+    taps.sqlite3      the investigations of the replayed taps (`beacon.scale.taps`),
+                      and the run's hold on Ember
+    unit_types.json   DataSF's unit type for each unit of the day, which the glossary
+                      is compared with (`beacon.scale.glossary`)
+    glossary.json     the claim on the run's glossary, and the glossary
     results.json      what the run came to (`beacon.scale.results`)
 
 **What a run is is decided once and kept** (`run.json`): generated tones heard by a
@@ -38,8 +42,9 @@ it stops the hearing, and the run is then not gone on with. A run whose hearing 
 closed makes no hearing client and needs nothing left of the hearing's budget: it
 can only pay for taps.
 
-**The hearing is closed when the replay of taps first begins** (`close_hearing`), so
-that every tap of a run is answered against the same evidence.
+**The hearing is closed when it is first complete** (`close_hearing`), before the
+taps are replayed and the glossary is learned, so that everything made of the whole
+day is of the same evidence.
 
 **Every call, a stand-in's too, is booked in the one Ember ledger** under the data
 directory, as the server's are: a run has no ledger of its own. A stand-in's rows
@@ -303,12 +308,13 @@ def held_for(
 
 
 def close_hearing(layout: Layout, last_pass: PassCount) -> None:
-    """Close a run's hearing for good, which is done when the replay of its taps
-    first begins. Every tap is investigated against the run's evidence, and its
-    answer is kept for good: were calls heard after some taps were answered, the
-    answers would be of two different days' evidence, and a result would put the
-    old answers beside the new incidents. So from the first claim of a tap on,
-    nothing more is heard in this run; calls that turn up later want a new run."""
+    """Close a run's hearing for good, which is done when it is first complete,
+    before anything is made of the whole day: the replay of its taps and its
+    glossary. Every tap is investigated against the run's evidence and the
+    glossary is learned from its incidents, each once, and what they came to is
+    kept for good: were calls heard afterwards, a result would put the old answers
+    and the old glossary beside the new incidents. So from then on nothing more
+    is heard in this run; calls that turn up later want a new run."""
     _write(layout.closed, asdict(last_pass))
 
 
@@ -515,12 +521,9 @@ def radio_ember(
             f"Nothing is left of the budget for hearing: the scope {other} holds it "
             "all, and the two kinds of paid run share one budget."
         )
-    ember = paid_ember(env, label, left, RADIO_BUDGET_NANOUSD, make)
-    if ember.ledger_file() != beside.ledger_file() or beside.ledger_replaced():
-        # Made on another file than the one the other scope's spend was read from.
-        ember.close()
-        raise ScaleError(LEDGER_REPLACED)
-    return ember
+    # Refused when it was made on another file than the one the other scope's
+    # spend was read from.
+    return paid_ember(env, label, left, RADIO_BUDGET_NANOUSD, make, beside=beside)
 
 
 def hearing_scope(settings: Settings) -> str:
@@ -543,11 +546,17 @@ def paid_ember(
     budget_nanousd: int,
     most: int,
     make: PaidClient | None = None,
+    *,
+    beside: EmberClient | None = None,
 ) -> EmberClient:
     """A live Ember client that pays under the scope `label`, whose budget is at
-    most `most`.
+    most `most`. With `beside`, the paying client the run's ledger was pinned
+    with, the new client has to have been made on that client's ledger file: a
+    scope's cap is counted in the ledger, and in a file put in its place the scope
+    could hold less than was spent.
 
-    Raises ScaleError when the budget is not one, or there is no live Ember."""
+    Raises ScaleError when the budget is not one, there is no live Ember, or the
+    ledger is not the one `beside` is on."""
     check_budget(label, budget_nanousd, most)
     scope = SpendScope(label, budget_nanousd)
     ember = EmberClient.from_env(env, scope=scope) if make is None else make(scope)
@@ -557,6 +566,11 @@ def paid_ember(
             "A paid run needs a live Ember: set REPLAY=0, MODEL_API_KEY, and "
             "EMBER_SPENT_BEFORE_USD. Without --paid a stand-in hears generated calls."
         )
+    if beside is not None and (
+        ember.ledger_file() != beside.ledger_file() or beside.ledger_replaced()
+    ):
+        ember.close()
+        raise ScaleError(LEDGER_REPLACED)
     return ember
 
 

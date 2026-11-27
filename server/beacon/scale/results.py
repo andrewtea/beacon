@@ -89,9 +89,10 @@ INCOMPLETE = (
     "The numbers below are of what was heard so far."
 )
 CLOSED = (
-    "The hearing was closed when the replay of taps began, so that every tap is "
-    "answered against the same evidence: a call put among the run's calls after that "
-    "is not heard in this run."
+    "The hearing was closed when it was first complete, before the taps were "
+    "replayed and the glossary was learned, so that everything made of the whole day "
+    "is of the same evidence: a call put among the run's calls after that is not "
+    "heard in this run."
 )
 LEDGER_LOST = (
     "The Ember ledger was replaced while the run was under way, so what the run "
@@ -206,6 +207,8 @@ def build(
     ledger_lost: bool = False,
     taps: Sequence[tuple[Replay, Standing, Run | None]],
     taps_stopped: str | None,
+    glossary: Sequence[Number] = (),
+    glossary_waiting: str | None = None,
     made_at: datetime | None = None,
 ) -> dict[str, Any]:
     """A run's results, as they are written and shown. `rows` is how many radio
@@ -215,7 +218,10 @@ def build(
     `last_pass` and `stopped` are how the latest hearing ended, `closed` whether
     the hearing was closed for the replay, `unread` what of DataSF's answer could
     not be read, and `ledger_lost` whether the Ember ledger was replaced under the
-    run. `taps` is every planned tap with how it stands, or nothing while the hearing
+    run. `glossary` is the glossary's numbers (`beacon.scale.glossary.numbers`), and
+    `glossary_waiting` the sentence for a glossary the same command would still ask
+    for, with which a run is not complete.
+    `taps` is every planned tap with how it stands, or nothing while the hearing
     is not complete."""
     live = settings.hearer == "live"
     generated = settings.audio == "generated"
@@ -226,7 +232,13 @@ def build(
     # stop, and no planned tap is waiting. It does not say that every call has a
     # row or every tap an answer: a call or a tap that was claimed and came to
     # nothing is counted in its own number, and is not done again.
-    complete = heard_complete and taps_stopped is None and waiting == 0 and not ledger_lost
+    complete = (
+        heard_complete
+        and taps_stopped is None
+        and waiting == 0
+        and glossary_waiting is None
+        and not ledger_lost
+    )
     caveats = [NOT_CHECKED]
     if not heard_complete:
         caveats.insert(0, INCOMPLETE)
@@ -246,12 +258,15 @@ def build(
         *_time_numbers(matched, generated=generated),
         *_cost_numbers(radio_spend, live=live, generated=generated, lost=ledger_lost),
         *_tap_numbers(taps, reading, matched, live=live, generated=generated),
+        *glossary,
     ]
     if taps_stopped is not None or waiting:
         caveats.append(
             f"The replay of taps is not complete: {waiting} planned taps have not been "
             "put to the investigator. " + _taps_stopped(taps_stopped, live=live)
         )
+    if glossary_waiting is not None:
+        caveats.append(glossary_waiting)
     return {
         "format": FORMAT,
         "name": name,
