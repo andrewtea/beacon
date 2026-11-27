@@ -53,15 +53,17 @@ from beacon.investigate.tools import Accounting, Call
 KEPT = timedelta(hours=24)
 
 _WAIT_SECONDS = 5.0
-_FORMAT = 2
-# 0 is a file that says no shape, which a new file is too. 1 kept a decision's
-# signals as their kinds only, and of `nearby_incidents` only the ids.
-#
-# A key added to what a tool keeps (`Call.returned`) that a reader takes as absent
-# when it is not there is no new shape: the feeds a count or a ground rested on
-# (`credits`, `aircraft_credits`, `rotorcraft_credits`) are read that way, so a run
-# kept before they were written names none and is kept, with the decision it made.
+_FORMAT = 3
+# The earlier shapes whose runs and decisions are dropped. 0 is a file that says no
+# shape, which a new file is too. 1 kept a decision's signals as their kinds only,
+# and of `nearby_incidents` only the ids.
 _EARLIER = frozenset({0, 1})
+# The earlier shapes whose runs and decisions are read as they are. 2 did not keep
+# which feeds a count, a ground, or a cited signal rested on (`credits`,
+# `aircraft_credits`, `rotorcraft_credits`, and a cited signal's `credits`); a run of
+# 2 is read as naming none. The number is raised all the same, so that an older
+# Beacon refuses a file whose runs name feeds it would not show the credit of.
+_READABLE = frozenset({2})
 _SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS run (
@@ -125,6 +127,7 @@ class Runs:
             earlier=_EARLIER,
             drop=("UPDATE run SET run = NULL WHERE run IS NOT NULL", "DELETE FROM crisis"),
             unknown=_UNKNOWN_SHAPE,
+            readable=_READABLE,
         )
         if refusal is not None:
             raise RunsError(refusal)
@@ -293,6 +296,8 @@ def _cited(kept: Mapping[str, Any]) -> Cited:
         kind=kept["kind"],
         confidence=kept["confidence"],
         evidence_ids=tuple(kept["evidence_ids"]),
+        # A decision of the shape before this one kept none.
+        credits=tuple(kept.get("credits", ())),
     )
 
 

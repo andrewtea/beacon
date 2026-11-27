@@ -383,8 +383,10 @@ def test_the_words_of_a_story_are_not_changed_without_the_files_number() -> None
     # sentence changed, raise `_FORMAT` in story/store.py and add the old number to
     # `_EARLIER`, so that kept stories in the old words are dropped; then put the
     # new number and digest here.
-    assert (store_module._FORMAT, digest) == (3, "df9585d83d76aaa6")
-    assert store_module._FORMAT not in store_module._EARLIER
+    assert (store_module._FORMAT, digest) == (4, "df9585d83d76aaa6")
+    assert store_module._FORMAT not in store_module._EARLIER | store_module._READABLE
+    # The words did not change from 3 to 4, so the stories of 3 are kept.
+    assert {3} == store_module._READABLE
 
 
 def test_an_event_that_left_511s_list_and_came_back_is_not_told_as_gone(
@@ -618,8 +620,9 @@ OLD_STORIES = {
         "latency_ms": 1,
     },
 }
-# A story of this shape from before Beacon asked adsb.lol: an aircraft's line that
-# cites a row in OpenSky's format, under that feed's name and label.
+# A story of the shape before this one, from before Beacon asked adsb.lol: an
+# aircraft's line that cites a row in OpenSky's format, under that feed's name and
+# label, with a credit kept as its words and one link.
 BEFORE_ADSBLOL = OLD_STORIES[2] | {
     "claims": [
         {
@@ -660,9 +663,7 @@ def old_file(tmp_path: Path, shape: int, journal: str = "wal") -> Path:
     one story, and one claim with no story."""
     path = tmp_path / "story" / "mock.sqlite3"
     path.parent.mkdir(parents=True)
-    story = json.dumps(
-        BEFORE_ADSBLOL if shape == store_module._FORMAT else OLD_STORIES.get(shape, OLD_STORIES[2])
-    )
+    story = json.dumps(BEFORE_ADSBLOL if shape == 3 else OLD_STORIES.get(shape, OLD_STORIES[2]))
     db = sqlite3.connect(path, isolation_level=None)
     db.execute(f"PRAGMA journal_mode = {journal}")
     db.executescript(SCHEMA.replace(":story", "'" + story.replace("'", "''") + "'"))
@@ -707,10 +708,10 @@ def test_a_file_of_an_earlier_shape_keeps_its_claims_and_none_of_its_stories(
     assert stories(tmp_path).latest("inc-a") == written
 
 
-def test_a_story_from_before_the_aircraft_feed_changed_is_kept_as_it_was_written(
+def test_a_file_of_the_shape_before_keeps_its_stories_and_gets_this_shapes_number(
     tmp_path: Path,
 ) -> None:
-    path = old_file(tmp_path, store_module._FORMAT)
+    path = old_file(tmp_path, 3)
     before = file_rows(path)
 
     opened = stories(tmp_path)
@@ -724,7 +725,12 @@ def test_a_story_from_before_the_aircraft_feed_changed_is_kept_as_it_was_written
     (source,) = claim.sources
     assert (source.source, source.label) == ("opensky", "OpenSky Network aircraft positions")
     assert (source.stand_in, source.credit) == (True, None)
-    assert file_rows(path) == before
+    # Nothing of the file changed but its number, which is this shape's now: a
+    # Beacon of before, which would read a credit of this shape without its
+    # pieces, refuses the file from here on.
+    assert file_rows(path) == [store_module._FORMAT, *before[1:]]
+    assert before[0] == 3
+    assert not opened.claim("inc-a", "one", at(5), timedelta(0))
 
 
 def test_a_credit_in_pieces_is_kept_with_its_pieces_and_one_link_as_it_always_was() -> None:
@@ -743,8 +749,8 @@ def test_a_credit_in_pieces_is_kept_with_its_pieces_and_one_link_as_it_always_wa
 
     kept = store_module._source_json(source(CREDIT_ADSBLOL))
     assert store_module._source_from(json.loads(json.dumps(kept))).credit == CREDIT_ADSBLOL
-    # 511's is one link, and is kept in the two fields a file of this shape always
-    # had, so an earlier Beacon reads it and this one reads an earlier Beacon's.
+    # 511's is one link, and is kept in the two fields the shape before had for a
+    # credit, which is how a story of that shape is read.
     kept = store_module._source_json(source(CREDIT_511))
     assert kept["credit"] == {"text": "data provided by 511.org", "url": "https://511.org"}
     assert store_module._source_from(kept).credit == CREDIT_511

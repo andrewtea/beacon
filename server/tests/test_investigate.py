@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+import beacon.investigate.store as store_module
 import beacon.investigate.tools as tools_module
 from beacon.ember import (
     CallLimitError,
@@ -1539,6 +1540,74 @@ def test_a_file_of_an_earlier_shape_keeps_its_claims_and_loses_its_runs(tmp_path
     assert again.crisis("inc-1") is None
 
 
+def test_a_file_of_the_shape_before_keeps_its_runs_and_decisions_and_gets_this_shapes_number(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "investigate" / "mock.sqlite3"
+    runs = runs_file(tmp_path)
+    runs.claim(TAP, at(6))
+    kept = {"incidents": [{"id": "inc-1", "distance_m": 100, "point_from": "blocks"}]}
+    call = Call("nearby_incidents", "no_lead", None, "look_for_a_lead", {}, True, kept)
+    spent = Accounting("fake", 0, 0, 0, 0, 0, 0, ("generation", 1, "hash"))
+    run = replace(
+        crisis_run(TAP, "inc-1", 6, ("alarm", "aircraft_circling")),
+        rounds=(Round(1, spent, (call,)),),
+    )
+    runs.write(run)
+    # As the shape before kept them: a cited signal with no feeds beside it.
+    with closing(sqlite3.connect(path)) as db:
+        for table, column, key in (("run", "run", "tap_id"), ("crisis", "decision", "incident_id")):
+            (name, text) = db.execute(f"SELECT {key}, {column} FROM {table}").fetchone()
+            assert '"credits": []' in text
+            before = text.replace(', "credits": []', "")
+            assert "credits" not in before
+            db.execute(f"UPDATE {table} SET {column} = ? WHERE {key} = ?", (before, name))
+        db.commit()
+        db.execute("PRAGMA user_version = 2")
+
+    again = Runs(path, "mock")
+
+    # Nothing is dropped: the run that was paid for and the decision it made are
+    # read as they were, and name no feed.
+    assert again.get(TAP) == (at(6), run)
+    decision = again.crisis("inc-1")
+    assert decision is not None
+    assert [(cited.kind, cited.credits) for cited in decision.cited] == [
+        ("alarm", ()),
+        ("aircraft_circling", ()),
+    ]
+    assert words.ground_feeds("aircraft_overhead", run) == []
+    # The file has this shape's number from here on, so a Beacon of before, which
+    # would show this shape's runs without the credits they name, refuses it.
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == store_module._FORMAT
+    assert store_module._FORMAT not in store_module._READABLE | store_module._EARLIER
+
+
+def test_a_decision_keeps_the_feeds_whose_credit_goes_with_each_signal_it_cited(
+    tmp_path: Path,
+) -> None:
+    runs = runs_file(tmp_path)
+    runs.claim(TAP, at(6))
+    outcome = Outcome(
+        status="incident",
+        incident_id="inc-1",
+        grounds=("near",),
+        confidence="low",
+        crisis=True,
+        crisis_cited=(
+            Cited("closure", "official", (3,), ("511",)),
+            Cited("aircraft_circling", "high", (7, 9), ("adsblol",)),
+        ),
+    )
+    runs.write(run_of(outcome=outcome))
+
+    again = runs_file(tmp_path)
+
+    assert again.get(TAP)[1].outcome == outcome  # type: ignore[index,union-attr]
+    assert again.crisis("inc-1").cited == outcome.crisis_cited  # type: ignore[union-attr]
+
+
 def test_a_file_the_first_shape_wrote_keeps_its_claims_and_none_of_what_it_cannot_read(
     tmp_path: Path,
 ) -> None:
@@ -1616,7 +1685,7 @@ def test_a_file_the_first_shape_wrote_keeps_its_claims_and_none_of_what_it_canno
     assert again.claim(TAP, at(7)) is False
     assert again.crisis("inc-1") is None
     with closing(sqlite3.connect(path)) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == store_module._FORMAT
     # And the file is this shape's from here on.
     again.claim("tap-AAAAAAAA0002", at(7))
     again.write(crisis_run("tap-AAAAAAAA0002", "inc-1", 7, ("alarm",)))

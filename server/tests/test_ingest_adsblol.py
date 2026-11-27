@@ -10,14 +10,13 @@ import pytest
 from beacon.evidence import EvidenceStore, EvidenceStoreError, Point
 from beacon.ingest.adsblol import (
     MAX_ALTITUDE_M,
-    MAX_HOLD_SECONDS,
     MAX_POSITION_AGE_SECONDS,
     AdsbLolAircraft,
     parse_aircraft,
 )
 from beacon.ingest.area import SAN_FRANCISCO
 from beacon.ingest.http import SourceError, SourceHttp
-from beacon.ingest.runner import PollerHeldError
+from beacon.ingest.runner import MAX_WAIT_SECONDS, Clock, PollReport, Runner
 
 NOON = datetime(2026, 11, 27, 20, 0, tzinfo=UTC)
 # 2026-11-27T20:00:00Z in milliseconds of Unix time.
@@ -88,6 +87,19 @@ def store(tmp_path: Path) -> EvidenceStore:
 @pytest.fixture
 def api() -> Api:
     return Api()
+
+
+@pytest.fixture
+def wall() -> list[datetime]:
+    """The real time, as a poller is told it, which a test moves."""
+    return [NOON]
+
+
+def poller_of(transport: Any, wall: list[datetime], **settings: Any) -> AdsbLolAircraft:
+    """A poller that keeps to adsb.lol's allowance, by a clock the test holds."""
+    return AdsbLolAircraft(
+        SourceHttp(httpx2.MockTransport(transport)), wall_clock=lambda: wall[0], **settings
+    )
 
 
 def test_with_no_key_the_poller_asks_for_a_circle_that_holds_the_city_within_the_free_allowance(
@@ -168,35 +180,86 @@ def test_how_often_adsb_lol_itself_is_asked_cannot_be_set() -> None:
             AdsbLolAircraft(stand_in, interval_seconds=interval)
 
 
-def test_a_process_that_starts_again_keeps_to_the_allowance(store: EvidenceStore, api: Api) -> None:
-    http = SourceHttp(httpx2.MockTransport(api))
-    first = AdsbLolAircraft(http)
+def test_a_process_that_starts_again_keeps_to_the_allowance(
+    store: EvidenceStore, api: Api, wall: list[datetime]
+) -> None:
+    first = poller_of(api, wall)
     first.poll(store, NOON)
 
     # Another process, begun a minute later, with nothing in memory of the first.
-    again = AdsbLolAircraft(http)
-    with pytest.raises(PollerHeldError, match="not asked again yet") as held:
-        again.poll(store, NOON + timedelta(seconds=60))
+    wall[0] = NOON + timedelta(seconds=60)
+    again = poller_of(api, wall)
+    held = again.poll(store, wall[0])
 
+    # It asks nothing, stores nothing, and says how long is left of the interval:
+    # that is no failure of adsb.lol's, and is not raised as one.
     assert len(api.requests) == 1
-    # It is told how long is left of the interval, and asks when it is over.
-    assert held.value.retry_after == pytest.approx(first.interval_seconds - 60)
-    assert (held.value.__cause__, held.value.__context__) == (None, None)
-    again.poll(store, NOON + timedelta(seconds=first.interval_seconds))
+    assert (held.added, held.unreadable, held.partial) == (0, 0, False)
+    assert held.again_in == pytest.approx(first.interval_seconds - 60)
+    wall[0] = NOON + timedelta(seconds=first.interval_seconds)
+    assert again.poll(store, wall[0]).again_in is None
     assert len(api.requests) == 2
 
 
-def test_the_moment_is_written_down_before_adsb_lol_is_asked(
-    store: EvidenceStore, api: Api
+def test_the_allowance_is_kept_by_the_time_of_the_request_and_not_of_the_runners_step(
+    store: EvidenceStore, api: Api, wall: list[datetime]
 ) -> None:
-    poller = AdsbLolAircraft(SourceHttp(httpx2.MockTransport(api)))
+    poller = poller_of(api, wall)
+    # The step began half a minute ago: the pollers before this one took that long.
+    step = NOON - timedelta(seconds=30)
+
+    poller.poll(store, step)
+
+    # The next request is an interval after this one was sent, not after the step began.
+    until = NOON + timedelta(seconds=poller.interval_seconds)
+    assert store.state("adsblol") == {"not_before": until.isoformat()}
+    # A process that starts then, whose own step began long after, is still held.
+    wall[0] = until - timedelta(seconds=1)
+    assert poller_of(api, wall).poll(store, until + timedelta(hours=1)).again_in == 1.0
+    assert len(api.requests) == 1
+
+
+def test_the_runner_asks_a_held_poller_again_when_its_time_comes_and_not_an_interval_later(
+    store: EvidenceStore, api: Api, wall: list[datetime]
+) -> None:
+    first = poller_of(api, wall, api_key="key-of-ours", requests_per_day=360_000)
+    assert first.interval_seconds == 10.0
+    first.poll(store, NOON)
+    # The server starts again nine seconds after its last request.
+    wall[0] = NOON + timedelta(seconds=9)
+    again = poller_of(api, wall, api_key="key-of-ours", requests_per_day=360_000)
+    runner = Runner([again], store, Clock(lambda: wall[0]))
+
+    (held,) = runner.step().values()
+
+    assert isinstance(held, PollReport)
+    assert held.again_in == 1.0
+    assert len(api.requests) == 1
+    # Nothing was asked, so nothing is known of the source from this process yet.
+    (status,) = runner.status()
+    assert (status.polled_at, status.ok) == (None, None)
+    wall[0] = NOON + timedelta(seconds=9.9)
+    runner.step()
+    assert len(api.requests) == 1
+    # A second after it looked, and not ten: the interval is not begun again.
+    wall[0] = NOON + timedelta(seconds=10)
+    runner.step()
+    assert len(api.requests) == 2
+    (status,) = runner.status()
+    assert (status.polled_at, status.ok) == (wall[0], True)
+
+
+def test_the_moment_is_written_down_before_adsb_lol_is_asked(
+    store: EvidenceStore, api: Api, wall: list[datetime]
+) -> None:
+    poller = poller_of(api, wall)
     seen: list[Any] = []
 
     def looked(request: httpx2.Request) -> httpx2.Response:
         seen.append(store.state("adsblol"))
         return api(request)
 
-    AdsbLolAircraft(SourceHttp(httpx2.MockTransport(looked))).poll(store, NOON)
+    poller_of(looked, wall).poll(store, NOON)
 
     until = NOON + timedelta(seconds=poller.interval_seconds)
     assert seen == [{"not_before": until.isoformat()}]
@@ -205,19 +268,19 @@ def test_the_moment_is_written_down_before_adsb_lol_is_asked(
     def down(request: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(503)
 
-    failing = AdsbLolAircraft(SourceHttp(httpx2.MockTransport(down)))
+    wall[0] = until
     with pytest.raises(SourceError):
-        failing.poll(store, until)
-    with pytest.raises(PollerHeldError):
-        poller.poll(store, until + timedelta(seconds=1))
+        poller_of(down, wall).poll(store, until)
+    wall[0] = until + timedelta(seconds=1)
+    assert poller.poll(store, wall[0]).again_in is not None
     # Only the first of the three reached the stand-in that answers.
     assert len(api.requests) == 1
 
 
 def test_when_the_moment_cannot_be_written_down_nothing_is_asked(
-    store: EvidenceStore, api: Api
+    store: EvidenceStore, api: Api, wall: list[datetime]
 ) -> None:
-    poller = AdsbLolAircraft(SourceHttp(httpx2.MockTransport(api)))
+    poller = poller_of(api, wall)
     store.close()
 
     with pytest.raises(EvidenceStoreError):
@@ -227,55 +290,67 @@ def test_when_the_moment_cannot_be_written_down_nothing_is_asked(
 
 
 def test_the_wait_adsb_lol_asks_for_is_kept_across_a_restart(
-    store: EvidenceStore, api: Api
+    store: EvidenceStore, api: Api, wall: list[datetime]
 ) -> None:
+    # It answered three seconds after it was asked, and the wait is from then.
+    answered = NOON + timedelta(seconds=3)
+
     def spent(request: httpx2.Request) -> httpx2.Response:
+        wall[0] = answered
         return httpx2.Response(429, headers={"Retry-After": "5400"})
 
-    # It answered three seconds after the poll began, and the wait is from then.
-    answered = NOON + timedelta(seconds=3)
-    poller = AdsbLolAircraft(SourceHttp(httpx2.MockTransport(spent)), wall_clock=lambda: answered)
     with pytest.raises(SourceError):
-        poller.poll(store, NOON)
+        poller_of(spent, wall).poll(store, NOON)
 
-    again = AdsbLolAircraft(SourceHttp(httpx2.MockTransport(api)))
-    with pytest.raises(PollerHeldError) as held:
-        again.poll(store, NOON + timedelta(hours=1))
-    assert held.value.retry_after == pytest.approx(1803.0)
+    wall[0] = NOON + timedelta(hours=1)
+    again = poller_of(api, wall)
+    assert again.poll(store, wall[0]).again_in == pytest.approx(1803.0)
     assert api.requests == []
-    again.poll(store, answered + timedelta(seconds=5400))
+    wall[0] = answered + timedelta(seconds=5400)
+    again.poll(store, wall[0])
     assert len(api.requests) == 1
 
 
-def test_a_wait_is_never_made_shorter_and_never_longer_than_a_day(
-    store: EvidenceStore, api: Api
+def test_a_wait_is_never_made_shorter_and_is_kept_for_as_long_as_the_runner_keeps_one(
+    store: EvidenceStore, wall: list[datetime]
 ) -> None:
-    waits = iter(["1", "99999999"])
-    clock = [NOON]
+    # Whatever the status: a server that is down can ask for a wait as well.
+    answers = iter([(429, "1"), (503, "172800"), (429, "99999999")])
 
-    def spent(request: httpx2.Request) -> httpx2.Response:
-        return httpx2.Response(429, headers={"Retry-After": next(waits)})
+    def waiting(request: httpx2.Request) -> httpx2.Response:
+        status, wait = next(answers)
+        return httpx2.Response(status, headers={"Retry-After": wait})
 
-    poller = AdsbLolAircraft(SourceHttp(httpx2.MockTransport(spent)), wall_clock=lambda: clock[0])
+    poller = poller_of(waiting, wall)
     with pytest.raises(SourceError):
         poller.poll(store, NOON)
     # A wait of a second ends before the interval that was written down does.
     until = NOON + timedelta(seconds=poller.interval_seconds)
     assert store.state("adsblol") == {"not_before": until.isoformat()}
 
-    clock[0] = until
-    with pytest.raises(SourceError):
+    wall[0] = until
+    with pytest.raises(SourceError) as failure:
         poller.poll(store, until)
-    # The daily window begins again within a day, whatever the answer says.
-    day = until + timedelta(seconds=MAX_HOLD_SECONDS)
-    assert store.state("adsblol") == {"not_before": day.isoformat()}
+    # Two days, as asked, and not one: what the runner keeps within a process is
+    # what a process that starts again keeps.
+    two_days = until + timedelta(days=2)
+    assert failure.value.retry_after == 172_800.0
+    assert store.state("adsblol") == {"not_before": two_days.isoformat()}
+    assert poller_of(waiting, wall).poll(store, until).again_in == 172_800.0
+
+    wall[0] = two_days
+    with pytest.raises(SourceError):
+        poller.poll(store, two_days)
+    # A week at the most, which is the longest the runner waits for any source.
+    week = two_days + timedelta(seconds=MAX_WAIT_SECONDS)
+    assert store.state("adsblol") == {"not_before": week.isoformat()}
 
 
 @pytest.mark.parametrize("saved", ["soon", 7, None, "2026-11-27T20:00:00", "9" * 41])
-def test_a_moment_that_cannot_be_read_holds_nothing_and_one_too_far_off_holds_a_day(
-    store: EvidenceStore, api: Api, saved: Any
+def test_a_moment_that_cannot_be_read_holds_nothing_and_one_too_far_off_holds_a_week(
+    store: EvidenceStore, api: Api, wall: list[datetime], saved: Any
 ) -> None:
-    poller = AdsbLolAircraft(SourceHttp(httpx2.MockTransport(api)))
+    poller = poller_of(api, wall)
     store.add([], state=("adsblol", {"not_before": saved}), now=NOON)
 
     poller.poll(store, NOON)
@@ -284,9 +359,8 @@ def test_a_moment_that_cannot_be_read_holds_nothing_and_one_too_far_off_holds_a_
     # A moment a year off is from a clock that has since been set back.
     far = NOON + timedelta(days=365)
     store.add([], state=("adsblol", {"not_before": far.isoformat()}), now=NOON)
-    with pytest.raises(PollerHeldError) as held:
-        poller.poll(store, NOON)
-    assert held.value.retry_after == MAX_HOLD_SECONDS
+    assert poller.poll(store, NOON).again_in == MAX_WAIT_SECONDS
+    assert len(api.requests) == 1
 
 
 def test_the_mock_scenarios_poller_keeps_no_allowance(store: EvidenceStore, api: Api) -> None:
@@ -301,15 +375,16 @@ def test_the_mock_scenarios_poller_keeps_no_allowance(store: EvidenceStore, api:
 
 
 def test_an_aircraft_becomes_a_row_named_by_its_address_and_the_time_of_its_position(
-    store: EvidenceStore, api: Api
+    store: EvidenceStore, api: Api, wall: list[datetime]
 ) -> None:
     api.aircraft = [craft()]
-    poller = AdsbLolAircraft(SourceHttp(httpx2.MockTransport(api)))
+    poller = poller_of(api, wall)
 
     first = poller.poll(store, NOON)
     # An aircraft that was not heard from again is listed with the same position.
     api.aircraft = [craft(seen_pos=2.0)]
-    second = poller.poll(store, NOON + timedelta(minutes=3))
+    wall[0] = NOON + timedelta(minutes=3)
+    second = poller.poll(store, wall[0])
 
     assert (first.added, second.added) == (1, 0)
     (aircraft,) = store.search()
@@ -414,10 +489,14 @@ def test_only_a_position_the_aircraft_broadcast_itself_is_trusted_highly(
         # Other fields were, and the position is the aircraft's own.
         ({"mlat": ["gs", "track", "baro_rate"]}, "adsb", "high"),
         ({"mlat": ..., "tisb": ...}, "adsb", "high"),
-        # A list that cannot be read says nothing either way.
+        # A list that cannot be read says nothing either way, and neither does one
+        # with a member that is no field's name: it is not taken for a list that
+        # names no position, which would make the position the aircraft's own.
         ({"mlat": "lat"}, "other", "medium"),
         ({"tisb": {"lat": True}}, "other", "medium"),
-        ({"mlat": [["lat"], 7, None]}, "adsb", "high"),
+        ({"mlat": [["lat"], 7, None]}, "other", "medium"),
+        ({"mlat": ["gs", 7]}, "other", "medium"),
+        ({"mlat": [], "tisb": [None]}, "other", "medium"),
     ],
 )
 def test_how_a_position_was_had_outranks_the_aircrafts_best_source(

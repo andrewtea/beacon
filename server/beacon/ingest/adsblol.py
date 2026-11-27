@@ -44,15 +44,19 @@ license is the Open Database License 1.0
   key is sent as `x-api-key`, and what it allows is not in the key, so the poller
   takes any key to allow 500 until it is told more (`requests_per_day`). Over the
   limit the API answers `429` with `Retry-After`.
-- **The allowance is kept to across restarts.** Before it asks, a live poller writes
-  into the evidence store the moment before which it will not ask again
-  (`not_before`): one interval on, where the interval is a day divided by the
-  allowance less `_SPARE_REQUESTS`, so no twenty-four hours hold more requests of
-  Beacon's than that. A `429`
-  moves that moment to the end of the wait adsb.lol asked for. A process that starts
-  reads it before it asks anything. It is one process's promise: two that share an
-  address and not a data directory each keep their own, which is one more reason to
-  run one server for each data directory.
+- **The allowance is kept to across restarts, and by every process on one data
+  directory.** Before it asks, a live poller promises in the evidence store not to
+  ask again before a moment (`EvidenceStore.reserve`, kept as `not_before`): one
+  interval on from the real time just before the request, where the interval is a
+  day divided by the allowance less `_SPARE_REQUESTS`, so no twenty-four hours hold
+  more requests of Beacon's than that. The look and the write are one transaction,
+  so two processes on one store cannot both find the time come. A wait adsb.lol asks
+  for (`Retry-After`, on a `429` or any other answer) moves the moment on to its end
+  (`postpone`), up to the week the runner waits at most, and never back. A process
+  that starts keeps the promise before it asks anything, and a poll that finds the
+  time not come asks nothing and says when it will (`PollReport.again_in`). Two
+  servers that share an address and not a data directory each keep their own
+  promise, which is one more reason to run one for each address.
 
 Each position of an aircraft is one row. Only aircraft a person on the street could
 notice are kept: airborne and below `MAX_ALTITUDE_M`. An airliner at cruise is not
@@ -85,7 +89,7 @@ from beacon.errors import raise_bare
 from beacon.evidence import Confidence, EvidenceStore, NewEvidence, Origin, Point
 from beacon.ingest.area import SAN_FRANCISCO, Bounds
 from beacon.ingest.http import SourceError, SourceHttp, fetch, read_json
-from beacon.ingest.runner import PollerHeldError, PollReport
+from beacon.ingest.runner import MAX_WAIT_SECONDS, PollReport
 
 SOURCE = "adsblol"
 API = "https://api.adsb.lol"
@@ -130,11 +134,12 @@ _SPARE_REQUESTS = 4
 MIN_INTERVAL_SECONDS = 10.0
 # The mock scenario has no allowance to keep to, and is asked this often.
 MOCK_INTERVAL_SECONDS = 30.0
-# The longest a live poller leaves adsb.lol alone because of what it wrote down or
-# was told: the daily window begins again within a day, and a moment further off
-# than that is a clock that was wrong.
-MAX_HOLD_SECONDS = 86_400.0
-_HELD = "adsb.lol is not asked again yet: Beacon keeps to its allowance across restarts."
+# The longest a poller leaves adsb.lol alone because of what was written down: as
+# long as the runner waits for a source that asked it to (`MAX_WAIT_SECONDS`). A
+# moment further off than that is from a clock that was wrong.
+_LONGEST_HOLD = timedelta(seconds=MAX_WAIT_SECONDS)
+# An interval a stand-in is given is no longer than a day.
+_MAX_INTERVAL_SECONDS = 86_400.0
 
 _MAX_BYTES = 5_000_000
 _MAX_RADIUS_NM = 250
@@ -192,8 +197,9 @@ class AdsbLolAircraft:
         adsb.lol that is played on a clock of its own, as the mock scenario is: a
         poller given one keeps to no allowance and writes no moment down, and a
         poller that asks the network is refused one, since its interval is the
-        allowance's to say. `wall_clock` is the time a wait adsb.lol asked for is
-        counted from, which is when it answered."""
+        allowance's to say. `wall_clock` is the real time, which the allowance is
+        kept by: when a request is about to be sent, and when adsb.lol answered
+        with a wait."""
         if api_key is not None and not (
             0 < len(api_key) <= 200 and set(api_key) <= _KEY_CHARACTERS
         ):
@@ -208,7 +214,9 @@ class AdsbLolAircraft:
         if interval_seconds is not None:
             if http.origin == "live":
                 raise ValueError("How often adsb.lol itself is asked is its allowance's to say.")
-            if isinstance(interval_seconds, bool) or not 0 < interval_seconds <= MAX_HOLD_SECONDS:
+            if isinstance(interval_seconds, bool) or not (
+                0 < interval_seconds <= _MAX_INTERVAL_SECONDS
+            ):
                 raise ValueError("An interval is a number of seconds, up to a day.")
         self._http = http
         self._api_key = api_key
@@ -236,7 +244,19 @@ class AdsbLolAircraft:
         # The mock scenario has no allowance: it is played on a clock of its own,
         # and a step of it that failed is played again at the same moment.
         if self._keeps_allowance:
-            self._reserve(store, now)
+            # By the real time at this moment, and not `now`, which is when the
+            # runner's step began: the pollers before this one may have taken a while.
+            asked_at = self._wall_clock()
+            standing = store.reserve(
+                self.name,
+                now=asked_at,
+                until=asked_at + timedelta(seconds=self.interval_seconds),
+                longest=_LONGEST_HOLD,
+            )
+            if standing is not None:
+                # Not yet time, by what this process or one before it wrote down.
+                # Nothing is asked, and that is no failure of adsb.lol's.
+                return PollReport(added=0, again_in=(standing - asked_at).total_seconds())
         try:
             body = fetch(
                 self._http,
@@ -248,50 +268,20 @@ class AdsbLolAircraft:
             )
         except SourceError as error:
             if self._keeps_allowance and _is_wait(error.retry_after):
-                self._wait(store, now, min(float(error.retry_after), MAX_HOLD_SECONDS))
+                # The wait adsb.lol asked for, counted from when it answered, is
+                # kept across a restart as the runner keeps it within a process.
+                answered = self._wall_clock()
+                wait = min(float(error.retry_after), MAX_WAIT_SECONDS)
+                store.postpone(
+                    self.name,
+                    now=answered,
+                    until=answered + timedelta(seconds=wait),
+                    longest=_LONGEST_HOLD,
+                )
             raise
         aircraft, unreadable = parse_aircraft(read_json(body, SOURCE), self.origin, self._bounds)
         added = store.add(aircraft, now=now)
         return PollReport(added=len(added), unreadable=unreadable)
-
-    def _reserve(self, store: EvidenceStore, now: datetime) -> None:
-        """Write down, before adsb.lol is asked, the moment before which it is not
-        asked again, so that a process that starts later keeps to it. When the
-        moment an earlier request wrote down has not come, nothing is asked.
-
-        Raises PollerHeldError in that case, and what the store raises when the
-        moment could not be written: then nothing is asked either."""
-        held = _not_before(store.state(self.name), now)
-        if held is not None and now < held:
-            raise_bare(PollerHeldError(_HELD, (held - now).total_seconds()))
-        self._save(store, now, now + timedelta(seconds=self.interval_seconds))
-
-    def _wait(self, store: EvidenceStore, now: datetime, seconds: float) -> None:
-        """Keep the wait adsb.lol asked for, counted from when it answered, when it
-        ends later than the moment already written down."""
-        until = self._wall_clock() + timedelta(seconds=seconds)
-        held = _not_before(store.state(self.name), now)
-        if held is None or until > held:
-            self._save(store, now, until)
-
-    def _save(self, store: EvidenceStore, now: datetime, not_before: datetime) -> None:
-        store.add([], state=(self.name, {"not_before": not_before.isoformat()}), now=now)
-
-
-def _not_before(saved: dict[str, Any], now: datetime) -> datetime | None:
-    """The moment a poller wrote down before which adsb.lol is not asked again, or
-    None when it wrote none that can be read. Never more than `MAX_HOLD_SECONDS`
-    from now: a moment further off is from a clock that has since been set back."""
-    text = saved.get("not_before")
-    if not isinstance(text, str) or len(text) > 40:
-        return None
-    try:
-        moment = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if moment.utcoffset() is None:
-        return None
-    return min(moment, now + timedelta(seconds=MAX_HOLD_SECONDS))
 
 
 def _is_wait(seconds: Any) -> bool:
@@ -400,9 +390,9 @@ def _position_source(entry: dict[str, Any]) -> str:
         fields = entry.get(listed)
         if fields is None:
             continue
-        if not isinstance(fields, list):
+        if not isinstance(fields, list) or not all(isinstance(name, str) for name in fields):
             return "other"
-        if any(name in ("lat", "lon") for name in fields if isinstance(name, str)):
+        if "lat" in fields or "lon" in fields:
             return source
     kind = entry.get("type")
     return _POSITION_SOURCES.get(kind, "other") if isinstance(kind, str) else "other"

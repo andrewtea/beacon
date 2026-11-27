@@ -130,6 +130,45 @@ def test_a_poller_that_is_holding_off_is_left_alone_for_as_long_as_it_says(
     assert held.polled == [seconds(0), seconds(600)]
 
 
+def test_a_poll_that_asked_nothing_is_made_again_when_it_says_and_changes_nothing_known(
+    store: EvidenceStore, time: Time, caplog: pytest.LogCaptureFixture
+) -> None:
+    class Waiting(FakePoller):
+        """Asks its source nothing until a moment, as a poller that keeps to a
+        source's allowance does, and says how long that is."""
+
+        not_before = seconds(45)
+
+        def poll(self, store: EvidenceStore, now: datetime) -> PollReport:
+            self.polled.append(now)
+            left = (self.not_before - now).total_seconds()
+            return PollReport(added=0, again_in=left) if left > 0 else PollReport(added=1)
+
+    poller = Waiting("sky", 600)
+    runner = Runner([poller], store, Clock(time))
+
+    with caplog.at_level(logging.DEBUG, logger="beacon.ingest"):
+        (report,) = runner.step().values()
+
+    # No failure, nothing logged, and nothing known of a source that was not asked.
+    assert isinstance(report, PollReport)
+    assert caplog.records == []
+    assert runner.status() == [PollerStatus("sky", None, None)]
+    # Again after the 45 seconds it said, and not after its interval of ten minutes.
+    time.moment = seconds(44)
+    runner.step()
+    time.moment = seconds(45)
+    runner.step()
+    assert poller.polled == [NOON, seconds(45)]
+    assert runner.status() == [PollerStatus("sky", seconds(45), True)]
+    # From a poll that asked, the interval is counted as ever.
+    time.moment = seconds(46)
+    runner.step()
+    time.moment = seconds(645)
+    runner.step()
+    assert poller.polled == [NOON, seconds(45), seconds(645)]
+
+
 def test_an_unexpected_failure_is_logged_by_its_kind_and_nothing_of_its_text(
     store: EvidenceStore, time: Time, caplog: pytest.LogCaptureFixture
 ) -> None:

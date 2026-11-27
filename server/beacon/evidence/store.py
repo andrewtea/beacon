@@ -34,7 +34,7 @@ import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, get_args
 
@@ -343,6 +343,45 @@ class EvidenceStore:
         if closed:
             raise_bare(EvidenceStoreError(_CLOSED))
 
+    def reserve(
+        self, name: str, *, now: datetime, until: datetime, longest: timedelta
+    ) -> datetime | None:
+        """Have a poller promise to leave its source alone until `until`, unless a
+        promise it made before still stands at `now`. Returns None when the promise
+        is made, and the moment of the standing one when it is not: the caller then
+        asks its source nothing.
+
+        The look and the write are one write transaction, so of two processes on
+        one file that both find the time come, one makes the promise and the other
+        is told of it. The promise is kept in the poller's state as `not_before`,
+        beside whatever else the poller saved. A standing promise is never read as
+        further off than `longest` from `now`: one that is, is from a clock that
+        has since been set back.
+
+        Raises EvidenceStoreError when the store is closed. Nothing is promised
+        then, and the caller asks its source nothing."""
+        with self._writing() as db:
+            saved = _saved_state(db, name)
+            standing = _not_before(saved, now, longest)
+            if standing is not None and now < standing:
+                return standing
+            _save_not_before(db, name, saved, min(until, now + longest), now)
+            return None
+
+    def postpone(self, name: str, *, now: datetime, until: datetime, longest: timedelta) -> None:
+        """Move a poller's promise on to `until`, when that is later than the one
+        that stands, and never the other way: a wait a source asked for is not cut
+        short by one that ends sooner. One write transaction, as `reserve` is, and
+        no further off than `longest` from `now`.
+
+        Raises EvidenceStoreError when the store is closed."""
+        with self._writing() as db:
+            saved = _saved_state(db, name)
+            standing = _not_before(saved, now, longest)
+            moment = min(until, now + longest)
+            if standing is None or moment > standing:
+                _save_not_before(db, name, saved, moment, now)
+
     def state(self, name: str) -> dict[str, Any]:
         """What the poller of that name saved last, or an empty mapping."""
         with closing(self._connect()) as db:
@@ -618,6 +657,39 @@ def _distance_m(lat_a: float, lon_a: float, lat_b: float, lon_b: float) -> float
     half_lon = math.radians(lon_b - lon_a) / 2
     chord = math.sin(half_lat) ** 2 + math.cos(phi_a) * math.cos(phi_b) * math.sin(half_lon) ** 2
     return 2 * _EARTH_RADIUS_M * math.asin(min(1.0, math.sqrt(chord)))
+
+
+def _saved_state(db: sqlite3.Connection, name: str) -> dict[str, Any]:
+    row = db.execute("SELECT state FROM poller_state WHERE name = ?", (name,)).fetchone()
+    saved = {} if row is None else json.loads(row[0])
+    return saved if isinstance(saved, dict) else {}
+
+
+def _not_before(saved: Mapping[str, Any], now: datetime, longest: timedelta) -> datetime | None:
+    """The moment a poller promised to leave its source alone until, or None when
+    it wrote none that can be read."""
+    text = saved.get("not_before")
+    if not isinstance(text, str) or len(text) > 40:
+        return None
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if moment.utcoffset() is None:
+        return None
+    return min(moment, now + longest)
+
+
+def _save_not_before(
+    db: sqlite3.Connection, name: str, saved: Mapping[str, Any], moment: datetime, now: datetime
+) -> None:
+    state = dict(saved) | {"not_before": moment.astimezone(UTC).isoformat()}
+    db.execute(
+        "INSERT INTO poller_state (name, state, updated_ms) VALUES (?, ?, ?) "
+        "ON CONFLICT (name) DO UPDATE SET state = excluded.state, "
+        "updated_ms = excluded.updated_ms",
+        (name, _json(state, "A poller's state"), _to_ms(now)),
+    )
 
 
 def _to_ms(moment: datetime) -> int:

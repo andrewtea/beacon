@@ -139,6 +139,78 @@ def test_a_pollers_state_is_saved_with_its_rows_or_not_at_all(store: EvidenceSto
     assert store.state("511") == {}
 
 
+WEEK = timedelta(days=7)
+
+
+def test_a_promise_to_leave_a_source_alone_is_made_once_and_stands_until_its_moment(
+    store: EvidenceStore,
+) -> None:
+    until = NOON + timedelta(seconds=180)
+    store.add([], state=("adsblol", {"other": 1}))
+
+    assert store.reserve("adsblol", now=NOON, until=until, longest=WEEK) is None
+    # It is kept beside whatever else the poller saved, and stands for every caller.
+    assert store.state("adsblol") == {"other": 1, "not_before": until.isoformat()}
+    later = until + timedelta(hours=1)
+    asked = NOON + timedelta(seconds=179)
+    assert store.reserve("adsblol", now=asked, until=later, longest=WEEK) == until
+    assert store.state("adsblol")["not_before"] == until.isoformat()
+    # At its moment it is over, and the next is made. Another poller has its own.
+    assert store.reserve("adsblol", now=until, until=later, longest=WEEK) is None
+    assert store.reserve("511", now=until, until=later, longest=WEEK) is None
+    assert store.state("adsblol")["not_before"] == later.isoformat()
+
+
+def test_of_two_processes_that_find_the_time_come_one_makes_the_promise(tmp_path: Path) -> None:
+    path = tmp_path / "evidence.sqlite3"
+    until = NOON + timedelta(seconds=180)
+    # Each with a store of its own on the one file, as a server and the one-shot
+    # command have, and all asking at the same moment.
+    stores = [EvidenceStore(path, "mock") for _ in range(8)]
+    together = threading.Barrier(len(stores))
+
+    def reserve(store: EvidenceStore) -> datetime | None:
+        together.wait(5)
+        return store.reserve("adsblol", now=NOON, until=until, longest=WEEK)
+
+    with ThreadPoolExecutor(len(stores)) as pool:
+        answers = list(pool.map(reserve, stores))
+
+    assert sorted(answers, key=lambda answer: answer is not None) == [None] + [until] * 7
+
+
+def test_a_promise_is_moved_on_and_never_back_and_never_further_than_the_longest(
+    store: EvidenceStore,
+) -> None:
+    until = NOON + timedelta(seconds=180)
+    store.reserve("adsblol", now=NOON, until=until, longest=WEEK)
+
+    store.postpone("adsblol", now=NOON, until=NOON + timedelta(seconds=1), longest=WEEK)
+    assert store.state("adsblol") == {"not_before": until.isoformat()}
+    two_days = NOON + timedelta(days=2)
+    store.postpone("adsblol", now=NOON, until=two_days, longest=WEEK)
+    assert store.state("adsblol") == {"not_before": two_days.isoformat()}
+    store.postpone("adsblol", now=NOON, until=NOON + timedelta(days=400), longest=WEEK)
+    assert store.state("adsblol") == {"not_before": (NOON + WEEK).isoformat()}
+    # A promise further off than the longest is from a clock that was set back:
+    # it is read as the longest, and a moment after that one does move it.
+    store.add([], state=("adsblol", {"not_before": (NOON + timedelta(days=400)).isoformat()}))
+    assert store.reserve("adsblol", now=NOON, until=until, longest=WEEK) == NOON + WEEK
+    # A poller with no promise yet gets one.
+    store.postpone("511", now=NOON, until=until, longest=WEEK)
+    assert store.state("511") == {"not_before": until.isoformat()}
+
+
+def test_a_closed_store_makes_no_promise(store: EvidenceStore) -> None:
+    store.close()
+
+    with pytest.raises(EvidenceStoreError):
+        store.reserve("adsblol", now=NOON, until=NOON + timedelta(seconds=180), longest=WEEK)
+    with pytest.raises(EvidenceStoreError):
+        store.postpone("adsblol", now=NOON, until=NOON + timedelta(seconds=180), longest=WEEK)
+    assert store.state("adsblol") == {}
+
+
 def test_data_that_is_not_json_is_refused_without_being_repeated(store: EvidenceStore) -> None:
     with pytest.raises(EvidenceStoreError) as refused:
         store.add([row("a", data={"speed": float("nan"), "patient": "Jane Doe"})])

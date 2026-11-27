@@ -206,8 +206,8 @@ class CallOut(BaseModel):
     returned_text: str
     # The credits the sources of what came back require: 511's, when a count of
     # road closures or an incident's place is from 511, and adsb.lol's, when the
-    # aircraft counted, or a signal named, rest on positions adsb.lol answered
-    # with. Show them with the call.
+    # aircraft counted, a signal named, or the aircraft found over an incident
+    # rest on positions adsb.lol answered with. Show them with the call.
     credits: list[CreditOut]
     # The call to Ember a clip or a photo was given to. Null for the other tools.
     ember: EmberCallOut | None
@@ -551,8 +551,9 @@ def _ground_credits(ground: str, run: Run) -> list[CreditOut]:
 def _credits(call: Call) -> list[CreditOut]:
     """The credits a call's answer requires where it is shown: 511's for a count
     of the closures it lists, and for an incident whose place is one of them, and
-    the credit of each feed the call kept the name of, for the aircraft it counted
-    or the signals it named (`credits`)."""
+    the credit of each feed the call kept the name of: for the aircraft it counted
+    or the signals it named (`credits`), and for the aircraft `nearby_incidents`
+    found over an incident (`aircraft_credits`, `rotorcraft_credits`)."""
     got = call.returned
     found = got.get("incidents")
     placed_by_511 = call.tool == "nearby_incidents" and any(
@@ -560,10 +561,22 @@ def _credits(call: Call) -> list[CreditOut]:
         for item in (found if isinstance(found, list) else [])
     )
     counted = call.tool == "get_official" and bool(got.get("closures"))
-    kept = got.get("credits") if call.tool in ("get_aircraft", "get_official") else None
-    return _of_feeds(
-        (["511"] if placed_by_511 or counted else []) + (kept if isinstance(kept, list) else [])
-    )
+    feeds: list[object] = ["511"] if placed_by_511 or counted else []
+    if call.tool in ("get_aircraft", "get_official"):
+        feeds += _listed(got.get("credits"))
+    if call.tool == "nearby_incidents":
+        # What was kept of each incident says whether an aircraft, or a rotorcraft,
+        # was over it in reach of the tap, and is shown with the call: that rests
+        # on the aircraft's positions, whether or not anything came of it.
+        for item in _listed(found):
+            if isinstance(item, dict):
+                feeds += _listed(item.get("aircraft_credits"))
+                feeds += _listed(item.get("rotorcraft_credits"))
+    return _of_feeds(feeds)
+
+
+def _listed(kept: object) -> list[Any]:
+    return kept if isinstance(kept, list) else []
 
 
 def _nearby(run: Run, snapshot: Snapshot) -> list[Any]:
@@ -686,7 +699,7 @@ def tap_run(request: Request, tap_id: str) -> TapRun:
                     kind=cited.kind,
                     confidence=cited.confidence,  # type: ignore[arg-type]
                     evidence_ids=list(cited.evidence_ids),
-                    credit=cited_credit(cited, taps.store.get),
+                    credit=cited_credit(cited),
                 )
                 for cited in run.outcome.crisis_cited
             ],

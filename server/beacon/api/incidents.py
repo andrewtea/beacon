@@ -1,16 +1,13 @@
-from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from beacon.evidence import Evidence
 from beacon.incident import Engine, Incident
 from beacon.incident.build import (
-    CREDIT_511,
+    CREDITS,
     STATUS_WORDS,
-    credit_of,
     label_of,
     weakest,
 )
@@ -392,8 +389,6 @@ def crisis_of(request: Request, incident: Incident) -> CrisisOut | None:
     }
     having = [signal for signal in incident.signals if signal.kind in kinds]
     by_model = decision.model == "live"
-    engine: Engine | None = getattr(request.app.state, "incidents", None)
-    get = _no_row if engine is None else engine.store.get
     return CrisisOut(
         active=incident.open,
         decided_at=decision.decided_at,
@@ -410,7 +405,7 @@ def crisis_of(request: Request, incident: Incident) -> CrisisOut | None:
                 else "same"
                 if set(cited.evidence_ids) <= now[cited.kind]
                 else "changed",
-                credit=cited_credit(cited, get),
+                credit=cited_credit(cited),
             )
             for cited in decision.cited
         ],
@@ -424,27 +419,20 @@ def crisis_of(request: Request, incident: Incident) -> CrisisOut | None:
     )
 
 
-def _no_row(_evidence_id: int) -> Evidence | None:
-    return None
-
-
-def cited_credit(cited: Cited, get: Callable[[int], Evidence | None]) -> CreditOut | None:
-    """The credit that goes with a signal a decision cited: that of the feed the
-    rows it rested on are from, which `get` reads. A row is never changed or
-    deleted, so it says where the signal came from long after the signal is gone.
-    Nothing is concluded from the signal's kind about a feed: an aircraft of the
+def cited_credit(cited: Cited) -> CreditOut | None:
+    """The credit that goes with a signal a decision cited: that of the feed its
+    rows were from, which the decision kept the name of (`Cited.credits`). Nothing
+    is concluded from the signal's kind about an aircraft's feed: one of the
     invented scenario, or of a store from before Beacon asked adsb.lol, carries no
-    notice of adsb.lol's.
+    notice of adsb.lol's. Reading it reads no evidence row.
 
-    A closure whose rows cannot be read keeps 511's credit: the only rows a
-    closure rests on are 511 events, and 511's agreement asks for the credit."""
-    read = [row for row in map(get, cited.evidence_ids) if row is not None]
-    for row in read:
-        credit = credit_of(row)
-        if credit is not None:
+    A closure always carries 511's credit, kept or not: the only rows a closure
+    rests on are 511 events, 511's agreement asks for the credit, and a decision
+    kept before feeds were written down names none."""
+    feeds = {*cited.credits, *(("511",) if cited.kind == "closure" else ())}
+    for feed, credit in CREDITS.items():
+        if feed in feeds:
             return CreditOut.model_validate(credit)
-    if cited.kind == "closure" and not read:
-        return CreditOut.model_validate(CREDIT_511)
     return None
 
 

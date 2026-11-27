@@ -192,6 +192,11 @@ class Cited:
     # How far the signal was trusted, and the evidence rows it rested on.
     confidence: str
     evidence_ids: tuple[int, ...] = ()
+    # The feeds, among those of its rows, whose credit goes wherever the signal is
+    # shown: names from `beacon.incident.build.CREDITS`, as the rows' sources had
+    # them then. Kept with the decision, which is shown long after the signal can
+    # be gone, so that showing it reads no row.
+    credits: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -560,6 +565,9 @@ def _crisis(said: Mapping[str, Any], incident: Incident) -> tuple[bool, tuple[Ci
                     for source in signal.sources
                     if source.evidence_id is not None
                 )
+            ),
+            credits=tuple(
+                sorted({source.source for source in signal.sources if source.credit is not None})
             ),
         )
         for signal in incident.signals

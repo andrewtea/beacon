@@ -592,23 +592,15 @@ def test_the_stand_in_takes_a_lead_that_is_near_over_a_farther_one_with_more_sig
 
 
 def test_what_a_decision_rested_on_carries_its_sources_credit_where_the_decision_is_shown(
-    world: World,
+    world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     world.rows.tap(6, ref=TAP)
     desk = world.desk(Script([form()]))
     client = world.app(desk)
     fire = fire_id(world)
-    # Positions far from anything, which no signal of the incident rests on now:
-    # one adsb.lol answered with, one of the invented scenario, and one a store
-    # from before Beacon asked adsb.lol holds.
-    nowhere = offset(HAYES, 6000, 0)
-    answered = world.rows.aircraft(1, nowhere, icao24="live01", origin="live")
-    invented = world.rows.aircraft(1, nowhere, icao24="mock01")
-    earlier = world.rows.aircraft(1, nowhere, icao24="old001", source="opensky")
-    closure = world.rows.traffic(1, "511.org/9", road="Geary Blvd", point=nowhere)
     # A decision that rested on a closure and on a circling aircraft, on rows the
     # incident's signals no longer rest on: what the incident shows now carries no
-    # credit for them.
+    # credit for them, so the decision kept which feeds they were from.
     outcome = Outcome(
         status="incident",
         incident_id=fire,
@@ -616,11 +608,9 @@ def test_what_a_decision_rested_on_carries_its_sources_credit_where_the_decision
         confidence="low",
         crisis=True,
         crisis_cited=(
-            # A closure rests on 511 events and nothing else, so it keeps 511's
-            # credit when its rows cannot be read.
-            Cited("closure", "official", (999,)),
+            Cited("closure", "official", (999,), ("511",)),
             Cited("alarm", "medium", (2,)),
-            Cited("aircraft_circling", "high", (invented.id, answered.id)),
+            Cited("aircraft_circling", "high", (998,), ("adsblol",)),
         ),
     )
     desk.runs.claim(TAP, at(6.5))
@@ -635,6 +625,10 @@ def test_what_a_decision_rested_on_carries_its_sources_credit_where_the_decision
         )
     )
     credit = credit_json(CREDIT_511)
+    read: list[int] = []
+    monkeypatch.setattr(
+        type(world.rows.store), "get", lambda _store, evidence_id: read.append(evidence_id)
+    )
 
     crisis = client.get(f"/api/incidents/{fire}").json()["incident"]["crisis"]
     run = client.get(f"/api/taps/{TAP}/run").json()
@@ -643,27 +637,21 @@ def test_what_a_decision_rested_on_carries_its_sources_credit_where_the_decision
         assert [(one["kind"], one["credit"]) for one in cited] == [
             ("closure", credit),
             ("alarm", None),
-            # One of the positions it rested on is one adsb.lol answered with.
+            # The positions it rested on were ones adsb.lol answered with.
             ("aircraft_circling", credit_json(CREDIT_ADSBLOL)),
         ]
     assert crisis["cited"][0]["now"] == "changed"
-    # The credit is the feed's that the rows are from, and is never worked out
-    # from the kind of signal: an invented aircraft holds nothing of adsb.lol's,
-    # and neither does a position an earlier feed gave.
-    get = world.rows.store.get
-    for rested_on, expected in (
-        ((invented.id,), None),
-        ((earlier.id,), None),
-        ((998,), None),
-        ((), None),
-        ((answered.id,), CREDIT_ADSBLOL),
-    ):
-        found = cited_credit(Cited("aircraft_circling", "high", rested_on), get)
-        assert (None if found is None else found.text) == (
-            None if expected is None else expected.text
-        )
-    assert cited_credit(Cited("closure", "official", (closure.id,)), get).text == CREDIT_511.text  # type: ignore[union-attr]
-    assert cited_credit(Cited("alarm", "medium", (999,)), get) is None
+    # Showing a decision reads no evidence row, however often it is asked for.
+    assert read == []
+    # The credit is the feed's the decision kept the name of, and is never worked
+    # out from the kind of signal: an aircraft of the invented scenario, or one a
+    # decision of before this was kept rested on, carries no notice of adsb.lol's.
+    assert cited_credit(Cited("aircraft_circling", "high", (998,))) is None
+    assert cited_credit(Cited("aircraft_circling", "high", (998,), ("opensky",))) is None
+    assert cited_credit(Cited("alarm", "medium", (2,))) is None
+    # A closure rests on 511 events and on nothing else, so it carries 511's
+    # credit whether or not the decision kept the feed's name.
+    assert cited_credit(Cited("closure", "official", (999,))).text == CREDIT_511.text  # type: ignore[union-attr]
 
 
 @pytest.mark.parametrize("origin", ["live", "mock"])
@@ -681,6 +669,7 @@ def test_what_rests_on_an_aircraft_carries_adsb_lols_notice_only_when_adsb_lol_a
 
     desk.investigate(TAP)
     answer, run = (client.get(f"/api/taps/{TAP}{path}").json() for path in ("", "/run"))
+    fire = fire_id(world)
 
     # The ground in the answer, and the same grounds where the trace lists them.
     grounds = {ground["kind"]: ground["credit"] for ground in answer["match"]["grounds"]}
@@ -689,6 +678,13 @@ def test_what_rests_on_an_aircraft_carries_adsb_lols_notice_only_when_adsb_lol_a
     assert "aircraft_overhead" in run["outcome"]["grounds"]
     assert run["outcome"]["credits"] == notices
     calls = {call["tool"]: call for round_ in run["rounds"] for call in round_["calls"]}
+    # What `nearby_incidents` kept says an aircraft, and a rotorcraft, was over the
+    # fire in reach of the tap, and the trace shows what was kept: that rests on
+    # the aircraft's positions whether or not a ground came of it.
+    (found,) = [i for i in calls["nearby_incidents"]["returned"]["incidents"] if i["id"] == fire]
+    feeds = ["adsblol"] if origin == "live" else []
+    assert (found["aircraft_credits"], found["rotorcraft_credits"]) == (feeds, feeds)
+    assert calls["nearby_incidents"]["credits"] == notices
     # A count of aircraft, and a signal the trace names that rests on one.
     assert calls["get_aircraft"]["returned"]["tracks"] == 1
     assert calls["get_aircraft"]["credits"] == notices
