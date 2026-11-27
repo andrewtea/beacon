@@ -14,11 +14,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from beacon import __version__
-from beacon.api import health, incidents, sources, taps
+from beacon.api import health, incidents, places, sources, taps
 from beacon.incident import Engine, open_engine
 from beacon.ingest import IngestConfigError, build
 from beacon.ingest.setup import PAID_SECONDS, STOP_SECONDS, Ingest
 from beacon.investigate import InvestigationDesk, Runs, RunsError, open_investigations
+from beacon.places import Admission
 from beacon.radio import core_dump_problem, forbid_core_dumps
 from beacon.story import StoryDesk, open_stories
 from beacon.taps import Taps, open_taps
@@ -32,7 +33,7 @@ SWEEP_SECONDS = 60.0
 STORY_SECONDS = 15.0
 # The routes that take something private. No log line and no telemetry is written
 # about a request to one: add a route here when it takes what a person sends.
-PRIVATE_PATHS = ("/api/taps",)
+PRIVATE_PATHS = ("/api/taps", "/api/places")
 
 logger = logging.getLogger("beacon")
 
@@ -374,8 +375,11 @@ def create_app() -> FastAPI:
     logging.getLogger("uvicorn.access").addFilter(_NO_PRIVATE_LINES)
     logging.getLogger("uvicorn.asgi").addFilter(_NOTHING)
     logging.getLogger("uvicorn.error").addFilter(_NO_TRACE)
+    # How many requests about saved places are worked on at once.
+    app.state.place_checks = Admission()
     app.include_router(health.router, prefix="/api")
     app.include_router(incidents.router, prefix="/api")
+    app.include_router(places.router, prefix="/api")
     app.include_router(sources.router, prefix="/api")
     app.include_router(taps.router, prefix="/api")
     return app

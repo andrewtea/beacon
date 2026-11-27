@@ -7,6 +7,7 @@ import { href, type Route, useRoute } from './lib/router.ts'
 import { sweepTaps } from './lib/tapStore.ts'
 import { Home } from './views/Home.tsx'
 import { IncidentView } from './views/IncidentView.tsx'
+import { PlacesView } from './views/PlacesView.tsx'
 import { TapView } from './views/TapView.tsx'
 import { TraceView } from './views/TraceView.tsx'
 
@@ -30,6 +31,8 @@ function View({
       return <TraceView key={route.id} id={route.id} />
     case 'incident':
       return <IncidentView key={route.id} id={route.id} />
+    case 'places':
+      return <PlacesView mode={mode} onOtherMode={onOtherMode} />
     case 'unknown':
       return (
         <div className="view">
@@ -69,13 +72,14 @@ export default function App() {
           <span className="tag stand-in">Invented scenario</span>
         )}
       </header>
-      {mode === 'mock' && route.view === 'home' && (
-        <p className="mock-banner">
-          Beacon is running on an invented scenario, not real sources. The
-          incidents, alerts, and notices it shows are made up and are not a
-          record of anything that happened.
-        </p>
-      )}
+      {mode === 'mock' &&
+        (route.view === 'home' || route.view === 'places') && (
+          <p className="mock-banner">
+            Beacon is running on an invented scenario, not real sources. The
+            incidents, alerts, and notices it shows are made up and are not a
+            record of anything that happened.
+          </p>
+        )}
       {unreachable && (
         <p className="note problem" role="status">
           {health.error?.message}

@@ -1,7 +1,7 @@
 import { useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
-import { ApiError } from '../api/http.ts'
+import { ApiError, OTHER_MODE } from '../api/http.ts'
 import type { Mode } from '../api/incidents.ts'
-import { OTHER_MODE, sendTap, type TapBody } from '../api/taps.ts'
+import { sendTap, type TapBody } from '../api/taps.ts'
 import { Icon } from '../components/Icon.tsx'
 import { locate, LocationError, MOCK_SPOTS, type Place } from '../lib/geo.ts'
 import { drawPhoto, PhotoError } from '../lib/photo.ts'
@@ -308,6 +308,18 @@ export function Home({
           </div>
         </section>
       )}
+
+      <section className="panel places-link" aria-labelledby="places-heading">
+        <h2 id="places-heading">Your places</h2>
+        <p className="meta">
+          Save a place, such as home, and see what Beacon has near it.
+        </p>
+        <a className="action" href={href.places}>
+          <Icon name="pin" />
+          Open your places
+          <Icon name="forward" size={16} />
+        </a>
+      </section>
 
       <YourTaps />
     </div>

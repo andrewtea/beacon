@@ -11,6 +11,7 @@ export type Route =
   | { view: 'tap'; id: string }
   | { view: 'trace'; id: string }
   | { view: 'incident'; id: string }
+  | { view: 'places' }
   | { view: 'unknown' }
 
 // Ids are the server's own: a tap's is letters, digits, `-` and `_`, and an
@@ -21,6 +22,7 @@ export function parseRoute(hash: string): Route {
   const parts = hash.replace(/^#\/?/, '').split('/').filter(Boolean)
   if (parts.length === 0) return { view: 'home' }
   const [head, id, tail] = parts
+  if (head === 'places' && parts.length === 1) return { view: 'places' }
   if (id === undefined || !ID.test(id)) return { view: 'unknown' }
   if (head === 'tap' && parts.length === 2) return { view: 'tap', id }
   if (head === 'tap' && tail === 'trace' && parts.length === 3)
@@ -34,6 +36,7 @@ export const href = {
   tap: (id: string) => `#/tap/${id}`,
   trace: (id: string) => `#/tap/${id}/trace`,
   incident: (id: string) => `#/incident/${id}`,
+  places: '#/places',
 }
 
 function subscribe(onChange: () => void): () => void {

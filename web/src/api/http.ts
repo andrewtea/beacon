@@ -10,6 +10,13 @@ export class ApiError extends Error {
   }
 }
 
+/** The header in which a tap, or a request about saved places, names the mode
+ * its sender was shown: what the app held to be the server's mode when the
+ * person pressed. */
+export const MODE_HEADER = 'Beacon-Mode'
+/** The status a server in the other mode refuses such a request with, unread. */
+export const OTHER_MODE = 409
+
 /** The JSON a route answers with. A reply that is not 2xx is an ApiError. */
 export async function fetchJson<T>(
   path: string,

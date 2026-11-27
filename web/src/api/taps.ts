@@ -1,4 +1,4 @@
-import { fetchJson } from './http.ts'
+import { fetchJson, MODE_HEADER } from './http.ts'
 import type { Confidence, Credit, IncidentSummary, Mode } from './incidents.ts'
 
 // The shapes of the tap routes, field for field as `server/beacon/api/taps.py`
@@ -146,11 +146,6 @@ export type TapRun = {
   cost_incomplete: boolean
   cost_text: string | null
 }
-
-/** The header in which a tap names the mode its sender was shown. */
-export const MODE_HEADER = 'Beacon-Mode'
-/** The status a server in the other mode refuses a tap with, unread. */
-export const OTHER_MODE = 409
 
 /**
  * Sends a tap. `shown` is the mode the app was showing when the button was

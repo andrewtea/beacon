@@ -1043,3 +1043,85 @@ button.quiet:hover {
 .view > .action.back {
   margin-top: 0;
 }
+
+/* Saved places */
+
+.place-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.place-head button {
+  flex: none;
+}
+
+.place-head h2 {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.near-list {
+  display: grid;
+  gap: 1rem;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.near-distance {
+  margin: 0 0 0.4rem;
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
+.near-basis {
+  margin: 0 0 0.6rem;
+}
+
+.add-place form {
+  display: grid;
+  gap: 0.5rem;
+  max-width: 24rem;
+  margin-bottom: 1rem;
+}
+
+.add-place label {
+  color: var(--text-soft);
+  font-size: 0.9rem;
+}
+
+.add-place input[type='text'] {
+  min-height: 2.75rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 0.7rem;
+  background: var(--surface);
+  color: var(--text-strong);
+  font: inherit;
+}
+
+.add-place input[type='text']::placeholder {
+  color: var(--text-soft);
+  opacity: 0.7;
+}
+
+.add-place button.action {
+  justify-content: center;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+}
+
+.add-place button.action:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.places-link .action {
+  margin-top: 0.25rem;
+}
