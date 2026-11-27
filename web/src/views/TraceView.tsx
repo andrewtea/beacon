@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useLayoutEffect } from 'react'
 import type { Credit } from '../api/incidents.ts'
 import {
   type EmberCall,
@@ -282,7 +282,9 @@ export function TraceView({
     runCadence,
   )
   const gone = polled.error?.status === 404
-  useEffect(() => {
+  // Before the page is drawn: whoever mounted the view shows that the tap is
+  // gone in this view's place, and it is said once.
+  useLayoutEffect(() => {
     if (!gone) return
     onGone?.()
     forgetTap(id)

@@ -32,10 +32,13 @@ const HEALTH_MS = 30_000
  * by this device at another time or by whoever a link came from. The server
  * would answer that it has no such tap, after the id was sent.
  *
- * A tap the server answered that it does not have stays said to be gone, for
- * as long as this tap's views are open: the views forget such a tap, and the
- * device then no longer knows it, which is no reason to stop saying what the
- * server answered. It is not asked for again.
+ * A tap the server answered that it does not have is said to be gone from then
+ * on, for as long as this tap's views are open, and is not asked for again,
+ * whatever else is so: that the views forget such a tap, so the device no
+ * longer knows it, is no reason to stop saying what the server answered, and
+ * that storage would not let it be forgotten, or that the server now takes
+ * something else, is no reason to ask again. Nothing of its last answer is
+ * shown.
  *
  * What is said of a tap that is not asked for is about now and from now on.
  * It can have been asked for before, by a view that was open when the server
@@ -55,9 +58,9 @@ function AskedFor({
   const invented = useSyncExternalStore(subscribeTaps, () => isInventedTap(id))
   const [gone, setGone] = useState(false)
   const onGone = useCallback(() => setGone(true), [])
+  if (gone) return <TapGone repeatsText={repeatsText} />
   if (input === 'own' || (input === 'invented' && invented))
     return children(onGone)
-  if (gone) return <TapGone repeatsText={repeatsText} />
   return (
     <div className="view tap-view">
       {input === null ? (

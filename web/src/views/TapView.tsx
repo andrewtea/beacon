@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useLayoutEffect } from 'react'
 import { fetchTapAnswer, type TapAnswer } from '../api/taps.ts'
 import { Icon } from '../components/Icon.tsx'
 import { IncidentCard } from '../components/IncidentCard.tsx'
@@ -146,7 +146,9 @@ export function TapView({
   )
   const gone = polled.error?.status === 404
   // A tap the server no longer has is not kept on the device either.
-  useEffect(() => {
+  // Before the page is drawn: whoever mounted the view shows that the tap is
+  // gone in this view's place, and it is said once.
+  useLayoutEffect(() => {
     if (!gone) return
     onGone?.()
     forgetTap(id)

@@ -13,7 +13,13 @@ import { IncidentCard } from './components/IncidentCard.tsx'
 import { Sources } from './components/Provenance.tsx'
 import { OPEN_MS } from './lib/cadence.ts'
 import { drawPhoto } from './lib/photo.ts'
-import { keepTap, keptTaps, resetTaps, sweepTaps } from './lib/tapStore.ts'
+import {
+  isInventedTap,
+  keepTap,
+  keptTaps,
+  resetTaps,
+  sweepTaps,
+} from './lib/tapStore.ts'
 import {
   FIRE_TAP,
   fireAnswer,
@@ -298,6 +304,67 @@ test.each(['tap', 'trace'])(
     expect(tapRequests(asked)).toHaveLength(1)
   },
 )
+
+test('a tap that is gone is not asked for again, though storage would not forget it and the view is changed', async () => {
+  // The device goes on knowing the tap, because storage refuses the write
+  // that would forget it. The 404 is what holds: neither of the tap's views
+  // asks again, on this server or after it says it takes a visitor's own.
+  keepTap({
+    id: FIRE_TAP,
+    at: new Date().toISOString(),
+    photo: false,
+    clip: false,
+    invented: true,
+  })
+  const refused = vi
+    .spyOn(Storage.prototype, 'setItem')
+    .mockImplementation(() => {
+      throw new DOMException('Full.', 'QuotaExceededError')
+    })
+  let takes = 'invented'
+  let has = true
+  const gone = () =>
+    Response.json({ detail: 'There is no such tap.' }, { status: 404 })
+  const asked = serve({
+    'GET /api/health': () => Response.json({ ...INVENTED_ONLY, input: takes }),
+    [`GET /api/taps/${FIRE_TAP}`]: () =>
+      has ? Response.json(fireAnswer) : gone(),
+    [`GET /api/taps/${FIRE_TAP}/run`]: gone,
+    [`GET /api/incidents/${FIRE_ID}`]: fireIncident,
+  })
+  const goTo = (hash: string) =>
+    act(async () => {
+      window.location.hash = hash
+      window.dispatchEvent(new HashChangeEvent('hashchange'))
+    })
+  window.location.hash = `#/tap/${FIRE_TAP}`
+  render(<App />)
+  // An answer first, so that there is one the view could go on showing.
+  await screen.findByRole('heading', { level: 1, name: /Fire at/ })
+
+  has = false
+  await goTo(`#/tap/${FIRE_TAP}/trace`)
+  expect(
+    await screen.findByRole('heading', { name: 'This tap is gone' }),
+  ).toBeInTheDocument()
+  expect(isInventedTap(FIRE_TAP)).toBe(true)
+  const before = tapRequests(asked).length
+
+  await goTo(`#/tap/${FIRE_TAP}`)
+  await goTo(`#/tap/${FIRE_TAP}/trace`)
+  takes = 'own'
+  await goTo(`#/tap/${FIRE_TAP}`)
+  await act(async () => undefined)
+
+  expect(
+    screen.getByRole('heading', { name: 'This tap is gone' }),
+  ).toBeInTheDocument()
+  expect(
+    screen.queryByRole('heading', { name: /Fire at/ }),
+  ).not.toBeInTheDocument()
+  expect(tapRequests(asked)).toHaveLength(before)
+  refused.mockRestore()
+})
 
 test('a server that takes a visitor’s own is asked for any tap, once it has said so', async () => {
   const asked = serve(fireRoutes)
