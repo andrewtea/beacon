@@ -2170,7 +2170,7 @@ def test_a_refusal_of_a_second_attempt_does_not_say_that_nothing_was_sent(
     api = MetaApi(create=lambda _request: _rate_limited())
     clock = Clock()
     # The scope has room for one attempt at the most it can cost, and not for two.
-    scope = SpendScope("ingest:openmhz", RESERVED_NANOUSD + 1)
+    scope = SpendScope("ingest:recordings", RESERVED_NANOUSD + 1)
     ember = api.client(storage, scope=scope, pacer=Pacer(3000, clock=clock, sleep=clock.sleep))
 
     with pytest.raises(EmberCallError) as raised:
@@ -2319,7 +2319,7 @@ def test_a_rate_limited_token_count_is_not_taken_for_an_attempt_that_was_sent(
         api_key="test-key",
         http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
         # No room for even one attempt at the most it can cost.
-        scope=SpendScope("ingest:openmhz", RESERVED_NANOUSD - 1),
+        scope=SpendScope("ingest:recordings", RESERVED_NANOUSD - 1),
         pacer=Pacer(3000, clock=clock, sleep=clock.sleep),
     )
 

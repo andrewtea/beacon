@@ -129,7 +129,7 @@ CREDITS = {"511": CREDIT_511, adsblol.SOURCE: CREDIT_ADSBLOL}
 Nearby = Callable[[Kind, Point, float, datetime, datetime], tuple[Sequence[Evidence], bool]]
 
 _LABELS = {
-    "openmhz": "Fire and EMS dispatch radio, as Ember heard it",
+    "recordings": "Fire and EMS dispatch radio, as Ember heard it",
     "nws": "National Weather Service alert feed",
     "511": "511 SF Bay traffic events",
     "notices": "Official notice, as Ember read it",
@@ -146,6 +146,10 @@ _INVENTED_LABELS = {"adsblol": "Aircraft positions"}
 # the row: no Ember heard that call or read that document, so the label does not
 # say one did. That a stand-in did is said beside it, from the row's `stand_in`.
 _STAND_IN_LABELS = {
+    "recordings": "Fire and EMS dispatch radio",
+    # The invented calls a mock store played before radio came from recorded calls
+    # are under this name. OpenMHz itself was never asked anything, so no row of a
+    # live store has it, and no model heard one.
     "openmhz": "Fire and EMS dispatch radio",
     "notices": "Official notice",
 }

@@ -22,7 +22,7 @@ const HAYES = { lat: 37.7766, lon: -122.4236 }
 
 const source = (from: Partial<Source>): Source => ({
   kind: 'radio',
-  source: 'openmhz',
+  source: 'recordings',
   label: 'Fire and EMS dispatch radio',
   confidence: 'medium',
   at: '2026-11-26T23:24:25Z',

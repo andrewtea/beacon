@@ -4,8 +4,9 @@ In mock mode the pollers are the real ones, and this stands where the network wo
 be: it answers a request to a source's address with what the scenario says that
 source would have answered at the clock's moment. It is strict about what it is
 asked, so a poller that would be refused by the real source is refused here: NWS
-needs a User-Agent, 511 a token, adsb.lol a point and a radius it answers for, and
-OpenMHz a time and the talkgroups to list. The notices feed is on a host of the story's own.
+needs a User-Agent, 511 a token, and adsb.lol a point and a radius it answers for.
+The notices feed is on a host of the story's own. Radio is not asked of anybody: the
+story's calls are on a shelf of their own (`beacon.scenario.radio.StoryShelf`).
 
 A request to any other address gets a 404, and nothing here opens a connection.
 """
@@ -18,7 +19,7 @@ from typing import Any
 
 import httpx2
 
-from beacon.scenario import notices, radio
+from beacon.scenario import notices
 from beacon.scenario.fire import Scenario
 
 # `/v2/point/{lat}/{lon}/{radius}`, with the radius in whole nautical miles.
@@ -52,17 +53,6 @@ def scenario_transport(scenario: Scenario, now: Callable[[], datetime]) -> httpx
                 return httpx2.Response(400, text="The mock scenario answers for now only.")
             # 511 begins its replies with a byte order mark.
             return _json(scenario.traffic_events(now()), bom=True)
-        if place == ("GET", "api.openmhz.com", f"/{radio.SYSTEM}/calls/newer"):
-            after, codes = url.params.get("time", ""), url.params.get("filter-code", "")
-            if not after.isdigit() or url.params.get("filter-type") != "talkgroup":
-                return httpx2.Response(400, text="A time and talkgroups are required.")
-            talkgroups = {int(code) for code in codes.split(",") if code.isdigit()}
-            return _json(radio.calls_answer(scenario.start, now(), int(after), talkgroups))
-        if (request.method, url.host) == ("GET", radio.AUDIO_HOST):
-            audio = radio.call_audio(url.path.removeprefix("/mock/"))
-            if audio is None:
-                return httpx2.Response(404, text="The mock scenario has no such call.")
-            return httpx2.Response(200, content=audio, headers={"content-type": "audio/wav"})
         if place == ("GET", notices.FEED_HOST, "/feed.json"):
             return _json(notices.feed(scenario.start, now()), "application/feed+json")
         if (request.method, url.host) == ("GET", notices.FEED_HOST):

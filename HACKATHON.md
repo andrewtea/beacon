@@ -17,7 +17,7 @@ Shared context for building Beacon, a mobile and web app, for the Meta Muse Embe
 - Budget is $10 total, and spend-limit alerts only email; they do not stop usage. Guard against runaway loops. Beacon's always-on inputs (radio audio, aircraft positions) spend the most, so cap them in code, not only in a dashboard.
 - The repo must be public, and the demo must show only what was built during the hackathon. Any recording replayed in the demo (radio, camera footage) must be one we have the rights to use.
 - Avoid the banned project types listed below. In particular, the map is not the main feature (no dashboard apps), photos only add evidence to an incident (no image analyzer), and EMS traffic is summarized without describing the patient (no medical advice).
-- Use only data we have rights to: check each source's terms, and ask OpenMHz and LiveATC before using their audio. Publish summaries, never raw radio audio.
+- Use only data we have rights to: check each source's terms, and ask before using anybody's audio. OpenMHz was asked and said not to use its API, so Beacon requests nothing from it; LiveATC has not been asked, and Beacon requests nothing from it either. Publish summaries, never raw radio audio.
 
 ## Organizer clarification (Discord, Nov 25)
 

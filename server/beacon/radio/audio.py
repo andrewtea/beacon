@@ -3,12 +3,13 @@
 Ember is sent a WAV file that Beacon made itself, and only that. A call that arrives
 as WAV is read and written out again (`plain_wav`), so what is sent is the samples
 that were counted and nothing else the file carried. A call that arrives as M4A, as
-OpenMHz serves it, or as MP3 is decoded by ffmpeg (`Ffmpeg`). Either way Beacon
+a recorder that compresses its calls writes it, or as MP3 is decoded by ffmpeg
+(`Ffmpeg`). Either way Beacon
 knows how long the audio really plays before it pays to have it heard, whatever the
 source said its length was.
 
 The audio is radio traffic, which can name people and describe patients, and it
-comes from the internet, so the decoder is given as little as can be:
+is a file somebody else wrote, so the decoder is given as little as can be:
 
 - **No file of the call is written.** The call is handed to ffmpeg as a file that
   exists only in memory (`memfd_create`, a Linux feature), and what ffmpeg makes of

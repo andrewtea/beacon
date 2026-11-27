@@ -71,7 +71,7 @@ class Rows:
         place = None if street is None else f"{block} block of {street}" if block else street
         return self._add(
             kind="radio",
-            source="openmhz",
+            source="recordings",
             occurred_at=at(minute),
             confidence="medium" if clarity == "clear" else "low",
             model="fake",

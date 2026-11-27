@@ -18,6 +18,7 @@ import pytest
 from beacon.ember import EmberClient, EmberConfigError, SpendScope
 from beacon.evidence import Evidence, EvidenceStore, EvidenceStoreError, NewEvidence
 from beacon.ingest import (
+    SOURCES,
     Clock,
     Ingest,
     IngestConfigError,
@@ -34,6 +35,7 @@ from beacon.ingest.adsblol import AdsbLolAircraft
 from beacon.ingest.http import SourceHttp, fetch
 from beacon.ingest.listing import listed_again_row, not_listed_row
 from beacon.ingest.nws import NwsAlerts
+from beacon.ingest.recordings import GENERATED_MARK
 from beacon.ingest.traffic511 import Traffic511
 from beacon.radio import NOTHING_KNOWN, Ffmpeg, Known
 from beacon.scenario import FIRE, INVENTED, Scenario, scenario_transport
@@ -178,11 +180,16 @@ def test_the_radio_of_the_mock_scenario_tells_the_fire_through_a_stand_in_for_em
 
     calls = ingest.store.search(kinds=["radio"])
     # Twenty calls were made. The click of a microphone was never heard.
-    assert [row.ref for row in calls] == [
-        f"mock-call-{number:04d}" for number in range(20) if number != 4
+    # Each is named as a recorder names a call's files: by its system, its
+    # talkgroup, when it began, and the recorder's count of calls.
+    assert [row.ref.rsplit("-", 1)[1] for row in calls] == [
+        f"call_{number}" for number in range(20) if number != 4
     ]
+    first = calls[0]
+    assert first.ref == f"invented/9101-{int(story(0).timestamp())}_851000000-call_0"
+    assert (first.data["system"], first.data["talkgroup"]) == ("invented", 9101)
     assert {(row.source, row.origin, row.model, row.point) for row in calls} == {
-        ("openmhz", "mock", "fake", None)
+        ("recordings", "mock", "fake", None)
     }
     # A call is stored when the poll after it hears it, at the time it was made.
     assert [calls[0].occurred_at, calls[-1].occurred_at] == [story(0), story(90)]
@@ -254,7 +261,7 @@ def test_a_mock_store_first_opened_shows_a_fire_already_under_way(
         "nws": 2,
         "511": 3,
         "adsblol": 31,
-        "openmhz": 10,
+        "recordings": 10,
         "notices": 1,
     }
     assert ingest.store.state("scenario") == {
@@ -263,7 +270,7 @@ def test_a_mock_store_first_opened_shows_a_fire_already_under_way(
         # How each poller's last poll went, for a process that goes on from here.
         "polls": {
             name: {"polled_at": NOON.isoformat(), "ok": True, "partial": False}
-            for name in ("nws", "adsblol", "511", "openmhz", "notices")
+            for name in ("nws", "adsblol", "511", "recordings", "notices")
         },
     }
     # The clock is let go when the story has been played up to now.
@@ -417,7 +424,7 @@ def test_a_restart_after_the_story_has_ended_still_says_how_the_last_polls_went(
         PollerStatus("nws", story(104), True),
         PollerStatus("adsblol", story(105), True),
         PollerStatus("511", story(104), True),
-        PollerStatus("openmhz", story(105), True),
+        PollerStatus("recordings", story(105), True),
         PollerStatus("notices", story(104), True),
     ]
 
@@ -495,7 +502,7 @@ def test_a_setting_that_names_no_source_is_mock_mode_through_and_through(
         "nws": 2,
         "511": 3,
         "adsblol": 31,
-        "openmhz": 10,
+        "recordings": 10,
         "notices": 1,
     }
 
@@ -616,59 +623,100 @@ def test_each_source_is_asked_with_the_settings_the_environment_holds(
 
 
 @pytest.fixture(autouse=True)
-def an_ffmpeg_that_can_be_confined(monkeypatch: pytest.MonkeyPatch) -> None:
+def an_ffmpeg_that_can_be_confined(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Building a poller for real radio tries ffmpeg out, confined, and reads where
     the host sends core dumps. These tests are about the settings, on any machine;
-    `test_radio_audio` is about ffmpeg and the host."""
+    `test_radio_audio` is about ffmpeg and the host. The directory of recordings
+    `RADIO` names is an empty one of each test's own."""
     monkeypatch.setattr(Ffmpeg, "problem", lambda self: None)
     monkeypatch.setattr("beacon.ingest.setup.core_dump_problem", lambda: None)
+    calls = tmp_path / "recorded-calls"
+    calls.mkdir()
+    monkeypatch.setitem(RADIO, "BEACON_RECORDINGS_DIR", str(calls))
 
 
 RADIO = {
-    "BEACON_LIVE_SOURCES": "openmhz",
-    "BEACON_OPENMHZ_PERMITTED": "1",
-    "BEACON_OPENMHZ_TALKGROUPS": "1201, 1203,1301",
-    "BEACON_OPENMHZ_EMS_TALKGROUPS": "1301",
-    "BEACON_OPENMHZ_BUDGET_USD": "0.25",
+    "BEACON_LIVE_SOURCES": "recordings",
+    "BEACON_RECORDINGS_PERMITTED": "1",
+    "BEACON_RECORDINGS_TALKGROUPS": "1201, 1203,1301",
+    "BEACON_RECORDINGS_EMS_TALKGROUPS": "1301",
+    "BEACON_RECORDINGS_BUDGET_USD": "0.25",
     "REPLAY": "0",
     "MODEL_API_KEY": "key-from-the-env",
 }
 
 
 @pytest.mark.parametrize(
-    ("settings", "message"),
+    ("changes", "message"),
     [
-        # Being able to ask is not permission to.
-        (RADIO | {"BEACON_OPENMHZ_PERMITTED": ""}, "needs its permission"),
-        (RADIO | {"BEACON_OPENMHZ_PERMITTED": "yes"}, "set BEACON_OPENMHZ_PERMITTED=1 once"),
-        (RADIO | {"BEACON_OPENMHZ_TALKGROUPS": ""}, "needs BEACON_OPENMHZ_TALKGROUPS"),
-        (RADIO | {"BEACON_OPENMHZ_TALKGROUPS": "fire,ems"}, "is a list of talkgroup numbers"),
-        (RADIO | {"BEACON_OPENMHZ_TALKGROUPS": "-1201"}, "is a list of talkgroup numbers"),
+        # Recorded calls are files on this machine, in a directory that is named.
+        ({"BEACON_RECORDINGS_DIR": ""}, "needs BEACON_RECORDINGS_DIR"),
+        ({"BEACON_RECORDINGS_DIR": "recorded-calls"}, "needs BEACON_RECORDINGS_DIR"),
+        ({"BEACON_RECORDINGS_DIR": "/nowhere/at/all"}, "needs BEACON_RECORDINGS_DIR"),
+        # Having a recording is not the right to use it.
+        ({"BEACON_RECORDINGS_PERMITTED": ""}, "used only with the right to"),
+        ({"BEACON_RECORDINGS_PERMITTED": "yes"}, "set BEACON_RECORDINGS_PERMITTED=1 when"),
+        ({"BEACON_RECORDINGS_TALKGROUPS": ""}, "needs BEACON_RECORDINGS_TALKGROUPS"),
+        ({"BEACON_RECORDINGS_TALKGROUPS": "fire,ems"}, "is a list of talkgroup numbers"),
+        ({"BEACON_RECORDINGS_TALKGROUPS": "-1201"}, "is a list of talkgroup numbers"),
         (
-            RADIO | {"BEACON_OPENMHZ_EMS_TALKGROUPS": "1301,1400"},
-            "names a talkgroup that BEACON_OPENMHZ_TALKGROUPS does not",
-        ),
-        (
-            RADIO | {"BEACON_OPENMHZ_MEDIA_HOSTS": "https://s3.example.org/calls"},
-            "is a list of host names",
+            {"BEACON_RECORDINGS_EMS_TALKGROUPS": "1301,1400"},
+            "names a talkgroup that BEACON_RECORDINGS_TALKGROUPS does not",
         ),
         # Every call is paid for, so the most it may cost has no default.
-        (RADIO | {"BEACON_OPENMHZ_BUDGET_USD": ""}, "needs BEACON_OPENMHZ_BUDGET_USD"),
-        (RADIO | {"BEACON_OPENMHZ_BUDGET_USD": "a little"}, "needs BEACON_OPENMHZ_BUDGET_USD"),
-        (RADIO | {"BEACON_OPENMHZ_BUDGET_USD": "250"}, "needs BEACON_OPENMHZ_BUDGET_USD"),
+        ({"BEACON_RECORDINGS_BUDGET_USD": ""}, "needs BEACON_RECORDINGS_BUDGET_USD"),
+        ({"BEACON_RECORDINGS_BUDGET_USD": "a little"}, "needs BEACON_RECORDINGS_BUDGET_USD"),
+        ({"BEACON_RECORDINGS_BUDGET_USD": "250"}, "needs BEACON_RECORDINGS_BUDGET_USD"),
         # A call cannot be replayed, so a client that only replays cannot hear one.
-        (RADIO | {"REPLAY": "1"}, "heard by a live Ember and cannot be replayed"),
+        ({"REPLAY": "1"}, "heard by a live Ember and cannot be replayed"),
     ],
 )
-def test_radio_is_not_polled_for_real_without_permission_a_budget_and_a_live_ember(
-    env: dict[str, str], monkeypatch: pytest.MonkeyPatch, settings: dict[str, str], message: str
+def test_radio_is_not_heard_for_real_without_the_right_to_a_budget_and_a_live_ember(
+    env: dict[str, str], monkeypatch: pytest.MonkeyPatch, changes: dict[str, str], message: str
 ) -> None:
     monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
 
     with pytest.raises(IngestConfigError, match=message) as refused:
-        build(env | settings)
+        build(env | RADIO | changes)
 
     assert "key-from-the-env" not in str(refused.value)
+    assert refused.value.__context__ is None
+    assert not (Path(env["BEACON_DATA_DIR"]) / "evidence").exists()
+
+
+def test_a_directory_of_generated_audio_is_no_live_source(
+    env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+    (Path(RADIO["BEACON_RECORDINGS_DIR"]) / GENERATED_MARK).write_text("Generated. No radio.")
+
+    with pytest.raises(IngestConfigError, match="marked as generated audio, which is no radio"):
+        build(env | RADIO)
+
+    # Refused before a client that can spend was built, or a store was opened.
+    assert not (Path(env["BEACON_DATA_DIR"]) / "ember").exists()
+    assert not (Path(env["BEACON_DATA_DIR"]) / "evidence").exists()
+
+
+@pytest.mark.parametrize("named", ["openmhz", "nws,openmhz", "OpenMHz", " openmhz , recordings"])
+def test_openmhz_is_no_source_and_no_setting_makes_it_one(
+    env: dict[str, str], monkeypatch: pytest.MonkeyPatch, named: str
+) -> None:
+    monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+    # Everything an earlier Beacon would have taken as leave to ask it.
+    asked_for = RADIO | {
+        "BEACON_LIVE_SOURCES": named,
+        "BEACON_OPENMHZ_PERMITTED": "1",
+        "BEACON_OPENMHZ_TALKGROUPS": "1201",
+        "BEACON_OPENMHZ_BUDGET_USD": "0.25",
+    }
+
+    for refuse in (lambda: live_sources(asked_for), lambda: build(env | asked_for)):
+        with pytest.raises(IngestConfigError, match="said not to") as refused:
+            refuse()
+        assert str(refused.value).startswith("BEACON_LIVE_SOURCES names openmhz. OpenMHz is not")
+
+    assert "openmhz" not in SOURCES
     assert not (Path(env["BEACON_DATA_DIR"]) / "evidence").exists()
 
 
@@ -692,7 +740,7 @@ def test_radio_is_not_polled_for_real_where_its_audio_cannot_be_converted(
 
     with pytest.raises(
         IngestConfigError,
-        match=r"^BEACON_LIVE_SOURCES names openmhz\. ffmpeg is run confined by bubblewrap",
+        match=r"^BEACON_LIVE_SOURCES names recordings\. ffmpeg is run confined by bubblewrap",
     ):
         build(env | RADIO)
 
@@ -712,7 +760,7 @@ def test_radio_is_not_polled_for_real_on_a_host_that_hands_core_dumps_to_a_colle
 
     with pytest.raises(
         IngestConfigError,
-        match=r"^BEACON_LIVE_SOURCES names openmhz\. This host pipes core dumps",
+        match=r"^BEACON_LIVE_SOURCES names recordings\. This host pipes core dumps",
     ):
         build(env | RADIO)
 
@@ -746,15 +794,15 @@ def test_naming_radio_builds_its_poller_with_a_live_ember_under_its_budget_and_a
 
     monkeypatch.setattr(EmberClient, "from_env", remember)
 
-    ingest = build(env | RADIO | {"BEACON_OPENMHZ_MEDIA_HOSTS": "S3.Example.org"}, Clock(time))
+    ingest = build(env | RADIO, Clock(time))
 
     assert (ingest.store.mode, ingest.http.origin, ingest.scenario) == ("live", "live", None)
-    assert [(status.name, status.ok) for status in ingest.runner.status()] == [("openmhz", None)]
+    assert [(status.name, status.ok) for status in ingest.runner.status()] == [("recordings", None)]
     # One client, which can spend, and every call it makes counts against the
     # budget the operator set for radio over all runs: 25 cents.
     ((ember, scope),) = built
     assert ember.spends
-    assert scope == SpendScope("ingest:openmhz", 250_000_000)
+    assert scope == SpendScope("ingest:recordings", 250_000_000)
     assert ember.spent_usd() == 0
     ingest.close()
 
@@ -822,7 +870,7 @@ def test_the_mock_scenarios_paying_pollers_are_closed_and_waited_for_with_the_po
 ) -> None:
     ingest = build(env, Clock(time))
 
-    assert [work.name for work in ingest.paid] == ["openmhz", "notices"]
+    assert [work.name for work in ingest.paid] == ["recordings", "notices"]
 
 
 def test_what_a_stand_in_answered_cannot_be_stored_as_a_real_sources(
@@ -973,7 +1021,7 @@ def test_a_change_about_a_stand_ins_row_is_a_stand_ins_whoever_saw_it(tmp_path: 
             ),
             NewEvidence(
                 kind="radio",
-                source="openmhz",
+                source="recordings",
                 ref="call-1",
                 occurred_at=NOON,
                 confidence="medium",
@@ -1196,7 +1244,7 @@ def test_the_mock_and_live_stores_are_kept_apart_in_one_data_directory(
         "nws": 2,
         "511": 3,
         "adsblol": 31,
-        "openmhz": 10,
+        "recordings": 10,
         "notices": 1,
     }
     assert (open_store(env).mode, open_store(env).path.name) == ("mock", "mock.sqlite3")
@@ -1356,17 +1404,17 @@ def test_naming_notices_builds_their_poller_with_a_live_ember_under_a_budget_of_
         return from_env(*args, scope=scope, **options)
 
     monkeypatch.setattr(EmberClient, "from_env", remember)
-    settings = RADIO | NOTICES | {"BEACON_LIVE_SOURCES": "notices,openmhz"}
+    settings = RADIO | NOTICES | {"BEACON_LIVE_SOURCES": "notices,recordings"}
     settings |= {"BEACON_NOTICES_HOSTS": "Files.Example.org"}
 
     ingest = build(env | settings, Clock(time))
 
     assert (ingest.store.mode, ingest.http.origin, ingest.scenario) == ("live", "live", None)
-    assert [status.name for status in ingest.runner.status()] == ["openmhz", "notices"]
+    assert [status.name for status in ingest.runner.status()] == ["recordings", "notices"]
     # Each paying poller has a client of its own, under a budget of its own, and
     # both are told when Beacon stops.
     assert scopes == [
-        SpendScope("ingest:openmhz", 250_000_000),
+        SpendScope("ingest:recordings", 250_000_000),
         SpendScope("ingest:notices", 500_000_000),
     ]
     radio, notices = ingest.paid

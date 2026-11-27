@@ -53,8 +53,8 @@ def test_every_line_of_a_timeline_names_its_row_its_source_and_its_confidence(ro
         (entry.kind, entry.confidence, entry.sources[0].evidence_id, entry.sources[0].source)
         for entry in incident.timeline
     ] == [
-        ("radio", "medium", call.id, "openmhz"),
-        ("radio", "low", heard.id, "openmhz"),
+        ("radio", "medium", call.id, "recordings"),
+        ("radio", "low", heard.id, "recordings"),
         ("closure", "official", closure.id, "511"),
         ("alert", "official", alert.id, "nws"),
         ("notice", "high", notice.id, "notices"),

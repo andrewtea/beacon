@@ -994,7 +994,7 @@ def test_a_poller_that_can_spend_has_a_budget_of_its_own(
     )
 
     radio = EmberClient.live(
-        storage, api_key="test-key", scope=SpendScope("ingest:openmhz", 500_000_000)
+        storage, api_key="test-key", scope=SpendScope("ingest:recordings", 500_000_000)
     )
 
     # Without one, all that holds its spending is the stop on everything.

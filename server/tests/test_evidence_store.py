@@ -46,7 +46,7 @@ def test_a_row_comes_back_as_it_was_stored(store: EvidenceStore) -> None:
     pacific = timezone(timedelta(hours=-8))
     new = NewEvidence(
         kind="radio",
-        source="openmhz",
+        source="recordings",
         ref="call-1",
         url="https://example.org/call-1",
         occurred_at=datetime(2026, 11, 27, 12, 0, 0, 250_000, tzinfo=pacific),
@@ -61,13 +61,13 @@ def test_a_row_comes_back_as_it_was_stored(store: EvidenceStore) -> None:
 
     (stored,) = store.add([new], now=minutes(1))
 
-    assert stored == store.get(stored.id) == store.find("openmhz", "call-1")
+    assert stored == store.get(stored.id) == store.find("recordings", "call-1")
     assert stored.recorded_at == minutes(1)
     # The same moment, told in UTC.
     assert stored.occurred_at == NOON + timedelta(milliseconds=250)
     assert (stored.kind, stored.source, stored.ref, stored.url) == (
         "radio",
-        "openmhz",
+        "recordings",
         "call-1",
         "https://example.org/call-1",
     )
@@ -98,7 +98,7 @@ def test_an_item_a_source_sends_twice_is_kept_once_and_never_changed(
 def test_the_live_store_refuses_what_a_stand_in_produced(tmp_path: Path) -> None:
     live = EvidenceStore(tmp_path / "live.sqlite3", "live")
     invented = row("invented", origin="mock")
-    by_a_fake = row("by-a-fake", kind="radio", source="openmhz", model="fake")
+    by_a_fake = row("by-a-fake", kind="radio", source="recordings", model="fake")
     assert invented.stand_in
     assert by_a_fake.stand_in
 
@@ -607,15 +607,15 @@ def test_an_item_is_claimed_by_one_caller_only_and_for_good(tmp_path: Path) -> N
     # Another process with the same file.
     other = EvidenceStore(path, "mock")
 
-    assert store.claim("openmhz", "call-1") is True
-    assert other.claim("openmhz", "call-1") is False
-    assert store.claim("openmhz", "call-1") is False
+    assert store.claim("recordings", "call-1") is True
+    assert other.claim("recordings", "call-1") is False
+    assert store.claim("recordings", "call-1") is False
     # A claim is on one source's item: the same reference of another source is free.
     assert other.claim("another", "call-1") is True
-    assert other.claim("openmhz", "call-2") is True
+    assert other.claim("recordings", "call-2") is True
 
     # It outlasts the process that made it.
-    assert EvidenceStore(path, "mock").claim("openmhz", "call-1") is False
+    assert EvidenceStore(path, "mock").claim("recordings", "call-1") is False
 
 
 def test_of_many_callers_claiming_at_once_exactly_one_gets_the_item(tmp_path: Path) -> None:
@@ -626,7 +626,7 @@ def test_of_many_callers_claiming_at_once_exactly_one_gets_the_item(tmp_path: Pa
     def claim(_caller: int) -> bool:
         store = EvidenceStore(path, "mock")
         start.wait(10)
-        return store.claim("openmhz", "call-1")
+        return store.claim("recordings", "call-1")
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         claims = list(pool.map(claim, range(8)))
@@ -635,35 +635,35 @@ def test_of_many_callers_claiming_at_once_exactly_one_gets_the_item(tmp_path: Pa
 
 
 def test_a_claim_that_is_given_up_can_be_made_again(store: EvidenceStore) -> None:
-    assert store.claim("openmhz", "call-1") is True
+    assert store.claim("recordings", "call-1") is True
 
-    store.release("openmhz", "call-1")
+    store.release("recordings", "call-1")
 
-    assert store.taken("openmhz", ["call-1"]) == set()
-    assert store.claim("openmhz", "call-1") is True
+    assert store.taken("recordings", ["call-1"]) == set()
+    assert store.claim("recordings", "call-1") is True
 
 
 def test_what_is_taken_is_what_is_claimed_or_stored(store: EvidenceStore) -> None:
-    store.claim("openmhz", "claimed")
-    store.add([row("stored", source="openmhz")])
+    store.claim("recordings", "claimed")
+    store.add([row("stored", source="recordings")])
     store.add([row("of-another-source")])
     refs = ["claimed", "stored", "of-another-source", "new", *(f"call-{n}" for n in range(1200))]
 
-    assert store.taken("openmhz", refs) == {"claimed", "stored"}
-    assert store.taken("openmhz", []) == set()
+    assert store.taken("recordings", refs) == {"claimed", "stored"}
+    assert store.taken("recordings", []) == set()
 
 
 def test_a_closed_store_takes_no_claim_and_gives_none_up(store: EvidenceStore) -> None:
-    store.claim("openmhz", "call-1")
+    store.claim("recordings", "call-1")
     store.close()
 
     with pytest.raises(EvidenceStoreError, match="is closed and takes no more rows"):
-        store.claim("openmhz", "call-2")
+        store.claim("recordings", "call-2")
     with pytest.raises(EvidenceStoreError, match="is closed and takes no more rows"):
-        store.release("openmhz", "call-1")
+        store.release("recordings", "call-1")
 
     # Reading goes on: the claim that was made is there, and the other is not.
-    assert store.taken("openmhz", ["call-1", "call-2"]) == {"call-1"}
+    assert store.taken("recordings", ["call-1", "call-2"]) == {"call-1"}
 
 
 def test_a_store_file_from_before_claims_is_given_the_table(tmp_path: Path) -> None:
@@ -674,7 +674,7 @@ def test_a_store_file_from_before_claims_is_given_the_table(tmp_path: Path) -> N
 
     store = EvidenceStore(path, "live")
 
-    assert store.claim("openmhz", "call-1") is True
+    assert store.claim("recordings", "call-1") is True
     assert refs(store.search()) == ["kept"]
 
 
