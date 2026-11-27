@@ -91,20 +91,27 @@ export function placeName(typed: string): string {
 // The name of the lock a change to the list is made under.
 const LOCK = 'beacon.places'
 
+/** The browser has no lock for the app's tabs to share. */
+class NoLock extends Error {}
+
 /**
  * Does `work` while no other tab of the app is changing the list. A change is a
  * reading of the whole list and a writing of it, and two tabs that did both at
  * once would each write back what the other had just changed: a place one
- * removed would be saved again by the other. The browser's lock makes them take
- * turns, and `work` reads the list only once its turn has come. A browser with
- * no such lock (it is there on `localhost` and over HTTPS) does the work at once.
+ * removed would be saved again by the other, and sent at its next asking. The
+ * browser's lock makes them take turns, and `work` reads the list only once its
+ * turn has come.
+ *
+ * A browser with no such lock changes nothing: the change fails, and the view
+ * says so. The lock is there wherever the app can find where a phone is, on
+ * `localhost` and over HTTPS.
  */
 async function alone<T>(work: () => T): Promise<T> {
   const locks =
     typeof navigator === 'undefined'
       ? undefined
       : (navigator as { locks?: LockManager }).locks
-  if (locks === undefined) return work()
+  if (locks === undefined) throw new NoLock()
   return (await locks.request(LOCK, () => work())) as T
 }
 
@@ -133,12 +140,14 @@ export async function savePlace(
       return write([...places, place]) ? 'saved' : 'failed'
     })
   } catch {
-    // The browser would not give the lock.
+    // The browser has no lock, or would not give it. Nothing was written.
     return 'failed'
   }
 }
 
-/** Remove a place from this device. Answers with whether storage took it. */
+/** Remove a place from this device. Answers with whether it was removed: false
+ * when storage would not take the change, and when the browser has no lock to
+ * make it under. */
 export async function removePlace(id: string): Promise<boolean> {
   try {
     return await alone(() => write(read().filter((place) => place.id !== id)))

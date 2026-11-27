@@ -38,7 +38,7 @@ function Near({ answer }: { answer: PlaceAnswer }) {
   return (
     <ul className="near-list">
       {answer.near.map((item) => {
-        // Not null when the distance is measured from where 511 lists a
+        // Not null when the distance is measured from where 511 listed a
         // closure, which the server's sentence says. The row is shown with the
         // distance it is under: how far it is trusted, and 511's credit. The
         // card's own confidence is its radio calls'.

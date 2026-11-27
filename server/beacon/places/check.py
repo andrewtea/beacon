@@ -49,8 +49,12 @@ NOT_AN_AREA = (
     "outside the area of an official order or alert. What an authority published says "
     "which area it covers."
 )
-# Said with a distance that is measured from a point of 511's.
-_FROM_511 = ", going by where 511 lists a road closure on its street"
+# Said with a distance that is measured from a point of 511's. "Listed", not
+# "lists": the point is from the version of a 511 event that had a road of the
+# incident's closed, and a later version can have it open again. The point is
+# still where the incident is taken to be; whether 511 lists a closure now is the
+# timeline's to say.
+_FROM_511 = ", going by where 511 listed a road closure on its street"
 
 
 @dataclass(frozen=True)

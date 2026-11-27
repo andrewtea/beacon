@@ -14,6 +14,7 @@ import {
   subscribePlaces,
 } from './lib/placeStore.ts'
 import { fireAnswer } from './test/fixtures.ts'
+import { fakeLocks } from './test/locks.ts'
 import { MOCK_HEALTH, serve } from './test/server.ts'
 
 const KEY = 'beacon.places.v1'
@@ -47,18 +48,6 @@ const stored = (): unknown =>
   JSON.parse(window.localStorage.getItem(KEY) ?? '[]')
 // A press, and whatever it starts: saving and removing are waited for.
 const click = (element: HTMLElement) => act(async () => element.click())
-
-/** The browser's lock, as tabs of one app share it: one holder at a time, in
- * the order they asked. */
-function fakeLocks() {
-  let last: Promise<unknown> = Promise.resolve()
-  const request = vi.fn((_name: string, work: () => unknown) => {
-    const turn = last.then(() => work())
-    last = turn.catch(() => undefined)
-    return turn
-  })
-  return { request }
-}
 
 beforeEach(() => {
   window.localStorage.clear()
@@ -149,7 +138,7 @@ test('a place with nothing near it says so in the server’s sentence, which is 
   expect(within(home).queryByText(NOTHING)).not.toBeInTheDocument()
 })
 
-test('a distance measured from where 511 lists a closure shows that row’s confidence and 511’s credit, beside that distance only', async () => {
+test('a distance measured from where 511 listed a closure shows that row’s confidence and 511’s credit, beside that distance only', async () => {
   await savePlace('Home', FIRE)
   const credit = { text: 'Data provided by 511.org', url: 'https://511.org' }
   const closure: Source = {
@@ -164,7 +153,7 @@ test('a distance measured from where 511 lists a closure shows that row’s conf
     model: null,
     credit,
   }
-  // Two incidents near one place: one where its block is, one where 511 lists
+  // Two incidents near one place: one where its block is, one where 511 listed
   // a closure on its street.
   const other: IncidentSummary = {
     ...fire,
@@ -174,7 +163,7 @@ test('a distance measured from where 511 lists a closure shows that row’s conf
     point_source: closure,
   }
   const BY_511 =
-    'Beacon has this incident about 300 m from this place, going by where 511 lists a road closure on its street.'
+    'Beacon has this incident about 300 m from this place, going by where 511 listed a road closure on its street.'
   expect(fire.point_source).toBeNull()
   serve({
     'GET /api/health': MOCK_HEALTH,
@@ -581,15 +570,50 @@ test('a place another tab removed while this one waited to save is not put back'
   expect(names()).toEqual(['Gym'])
 })
 
-test('a browser that will not give the lock changes nothing, and says so', async () => {
+test('a browser with no lock for its tabs to share, or one that will not give it, changes nothing and says so', async () => {
   await savePlace('Home', FIRE)
+  const before = window.localStorage.getItem(KEY)
+  const write = vi.spyOn(Storage.prototype, 'setItem')
+  const id = placesSnapshot()[0].id
+
+  // No lock at all: the list is not read and written with nothing to keep
+  // another tab's change from being undone.
+  vi.stubGlobal('navigator', { geolocation: navigator.geolocation })
+  expect(await savePlace('Work', FAR)).toBe('failed')
+  expect(await removePlace(id)).toBe(false)
+
+  // A lock the browser refuses.
   vi.stubGlobal('navigator', {
-    ...navigator,
     locks: { request: () => Promise.reject(new DOMException('no')) },
   })
-
   expect(await savePlace('Work', FAR)).toBe('failed')
-  expect(await removePlace(placesSnapshot()[0].id)).toBe(false)
+  expect(await removePlace(id)).toBe(false)
+
+  expect(write).not.toHaveBeenCalled()
+  expect(window.localStorage.getItem(KEY)).toBe(before)
+})
+
+test('with no lock, the page says that nothing was saved and that a place is still there', async () => {
+  await savePlace('Home', FIRE)
+  serve({ 'GET /api/health': MOCK_HEALTH, [CHECK]: answer(nearFire) })
+  vi.stubGlobal('navigator', { geolocation: navigator.geolocation })
+  render(<App />)
+
+  await click(
+    await screen.findByRole('button', {
+      name: 'Save “Across town, North Beach”',
+    }),
+  )
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'This browser would not keep the place. Nothing was saved.',
+  )
+
+  await click(
+    screen.getByRole('button', { name: 'Remove Home from this device' }),
+  )
+  expect(
+    await screen.findByText(/The place is still\s+saved on this device\./),
+  ).toBeInTheDocument()
   expect(stored()).toEqual([{ id: expect.any(String), name: 'Home', ...FIRE }])
 })
 

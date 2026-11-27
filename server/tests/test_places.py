@@ -305,12 +305,26 @@ def test_a_distance_measured_from_a_point_of_511s_says_so_and_carries_511s_credi
     assert fire["incident"]["point_from"] == "closure"
     assert fire["text"] == (
         f"Beacon has this incident about {fire['distance_m']} m from this place, going by "
-        "where 511 lists a road closure on its street."
+        "where 511 listed a road closure on its street."
     )
     # The row the point is from, with how far it is trusted and 511's credit.
     source = fire["incident"]["point_source"]
     assert (source["source"], source["confidence"]) == ("511", "official")
     assert source["credit"] == {"text": CREDIT_511.text, "url": CREDIT_511.url}
+    assert "closure" in {signal["kind"] for signal in fire["incident"]["signals"]}
+
+    # 511 then lists the road open again. The point is still the earlier version's,
+    # and the sentence does not say that 511 lists a closure now.
+    closed = source["evidence_id"]
+    rows.traffic(5.5, closed=False)
+    later = check(TestClient(app, headers=SHOWN), HOME).json()
+    (fire,) = later["places"][0]["near"]
+    assert "closure" not in {signal["kind"] for signal in fire["incident"]["signals"]}
+    assert fire["incident"]["point_source"]["evidence_id"] == closed
+    assert fire["text"].endswith(", going by where 511 listed a road closure on its street.")
+    said = json.dumps(later)
+    assert "511 lists a road closure" not in said
+    assert "lists a road closed" not in said
 
 
 def test_a_check_keeps_nothing_and_logs_nothing(
