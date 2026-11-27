@@ -513,6 +513,228 @@ def test_a_deletion_that_was_cut_short_is_finished_by_the_next_one(
     assert not (data_dir() / "evidence" / "mock.sqlite3").exists()
 
 
+# Setting a store aside, so that a story is begun anew by hand.
+
+
+def plain() -> dict[str, str]:
+    """A server's environment with nothing that tells the story again."""
+    return {ENV_KEY: os.environ[ENV_KEY]}
+
+
+def set_aside(now: datetime) -> object:
+    with alone() as lock:
+        return serve.set_aside(plain(), now, lock)
+
+
+ASIDE_AT = datetime(2026, 12, 1, 18, 30, 5, tzinfo=UTC)
+ASIDE_IN = "told/20261201T183005Z"
+
+
+def test_a_store_set_aside_is_moved_whole_and_nothing_is_deleted() -> None:
+    served()
+    root = data_dir()
+    # What a server on real sources keeps, the ledger, and a device's subscription
+    # are not the story's, and stay where they are.
+    for directory in ("evidence", "investigate", "story"):
+        (root / directory / "live.sqlite3").write_bytes(b"a live store's")
+    before = kept()
+    mock = [f"{directory}/{name}" for directory, name in serve.MOCK_FILES]
+    assert set(mock) <= set(before)
+
+    assert str(set_aside(ASIDE_AT)) == ASIDE_IN
+
+    after = kept()
+    # Each file is where it was moved to, to the byte, and no longer where it was.
+    assert {name: after[f"{ASIDE_IN}/{name}"] for name in mock} == {
+        name: before[name] for name in mock
+    }
+    assert not any(name in after for name in mock)
+    assert {name: held for name, held in before.items() if name not in mock} == {
+        name: held for name, held in after.items() if not name.startswith("told/")
+    }
+    # It is still the store it was: its story can be read where it now is.
+    moved = EvidenceStore(root / ASIDE_IN / "evidence" / "mock.sqlite3", "mock")
+    try:
+        assert isinstance(moved.state("scenario")["start"], str)
+    finally:
+        moved.close()
+    # With no mock store there is nothing to set aside, and no directory is made.
+    assert set_aside(ASIDE_AT + timedelta(minutes=1)) is None
+    assert [path.name for path in (root / "told").iterdir()] == ["20261201T183005Z"]
+
+
+def test_nothing_is_made_for_asking_where_there_is_no_mock_store() -> None:
+    assert set_aside(ASIDE_AT) is None
+    assert files() == {}
+    assert not (data_dir() / "told").exists()
+
+
+def test_the_server_started_after_a_store_was_set_aside_begins_the_story_anew(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    over = served()
+    assert set_aside(ASIDE_AT) is not None
+
+    # At the minute it is told to, which a store whose story had begun would not.
+    monkeypatch.setenv("BEACON_MOCK_STORY_MINUTE", "77")
+    anew = served()
+
+    assert anew != over
+    assert anew - datetime.now(UTC) < serve.PLAYED_FOR - timedelta(minutes=76)
+    # Set aside at the same second, the second store gets a directory of its own.
+    assert str(set_aside(ASIDE_AT)) == ASIDE_IN + "-2"
+    assert {path.name for path in (data_dir() / "told").iterdir()} == {
+        "20261201T183005Z",
+        "20261201T183005Z-2",
+    }
+
+
+def test_a_store_muse_ember_worked_on_is_set_aside_as_it_is_and_never_deleted() -> None:
+    over = served()
+    root = data_dir()
+    store = EvidenceStore(root / "evidence" / "mock.sqlite3", "mock")
+    store.mark_paid()
+    store.close()
+    # A server that tells the story again refuses the store, whatever comes of it.
+    with pytest.raises(serve.ServeError, match="Nothing was deleted"):
+        begin_again(over)
+    before = kept()["evidence/mock.sqlite3"]
+
+    assert str(set_aside(ASIDE_AT)) == ASIDE_IN
+
+    # The claims on what was paid for are where the store is, and it still says
+    # whose it is.
+    assert kept()[f"{ASIDE_IN}/evidence/mock.sqlite3"] == before
+    moved = EvidenceStore(root / ASIDE_IN / "evidence" / "mock.sqlite3", "mock")
+    try:
+        assert moved.paid
+    finally:
+        moved.close()
+
+
+@pytest.mark.parametrize("how", ["the file", "a second name"])
+def test_a_link_to_another_stores_file_is_not_set_aside_in_its_place(how: str) -> None:
+    served()
+    folder = data_dir() / "investigate"
+    for each in folder.iterdir():
+        each.unlink()
+    if how == "the file":
+        (folder / "mock.sqlite3").symlink_to(push_file())
+    else:
+        os.link(push_file(), folder / "mock.sqlite3")
+    before = kept()
+
+    with pytest.raises(serve.ServeError, match=r"under investigate/ .* Nothing was moved"):
+        set_aside(ASIDE_AT)
+
+    assert kept() == before
+    assert not (data_dir() / "told").exists()
+
+
+def test_a_file_something_still_has_open_is_not_set_aside_and_neither_is_any_other(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(serve, "_WAIT_SECONDS", 0.05)
+    served()
+    path = data_dir() / "evidence" / "mock.sqlite3"
+    with closing(sqlite3.connect(path)) as reading, closing(sqlite3.connect(path)) as writing:
+        reading.execute("BEGIN")
+        reading.execute("SELECT count(*) FROM evidence").fetchall()
+        with writing:
+            writing.execute(
+                "INSERT INTO poller_state (name, state, updated_ms) VALUES ('since', '{}', 0)"
+            )
+
+        with pytest.raises(serve.ServeError, match=r"is open somewhere.* Nothing was moved"):
+            set_aside(ASIDE_AT)
+
+        assert {f"{d}/{n}" for d, n in serve.MOCK_FILES} <= set(files())
+        assert not (data_dir() / "told").exists()
+    assert set_aside(ASIDE_AT) is not None
+
+
+def test_there_has_to_be_a_directory_of_the_data_directorys_own_to_move_a_store_to(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    served()
+    elsewhere = tmp_path_factory.mktemp("elsewhere")
+    (data_dir() / "told").symlink_to(elsewhere, target_is_directory=True)
+    before = kept()
+
+    with pytest.raises(
+        serve.ServeError, match=r"is not a directory of its own.* Nothing was moved"
+    ):
+        set_aside(ASIDE_AT)
+
+    assert kept() == before
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_a_move_that_was_cut_short_says_what_was_moved_and_is_finished_by_the_next(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    served()
+    replace = os.replace
+
+    def fails_on_the_stories(old: Path, new: Path) -> None:
+        if Path(old).parent.name == "story":
+            raise OSError("no")
+        replace(old, new)
+
+    monkeypatch.setattr(serve.os, "replace", fails_on_the_stories)
+    with pytest.raises(serve.ServeError, match="could not all be moved") as refused:
+        set_aside(ASIDE_AT)
+    assert "told/20261201T183005Z/" in str(refused.value)
+    # Nothing of a path, or of the error that stopped it, is under the sentence.
+    assert refused.value.__context__ is None
+    # The store that says there is a story went first: no old story goes on with
+    # the record of what was paid for it gone.
+    assert (data_dir() / ASIDE_IN / "evidence" / "mock.sqlite3").is_file()
+    assert not (data_dir() / "evidence" / "mock.sqlite3").exists()
+    assert (data_dir() / "story" / "mock.sqlite3").is_file()
+
+    monkeypatch.setattr(serve.os, "replace", replace)
+    assert str(set_aside(ASIDE_AT)) == ASIDE_IN + "-2"
+    left = [f"{d}/{n}" for d, n in serve.MOCK_FILES if d != "evidence"]
+    assert all(f"{ASIDE_IN}-2/{name}" in files() for name in left)
+    assert not any(name in files() for name in left)
+
+
+def test_the_command_sets_aside_and_serves_nothing_and_is_refused_under_a_server(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    served()
+    monkeypatch.setattr(serve, "run", lambda *_, **__: pytest.fail("It served."))
+    monkeypatch.setattr(serve, "uvicorn_server", lambda *_: pytest.fail("It served."))
+
+    # A server has the stores: nothing is moved under it.
+    with alone():
+        assert serve.main(["--set-aside"], plain()) == 2
+    assert capsys.readouterr().err.startswith("Nothing was set aside. ")
+    assert not (data_dir() / "told").exists()
+    # A server on real sources has no story to begin anew.
+    assert serve.main(["--set-aside"], plain() | {"BEACON_LIVE_SOURCES": "nws"}) == 2
+    assert "is for the invented scenario" in capsys.readouterr().err
+    assert not (data_dir() / "told").exists()
+
+    assert serve.main(["--set-aside"], plain()) == 0
+    said = capsys.readouterr().out
+    assert "were moved to told/" in said
+    assert "begins the invented story anew" in said
+    assert not (data_dir() / "evidence" / "mock.sqlite3").exists()
+    # The stores are given up: the server that is started next has them.
+    with alone():
+        pass
+    assert serve.main(["--set-aside"], plain()) == 0
+    assert "There is no mock store" in capsys.readouterr().out
+
+
+def test_a_server_that_tells_the_story_again_begins_it_at_the_twentieth_minute_only() -> None:
+    # What such a server says of how often the story begins is worked out from it.
+    with pytest.raises(serve.ServeError, match="BEACON_MOCK_STORY_MINUTE is not set beside it"):
+        serve.repeats(env() | {"BEACON_MOCK_STORY_MINUTE": "20"})
+
+
 @pytest.mark.parametrize(
     ("more", "said"),
     [

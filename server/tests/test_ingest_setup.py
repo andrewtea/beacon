@@ -29,6 +29,7 @@ from beacon.ingest import (
     build,
     live_sources,
     open_store,
+    setup,
     source_pollers,
 )
 from beacon.ingest.adsblol import AdsbLolAircraft
@@ -277,6 +278,65 @@ def test_a_mock_store_first_opened_shows_a_fire_already_under_way(
     }
     # The clock is let go when the story has been played up to now.
     assert ingest.clock.now() == NOON
+
+
+def test_a_new_mock_store_begins_its_story_at_the_minute_it_is_told_to(
+    env: dict[str, str], time: Time, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Somebody who shows the story wants a moment of it now, not in an hour: the
+    # all-clear on the radio is in its 78th minute.
+    ingest = build(env | {setup.STORY_MINUTE_VARIABLE: "77"}, Clock(time))
+    ingest.catch_up()
+
+    start = NOON - timedelta(minutes=77)
+    assert ingest.store.state("scenario")["start"] == start.isoformat()
+    # Every row of those minutes has the time it would have had, and what the
+    # story has not come to is not there.
+    calls = ingest.store.search(kinds=["radio"])
+    assert calls[0].occurred_at == start
+    assert calls[-1].occurred_at == start + timedelta(minutes=60)
+    assert [row.data["notice_type"] for row in ingest.store.search(kinds=["notice"])] == [
+        "evacuation_order",
+        "all_clear",
+    ]
+    # From there it goes on by the clock, as any story does.
+    time.moment = NOON + timedelta(minutes=1, seconds=10)
+    ingest.catch_up()
+    last = ingest.store.search(kinds=["radio"])[-1]
+    assert (last.occurred_at, last.data["details"]) == (
+        start + timedelta(minutes=78),
+        ["all_clear"],
+    )
+
+    # The setting is read when a story begins and at no other time: a store whose
+    # story has begun goes on with it, and the server says the setting did nothing.
+    caplog.clear()
+    again = build(env | {setup.STORY_MINUTE_VARIABLE: "5"}, Clock(time))
+    assert again.store.state("scenario")["start"] == start.isoformat()
+    assert [record.getMessage() for record in caplog.records] == [setup._ALREADY_BEGUN]
+    caplog.clear()
+    build(env, Clock(time))
+    build(env | {setup.STORY_MINUTE_VARIABLE: "77"}, Clock(time))
+    # Not said by a server that asked for nothing, and the story is 78 minutes
+    # old by now, not 77.
+    assert [record.getMessage() for record in caplog.records] == [setup._ALREADY_BEGUN]
+
+
+def test_the_minute_a_story_begins_at_is_a_whole_minute_the_story_has(
+    env: dict[str, str], tmp_path: Path
+) -> None:
+    assert setup.head_start({}) == timedelta(minutes=20) == setup.MOCK_HEAD_START
+    assert setup.head_start({setup.STORY_MINUTE_VARIABLE: "0"}) == timedelta(0)
+    # The story's last minute is the 95th.
+    assert setup.head_start({setup.STORY_MINUTE_VARIABLE: "95"}) == timedelta(minutes=95)
+    for setting in ("96", "-1", "+7", "7.5", "", " 7", "1_0", "seven", "\u0667"):
+        with pytest.raises(IngestConfigError, match="a whole number from 0 to 95"):
+            build(env | {setup.STORY_MINUTE_VARIABLE: setting})
+    # A real source has no story, and the setting is not let pass as if it did something.
+    with pytest.raises(IngestConfigError, match="there is no story to begin"):
+        build(env | {setup.STORY_MINUTE_VARIABLE: "7", "BEACON_LIVE_SOURCES": "nws"})
+    # A refused setting leaves no store.
+    assert not (tmp_path / "evidence").exists()
 
 
 def test_a_restart_continues_the_story_it_was_telling(env: dict[str, str], time: Time) -> None:

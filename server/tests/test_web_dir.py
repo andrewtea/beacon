@@ -90,6 +90,9 @@ def test_what_changes_with_a_deploy_is_asked_about_each_time_and_the_rest_is_kep
     # were last deployed, the worker that shows a notification among them.
     for path in ("/", "/index.html", "/sw.js", "/push-sw.js", "/manifest.webmanifest"):
         assert client.get(path).headers["cache-control"] == "no-cache", path
+    # The page asks a portal it is passed through to put no script of its own
+    # into it: its fragment names a tap's id.
+    assert client.get("/").headers["x-amp-review-widget"] == "off"
     # A file whose name holds a digest of what it holds.
     kept = client.get("/assets/index-3f2a9c1b.js")
     assert kept.headers["cache-control"] == "public, max-age=31536000, immutable"

@@ -52,6 +52,25 @@ server starts it again.
 
 It is for the invented scenario only: with `BEACON_LIVE_SOURCES` naming a source,
 or with the pollers off, `BEACON_MOCK_REPEAT=1` is refused.
+
+**`--set-aside` is how a story is begun anew by hand**, which is what somebody who
+shows the invented story to others needs, and the one way a telling Muse Ember was
+paid for makes room for another:
+
+    python -m beacon.serve --set-aside
+
+It moves the mock store's files (`MOCK_FILES`), whole, into a directory of their
+own under `told/` in the data directory, and ends: **it serves nothing**. Nothing
+is deleted, so the claims on what was paid for are kept, where they were made.
+The server that is started next finds no mock store and begins the story, at the
+minute `BEACON_MOCK_STORY_MINUTE` names. It is a command of its own, and no
+setting of the server's, because whatever keeps a server running starts it again,
+and a server that began the story anew each time it was started would have Muse
+Ember paid for a new telling at every restart. It runs under the same lock and
+the same looks at each file as `begin_again`, and refuses while a server has the
+stores. A telling begun after it is paid for like the first: what holds the cost
+of every telling together is the budget of each of the telling's scopes, which is
+over every telling in the one ledger.
 """
 
 import argparse
@@ -65,7 +84,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import closing, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, NoReturn, Protocol
 
 import uvicorn
@@ -82,6 +101,7 @@ from beacon.ingest.setup import (
     _AFTER_THE_STORY,
     _SCENARIO_STATE,
     MOCK_HEAD_START,
+    STORY_MINUTE_VARIABLE,
     IngestConfigError,
     live_sources,
     whose,
@@ -200,6 +220,13 @@ def repeats(env: Mapping[str, str]) -> bool:
         )
     if env.get(INGEST_VARIABLE, "1") != "1":
         raise ServeError(f"{REPEAT_VARIABLE}=1 needs the pollers, which play the story.")
+    if STORY_MINUTE_VARIABLE in env:
+        # What such a server says of itself (`REPEATS`) names how often the story
+        # begins, which is worked out from the twenty minutes.
+        raise ServeError(
+            f"{REPEAT_VARIABLE}=1 begins every telling twenty minutes into the story: "
+            f"{STORY_MINUTE_VARIABLE} is not set beside it."
+        )
     if teller_of(env) == "ember":
         # Every telling by Muse Ember is paid for, and what is deleted between two
         # tellings would be the claims on what was paid for.
@@ -229,7 +256,12 @@ def over_at(start: datetime) -> datetime:
 class NotTheMockStoresError(Exception):
     """What is where one of the mock store's files is kept was not seen to be
     that file: a link, another kind of store, a live store's, one a newer Beacon
-    wrote, or one that could not be read. The text is fixed."""
+    wrote, or one that could not be read. The text is fixed, and names only the
+    directory of that kind of store (`directory`)."""
+
+    def __init__(self, directory: str) -> None:
+        super().__init__(_NOT_THE_FILE.format(directory))
+        self.directory = directory
 
 
 _NOT_THE_FILE = (
@@ -308,6 +340,158 @@ def begin_again(env: Mapping[str, str], now: datetime, lock: DataLock) -> bool:
         held.close()
 
 
+# Where a mock store's files are moved to when they are set aside: a directory for
+# each time, under this one in the data directory.
+ASIDE = "told"
+_NOT_SET_ASIDE = (
+    "What is kept as the mock store's under {}/ could not be seen to be that store's "
+    "own file: it is a link, it could not be read, or it does not say it is the mock "
+    "store's, in a shape and with the tables this Beacon knows. Nothing was moved. "
+    "Find out what is there."
+)
+_ASIDE_OPEN = (
+    "The mock store's files were not set aside: one of them is open somewhere, or "
+    "its log could not be emptied. Nothing was moved. Stop whatever has the data "
+    "directory's stores, and give the command again."
+)
+_ASIDE_NOWHERE = (
+    f"The mock store's files were not set aside: {ASIDE}/ under the data directory "
+    "is not a directory of its own that a new one can be made in. Nothing was moved."
+)
+_ASIDE_PARTLY = (
+    "The mock store's files could not all be moved, and the ones that were are "
+    f"under {ASIDE}/{{}}/ in the data directory. The evidence store is moved first, "
+    "so a server started now begins a new story, beside what is left of the last "
+    "one's stories and investigations. Find out why a file could not be moved, and "
+    "give the command again: it moves what is left."
+)
+
+
+def set_aside(env: Mapping[str, str], now: datetime, lock: DataLock) -> PurePath | None:
+    """Move the mock store's files out of the way, into a directory of their own
+    under `told/` in the data directory, so that the server that starts next
+    begins the story anew. Answers where they went, relative to the data
+    directory, or None, with nothing changed, when there is no mock store.
+
+    **Nothing is deleted**, a store Muse Ember worked on included: its files hold
+    the claims on what was paid for, and are kept as they are. The story that
+    begins next is another telling, with claims of its own, and is paid for like
+    the first.
+
+    `lock` is the data directory's, held alone by the caller, who has no store
+    open. Every file that is there is looked at as `begin_again` looks, and every
+    log is emptied, before one is moved. **The evidence store is moved first**: it
+    is what says there is a story, so a move that stopped part of the way leaves a
+    server to begin a new story, whose incidents have ids of their own, beside
+    stories and investigations nothing asks for again, and never an old story
+    going on with the record of what was paid for it gone.
+
+    Raises ServeError, with nothing moved, for a file that was not seen to be the
+    mock store's own of its kind, for one something has open, when something has
+    the taps' media, and when there is nowhere to move them to; and ServeError
+    that says so when a file could not be moved after another was.
+    EmberConfigError for a relative `BEACON_DATA_DIR`."""
+    data = default_data_dir(env)
+    if not (lock.held and lock.exclusive and lock.data == data):
+        raise ValueError("A store is set aside only by who holds the stores alone.")
+    there: list[tuple[str, Path]] = []
+    refused: str | None = None
+    try:
+        for directory, name in MOCK_FILES:
+            path = _own(data, directory, name)
+            if path is not None:
+                _mock_stores(path)
+                there.append((directory, path))
+    except NotTheMockStoresError as error:
+        refused = error.directory
+    if refused is not None:
+        raise ServeError(_NOT_SET_ASIDE.format(refused))
+    if not there:
+        return None
+    busy = False
+    try:
+        # The lock of whoever sweeps the taps' media (`python -m beacon.taps`).
+        held = TapMedia(data / "taps", "mock")
+    except MediaLockedError:
+        busy = True
+    if busy:
+        raise ServeError(_ASIDE_OPEN)
+    try:
+        try:
+            # Every log is emptied before any file goes: one that is busy stops it all.
+            for _, path in there:
+                _settle(path)
+        except (StillOpenError, sqlite3.Error):
+            busy = True
+        if busy:
+            raise ServeError(_ASIDE_OPEN)
+        aside = _a_place_aside(data, now)
+        if aside is None:
+            raise ServeError(_ASIDE_NOWHERE)
+        moved = False
+        try:
+            for directory, path in reversed(there):
+                (aside / directory).mkdir()
+                for each in (path, *(path.with_name(path.name + suffix) for suffix in _BESIDE)):
+                    with suppress(FileNotFoundError):
+                        os.replace(each, aside / directory / each.name)
+                        moved = True
+        except OSError:
+            busy = True
+        if busy:
+            # Outside the handler, so that nothing of a path is under the error.
+            raise ServeError(_ASIDE_PARTLY.format(aside.name) if moved else _ASIDE_NOWHERE)
+        return PurePath(ASIDE) / aside.name
+    finally:
+        held.close()
+
+
+def _a_place_aside(data: Path, now: datetime) -> Path | None:
+    """A new directory under `told/` for the files of one mock store, named for
+    the moment, or None when one could not be made: `told/` has to be a directory
+    of its own and no link, which could be to anywhere."""
+    root = data / ASIDE
+    try:
+        root.mkdir(mode=0o700, exist_ok=True)
+        if not stat.S_ISDIR(os.lstat(root).st_mode):
+            return None
+        stamp = now.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+        for name in (stamp, *(f"{stamp}-{again}" for again in range(2, 100))):
+            try:
+                (root / name).mkdir(mode=0o700)
+            except FileExistsError:
+                continue
+            return root / name
+    except OSError:
+        pass
+    return None
+
+
+def aside(env: Mapping[str, str], clock: Callable[[], datetime] | None = None) -> str:
+    """`python -m beacon.serve --set-aside`: set the mock store's files aside, and
+    say in a sentence what was done. It serves nothing.
+
+    Raises ServeError as `set_aside` does and for a server on real sources, which
+    has no story, DataLockedError when a server or another command has the data
+    directory's stores, and IngestConfigError as `live_sources` does."""
+    if live_sources(env):
+        raise ServeError(
+            "--set-aside is for the invented scenario: with a real source named, "
+            "there is no story to begin anew, and nothing is moved."
+        )
+    lock = DataLock(default_data_dir(env), shared=False)
+    try:
+        went = set_aside(env, (datetime.now(UTC) if clock is None else clock()), lock)
+    finally:
+        lock.close()
+    if went is None:
+        return "There is no mock store under the data directory: nothing was moved."
+    return (
+        f"The mock store's files were moved to {went}/ under the data directory, as "
+        "they were. The server that is started next begins the invented story anew."
+    )
+
+
 def _own(data: Path, directory: str, name: str) -> Path | None:
     """The file of one of the mock store's kinds, or None when there is none.
 
@@ -347,7 +531,7 @@ def _own(data: Path, directory: str, name: str) -> Path | None:
             linked = not stat.S_ISREG(found.st_mode) or found.st_nlink != 1
             there = there or each == path
     if linked:
-        raise_bare(NotTheMockStoresError(_NOT_THE_FILE.format(directory)))
+        raise_bare(NotTheMockStoresError(directory))
     return path if there else None
 
 
@@ -376,7 +560,7 @@ def _mock_stores(path: Path) -> None:
             and said.tables - _SQLITES_OWN <= kind.tables
         ):
             return
-    raise_bare(NotTheMockStoresError(_NOT_THE_FILE.format(path.parent.name)))
+    raise_bare(NotTheMockStoresError(path.parent.name))
 
 
 def _settle(path: Path) -> None:
@@ -615,7 +799,23 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
     parser = argparse.ArgumentParser(prog="python -m beacon.serve", description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=int(env.get("PORT") or 8000))
+    parser.add_argument(
+        "--set-aside",
+        action="store_true",
+        help=(
+            "move the mock store's files into a directory of their own under told/ "
+            "in the data directory, deleting nothing, and end without serving: the "
+            "server that is started next begins the invented story anew"
+        ),
+    )
     options = parser.parse_args(argv)
+    if options.set_aside:
+        try:
+            print(aside(env))
+        except (ServeError, IngestConfigError, EmberConfigError, DataLockedError) as error:
+            print(f"Nothing was set aside. {error}", file=sys.stderr)
+            return 2
+        return 0
 
     def make_server(app: FastAPI) -> Any:
         return uvicorn_server(app, options.host, options.port)

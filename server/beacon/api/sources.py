@@ -24,6 +24,12 @@ class Sources(BaseModel):
     # `mock` when the pollers are fed the invented scenario and no real source is
     # asked anything. Everything built on the evidence is then a stand-in's.
     mode: Literal["live", "mock"]
+    # On the invented scenario: the moment its story's first minute is counted
+    # from, which is before the store was begun by as many minutes as the story
+    # was begun at (`BEACON_MOCK_STORY_MINUTE`, twenty when it is not set). It is
+    # how somebody who shows the story works out which minute it is in. Null on
+    # real sources, which have no story.
+    story_began_at: datetime | None
     sources: list[Source]
 
 
@@ -35,6 +41,7 @@ def sources(request: Request) -> Sources:
     rows = ingest.store.count_by_source()
     return Sources(
         mode=ingest.store.mode,
+        story_began_at=None if ingest.scenario is None else ingest.scenario.start,
         sources=[
             Source(
                 name=status.name,

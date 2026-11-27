@@ -537,11 +537,22 @@ async def _validation_error(_request: Request, error: RequestValidationError) ->
     return JSONResponse({"detail": detail}, status_code=422)
 
 
+# The header by which a page tells an Amp portal to inject nothing into it
+# (https://ampcode.com/docs/orbs: the review widget).
+NOTHING_ADDED = ("X-Amp-Review-Widget", "off")
+
+
 class _Web(StaticFiles):
     """The built app's files. A file under `assets/` has a digest of what it holds
     in its name and is kept by a browser for good. Every other file (the page, the
     service workers, the manifest) is asked about each time, so that a browser has
-    the app, and the worker that shows a notification, as they were last deployed."""
+    the app, and the worker that shows a notification, as they were last deployed.
+
+    **Every file asks that nothing be added to it on its way** (`NOTHING_ADDED`).
+    An Amp portal puts a script of its own, a button for comments on the page, into
+    an HTML page it passes on, unless the page's response says otherwise. Beacon's
+    page names a tap's id in its fragment, which is for its sender and no other
+    script to read, and the page is what a person is shown and what is filmed."""
 
     async def get_response(self, path: str, scope: Scope) -> Response:
         response = await super().get_response(path, scope)
@@ -549,6 +560,7 @@ class _Web(StaticFiles):
         response.headers["Cache-Control"] = (
             "public, max-age=31536000, immutable" if kept else "no-cache"
         )
+        response.headers[NOTHING_ADDED[0]] = NOTHING_ADDED[1]
         return response
 
 

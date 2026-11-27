@@ -28,6 +28,8 @@ def test_sources_says_the_data_is_mock_and_how_each_pollers_last_poll_went(
     assert before.status_code == 200
     assert before.json() == {
         "mode": "mock",
+        # The story began twenty minutes before its store did.
+        "story_began_at": "2026-11-27T19:40:00Z",
         "sources": [
             {"name": name, "polled_at": None, "ok": None, "partial": False, "rows": 0}
             for name in ("nws", "adsblol", "511", "recordings", "notices")
@@ -38,6 +40,8 @@ def test_sources_says_the_data_is_mock_and_how_each_pollers_last_poll_went(
 
     assert client.get("/api/sources").json() == {
         "mode": "mock",
+        # The story began twenty minutes before its store did.
+        "story_began_at": "2026-11-27T19:40:00Z",
         "sources": [
             {
                 "name": "nws",
