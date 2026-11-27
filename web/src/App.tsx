@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import './App.css'
-import { fetchHealth } from './api/health.ts'
+import { fetchHealth, type Input } from './api/health.ts'
 import { Icon } from './components/Icon.tsx'
 import { usePolled } from './lib/poll.ts'
 import { usePushSync } from './lib/pushSync.ts'
@@ -19,17 +19,19 @@ const HEALTH_MS = 30_000
 function View({
   route,
   mode,
+  input,
   repeatsText,
   onOtherMode,
 }: {
   route: Route
   mode: 'live' | 'mock' | null
+  input: Input
   repeatsText: string | null
   onOtherMode: () => void
 }) {
   switch (route.view) {
     case 'home':
-      return <Home mode={mode} onOtherMode={onOtherMode} />
+      return <Home mode={mode} input={input} onOtherMode={onOtherMode} />
     case 'tap':
       return <TapView key={route.id} id={route.id} repeatsText={repeatsText} />
     case 'trace':
@@ -41,7 +43,7 @@ function View({
     case 'map':
       return <MapView key={route.id} id={route.id} />
     case 'places':
-      return <PlacesView mode={mode} onOtherMode={onOtherMode} />
+      return <PlacesView mode={mode} input={input} onOtherMode={onOtherMode} />
     case 'results':
       return <ResultsView />
     case 'unknown':
@@ -70,6 +72,10 @@ export default function App() {
   // the server that comes back can be another one, on other sources.
   const mode = unreachable ? null : (health.data?.mode ?? null)
   const repeatsText = unreachable ? null : (health.data?.repeats_text ?? null)
+  // What the server takes from a visitor. Nothing is sent while the mode is not
+  // known, so what is taken matters only once the server has said both.
+  const input: Input =
+    !unreachable && health.data?.input === 'invented' ? 'invented' : 'own'
   const frontText = unreachable ? null : (health.data?.front_text ?? null)
   const frontMore = unreachable ? null : (health.data?.front_more_text ?? null)
   // A tap the server no longer answers for is deleted from this device.
@@ -101,8 +107,8 @@ export default function App() {
           </p>
         )}
       {/* On a server behind a host nobody has checked: the server's sentence
-          about that, on the pages a person sends something from, whatever the
-          scenario. What is sent is theirs even when the incidents are made up. */}
+          about what it takes and why, on the pages a person sends something
+          from. */}
       {frontText !== null &&
         (route.view === 'home' || route.view === 'places') && (
           <div className="note front-note">
@@ -124,6 +130,7 @@ export default function App() {
         <View
           route={route}
           mode={mode}
+          input={input}
           repeatsText={repeatsText}
           onOtherMode={askAgain}
         />

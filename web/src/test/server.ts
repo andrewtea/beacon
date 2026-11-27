@@ -47,6 +47,7 @@ export const MOCK_HEALTH = {
   version: '1.2.3',
   mode: 'mock',
   repeats_text: null,
+  input: 'own',
   front_text: null,
   front_more_text: null,
 }

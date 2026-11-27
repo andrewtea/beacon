@@ -94,6 +94,12 @@ CREATE TABLE IF NOT EXISTS claims (
 ) WITHOUT ROWID;
 """
 
+# The tables an evidence store has, and the one no other of Beacon's files has: how
+# a file is told from another kind's. `sqlite_sequence` is SQLite's own, for the
+# rows' ids.
+TABLES = frozenset({"evidence", "poller_state", "store_meta", "claims", "sqlite_sequence"})
+OWN_TABLE = "evidence"
+
 _SCHEMA_STATEMENTS = tuple(part.strip() for part in _SCHEMA.split(";") if part.strip())
 
 _MODE = "SELECT value FROM store_meta WHERE key = 'mode'"

@@ -121,6 +121,53 @@ test('a place is kept on the device under its name, and only where it is is sent
   expect(within(section).getByText('Invented')).toBeInTheDocument()
 })
 
+test('a server that takes only the invented places is sent no place of a person’s own, and none is asked of the phone', async () => {
+  // A place saved when another server took it: somebody's own.
+  const OWN = { lat: 37.775, lon: -122.42 }
+  await savePlace('Home', OWN)
+  await savePlace('The fire', FIRE)
+  const asked = serve({
+    'GET /api/health': {
+      ...MOCK_HEALTH,
+      input: 'invented',
+      front_text:
+        'On this server a tap is sent from one of two invented places.',
+      front_more_text: 'The rest.',
+    },
+    [CHECK]: answer(nearFire),
+  })
+  render(<App />)
+
+  // Once the server has said what it takes, the invented place is asked about,
+  // and answered under its own name.
+  await screen.findByText(/This server is asked only about the two invented/)
+  const section = (
+    await screen.findByRole('heading', { name: 'The fire' })
+  ).closest('section')!
+  expect(await within(section).findByText(DISTANCE)).toBeInTheDocument()
+  const sent = asked.filter((request) => request.key === CHECK)
+  expect(sent.map((request) => request.body)).toEqual([{ places: [FIRE] }])
+  expect(JSON.stringify(asked)).not.toContain('37.775')
+  // The other stays on the device, is said not to be sent, and can be removed.
+  expect(
+    screen.getByText(/This server is asked only about the two invented places/),
+  ).toHaveTextContent('Nothing of the places below is sent to it.')
+  const home = screen.getByRole('heading', { name: 'Home' }).closest('section')!
+  expect(within(home).queryByText(DISTANCE)).not.toBeInTheDocument()
+  expect(
+    within(home).getByRole('button', { name: 'Remove Home from this device' }),
+  ).toBeInTheDocument()
+  // Where the phone is cannot be saved here: only the two invented places can.
+  expect(
+    screen.queryByRole('button', { name: 'Save where I am now' }),
+  ).not.toBeInTheDocument()
+  expect(
+    screen.getByRole('button', {
+      name: 'Save “Across town, North Beach”',
+    }),
+  ).toBeInTheDocument()
+})
+
 test('a place with nothing near it says so in the server’s sentence, which is no all-clear', async () => {
   await savePlace('Home', FIRE)
   await savePlace('Work', FAR)

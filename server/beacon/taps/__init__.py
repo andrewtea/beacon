@@ -13,6 +13,7 @@ and `media` for what is taken as a photo or a clip and what is stripped from it.
 import logging
 from collections.abc import Mapping
 
+from beacon import front
 from beacon.ember.client import default_data_dir
 from beacon.ingest.setup import open_store
 from beacon.radio.audio import Ffmpeg, core_dump_problem
@@ -104,4 +105,6 @@ def open_taps(env: Mapping[str, str]) -> Taps:
         # Nothing is left open by taps that were not opened.
         store.close()
         raise
-    return Taps(store, media, photos=photos)
+    # A server behind a host nobody has checked takes only the invented places.
+    only = front.SPOTS if front.input_of(env) == "invented" else None
+    return Taps(store, media, photos=photos, only=only)

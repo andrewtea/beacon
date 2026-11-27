@@ -118,8 +118,11 @@ class Look:
     mode: str | None
     # Its `user_version`: 0 for a file that says no shape.
     shape: int
-    # Whether it has any table at all. A file with none was begun and never used.
-    tables: bool
+    # The names of its tables.
+    tables: frozenset[str]
+    # How many things its schema holds in all: tables, indexes, views, triggers.
+    # None at all is a file that was begun and never written to.
+    objects: int
 
 
 def look(path: Path, *, meta: str = "meta") -> Look:
@@ -136,10 +139,11 @@ def look(path: Path, *, meta: str = "meta") -> Look:
     address = f"file:{quote(str(path))}?mode=ro"
     with closing(sqlite3.connect(address, uri=True, timeout=_WAIT_SECONDS)) as db:
         shape = db.execute("PRAGMA user_version").fetchone()[0]
-        tables = {
-            row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
-        }
+        schema = db.execute("SELECT type, name FROM sqlite_master").fetchall()
+        tables = frozenset(name for kind, name in schema if kind == "table")
         said = None
         if meta in tables:
             said = db.execute(f"SELECT value FROM {meta} WHERE key = 'mode'").fetchone()
-    return Look(mode=None if said is None else said[0], shape=shape, tables=bool(tables))
+    return Look(
+        mode=None if said is None else said[0], shape=shape, tables=tables, objects=len(schema)
+    )

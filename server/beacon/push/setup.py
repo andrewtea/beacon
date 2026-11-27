@@ -9,6 +9,7 @@ from pathlib import Path
 
 import httpx2
 
+from beacon import front
 from beacon.ember.client import default_data_dir
 from beacon.errors import raise_bare
 from beacon.files import Mode
@@ -16,6 +17,7 @@ from beacon.incident import Engine, Snapshot
 from beacon.ingest.http import SourceHttp
 from beacon.investigate import Runs
 from beacon.push.desk import Notifier, Pass
+from beacon.push.notice import OFF
 from beacon.push.store import Subscriptions, SubscriptionsError
 from beacon.push.vapid import SUBJECT_VARIABLE, Vapid, open_vapid, subject_of
 
@@ -51,6 +53,8 @@ class Push:
     notifier: Notifier | None
     # Why this server sends none, for its operator, or None when it sends.
     off: str | None = None
+    # What a person is told of a server that sends none.
+    off_text: str = OFF
     # The other mode's file, when there is one: swept, and nothing else.
     others: tuple[Subscriptions, ...] = ()
     # Whether the other mode has a file this Beacon could not open, which it
@@ -134,6 +138,12 @@ def open_push(
     other: Mode = "live" if mode == "mock" else "mock"
     directory = default_data_dir(env) / "push"
     off = TURNED_OFF if setting == "0" else NO_CONTACT if subject is None else None
+    said = OFF
+    if front.input_of(env) == "invented":
+        # A device's address is its own, and is not taken through a host nobody
+        # has checked (`beacon.front`). What an earlier server kept is deleted as
+        # on any server that sends none.
+        off, said = front.PUSH_OFF_REASON, front.PUSH_OFF
     made = True
     try:
         directory.mkdir(parents=True, exist_ok=True)
@@ -163,6 +173,7 @@ def open_push(
         vapid=vapid,
         notifier=notifier,
         off=off,
+        off_text=said,
         others=others,
         unswept=unswept,
     )

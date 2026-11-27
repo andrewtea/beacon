@@ -39,19 +39,18 @@ esac
 
 # bubblewrap, and no other program, may make a user namespace. Ubuntu's AppArmor
 # refuses that to an unprivileged program with no profile. Where bubblewrap can
-# confine already, whatever policy lets it is left alone. Where it cannot and a
-# policy for it is there, that policy is somebody's decision and is not replaced:
-# this stops. Only where there is none is one added, which leaves the restriction
-# on for everything else on the Box.
+# confine already, whatever policy lets it is left alone. Where it cannot, the
+# profile below is added, which leaves the restriction on for everything else on
+# the Box, unless a policy for bubblewrap that is not this one is there: that is
+# somebody's decision and is not replaced, and this stops.
+profile=/etc/apparmor.d/bwrap
 if ! confines; then
-  existing=$(sudo grep -rlsE '(^|[[:space:]])/usr/bin/bwrap([[:space:]]|$)' /etc/apparmor.d || true)
-  if [ -n "$existing" ] || [ -e /etc/apparmor.d/bwrap ]; then
-    echo "bubblewrap cannot confine here, and a policy for it is already in" >&2
-    echo "/etc/apparmor.d, which this script does not replace:" >&2
-    echo "${existing:-/etc/apparmor.d/bwrap}" >&2
-    exit 1
-  fi
-  new=$(sudo mktemp /etc/apparmor.d/.beacon-bwrap.XXXXXX)
+  # What a run that was cut short left behind, here or where an earlier version
+  # of this script wrote it.
+  sudo sh -c 'rm -f /etc/.beacon-bwrap.* /etc/apparmor.d/.beacon-bwrap.*'
+  # Written beside the directory AppArmor loads policies from, and not in it: on
+  # the same filesystem, so that it can be linked in, and nowhere it is loaded from.
+  new=$(sudo mktemp /etc/.beacon-bwrap.XXXXXX)
   trap 'sudo rm -f "$new"' EXIT
   sudo tee "$new" >/dev/null <<'PROFILE'
 # Beacon: lets bubblewrap make the user namespace it confines ffmpeg in
@@ -66,12 +65,34 @@ profile bwrap /usr/bin/bwrap flags=(unconfined) {
 }
 PROFILE
   sudo chmod 644 "$new"
-  # Read by AppArmor's own parser before it is put anywhere it would be loaded from.
-  sudo apparmor_parser --skip-kernel-load "$new"
-  # A link is made only where no file is: a policy put there meanwhile is kept.
-  sudo ln "$new" /etc/apparmor.d/bwrap
-  sudo apparmor_parser -r /etc/apparmor.d/bwrap
-  confines
+  if sudo test -e "$profile" || sudo test -L "$profile"; then
+    # Either this script's own profile, to the byte, from a run that was cut short
+    # after it was put in place and before it was loaded, which is loaded below;
+    # or somebody else's.
+    if sudo test -L "$profile" || ! sudo cmp -s "$new" "$profile"; then
+      echo "bubblewrap cannot confine here, and a policy for it that is not this" >&2
+      echo "script's is at $profile. It is not replaced." >&2
+      exit 1
+    fi
+  else
+    existing=$(sudo grep -rlsE '(^|[[:space:]])/usr/bin/bwrap([[:space:]]|$)' /etc/apparmor.d || true)
+    if [ -n "$existing" ]; then
+      echo "bubblewrap cannot confine here, and a policy for it is already in" >&2
+      echo "/etc/apparmor.d, which this script does not replace:" >&2
+      echo "$existing" >&2
+      exit 1
+    fi
+    # Read by AppArmor's own parser before it is put where it would be loaded from.
+    sudo apparmor_parser --skip-kernel-load "$new"
+    # A link is made only where no file is: a policy put there meanwhile is kept.
+    sudo ln "$new" "$profile"
+  fi
+  sudo apparmor_parser -r "$profile"
+  if ! confines; then
+    echo "The profile at $profile is loaded, and bubblewrap still cannot confine" >&2
+    echo "here. Photos stay off until it can." >&2
+    exit 1
+  fi
 fi
 
 echo "core_pattern: $(cat /proc/sys/kernel/core_pattern)"

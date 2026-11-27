@@ -60,16 +60,19 @@ class DataLock:
             self._file = -1
             raise_bare(
                 DataLockedError(
-                    "Another Beacon process has this data directory's stores: a server "
-                    "that runs the pollers has them alone, and nothing else that opens a "
-                    "store runs beside it. Stop it first, or give this one a data "
-                    "directory of its own (BEACON_DATA_DIR)."
+                    "Another Beacon process has this data directory's stores alone: a "
+                    "server that runs the pollers, beside which nothing else that opens a "
+                    "store runs. Stop it first. The pollers are run apart from the server "
+                    "only beside a server started with BEACON_INGEST=0, both on this one "
+                    "data directory."
                     if shared
                     else "Another Beacon process has this data directory's stores open: a "
                     "server, or `python -m beacon.ingest`. A server that runs the pollers "
-                    "has them alone. Stop the other first, start this one without its "
-                    "pollers (BEACON_INGEST=0), or give it a data directory of its own "
-                    "(BEACON_DATA_DIR)."
+                    "has them alone. Stop the other first, or start this one without its "
+                    "pollers (BEACON_INGEST=0) beside `python -m beacon.ingest`, on this "
+                    "one data directory. Do not give either a second data directory: its "
+                    "ledger and its claims would be apart from this one's, and the same "
+                    "work could be paid for twice."
                 )
             )
         except BaseException:

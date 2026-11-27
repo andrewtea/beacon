@@ -390,7 +390,7 @@ def _tap_row(request: Request, tap_id: str) -> tuple[Taps, Evidence, Snapshot]:
     if taps is None or engine is None:
         raise HTTPException(503, "This server is not taking taps.")
     row = taps.store.find(SOURCE, tap_id) if is_tap_id(tap_id) else None
-    if row is None or row.kind != "tap" or row.point is None:
+    if row is None or row.kind != "tap" or row.point is None or not taps.answers_for(row):
         raise HTTPException(404, _NO_SUCH_TAP)
     snapshot = engine.snapshot()
     if snapshot.as_of - row.occurred_at > ANSWERED:

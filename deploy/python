@@ -16,8 +16,10 @@ export BEACON_DATA_DIR="${BEACON_DATA_DIR:-${AMP_DEPLOYMENT_DATA_DIRECTORY:?Set 
 export BEACON_WEB_DIR="${BEACON_WEB_DIR-$here/web/dist}"
 # No Ember is asked anything until a deployment is given a key and told to.
 export REPLAY="${REPLAY-1}"
-# Nobody has seen what the host in front of a deployment writes down of a request,
-# and the server says so to every visitor until the deployment says `verified`.
+# Nobody has seen what the host in front of a deployment writes down of a request.
+# Until the deployment says `verified`, the server takes nothing of a visitor's
+# own: only the invented scenario's two places (beacon/front.py). Set to nothing,
+# it is refused by the server, so this default is not emptied by accident.
 export BEACON_FRONT_END="${BEACON_FRONT_END-unverified}"
 
 # What follows is the demonstration's, on the invented scenario only. A deployment

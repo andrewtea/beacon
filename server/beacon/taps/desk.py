@@ -40,13 +40,21 @@ import sqlite3
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from beacon import front
 from beacon.errors import raise_bare
-from beacon.evidence import EvidenceStore, EvidenceStoreError, Mode, NewEvidence, Point
+from beacon.evidence import (
+    Evidence,
+    EvidenceStore,
+    EvidenceStoreError,
+    Mode,
+    NewEvidence,
+    Point,
+)
 from beacon.ingest.area import SAN_FRANCISCO, Bounds
 from beacon.radio.audio import ConversionStopped, ConversionUnavailable
 from beacon.taps.media import (
@@ -135,15 +143,21 @@ class Taps:
         photos: PhotoConverter | None = None,
         clock: Callable[[], datetime] | None = None,
         bounds: Bounds = SAN_FRANCISCO,
+        only: Collection[Point] | None = None,
     ) -> None:
         """`photos` draws a tap's photo again (`beacon.taps.media.clean_photo`).
         Without one, a tap that sends a photo is refused, and one that sends none
-        is taken. It is closed with the taps (`close`)."""
+        is taken. It is closed with the taps (`close`).
+
+        With `only`, a tap is taken only from one of those places, to the digit
+        as it was sent, and with nothing else: no accuracy, no clip, no photo
+        (`beacon.front`). `answers_for` then says the same of a row."""
         self._store = store
         self._media = media
         self._photos = photos
         self._clock = (lambda: datetime.now(UTC)) if clock is None else clock
         self._bounds = bounds
+        self._only = None if only is None else frozenset(only)
         # When the taps of the last minute were taken, by a clock that only goes forward.
         self._recent: deque[float] = deque()
         self._counting = threading.Lock()
@@ -153,6 +167,21 @@ class Taps:
     @property
     def store(self) -> EvidenceStore:
         return self._store
+
+    def answers_for(self, row: Evidence) -> bool:
+        """Whether this server answers for a tap's row: any, or, on a server that
+        takes a tap only from certain places, one that is what such a tap is. A
+        row an earlier server took from where somebody was is answered for by
+        no route of this one, so its id is asked for at no address."""
+        if self._only is None:
+            return True
+        data = row.data
+        return (
+            row.point in self._only
+            and data.get("accuracy_m") is None
+            and data.get("photo") is None
+            and data.get("clip") is None
+        )
 
     def admit(self) -> Callable[[], None]:
         """Take one of the `MAX_TAPS_AT_ONCE` places, for as long as a tap is being
@@ -195,6 +224,16 @@ class Taps:
 
         Raises TapError when the tap cannot be used or cannot be taken just now."""
         point, accuracy_m, photo_sent, clip_sent = _read(payload)
+        if self._only is not None and not (
+            accuracy_m is None
+            and photo_sent is None
+            and clip_sent is None
+            # As it was sent, not as it would be kept: a place a block away
+            # that rounds to one of these is still somebody's own.
+            and point in self._only
+        ):
+            # Before anything of it is decoded, counted, or kept.
+            raise_bare(TapError(403, front.TAP_REFUSED))
         if not self._bounds.holds(point):
             raise_bare(
                 TapError(422, "Beacon covers San Francisco, and this tap is from somewhere else.")
@@ -357,7 +396,7 @@ def _row(
         confidence="low",
         # A real person's tap, whichever store it is kept in.
         origin="live",
-        point=Point(round(point.lat, PLACES), round(point.lon, PLACES)),
+        point=_kept(point),
         data={
             # How far off the phone said its position could be, in metres. The
             # position kept is the middle of a box about a block across.
@@ -369,6 +408,11 @@ def _row(
             "media_kept_until": None if kept_until is None else kept_until.isoformat(),
         },
     )
+
+
+def _kept(point: Point) -> Point:
+    """A tap's place as its row keeps it: rounded to about a block."""
+    return Point(round(point.lat, PLACES), round(point.lon, PLACES))
 
 
 def _read(payload: Any) -> tuple[Point, int | None, str | None, str | None]:

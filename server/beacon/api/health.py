@@ -3,7 +3,7 @@ from typing import Literal
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
-from beacon import __version__
+from beacon import __version__, front
 
 router = APIRouter()
 
@@ -20,24 +20,32 @@ class Health(BaseModel):
     # becomes of the taps sent before. Shown with what says the scenario is
     # invented. Null on every other server.
     repeats_text: str | None = None
-    # On a server reached through a host nobody has seen keep the private routes
-    # out of its records (`BEACON_FRONT_END=unverified`): a sentence that says so,
-    # shown wherever a person is about to send something. Null on every other.
+    # What this server takes from a visitor (`beacon.front`): their `own` place,
+    # clip, photo, saved places, and notification address, or only the `invented`
+    # scenario's two places, which is what a server takes that is reached through
+    # a host nobody has seen keep the private routes out of its records
+    # (`BEACON_FRONT_END=unverified`). The app then asks for no place, sound, or
+    # photo and sends none.
+    input: front.Input = "own"
+    # On a server that takes only the invented places: a sentence that says so and
+    # why, shown on the pages a person sends something from. Null on every other.
     front_text: str | None = None
-    # The rest of that: what is sent, what the host may keep, and what a tap's id
-    # in a request's address lets its holder read. Shown when it is asked for,
-    # beside the sentence above. Null whenever that one is.
+    # The rest of that: what the host may keep, and what a tap's id in a request's
+    # address lets its holder read. Shown when it is asked for, beside the
+    # sentence above. Null whenever that one is.
     front_more_text: str | None = None
 
 
 @router.get("/health")
 def health(request: Request) -> Health:
     engine = getattr(request.app.state, "incidents", None)
+    takes: front.Input = getattr(request.app.state, "input", "own")
     return Health(
         status="ok",
         version=__version__,
         mode=None if engine is None else engine.mode,
         repeats_text=getattr(request.app.state, "repeats_text", None),
-        front_text=getattr(request.app.state, "front_text", None),
-        front_more_text=getattr(request.app.state, "front_more_text", None),
+        input=takes,
+        front_text=front.INVENTED if takes == "invented" else None,
+        front_more_text=front.INVENTED_MORE if takes == "invented" else None,
     )

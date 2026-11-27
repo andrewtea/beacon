@@ -86,27 +86,72 @@ test('says, in the server’s sentence, that the invented scenario is told again
   expect(banner).toHaveTextContent(repeats)
 })
 
-test('says, in the server’s sentences, that nobody has checked what the host in front of it writes down', async () => {
-  const front =
-    'What you send here is real, whatever the scenario, and nobody has checked what the hosting service writes down.'
-  const more = 'The address a tap’s answer is read at holds the tap’s id.'
-  serve({
-    'GET /api/health': {
-      ...MOCK_HEALTH,
-      front_text: front,
-      front_more_text: more,
-    },
-  })
+const FRONT =
+  'On this server a tap is sent from one of two invented places, not from where you are.'
+const FRONT_MORE = 'The address a tap’s answer is read at holds the tap’s id.'
+const INVENTED_ONLY = {
+  ...MOCK_HEALTH,
+  input: 'invented',
+  front_text: FRONT,
+  front_more_text: FRONT_MORE,
+}
+
+test('says, in the server’s sentences, what a server behind an unchecked host takes and why', async () => {
+  serve({ 'GET /api/health': INVENTED_ONLY })
 
   render(<App />)
 
   // On the page a tap is sent from, before anybody taps, apart from what says
   // the scenario is invented: it is about what a person sends, not the incidents.
-  expect(await screen.findByText(front)).toBeInTheDocument()
-  expect(screen.getByText(INVENTED)).not.toHaveTextContent(front)
+  expect(await screen.findByText(FRONT)).toBeInTheDocument()
+  expect(screen.getByText(INVENTED)).not.toHaveTextContent(FRONT)
   // The rest is the server's too, and is there for whoever opens it.
   expect(screen.getByText('More about this')).toBeInTheDocument()
-  expect(screen.getByText(more)).toBeInTheDocument()
+  expect(screen.getByText(FRONT_MORE)).toBeInTheDocument()
+})
+
+test('on a server that takes only the invented places, the button sends one of them and asks the phone nothing', async () => {
+  const asked = serve({
+    ...fireRoutes,
+    'GET /api/health': INVENTED_ONLY,
+    'POST /api/taps': () => Response.json(receipt(FIRE_TAP), { status: 201 }),
+  })
+  // A phone that would say where it is, to the metre, if it were asked.
+  const located = vi.fn((found: PositionCallback) =>
+    found({
+      coords: { latitude: 37.775123, longitude: -122.419876, accuracy: 8 },
+    } as GeolocationPosition),
+  )
+  vi.stubGlobal('navigator', {
+    ...navigator,
+    geolocation: { getCurrentPosition: located },
+  })
+  render(<App />)
+
+  await screen.findByText(FRONT)
+  // Nothing can be added to a tap, and nothing says a tap sends where you are.
+  expect(
+    screen.queryByRole('checkbox', { name: '5 seconds of sound' }),
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('button', { name: 'A photo' }),
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByText(/A tap sends where you are/),
+  ).not.toBeInTheDocument()
+  // The button says what it sends here.
+  expect(
+    screen.getByText(/the button sends a tap from an invented place/),
+  ).toHaveTextContent('Where you are is not asked for and not sent.')
+  click(screen.getByRole('button', { name: ASK }))
+
+  await screen.findByRole('heading', { level: 1, name: /Fire at/ })
+  const sent = asked.filter((request) => request.key === 'POST /api/taps')
+  expect(sent).toHaveLength(1)
+  // The invented place to the digit, and nothing else: no accuracy, no clip.
+  expect(sent[0].body).toEqual({ location: { lat: 37.776, lon: -122.424 } })
+  expect(located).not.toHaveBeenCalled()
+  vi.unstubAllGlobals()
 })
 
 test('a tap that is gone says the most an answer is kept, and on a server that tells its story again, that', async () => {

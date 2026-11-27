@@ -6,6 +6,7 @@ import {
   useSyncExternalStore,
 } from 'react'
 import { OTHER_MODE } from '../api/http.ts'
+import type { Input } from '../api/health.ts'
 import type { Mode } from '../api/incidents.ts'
 import { checkPlaces, type PlaceAnswer } from '../api/places.ts'
 import { Icon } from '../components/Icon.tsx'
@@ -13,7 +14,7 @@ import { IncidentCard } from '../components/IncidentCard.tsx'
 import { Notifications } from '../components/Notifications.tsx'
 import { ConfidenceLabel, Sources } from '../components/Provenance.tsx'
 import { PLACES_MS } from '../lib/cadence.ts'
-import { locate, LocationError, MOCK_SPOTS } from '../lib/geo.ts'
+import { isMockSpot, locate, LocationError, MOCK_SPOTS } from '../lib/geo.ts'
 import {
   MOST_PLACES,
   NAME_MOST,
@@ -190,7 +191,17 @@ const SAID = { full: FULL, elsewhere: ELSEWHERE, failed: NOT_KEPT }
 
 /** Saving a place: where the phone is now, under a name. On the invented
  * scenario, also a place in it. */
-function AddPlace({ mode, full }: { mode: Mode | null; full: boolean }) {
+function AddPlace({
+  mode,
+  full,
+  invented,
+}: {
+  mode: Mode | null
+  full: boolean
+  // Whether the server takes only the invented scenario's two places: where the
+  // phone is is then not asked for, and only those two are offered.
+  invented: boolean
+}) {
   const [name, setName] = useState('')
   const [saving, setSaving] = useState<Saving>({ kind: 'idle' })
   const busy = saving.kind === 'locating'
@@ -245,27 +256,30 @@ function AddPlace({ mode, full }: { mode: Mode | null; full: boolean }) {
         <p className="meta">{FULL}</p>
       ) : (
         <>
-          <form onSubmit={(event) => void saveHere(event)}>
-            <label htmlFor="place-name">Its name, for you only</label>
-            <input
-              id="place-name"
-              type="text"
-              value={name}
-              maxLength={NAME_MOST}
-              placeholder="Home"
-              autoComplete="off"
-              onChange={(event) => setName(event.target.value)}
-            />
-            <button type="submit" className="action" disabled={busy}>
-              <Icon name="pin" />
-              {busy ? 'Finding where you are…' : 'Save where I am now'}
-            </button>
-          </form>
+          {!invented && (
+            <form onSubmit={(event) => void saveHere(event)}>
+              <label htmlFor="place-name">Its name, for you only</label>
+              <input
+                id="place-name"
+                type="text"
+                value={name}
+                maxLength={NAME_MOST}
+                placeholder="Home"
+                autoComplete="off"
+                onChange={(event) => setName(event.target.value)}
+              />
+              <button type="submit" className="action" disabled={busy}>
+                <Icon name="pin" />
+                {busy ? 'Finding where you are…' : 'Save where I am now'}
+              </button>
+            </form>
+          )}
           {mode === 'mock' && (
             <>
               <p className="meta">
-                This server runs on a made-up fire. If you are not in San
-                Francisco, save a place in the invented scenario.
+                {invented
+                  ? 'This server runs on a made-up fire and is asked only about its two invented places. Save one of them.'
+                  : 'This server runs on a made-up fire. If you are not in San Francisco, save a place in the invented scenario.'}
               </p>
               <div className="spot-list">
                 {MOCK_SPOTS.map((spot) => (
@@ -301,14 +315,22 @@ function AddPlace({ mode, full }: { mode: Mode | null; full: boolean }) {
 
 export function PlacesView({
   mode,
+  input = 'own',
   onOtherMode,
 }: {
+  // What the server takes from a visitor. When that is only the invented
+  // scenario's two places, a saved place that is neither is sent nowhere.
+  input?: Input
   // The mode the server said it is in at the latest asking, or null when that
   // is not known: no place is sent to a server the person was not told of.
   mode: Mode | null
   onOtherMode?: () => void
 }) {
   const places = useSyncExternalStore(subscribePlaces, placesSnapshot)
+  const invented = input === 'invented'
+  // The places this server is asked about, and the ones it is not.
+  const asked = invented ? places.filter(isMockSpot) : places
+  const unasked = invented ? places.filter((place) => !isMockSpot(place)) : []
   return (
     <div className="view places-view">
       <a className="action back" href={href.home}>
@@ -319,9 +341,9 @@ export function PlacesView({
       <p className="meta">
         A place’s name is kept on this device only. To see what is near a place,
         Beacon is sent where it is, rounded to about a block, without its name,
-        and keeps nothing of that request. With notifications on, Beacon’s
-        server does keep where your places are: Notifications, below, says what
-        it keeps.
+        and keeps nothing of that request.
+        {!invented &&
+          ' With notifications on, Beacon’s server does keep where your places are: Notifications, below, says what it keeps.'}
       </p>
       {places.length > 0 &&
         (mode === null ? (
@@ -334,9 +356,27 @@ export function PlacesView({
             <PlaceList places={places} answers={null} asking={false} />
           </>
         ) : (
-          <Checked places={places} mode={mode} onOtherMode={onOtherMode} />
+          <>
+            {asked.length > 0 && (
+              <Checked places={asked} mode={mode} onOtherMode={onOtherMode} />
+            )}
+            {unasked.length > 0 && (
+              <>
+                <p className="note" role="status">
+                  This server is asked only about the two invented places.
+                  Nothing of the places below is sent to it. They stay saved on
+                  this device, and can be removed.
+                </p>
+                <PlaceList places={unasked} answers={null} asking={false} />
+              </>
+            )}
+          </>
         ))}
-      <AddPlace mode={mode} full={places.length >= MOST_PLACES} />
+      <AddPlace
+        mode={mode}
+        full={places.length >= MOST_PLACES}
+        invented={invented}
+      />
       <Notifications mode={mode} />
     </div>
   )

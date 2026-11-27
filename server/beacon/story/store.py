@@ -76,6 +76,10 @@ _READABLE = frozenset({3})
 # Every shape this Beacon takes a stories file in: its own and the ones it makes
 # its own from. A file in any other is refused, and is nobody's to delete.
 SHAPES = frozenset({_FORMAT, *_EARLIER, *_READABLE})
+# The tables a stories file has, in every one of those shapes, and the one no
+# other of Beacon's files has: how a file is told from another kind's.
+TABLES = frozenset({"story", "meta"})
+OWN_TABLE = "story"
 # One statement each: they are run inside the transaction that begins a file.
 _SCHEMA = (
     """

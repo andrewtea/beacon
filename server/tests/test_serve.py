@@ -2,6 +2,7 @@
 story begun again when it is over."""
 
 import asyncio
+import contextlib
 import logging
 import os
 import socket
@@ -89,10 +90,13 @@ def test_the_story_is_played_for_as_long_as_the_pollers_play_it() -> None:
     assert serve.over_at(start) == start + timedelta(minutes=105)
     assert timedelta(minutes=20) == MOCK_HEAD_START
     assert "about every 85 minutes" in serve.REPEATS
-    # What a person is told is how long an answer is kept here, and that a photo's
-    # hour is the most it is kept for, not a promise of an hour.
+    # What a person is told is how long an answer is kept here. Of a photo, that
+    # it cannot be read after its hour and that the sweep then deletes it: no
+    # moment of deletion is promised, since the sweep runs only while the server is up.
     assert "kept here for about 85 minutes at most" in serve.REPEATS
-    assert "within about an hour" in serve.REPEATS
+    assert "cannot be read after an hour" in serve.REPEATS_MEDIA
+    assert "sweep then deletes it" in serve.REPEATS_MEDIA
+    assert "within" not in serve.REPEATS_MEDIA
 
 
 def test_nothing_is_deleted_before_the_story_is_over_or_where_there_is_no_mock_store() -> None:
@@ -271,10 +275,101 @@ def test_a_file_that_does_not_say_it_is_the_mock_stores_is_not_deleted_and_nothi
         path.write_bytes(b"not a SQLite file, whatever it is" * 40)
     before = kept()
 
-    with pytest.raises((serve.NotTheMockStoresError, sqlite3.Error)):
+    with pytest.raises(serve.NotTheMockStoresError, match="Nothing was deleted"):
         begin_again(over + timedelta(hours=1))
 
     assert kept() == before
+
+
+def push_file() -> Path:
+    return data_dir() / "push" / "mock.sqlite3"
+
+
+@pytest.mark.parametrize("how", ["the directory", "the file", "a second name"])
+def test_a_link_to_another_stores_file_is_not_followed_to_delete_it(how: str) -> None:
+    # The devices' subscriptions say `mock` too, in a shape number the
+    # investigations file also has. Reached through a link where the
+    # investigations are kept, they are not deleted in that file's place.
+    over = served()
+    folder = data_dir() / "investigate"
+    for each in folder.iterdir():
+        each.unlink()
+    if how == "the directory":
+        folder.rmdir()
+        folder.symlink_to(data_dir() / "push", target_is_directory=True)
+    elif how == "the file":
+        (folder / "mock.sqlite3").symlink_to(push_file())
+    else:
+        os.link(push_file(), folder / "mock.sqlite3")
+    subscriptions = push_file().read_bytes()
+    before = {name: held for name, held in kept().items() if not name.startswith("investigate/")}
+
+    with pytest.raises(serve.NotTheMockStoresError, match="is a link"):
+        begin_again(over + timedelta(hours=1))
+
+    assert push_file().read_bytes() == subscriptions
+    after = {name: held for name, held in kept().items() if not name.startswith("investigate/")}
+    assert after == before
+
+
+@pytest.mark.parametrize("what", ["the subscriptions", "the stories", "only a view"])
+@pytest.mark.parametrize("where", ["investigate", "story", "evidence"])
+def test_a_file_of_another_kind_is_not_deleted_whatever_it_says_of_itself(
+    where: str, what: str
+) -> None:
+    # What a file says is not whose it is: a copy of the subscriptions says `mock`
+    # in a shape the investigations file has too. A file is known by its tables,
+    # and one that holds anything at all is not "never written to".
+    if where == "story" and what == "the stories":
+        return
+    over = served()
+    path = data_dir() / where / "mock.sqlite3"
+    for beside in (path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")):
+        beside.unlink(missing_ok=True)
+    if what == "only a view":
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute("CREATE VIEW kept AS SELECT 1 AS n")
+    else:
+        source = push_file() if what == "the subscriptions" else data_dir() / "story.copy"
+        if what == "the stories":
+            Stories(source, "mock").close()
+        with closing(sqlite3.connect(source)) as db:
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        path.write_bytes(source.read_bytes())
+    before = kept()
+
+    with pytest.raises(serve.NotTheMockStoresError):
+        begin_again(over + timedelta(hours=1))
+
+    assert kept() == before
+
+
+def test_a_server_that_tells_the_story_again_does_not_run_on_a_file_that_is_not_its_own(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # It would open the same file to write to. Whether or not the story is over.
+    served()
+    path = data_dir() / "investigate" / "mock.sqlite3"
+    for beside in (path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")):
+        beside.unlink(missing_ok=True)
+    path.symlink_to(push_file())
+    subscriptions = push_file().read_bytes()
+    made: list[FastAPI] = []
+
+    def make_server(app: FastAPI) -> Stub:
+        made.append(app)
+        return Stub(app)
+
+    with pytest.raises(serve.NotTheMockStoresError):
+        serve.run(env(), make_server)
+
+    assert made == []
+    assert push_file().read_bytes() == subscriptions
+    # Nothing of it was left running, so the stores are anybody's again.
+    DataLock(data_dir(), shared=False).close()
+    # And the command says so in a sentence, with a status that is a failure.
+    assert serve.main([], env()) == 3
+    assert capsys.readouterr().err.startswith("The server does not run. What is kept as")
 
 
 def test_a_file_something_still_has_open_is_not_deleted(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -287,7 +382,9 @@ def test_a_file_something_still_has_open_is_not_deleted(monkeypatch: pytest.Monk
         reading.execute("BEGIN")
         reading.execute("SELECT count(*) FROM evidence").fetchall()
         with writing:
-            writing.execute("CREATE TABLE written_since (n)")
+            writing.execute(
+                "INSERT INTO poller_state (name, state, updated_ms) VALUES ('since', '{}', 0)"
+            )
         names = set(files())
 
         with pytest.raises(serve.StillOpenError, match="still open"):
@@ -422,7 +519,8 @@ def test_a_server_whose_story_is_over_stops_and_starts_on_a_new_store(
     DataLock(data_dir(), shared=False).close()
     assert len(tellings) == 2
     assert tellings[0] is not tellings[1]
-    assert seen == [(serve.REPEATS, 1), (serve.REPEATS, 0)]
+    said = serve.REPEATS + serve.REPEATS_MEDIA
+    assert seen == [(said, 1), (said, 0)]
     assert "the taps sent before and their answers are deleted" in serve.REPEATS
 
 
@@ -499,12 +597,116 @@ def test_a_telling_that_did_not_stop_whole_ends_the_process_and_deletes_nothing(
         made.append(app)
         return Stub(app)
 
-    status = serve.run(env(), make_server, clock=lambda: datetime.now(UTC) + timedelta(hours=3))
+    left: list[bool] = []
 
-    assert (status, len(made)) == (serve.LEFT_RUNNING, 1)
+    def leave() -> None:
+        # Where the process is ended: while the loop that served still runs, which
+        # is before anything waits for the threads that did not stop.
+        left.append(asyncio.get_running_loop().is_running())
+
+    status = serve.run(
+        env(), make_server, clock=lambda: datetime.now(UTC) + timedelta(hours=3), leave=leave
+    )
+
+    assert (status, len(made), left) == (serve.LEFT_RUNNING, 1, [True])
     assert made[0].state.stopped_whole is False
     assert "did not stop whole" in caplog.text
     assert {f"{d}/{n}" for d, n in serve.MOCK_FILES} <= set(files())
+    # The lock is not given up: a thread may still have a store open. It is gone
+    # with the process.
+    with pytest.raises(DataLockedError):
+        DataLock(data_dir(), shared=True)
+
+
+@pytest.mark.parametrize("repeat", ["1", "0"])
+def test_a_server_stopped_as_asked_that_did_not_stop_whole_keeps_the_stores(
+    monkeypatch: pytest.MonkeyPatch, repeat: str
+) -> None:
+    # Not only a telling that was over: a server stopped by a signal can leave a
+    # worker behind as well.
+    async def not_whole(ingest: object) -> bool:
+        await stop(ingest)  # type: ignore[arg-type]
+        return False
+
+    stop = beacon.main._stop_ingest
+    monkeypatch.setattr(beacon.main, "_stop_ingest", not_whole)
+    left: list[int] = []
+
+    def started(server: Stub) -> None:
+        server.should_exit = True
+
+    status = serve.run(
+        env() | {serve.REPEAT_VARIABLE: repeat},
+        lambda app: Stub(app, started),
+        leave=lambda: left.append(1),
+    )
+
+    # Only the invented scenario's server that tells its story again is ended at
+    # once. Any other ends as it would, and the lock is the process's until then.
+    assert (status, left) == ((serve.LEFT_RUNNING, [1]) if repeat == "1" else (0, []))
+    with pytest.raises(DataLockedError):
+        DataLock(data_dir(), shared=True)
+
+
+def test_a_server_run_by_itself_keeps_the_stores_when_it_did_not_stop_whole(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `uvicorn beacon.main:app`, which holds the lock itself.
+    async def not_whole(ingest: object) -> bool:
+        await stop(ingest)  # type: ignore[arg-type]
+        return False
+
+    stop = beacon.main._stop_ingest
+    monkeypatch.setattr(beacon.main, "_stop_ingest", not_whole)
+    with TestClient(create_app()):
+        pass
+
+    with pytest.raises(DataLockedError):
+        DataLock(data_dir(), shared=True)
+
+
+@pytest.mark.parametrize("shared", [True, False])
+def test_a_refused_lock_never_advises_a_second_data_directory(shared: bool) -> None:
+    # A second directory has a ledger and claims of its own: the same work could
+    # be paid for twice.
+    with alone(), pytest.raises(DataLockedError) as refused:
+        DataLock(data_dir(), shared=shared)
+
+    said = str(refused.value)
+    assert "Stop" in said
+    assert "this one data directory" in said
+    assert "BEACON_DATA_DIR" not in said
+    assert "of its own" not in said
+
+
+def test_a_server_that_could_not_start_and_left_something_running_keeps_the_stores(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # What had begun before the start failed is ended as on any stop, and may not
+    # all have ended.
+    async def not_whole(ingest: object) -> bool:
+        await stop(ingest)  # type: ignore[arg-type]
+        return False
+
+    def fails(*args: object) -> None:
+        raise beacon.main.ServerSetupError("no")
+
+    stop = beacon.main._stop_ingest
+    monkeypatch.setattr(beacon.main, "_stop_ingest", not_whole)
+    monkeypatch.setattr(beacon.main, "open_push", fails)
+
+    class Failing(Stub):
+        async def serve(self) -> None:
+            # As uvicorn does with a startup that failed: it never says it started.
+            with contextlib.suppress(beacon.main.ServerSetupError):
+                await super().serve()
+
+    left: list[int] = []
+    status = serve.run(env(), Failing, leave=lambda: left.append(1))
+
+    assert (status, left) == (serve.LEFT_RUNNING, [1])
+    with pytest.raises(DataLockedError):
+        DataLock(data_dir(), shared=True)
 
 
 def test_a_server_that_stopped_says_so_only_when_every_part_of_it_did() -> None:

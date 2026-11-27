@@ -6,6 +6,7 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from beacon import front
 from beacon.api.body import read_body
 from beacon.api.incidents import IncidentSummary, summary_of
 from beacon.api.taps import MODE_HEADER
@@ -152,6 +153,12 @@ def _read_and_answer(request: Request, engine: Engine, body: bytes) -> PlacesAns
     if sent.keys() != {"places"}:
         raise PlacesError(422, SHAPE)
     points = read_places(sent["places"])
+    if getattr(request.app.state, "input", "own") == "invented" and not all(
+        front.invented(point) for point in points
+    ):
+        # A server behind a host nobody has checked is asked about no place of a
+        # person's own (`beacon.front`).
+        raise PlacesError(403, front.PLACES_REFUSED)
     # One reading for the whole answer.
     snapshot = engine.snapshot()
     places = []

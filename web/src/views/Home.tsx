@@ -1,5 +1,6 @@
 import { useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { ApiError, OTHER_MODE } from '../api/http.ts'
+import type { Input } from '../api/health.ts'
 import type { Mode } from '../api/incidents.ts'
 import { sendTap, type TapBody } from '../api/taps.ts'
 import { Icon } from '../components/Icon.tsx'
@@ -83,8 +84,13 @@ function YourTaps() {
 
 export function Home({
   mode,
+  input = 'own',
   onOtherMode,
 }: {
+  // What the server takes from a visitor. When that is only the invented
+  // scenario's two places, the button sends a tap from the first of them, and
+  // where the phone is, a sound, and a photo are neither asked for nor sent.
+  input?: Input
   // The mode the server said it is in at the latest asking, or null when that
   // is not known.
   mode: Mode | null
@@ -116,7 +122,7 @@ export function Home({
       sending.current = null
       setPhase({ kind: 'idle' })
     },
-    [mode],
+    [mode, input],
   )
 
   const busy = drawing ? 'Reading the picture…' : BUSY[phase.kind]
@@ -124,9 +130,14 @@ export function Home({
   // before a tap is taken, so that nobody sends where they are, a clip, or a
   // photo to the scenario without having been told that is what it is.
   const ready = mode !== null
+  const invented = input === 'invented'
 
-  const tap = async (from?: Place) => {
+  const tap = async (given?: Place) => {
     if (busy !== null || mode === null) return
+    // On a server that takes only the invented places, the button's tap is from
+    // the first of them: the phone is not asked where it is.
+    const from = given ?? (invented ? MOCK_SPOTS[0].place : undefined)
+    const clipWanted = withClip && !invented
     // The mode that was on the screen when the button was pressed. The tap
     // names it, and a server in the other mode refuses the tap unread.
     const shown = mode
@@ -141,16 +152,18 @@ export function Home({
     try {
       // The sound is recorded while the phone finds where it is: a siren does
       // not wait.
-      setPhase({ kind: withClip ? 'listening' : 'locating' })
+      setPhase({
+        kind: clipWanted ? 'listening' : from ? 'sending' : 'locating',
+      })
       const [place, clip] = await Promise.all([
         from ?? locate(),
-        withClip ? recordClip(CLIP_SECONDS, controller.signal) : null,
+        clipWanted ? recordClip(CLIP_SECONDS, controller.signal) : null,
       ])
       unlessCalledOff()
       setPhase({ kind: 'sending' })
       const body: TapBody = { location: place }
       if (clip !== null) body.clip = toBase64(clip)
-      if (photo !== null) {
+      if (photo !== null && !invented) {
         body.photo = toBase64(new Uint8Array(await photo.arrayBuffer()))
         unlessCalledOff()
       }
@@ -219,9 +232,11 @@ export function Home({
         </button>
         <p className="ask-status" role="status" aria-live="polite">
           {busy ??
-            (ready
-              ? 'Heard a siren or saw a helicopter? Tap, and Beacon looks into what is going on near you.'
-              : 'Beacon takes a tap once it has heard from its server.')}
+            (!ready
+              ? 'Beacon takes a tap once it has heard from its server.'
+              : invented
+                ? `On this server the button sends a tap from an invented place: ${MOCK_SPOTS[0].name}. Where you are is not asked for and not sent.`
+                : 'Heard a siren or saw a helicopter? Tap, and Beacon looks into what is going on near you.')}
         </p>
         {phase.kind === 'failed' && (
           <p className="note problem" role="alert">
@@ -230,68 +245,75 @@ export function Home({
         )}
       </div>
 
-      <fieldset className="extras" disabled={busy !== null || !ready}>
-        <legend>Add to your tap</legend>
-        <label className="extra">
-          <input
-            type="checkbox"
-            checked={withClip}
-            onChange={(event) => setWithClip(event.target.checked)}
-          />
-          <Icon name="mic" />
-          <span>{CLIP_SECONDS} seconds of sound</span>
-        </label>
-        <input
-          ref={picker}
-          className="sr-only"
-          type="file"
-          accept="image/*"
-          capture="environment"
-          tabIndex={-1}
-          aria-hidden="true"
-          onChange={(event) => {
-            void choosePhoto(event.target.files?.[0])
-            event.target.value = ''
-          }}
-        />
-        {photo === null ? (
-          <button
-            type="button"
-            className="extra"
-            onClick={() => picker.current?.click()}
-          >
-            <Icon name="camera" />
-            <span>A photo</span>
-          </button>
-        ) : (
-          <button
-            type="button"
-            className="extra on"
-            onClick={() => setPhoto(null)}
-          >
-            <Icon name="camera" />
-            <span>Photo attached. Remove it</span>
-          </button>
-        )}
-      </fieldset>
-      {photoProblem !== null && (
-        <p className="note problem" role="alert">
-          {photoProblem}
-        </p>
+      {/* Nothing is added to a tap, and no place of a person's own goes with
+          one, on a server that takes only the invented places. */}
+      {!invented && (
+        <>
+          <fieldset className="extras" disabled={busy !== null || !ready}>
+            <legend>Add to your tap</legend>
+            <label className="extra">
+              <input
+                type="checkbox"
+                checked={withClip}
+                onChange={(event) => setWithClip(event.target.checked)}
+              />
+              <Icon name="mic" />
+              <span>{CLIP_SECONDS} seconds of sound</span>
+            </label>
+            <input
+              ref={picker}
+              className="sr-only"
+              type="file"
+              accept="image/*"
+              capture="environment"
+              tabIndex={-1}
+              aria-hidden="true"
+              onChange={(event) => {
+                void choosePhoto(event.target.files?.[0])
+                event.target.value = ''
+              }}
+            />
+            {photo === null ? (
+              <button
+                type="button"
+                className="extra"
+                onClick={() => picker.current?.click()}
+              >
+                <Icon name="camera" />
+                <span>A photo</span>
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="extra on"
+                onClick={() => setPhoto(null)}
+              >
+                <Icon name="camera" />
+                <span>Photo attached. Remove it</span>
+              </button>
+            )}
+          </fieldset>
+          {photoProblem !== null && (
+            <p className="note problem" role="alert">
+              {photoProblem}
+            </p>
+          )}
+          <p className="meta privacy">
+            A tap sends where you are, rounded to about a block, and whatever
+            you add. A clip or a photo goes only with the tap, as evidence for
+            it, and after an hour Beacon cannot read it and its sweep deletes
+            it. Beacon keeps nothing that says who sent a tap.
+          </p>
+        </>
       )}
-      <p className="meta privacy">
-        A tap sends where you are, rounded to about a block, and whatever you
-        add. A clip or a photo goes only with the tap, as evidence for it, and
-        Beacon keeps it for an hour at most. Beacon keeps nothing that says who
-        sent a tap.
-      </p>
 
       {mode === 'mock' && (
         <section className="panel mock-spots" aria-labelledby="spots-heading">
           <h2 id="spots-heading">Try the invented scenario</h2>
           <p className="meta">
-            This server runs on a made-up fire, not real sources. If you are not
-            in San Francisco, send a tap as if from one of these places.
+            {invented
+              ? 'This server runs on a made-up fire, not real sources. Send a tap as if from one of these places.'
+              : 'This server runs on a made-up fire, not real sources. If you are not in San Francisco, send a tap as if from one of these places.'}
           </p>
           <div className="spot-list">
             {MOCK_SPOTS.map((spot) => (

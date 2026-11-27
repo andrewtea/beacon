@@ -4,13 +4,8 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
-from beacon.main import (
-    FRONT_UNVERIFIED,
-    FRONT_UNVERIFIED_MORE,
-    ServerSetupError,
-    app,
-    create_app,
-)
+from beacon import front
+from beacon.main import ServerSetupError, app, create_app
 
 
 def test_health_reports_ok_and_the_package_version() -> None:
@@ -19,12 +14,13 @@ def test_health_reports_ok_and_the_package_version() -> None:
     assert response.status_code == 200
     # No lifespan ran, so this server reads no evidence and has no mode to name.
     # Nor does it tell a story again: only `beacon.serve` can, and says so here.
-    # And nothing says its front end is unchecked.
+    # And nothing says its front end is unchecked: it takes a visitor's own.
     assert response.json() == {
         "status": "ok",
         "version": version("beacon-server"),
         "mode": None,
         "repeats_text": None,
+        "input": "own",
         "front_text": None,
         "front_more_text": None,
     }
@@ -39,34 +35,30 @@ class Tap(BaseModel):
     latitude: float
 
 
-def test_a_server_behind_a_front_end_nobody_checked_says_so_to_every_visitor(
+def test_a_server_behind_a_front_end_nobody_checked_says_what_it_takes_and_why(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Only the incidents are invented. What a visitor sends is theirs, and a host
-    # in front of the server can write down the address a tap's answer is read at.
     plain = TestClient(create_app()).get("/api/health").json()
-    assert (plain["front_text"], plain["front_more_text"]) == (None, None)
+    assert (plain["input"], plain["front_text"], plain["front_more_text"]) == ("own", None, None)
     monkeypatch.setenv("BEACON_FRONT_END", "verified")
-    assert TestClient(create_app()).get("/api/health").json()["front_text"] is None
+    checked = TestClient(create_app()).get("/api/health").json()
+    assert (checked["input"], checked["front_text"]) == ("own", None)
 
     monkeypatch.setenv("BEACON_FRONT_END", "unverified")
     health = TestClient(create_app()).get("/api/health").json()
 
-    # The sentence a visitor reads before they send anything says both things.
-    said = health["front_text"]
-    assert said == FRONT_UNVERIFIED
-    assert "What you send here is real" in said
-    assert "nobody has checked" in said
-    # And the rest says what is sent and what a tap's id in an address is good for.
-    more = health["front_more_text"]
-    assert more == FRONT_UNVERIFIED_MORE
-    assert "holds the tap's id" in more
-    # It does not say what the host keeps, which nobody knows.
-    assert "may keep" in more
+    assert health["input"] == "invented"
+    assert (health["front_text"], health["front_more_text"]) == (
+        front.INVENTED,
+        front.INVENTED_MORE,
+    )
 
-    monkeypatch.setenv("BEACON_FRONT_END", "probably fine")
-    with pytest.raises(ServerSetupError, match="is verified or unverified"):
-        create_app()
+    # Neither word, the empty one included, stops the server: a deployment's
+    # default is not emptied into a server that takes everything and says nothing.
+    for wrong in ("probably fine", ""):
+        monkeypatch.setenv("BEACON_FRONT_END", wrong)
+        with pytest.raises(ServerSetupError, match="is verified or unverified"):
+            create_app()
 
 
 def test_a_request_that_fails_validation_is_not_echoed_back() -> None:

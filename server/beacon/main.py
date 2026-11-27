@@ -18,7 +18,7 @@ from starlette.routing import Match, Mount
 from starlette.staticfiles import StaticFiles
 from starlette.types import Scope
 
-from beacon import __version__
+from beacon import __version__, front
 from beacon.api import health, incidents, places, push, scale, sources, taps
 from beacon.datadir import DataLock
 from beacon.ember.client import default_data_dir
@@ -39,27 +39,6 @@ INGEST_VARIABLE = "BEACON_INGEST"
 # server then serves from its own origin, beside `/api`. Unset, it serves the API
 # alone, and something else serves the app.
 WEB_VARIABLE = "BEACON_WEB_DIR"
-# The setting that says whether what stands between the internet and this server
-# is known to keep the private routes out of what it writes down: `unverified`
-# when nobody has seen that it does, as on a host whose front end is not the
-# operator's. The server then says so to every visitor (`front_text` of
-# `GET /api/health`). Unset or `verified`, it says nothing.
-FRONT_VARIABLE = "BEACON_FRONT_END"
-# The first is what a visitor reads before they send anything; the second is the
-# rest of it, which the app shows when it is asked for.
-FRONT_UNVERIFIED = (
-    "What you send here is real, whatever the scenario, and nobody has checked what "
-    "the hosting service this server is reached through writes down of a request."
-)
-FRONT_UNVERIFIED_MORE = (
-    "A tap sends where you are, rounded to about a block, with any clip or photo you "
-    "add, and a saved place and a notification send what their page says. The "
-    "hosting service's records are not Beacon's to read or set. It may keep the "
-    "address of each request, when it came, and where from. The address a tap's "
-    "answer is read at holds the tap's id, and whoever has that id can read the "
-    "answer for as long as this server keeps it. Beacon's own server writes no log "
-    "of those requests."
-)
 # How often the photos and clips whose hour is over are deleted.
 SWEEP_SECONDS = 60.0
 # How often the incidents are looked over for one whose story is due.
@@ -280,7 +259,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         async with _running(app, setting):
             yield
     finally:
-        if ours is not None:
+        # Given up only when everything that was begun is known to have ended. A
+        # worker that did not stop in the time it was given may still have a store
+        # open, so the lock is then kept until the process is gone, which is when
+        # the operating system gives it up: nothing else opens a store under it.
+        if ours is not None and getattr(app.state, "stopped_whole", None) is not False:
             ours.close()
 
 
@@ -310,6 +293,10 @@ async def _running(app: FastAPI, setting: str) -> AsyncIterator[None]:
         # The incidents are read from the same evidence store the taps go to,
         # which is there whether or not this server runs the pollers.
         engine = open_engine(os.environ, taps.store)
+        if app.state.input == "invented" and engine.mode != "mock":
+            # Two invented places are of no use to a server on real sources, and
+            # it is not to take a visitor's own through a host nobody has checked.
+            raise ServerSetupError(front.NOT_WITH_A_REAL_SOURCE)
         app.state.incidents = engine
         # What Ember writes about an incident: a stand-in's on the mock store, and
         # on the live store written only under a budget somebody set.
@@ -572,18 +559,15 @@ def _web_directory() -> Path | None:
     return directory
 
 
-def _front_text() -> tuple[str, str] | None:
-    """What a visitor is told of what stands in front of this server, by
-    `BEACON_FRONT_END`: the sentence shown before they send anything and the rest
-    of it, or None.
+def _input() -> front.Input:
+    """What this server takes from a visitor, by `BEACON_FRONT_END` (`beacon.front`).
 
     Raises ServerSetupError for a setting that is neither word."""
-    setting = os.environ.get(FRONT_VARIABLE, "")
-    if setting in ("", "verified"):
-        return None
-    if setting != "unverified":
-        raise ServerSetupError(f"{FRONT_VARIABLE} is verified or unverified.")
-    return FRONT_UNVERIFIED, FRONT_UNVERIFIED_MORE
+    try:
+        return front.input_of(os.environ)
+    except front.FrontError as error:
+        refused = str(error)
+    raise ServerSetupError(refused)
 
 
 def create_app() -> FastAPI:
@@ -623,7 +607,7 @@ def create_app() -> FastAPI:
     app.include_router(sources.router, prefix="/api")
     app.include_router(taps.router, prefix="/api")
     # Read when the app is made, so that a setting that is no word stops the server.
-    app.state.front_text, app.state.front_more_text = _front_text() or (None, None)
+    app.state.input = _input()
     web = _web_directory()
     if web is not None:
         # After every route, and for no path under /api (`_WebMount`), so that

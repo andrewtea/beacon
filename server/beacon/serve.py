@@ -23,19 +23,29 @@ every tap sent to it, the stand-in's investigations of those taps, and the
 stand-in's stories: `MOCK_FILES`. Nothing in them was paid for. It never touches a
 live store's files, the Ember ledger, a scale run, or the push subscriptions, which
 are devices' and have their own lifetimes. A tap's photo or clip is left to the
-server's sweep, which keeps one for an hour at most and deletes one sooner once
-its tap is gone.
+server's sweep, which deletes one once its hour is over and sooner once its tap
+is gone.
 
 **Under what it deletes.** This process holds the data directory's stores alone
 (`beacon.datadir.DataLock`) from before the first store is opened until the
 process ends, over every telling and every deletion between them, so no other
 server and no `python -m beacon.ingest` has a store open then or opens one
-meanwhile. Before anything is changed, each file is read through a connection that
-cannot write and has to say it is the mock store's, in a shape this Beacon knows:
-a file that says it is a live store's, or one a newer Beacon wrote, is nobody's to
-delete, and with one there nothing is deleted at all. A file whose write-ahead log
-SQLite could not empty, because something still has it open, is not deleted
-either.
+meanwhile. Before anything is changed, each file has to be that kind of store's own
+file and no link to another (`_own`), and is read through a connection that cannot
+write: it has to say it is the mock store's, in a shape this Beacon knows, and
+hold that kind's tables and no others (`_mock_stores`). The push subscriptions
+file says `mock` too, in a shape number the other files also have, so what a file
+says is not enough to know whose it is. A file that fails any of that is nobody's
+to delete: nothing is deleted, **and the server does not go on**, because it would
+open the same file to write to. A file whose write-ahead log SQLite could not
+empty, because something still has it open, is not deleted either; the story is
+then served as far as it was told.
+
+**A telling that did not stop whole ends the process**, at once and before
+anything else is waited for (`run`'s `leave`): a thread of it may still have a
+store open, so nothing is deleted and no second server is started beside it. The
+lock is not given up then. It is gone with the process, and whatever runs the
+server starts it again.
 
 It is for the invented scenario only: with `BEACON_LIVE_SOURCES` naming a source,
 or with the pollers off, `BEACON_MOCK_REPEAT=1` is refused.
@@ -46,12 +56,14 @@ import asyncio
 import logging
 import os
 import sqlite3
+import stat
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import closing
+from contextlib import closing, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol
 
 import uvicorn
 from fastapi import FastAPI
@@ -60,7 +72,9 @@ from beacon import files
 from beacon.datadir import DataLock, DataLockedError
 from beacon.ember.client import default_data_dir
 from beacon.ember.errors import EmberConfigError
+from beacon.errors import raise_bare
 from beacon.evidence import EvidenceStore, EvidenceStoreError
+from beacon.evidence import store as evidence_store
 from beacon.ingest.setup import (
     _AFTER_THE_STORY,
     _SCENARIO_STATE,
@@ -85,19 +99,37 @@ MOCK_FILES = (
     ("story", "mock.sqlite3"),
     ("evidence", "mock.sqlite3"),
 )
-# How each of them says it is the mock store's: the table its mode is written in,
-# and the shapes this Beacon knows it in. The evidence store says no shape.
+
+
+@dataclass(frozen=True)
+class _Kind:
+    """How a file of one kind is known: the table its mode is written in, the
+    shapes this Beacon knows it in, the tables it can have, and the table no
+    other kind has."""
+
+    meta: str
+    shapes: frozenset[int]
+    tables: frozenset[str]
+    own: str
+
+
+# The evidence store says no shape.
 _SAYS = {
-    "investigate": ("meta", investigations.SHAPES),
-    "story": ("meta", stories.SHAPES),
-    "evidence": ("store_meta", frozenset({0})),
+    "investigate": _Kind(
+        "meta", investigations.SHAPES, investigations.TABLES, investigations.OWN_TABLE
+    ),
+    "story": _Kind("meta", stories.SHAPES, stories.TABLES, stories.OWN_TABLE),
+    "evidence": _Kind(
+        "store_meta", frozenset({0}), evidence_store.TABLES, evidence_store.OWN_TABLE
+    ),
 }
 # How long a story is played for, from its start to the last moment anything of it
 # changes. The story then has nothing more to tell.
 PLAYED_FOR = DURATION + _AFTER_THE_STORY
-# The status the process ends with when a telling that was over did not stop
-# whole. `__main__` then ends the process without waiting for a thread: only the
-# invented story is ever told again, and nothing on the mock store is paid for.
+# The status the process ends with when a server that tells the story again did
+# not stop whole. The process is then ended without waiting for a thread
+# (`_leave`): only the invented story is ever told again, and nothing on the mock
+# store is paid for.
 LEFT_RUNNING = 4
 # How often a running server is asked whether its story is over.
 CHECK_SECONDS = 15.0
@@ -108,9 +140,14 @@ REPEATS = (
     "On this server the invented scenario is told again from its beginning when it "
     f"is over, about every {_EVERY_MINUTES} minutes. Each time, the taps sent before "
     f"and their answers are deleted, so an answer is kept here for about {_EVERY_MINUTES} "
-    "minutes at most, not for the 23 hours another server can keep one. A photo or a "
-    "clip sent with a tap is deleted by the server's sweep: within about an hour, as "
-    "on any server, and within minutes once its tap has been deleted."
+    "minutes at most, not for the 23 hours another server can keep one."
+)
+# Said after it by a server that takes a clip or a photo with a tap. It promises
+# no moment of deletion: the sweep runs each minute, and only while the server is up.
+REPEATS_MEDIA = (
+    " A photo or a clip sent with a tap cannot be read after an hour, as on any "
+    "server, and the server's sweep then deletes it. The sweep deletes one sooner "
+    "once its tap has been deleted."
 )
 # How long SQLite is waited for when a file's log is emptied before it is deleted.
 _WAIT_SECONDS = 5.0
@@ -148,8 +185,18 @@ def over_at(start: datetime) -> datetime:
 
 
 class NotTheMockStoresError(Exception):
-    """A file where one of the mock store's is kept does not say it is the mock
-    store's, in a shape this Beacon knows. The text is fixed."""
+    """What is where one of the mock store's files is kept was not seen to be
+    that file: a link, another kind of store, a live store's, one a newer Beacon
+    wrote, or one that could not be read. The text is fixed."""
+
+
+_NOT_THE_FILE = (
+    "What is kept as the mock store's under {}/ could not be seen to be that store's "
+    "own file: it is a link, it could not be read, or it does not say it is the mock "
+    "store's, in a shape and with the tables this Beacon knows. Nothing was deleted, "
+    "and a server that tells the invented story again does not run on it. Find out "
+    "what is there."
+)
 
 
 class StillOpenError(Exception):
@@ -166,23 +213,28 @@ def begin_again(env: Mapping[str, str], now: datetime, lock: DataLock) -> bool:
     no mock store or its story is not over. Only `MOCK_FILES` are deleted, and
     none of them before every one that is there was seen to be the mock store's.
 
-    Raises NotTheMockStoresError and sqlite3.Error for a file that does not say it
-    is the mock store's, StillOpenError for one something has open,
-    MediaLockedError when something has the taps' media, EvidenceStoreError when
-    the mock store cannot be read as one, EmberConfigError for a relative
-    `BEACON_DATA_DIR`, and OSError when a file could not be deleted, which leaves
-    the evidence store, and so the next try, in place."""
+    Raises NotTheMockStoresError for a file that was not seen to be the mock
+    store's own of its kind, StillOpenError for one something has open,
+    sqlite3.Error when its log could not be emptied, MediaLockedError when
+    something has the taps' media, EvidenceStoreError when the mock store cannot
+    be read as one, EmberConfigError for a relative `BEACON_DATA_DIR`, and OSError
+    when a file could not be deleted, which leaves the evidence store, and so the
+    next try, in place."""
     data = default_data_dir(env)
     if not (lock.held and lock.exclusive and lock.data == data):
         raise ValueError("The story is begun again only by who holds the stores alone.")
-    evidence = data / MOCK_FILES[-1][0] / MOCK_FILES[-1][1]
-    if not evidence.is_file():
-        return False
-    there = [data / directory / name for directory, name in MOCK_FILES]
-    there = [path for path in there if path.is_file()]
-    # Before any file is written to: each says whose it is, read-only.
+    # Before any file is written to, and whether or not there is a story to begin
+    # again: each that is there is that store's own file and says so, read-only.
+    there = [
+        path
+        for path in (_own(data, directory, name) for directory, name in MOCK_FILES)
+        if path is not None
+    ]
     for path in there:
         _mock_stores(path)
+    evidence = data / MOCK_FILES[-1][0] / MOCK_FILES[-1][1]
+    if evidence not in there:
+        return False
     # The lock of whoever sweeps the taps' media (`python -m beacon.taps`).
     held = TapMedia(data / "taps", "mock")
     try:
@@ -196,6 +248,8 @@ def begin_again(env: Mapping[str, str], now: datetime, lock: DataLock) -> bool:
         # Every log is emptied before any file goes: one that is busy stops it all.
         for path in there:
             _settle(path)
+        # Each of them, one that is not there included: what SQLite left beside a
+        # file that is gone would be found by a new file of the same name.
         for directory, name in MOCK_FILES:
             _delete(data / directory / name)
         return True
@@ -203,21 +257,53 @@ def begin_again(env: Mapping[str, str], now: datetime, lock: DataLock) -> bool:
         held.close()
 
 
-def _mock_stores(path: Path) -> None:
-    """See that the file says it is the mock store's, in a shape this Beacon
-    knows, or is a file nothing was ever written to. It writes nothing.
+def _own(data: Path, directory: str, name: str) -> Path | None:
+    """The file of one of the mock store's kinds, or None when there is none.
 
-    Raises NotTheMockStoresError when it is not, and sqlite3.Error when it cannot
-    be read as a SQLite file."""
-    meta, shapes = _SAYS[path.parent.name]
-    said = files.look(path, meta=meta)
-    if not said.tables and said.shape == 0:
-        return
-    if said.mode != "mock" or said.shape not in shapes:
-        raise NotTheMockStoresError(
-            f"The file kept as the mock store's under {path.parent.name}/ does not say "
-            "it is the mock store's, in a shape this Beacon knows. It is not deleted."
-        )
+    Raises NotTheMockStoresError when what is there is not a file of its own in a
+    directory of its own: a link, of either kind, can be to another store's file,
+    which would be deleted in this one's place."""
+    folder = data / directory
+    path = folder / name
+    linked = folder.is_symlink()
+    if not linked:
+        try:
+            found = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        except NotADirectoryError:
+            linked = True
+        else:
+            linked = not stat.S_ISREG(found.st_mode) or found.st_nlink != 1
+    if linked:
+        raise_bare(NotTheMockStoresError(_NOT_THE_FILE.format(directory)))
+    return path
+
+
+def _mock_stores(path: Path) -> None:
+    """See that the file is its kind's and the mock store's, in a shape this
+    Beacon knows, or is a file nothing was ever written to. It writes nothing.
+
+    Its kind is known by its tables, not by what it says: every one of Beacon's
+    files says a mode, several in the same table and with the same shape number.
+
+    Raises NotTheMockStoresError when it is not, and when it could not be read:
+    a file that was not seen to be the mock store's is not opened to write to."""
+    kind = _SAYS[path.parent.name]
+    said = None
+    with suppress(sqlite3.Error):
+        said = files.look(path, meta=kind.meta)
+    if said is not None:
+        if said.objects == 0 and said.shape == 0:
+            return
+        if (
+            said.mode == "mock"
+            and said.shape in kind.shapes
+            and kind.own in said.tables
+            and said.tables <= kind.tables
+        ):
+            return
+    raise_bare(NotTheMockStoresError(_NOT_THE_FILE.format(path.parent.name)))
 
 
 def _settle(path: Path) -> None:
@@ -249,10 +335,19 @@ class _Server(Protocol):
 
 
 async def _serve(
-    server: _Server, app: FastAPI, *, repeat: bool, clock: Callable[[], datetime]
+    server: _Server,
+    app: FastAPI,
+    *,
+    repeat: bool,
+    clock: Callable[[], datetime],
+    leave: Callable[[], object] | None = None,
 ) -> bool:
     """Serve until the server is told to stop, or, with `repeat`, until the story
-    it plays is over, and say whether it ended because the story was over."""
+    it plays is over, and say whether it ended because the story was over.
+
+    `leave` is called when the server that stopped did not stop whole, here and
+    not after this returns: what runs this then waits for the threads that did not
+    stop, for minutes, before anything else can end the process."""
     serving = asyncio.ensure_future(server.serve())
     over = False
     try:
@@ -270,7 +365,18 @@ async def _serve(
         if not serving.done():
             server.should_exit = True
         await serving
+    if leave is not None and _left_running(server, app):
+        leave()
     return over
+
+
+def _left_running(server: _Server, app: FastAPI) -> bool:
+    """Whether something of a server that stopped may still be running: its
+    shutdown said that not everything it began has ended, or it began and its
+    shutdown said nothing. A server that could not start says the first too, when
+    what it had begun by then did not all end."""
+    stopped = getattr(app.state, "stopped_whole", None)
+    return stopped is False or (server.started and stopped is not True)
 
 
 def run(
@@ -279,30 +385,44 @@ def run(
     *,
     clock: Callable[[], datetime] | None = None,
     make_app: Callable[[], FastAPI] | None = None,
+    leave: Callable[[], object] | None = None,
 ) -> int:
     """Run the server, again and again while its story is told again. Returns the
     process's exit status: 0 when the server stopped as asked, 3 when it could not
-    start, and `LEFT_RUNNING` when a telling that was over did not stop whole.
+    start, and `LEFT_RUNNING` when a server that tells the story again did not
+    stop whole.
 
-    Raises ServeError and IngestConfigError as `repeats` does, and DataLockedError
-    when another process has the data directory's stores."""
+    `leave` ends the process when such a server did not stop whole, and is called
+    the moment that is known (`_serve`); it is the invented scenario's server only,
+    on which nothing is paid for. Without one, as in a test, `LEFT_RUNNING` is
+    returned instead. **The stores' lock is given up only by a server that stopped
+    whole**: after any other, a thread may still have a store open, and the lock
+    is kept until the process is gone.
+
+    Raises ServeError and IngestConfigError as `repeats` does, DataLockedError
+    when another process has the data directory's stores, and
+    NotTheMockStoresError when a file kept as the mock store's is not that."""
     from beacon.main import create_app
 
     clock = (lambda: datetime.now(UTC)) if clock is None else clock
     make_app = create_app if make_app is None else make_app
-    repeat = repeats(env)
+    # Whether this is a server that tells the story again, whatever becomes of one
+    # try to: it is then the invented scenario's, and may be ended at once.
+    told_again = repeat = repeats(env)
     # Held from here to the end of the process, over every telling and every
     # deletion between them: nothing else opens a store of this directory in a gap.
     lock = DataLock(default_data_dir(env), shared=env.get(INGEST_VARIABLE, "1") == "0")
+    whole = True
     try:
         while True:
             if repeat:
                 try:
                     begin_again(env, clock(), lock)
                 except _NOT_BEGUN:
-                    # The story is then served as far as it was told, and not begun
-                    # again by this process: asking over and over would stop the
-                    # server each time.
+                    # The files are the mock store's own, and one could not be had
+                    # just now. The story is served as far as it was told, and not
+                    # begun again by this process: asking over and over would stop
+                    # the server each time.
                     logger.error(
                         "The invented story could not be begun again: its files were "
                         "not deleted. This server goes on with the story as it stands."
@@ -310,35 +430,62 @@ def run(
                     repeat = False
             # An app for each telling, so that nothing of the one before is read.
             app = make_app()
-            app.state.repeats_text = REPEATS if repeat else None
+            app.state.repeats_text = _repeats_text(app) if repeat else None
             # The lock this process already holds, which the app does not take again.
             app.state.data_lock = lock
             server = make_server(app)
-            over = asyncio.run(_serve(server, app, repeat=repeat, clock=clock))
-            if not server.started:
-                return 3
-            if not over:
-                return 0
-            if getattr(app.state, "stopped_whole", False) is not True:
+            over = asyncio.run(
+                _serve(server, app, repeat=repeat, clock=clock, leave=leave if told_again else None)
+            )
+            whole = not _left_running(server, app)
+            if not whole and told_again:
                 # Something of that telling may still have a store open, on a
                 # thread that did not end in the time it was given. Nothing is
                 # deleted under it, and no second server is started beside it in
                 # this process: the process ends, and whatever runs it starts it
                 # again, with nothing of the last one left.
-                logger.error(
-                    "The server whose story is over did not stop whole. This process "
-                    "ends without beginning the story again; started again, it does."
-                )
+                logger.error(_LEFT)
                 return LEFT_RUNNING
+            if not server.started:
+                return 3
+            if not over or not whole:
+                return 0
             logger.info("The invented story is over. It is begun again.")
     finally:
-        lock.close()
+        if whole:
+            lock.close()
 
 
-# What keeps a story from being begun again. None of them is raised with anything
-# of a file under it but SQLite's own, which the log does not print.
+_LEFT = (
+    "The server did not stop whole. This process ends without beginning the "
+    "invented story again; started again, it does."
+)
+
+
+def _repeats_text(app: FastAPI) -> str:
+    """What a server that tells the story again says of it: of a clip or a photo
+    only where one is taken."""
+    takes_media = getattr(app.state, "input", "own") == "own"
+    return REPEATS + (REPEATS_MEDIA if takes_media else "")
+
+
+def _leave() -> NoReturn:
+    """End the process now, with `LEFT_RUNNING`. A thread that did not stop would
+    keep the process from ending, and the address from being served again, and
+    waiting for it comes before anything else in an ordinary exit."""
+    logger.error(_LEFT)
+    logging.shutdown()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(LEFT_RUNNING)
+
+
+# What keeps a story from being begun again and leaves the server to go on with it
+# as it stands: something else has a file just now. None of them is raised with
+# anything of a file under it but SQLite's own, which the log does not print. A file
+# that is not the mock store's own (`NotTheMockStoresError`) is not among them: the
+# server would open it to write to.
 _NOT_BEGUN = (
-    NotTheMockStoresError,
     StillOpenError,
     MediaLockedError,
     EvidenceStoreError,
@@ -378,10 +525,13 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
         return uvicorn_server(app, options.host, options.port)
 
     try:
-        return run(env, make_server)
+        return run(env, make_server, leave=_leave)
     except (ServeError, IngestConfigError, EmberConfigError) as error:
         print(f"The server was not started. {error}", file=sys.stderr)
         return 2
+    except NotTheMockStoresError as error:
+        print(f"The server does not run. {error}", file=sys.stderr)
+        return 3
     except DataLockedError as error:
         print(f"The server was not started. {error}", file=sys.stderr)
         return 3
@@ -390,10 +540,5 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
 if __name__ == "__main__":
     status = main()
     if status == LEFT_RUNNING:
-        # A thread that did not stop would keep the process from ending, and the
-        # address from being served again.
-        logging.shutdown()
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(status)
+        _leave()
     raise SystemExit(status)
