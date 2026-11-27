@@ -533,7 +533,7 @@ def test_a_call_is_measured_by_its_audio_and_not_by_what_its_json_says(
         ({"call_length_ms": 10_000}, 9.4, True),
         ({"call_length_ms": 10_000}, 9.2, False),
         ({"call_length_ms": 10_000}, 10.8, False),
-        # In whole seconds, as before v5: a second more.
+        # In whole seconds only: a second more.
         ({"call_length_ms": None, "call_length": 10}, 8.4, True),
         ({"call_length_ms": None, "call_length": 10}, 11.6, True),
         ({"call_length_ms": None, "call_length": 10}, 8.2, False),
@@ -1403,6 +1403,43 @@ def test_a_poll_that_fails_adds_nothing_to_its_passes_count(
     assert poller.last_pass == PassCount(stored=1, unready=1)
 
 
+def test_a_poll_whose_end_could_not_be_written_moves_no_pass_on_and_ends_none(
+    store: EvidenceStore, radio: Radio, storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(recordings_module, "MAX_LISTED", 2)
+    monkeypatch.setattr(recordings_module, "MAX_PAGES", 1)
+    day = NOON - timedelta(days=7)
+    # Passed over by their JSON, so a poll writes nothing but its end.
+    for number in range(1, 5):
+        radio.call(number, day + timedelta(minutes=number), length=0.2)
+    poller = build(radio, storage, backlog=True, calls_per_poll=2)
+    assert poller.poll(store, NOON).partial is True
+    reached = radio.filed[radio.ref(2)].place
+    add = EvidenceStore.add
+
+    def no_room(self: EvidenceStore, items: Any, **options: Any) -> Any:
+        raise EvidenceStoreError("The evidence store could not be written.")
+
+    # The pass's last poll reads the listing to its end and cannot write that it did.
+    monkeypatch.setattr(EvidenceStore, "add", no_room)
+    with pytest.raises(EvidenceStoreError):
+        poller.poll(store, NOON)
+
+    # No pass is said to have ended, cleanly or otherwise, and the pass is where it was.
+    assert poller.last_pass is None
+    monkeypatch.setattr(EvidenceStore, "add", add)
+    assert poller.poll(store, NOON) == PollReport(added=0)
+    assert [after for after, _ in radio.listings] == [BEGINNING, reached, reached]
+    assert poller.last_pass == PassCount()
+
+    # Nor does a first poll that cannot write its end leave a pass ended behind it.
+    fresh = build(radio, storage, backlog=True, calls_per_poll=2)
+    monkeypatch.setattr(EvidenceStore, "add", no_room)
+    with pytest.raises(EvidenceStoreError):
+        fresh.poll(store, NOON)
+    assert fresh.last_pass is None
+
+
 def test_a_backlog_is_gone_over_again_and_what_a_pass_could_not_use_is_counted_each_time(
     store: EvidenceStore, radio: Radio, storage: Storage
 ) -> None:
@@ -1559,7 +1596,7 @@ def test_a_call_is_read_from_its_json_file_with_its_time_and_length() -> None:
 
 def test_a_call_is_read_as_trunk_recorder_wrote_it_before_it_kept_milliseconds() -> None:
     at = seconds(-30)
-    # As v4 names and describes a call: whole seconds, in the name and in the JSON.
+    # Whole seconds, in the name and in the JSON, as some versions write a call.
     filed = filed_as("sfd", ("2026", "11", "27"), f"{FIRE}-{int(at.timestamp())}_851012500-call_7")
     assert filed is not None
     body = json.loads(details_of(filed, 7.0))
@@ -1651,7 +1688,7 @@ def test_a_file_that_is_no_json_object_is_not_read(body: bytes) -> None:
 @pytest.mark.parametrize(
     "name",
     [
-        # Before v5, and since: milliseconds in the start, and a TDMA slot.
+        # Whole seconds, as v5.0.0 writes, and milliseconds and a TDMA slot, as v5.2.1 does.
         "1201-1795809570_851012500-call_7",
         "1201-1795809570.123_851012500-call_7",
         "1201-1795809570.123_851012500.1-call_7",

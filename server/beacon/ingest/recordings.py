@@ -18,13 +18,15 @@ trunk-recorder's source (`call_concluder.cc`, v5.2.1), and **no recording of rea
 radio has been read by this code yet**: the mock scenario's calls and the tests' are
 generated.
 
-- **The name.** `<start>` is the second the call began, with its milliseconds after
-  a dot in v5.2.1 (`1795809570.123`) and without in earlier versions; `<freq>` can
-  be followed by a dot and a TDMA slot. A name says when the first transmission began, and the JSON
-  can say a later start, because transmissions too short to keep are dropped after
-  the name is made. So a call is found, ordered, and named in the evidence store by
-  its files' name, and its time is the JSON's, which has to lie within
-  `MAX_START_AFTER_NAME` of the name's.
+- **The name.** `<start>` is the second the call began, written in whole seconds
+  or with its milliseconds after a dot (`1795809570.123`), and both are read:
+  v5.0.0 writes the first and v5.2.1 the second, to name two versions and no
+  boundary between them. `<freq>` can be followed by a dot and a TDMA slot. A name
+  says when the first transmission began, and the JSON can say a later start,
+  because transmissions too short to keep are dropped after the name is made. So a
+  call is found, ordered, and named in the evidence store by its files' name, and
+  its time is the JSON's, which has to lie within `MAX_START_AFTER_NAME` of the
+  name's.
 - **The JSON.** Beacon reads `talkgroup`, `start_time` and `start_time_ms`,
   `call_length_ms` (or the rounded `call_length`), `emergency`, and `encrypted`, and
   nothing else: not the radios that transmitted (`srcList`), which are never kept.
@@ -211,9 +213,9 @@ _MAX_DAY_ENTRIES = 200_000
 # trunk-recorder's short name for a system, which is the directory its calls are in.
 _SYSTEM = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,39}")
 # `<talkgroup>-<start>_<freq>-call_<n>`, as trunk-recorder names a call's files:
-# the start in seconds, with milliseconds after a dot in v5.2.1 and without in
-# earlier versions, and the frequency in hertz, with a TDMA slot after a dot where
-# there is one.
+# the start in whole seconds or with milliseconds after a dot (v5.0.0 writes the
+# first and v5.2.1 the second), and the frequency in hertz, with a TDMA slot after a
+# dot where there is one.
 _STEM = re.compile(r"(\d{1,8})-(\d{9,11})(?:\.\d{1,3})?_(\d{1,12}(?:\.\d{1,6})?)-call_(\d{1,9})")
 _NUMBER = re.compile(r"\d{1,4}")
 # The kinds of audio file a call can have, in the order they are looked for.
@@ -639,7 +641,16 @@ class RecordedRadio:
             if full or not more or not page:
                 ended = not full and not more
                 break
-        # At the end of a pass the next begins again, with what was not ready.
+        if not self._backlog:
+            # Everything up to here was looked at: up to now, when the listing was
+            # read to its end.
+            progress.after_s = max(progress.after_s, now_s if ended else after[0])
+        store.add([], state=(self.name, progress.as_state()), now=now)
+        # Only now that the poll's end is written does the pass move on and count
+        # it: a poll that fails, at that write too, leaves the place the pass had
+        # reached and what it had counted as they were, and no pass is said to
+        # have ended that did not. At the end of a pass the next begins again,
+        # with what was not ready.
         self._pass_at = None if ended else after
         self._counted = PassCount(
             stored=self._counted.stored + stored,
@@ -648,11 +659,6 @@ class RecordedRadio:
         )
         if ended:
             self._last_pass, self._counted = self._counted, PassCount()
-        if not self._backlog:
-            # Everything up to here was looked at: up to now, when the listing was
-            # read to its end.
-            progress.after_s = max(progress.after_s, now_s if ended else after[0])
-        store.add([], state=(self.name, progress.as_state()), now=now)
         return PollReport(added=stored, unreadable=unready + unusable, partial=not ended)
 
     def _take(
