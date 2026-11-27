@@ -825,6 +825,8 @@ def test_the_feed_is_named_by_an_https_address(site: Site, storage: Storage, fee
         {"feed_url": "https://www.Broadcastify.com/feed.json"},
         {"document_hosts": ["media.openmhz.com"]},
         {"document_hosts": ["files.elsewhere.example", "S3.Broadcastify.com."]},
+        {"feed_url": "https://api.openmhz\u3002com/feed.json"},
+        {"document_hosts": ["media\u3002openmhz\u3002com"]},
     ],
 )
 def test_no_feed_and_no_document_is_on_a_service_beacon_requests_nothing_from(

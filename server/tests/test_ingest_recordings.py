@@ -47,6 +47,7 @@ from beacon.ingest.recordings import (
     UNUSABLE_RUN_LIMIT,
     Directory,
     Filed,
+    PassCount,
     Place,
     RecordedRadio,
     filed_as,
@@ -101,7 +102,7 @@ def form(**changes: Any) -> dict[str, Any]:
 
 
 def filed_at(number: int, at: datetime, talkgroup: int = FIRE) -> Filed:
-    """A call's files as trunk-recorder names them since v5: by talkgroup, start
+    """A call's files as trunk-recorder v5.2.1 names them: by talkgroup, start
     with its milliseconds, frequency, and the recorder's count of calls."""
     start_s = int(at.timestamp())
     return Filed(
@@ -1315,6 +1316,93 @@ def test_calls_that_began_in_the_same_second_do_not_hide_one_another(
     assert again.poll(store, NOON) == PollReport(added=0)
 
 
+def test_a_poll_is_held_to_the_audio_it_reads_whatever_came_of_each_call(
+    store: EvidenceStore, radio: Radio, storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    broken = radio.call(1, seconds(-60))
+    whole = radio.json[broken]
+    assert isinstance(whole, bytes)
+    radio.json[broken] = whole[: len(whole) // 2]
+    radio.call(2, seconds(-50))
+    radio.call(3, seconds(-40), length=0.2)
+    radio.call(4, seconds(-30))
+    poller = build(radio, storage, calls_per_poll=1)
+
+    report = poller.poll(store, NOON)
+
+    # A JSON that could not be read cost no audio: the call after it is heard.
+    # The one after that is passed over by its JSON, and the last waits.
+    assert (report.added, report.unreadable, report.partial) == (1, 1, True)
+    assert radio.downloads == [radio.ref(2)]
+    assert radio.read_details == [radio.ref(number) for number in (1, 2, 3, 4)]
+
+    # A call another process claims after its audio was read has had its audio read.
+    radio.call(5, seconds(-20))
+    claim = EvidenceStore.claim
+
+    def lost(self: EvidenceStore, source: str, ref: str, **options: Any) -> bool:
+        return ref != radio.ref(4) and claim(self, source, ref, **options)
+
+    monkeypatch.setattr(EvidenceStore, "claim", lost)
+    report = poller.poll(store, NOON)
+
+    assert (report.added, report.unreadable, report.partial) == (0, 0, True)
+    assert radio.downloads == [radio.ref(2), radio.ref(4)]
+    assert radio.asked == [tone(2)]
+
+
+def test_a_pass_is_counted_over_all_its_polls_and_tells_unready_from_unusable(
+    store: EvidenceStore, radio: Radio, storage: Storage
+) -> None:
+    day = NOON - timedelta(days=7)
+    silent = radio.call(1, day, audio=GONE)
+    for number in (2, 3, 4):
+        radio.call(number, day + timedelta(minutes=number))
+    radio.call(5, day + timedelta(minutes=5), "Sorry, I could not make that out.")
+    poller = build(radio, storage, backlog=True, calls_per_poll=2)
+    assert poller.last_pass is None
+
+    reports = [poller.poll(store, NOON) for _ in range(3)]
+
+    # The call that was not ready is in the first poll only, and the pass's last
+    # poll is a clean one: the pass, over all its polls, was not.
+    assert [(report.added, report.unreadable, report.partial) for report in reports] == [
+        (1, 1, True),
+        (2, 0, True),
+        (0, 1, False),
+    ]
+    assert poller.last_pass == PassCount(stored=3, unready=1, unusable=1)
+
+    # The next pass looks again at the call nobody claimed, and not at the one
+    # that was claimed and came to nothing, which is never asked about again.
+    assert poller.poll(store, NOON) == PollReport(added=0, unreadable=1)
+    assert poller.last_pass == PassCount(unready=1)
+    radio.clips[silent] = tone(1)
+    radio.heard[tone(1)] = form()
+    assert poller.poll(store, NOON) == PollReport(added=1)
+    assert poller.last_pass == PassCount(stored=1)
+    assert radio.asked.count(tone(5)) == 1
+
+
+def test_a_poll_that_fails_adds_nothing_to_its_passes_count(
+    store: EvidenceStore, radio: Radio, storage: Storage
+) -> None:
+    day = NOON - timedelta(days=7)
+    radio.call(1, day, audio=GONE)
+    failing = radio.call(2, day + timedelta(minutes=1), audio=SourceError("recordings", "failed"))
+    poller = build(radio, storage, backlog=True)
+
+    with pytest.raises(SourceError):
+        poller.poll(store, NOON)
+    radio.clips[failing] = tone(2)
+    radio.heard[tone(2)] = form()
+    report = poller.poll(store, NOON)
+
+    # The pass went on from before the poll that failed, and counts each call once.
+    assert (report.added, report.unreadable) == (1, 1)
+    assert poller.last_pass == PassCount(stored=1, unready=1)
+
+
 def test_a_backlog_is_gone_over_again_and_what_a_pass_could_not_use_is_counted_each_time(
     store: EvidenceStore, radio: Radio, storage: Storage
 ) -> None:
@@ -1773,6 +1861,73 @@ def test_a_directory_whose_mark_changes_while_it_is_read_is_read_no_further(
     mark.write_text("Generated audio. No radio.")
     with pytest.raises(SourceError, match=unmarked_once):
         recorded.listed(BEGINNING, int(NOON.timestamp()), {FIRE}, 10)
+
+
+def test_a_directory_marked_between_its_listing_and_a_files_reading_hands_on_no_bytes(
+    calls: Path,
+    store: EvidenceStore,
+    radio: Radio,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mark = calls / GENERATED_MARK
+    filed = filed_at(1, seconds(-30))
+    put(calls, filed, tone(1))
+    recorded = Directory(calls, SYSTEM)
+    start = int(NOON.timestamp())
+    assert recorded.listed(BEGINNING, start, {FIRE}, 10) == ([filed], False)
+
+    # Marked as generated after the listing: what is read now is not handed on as
+    # a recording of real radio, which is what this reader was opened as.
+    mark.write_text("Generated audio. No radio.")
+    for read in (recorded.details, recorded.audio):
+        with pytest.raises(SourceError, match="mark as generated audio has changed") as failure:
+            read(filed)
+        assert (failure.value.__context__, failure.value.__cause__) == (None, None)
+
+    # And the other way, under a poller, with the change made while a file is read.
+    generated = Directory(calls, SYSTEM)
+    radio.heard[tone(1)] = form()
+    poller = RecordedRadio(
+        generated, EmberClient.fake(storage, radio.ember), talkgroups=(FIRE,), known=KNOWN
+    )
+    read_file = recordings_module._file
+
+    def unmarked_meanwhile(directory: int, name: str, most: int) -> bytes | None:
+        body = read_file(directory, name, most)
+        if name.endswith(".wav"):
+            mark.unlink()
+        return body
+
+    monkeypatch.setattr(recordings_module, "_file", unmarked_meanwhile)
+    with pytest.raises(SourceError, match="mark as generated audio has changed"):
+        poller.poll(store, NOON)
+
+    # Nothing was claimed, and nothing was sent.
+    assert (radio.asked, refs(store), store.taken("recordings", [filed.ref])) == ([], [], set())
+
+
+def test_a_listing_opens_no_year_and_no_month_outside_the_days_it_is_of(
+    calls: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    filed = filed_at(1, seconds(-30))
+    put(calls, filed, tone(1))
+    for old in (("2019", "3", "5"), ("2026", "8", "1"), ("2031", "1", "1")):
+        calls.joinpath(SYSTEM, *old).mkdir(parents=True)
+    shelf = Directory(calls, SYSTEM)
+    opened_as = recordings_module._opened
+    entered: list[tuple[str, ...]] = []
+
+    def watching(above: int, *names: str) -> Any:
+        entered.append(names)
+        return opened_as(above, *names)
+
+    monkeypatch.setattr(recordings_module, "_opened", watching)
+    start = int(NOON.timestamp())
+
+    assert shelf.listed((start - 300, ""), start, {FIRE}, 10) == ([filed], False)
+    # An old year that cannot be read just now would otherwise stop today's poll.
+    assert entered == [(SYSTEM,), ("2026",), ("11",), ("2026", "11", "27")]
 
 
 def test_a_mark_that_cannot_be_looked_at_is_not_taken_for_no_mark(

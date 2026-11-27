@@ -19,8 +19,8 @@ radio has been read by this code yet**: the mock scenario's calls and the tests'
 generated.
 
 - **The name.** `<start>` is the second the call began, with its milliseconds after
-  a dot since v5 (`1795809570.123`) and without before; `<freq>` can be followed by
-  a dot and a TDMA slot. A name says when the first transmission began, and the JSON
+  a dot in v5.2.1 (`1795809570.123`) and without in earlier versions; `<freq>` can
+  be followed by a dot and a TDMA slot. A name says when the first transmission began, and the JSON
   can say a later start, because transmissions too short to keep are dropped after
   the name is made. So a call is found, ordered, and named in the evidence store by
   its files' name, and its time is the JSON's, which has to lie within
@@ -51,8 +51,9 @@ What a shelf of calls is decides what its rows are (`Directory`, `RecordedRadio.
 A `Directory` is held open from when it is made: every listing and every file is
 reached from that one descriptor, each directory opened from the one above it and
 none through a symbolic link, so a directory put in its place later is not read.
-Whether it is marked is looked at then, and again at every listing; a directory
-whose answer has changed is not read any further.
+Whether it is marked is looked at then, again at every listing, and again after
+every file is read and before its bytes are handed on; a directory whose answer has
+changed is not read any further.
 
 The poller reads the calls on the talkgroups it was given, has Ember hear each
 (`beacon.radio`), and stores one row for the call. What follows from what the audio is:
@@ -89,12 +90,21 @@ The poller reads the calls on the talkgroups it was given, has Ember hear each
   was replaced under the process, the poller stops for the life of the process: an
   operator has to compare Meta's Usage page with the ledger first.
 - **The listing is read in passes, a page at a time.** A page is the calls next
-  after a place in the order of start and name, so calls that share a second do not
-  hide one another. A poll reads the audio of no more than `calls_per_poll` calls
-  and reads no more than `MAX_PAGES` pages; one that has not reached the
-  end of the listing by then is `partial`, and the next poll of this process goes
-  on from that place, so every poll gets further. A day's directory with more
-  entries than `_MAX_DAY_ENTRIES` fails the poll and is not read in part.
+  after a place in the order of the second a call began, by its files' name, and
+  then of that name: calls that share a second do not hide one another, and within
+  a second they are in the order of their names, which is not the order of their
+  milliseconds. A poll reads the audio of no more than `calls_per_poll` calls and
+  no more than `MAX_PAGES` pages; one that has not reached the end of the listing
+  by then is `partial`, and the next poll of this process goes on from that place,
+  so every poll gets further. A day's directory with more entries than
+  `_MAX_DAY_ENTRIES` fails the poll and is not read in part.
+- **A pass is counted over all its polls** (`RecordedRadio.last_pass`, a
+  `PassCount`). `PollReport.unreadable` is one poll's, and puts together two things
+  a pass keeps apart: calls that were `unready`, which nobody claimed and a later
+  pass looks at again, and calls that were `unusable`, which were claimed and
+  Ember's answer came to nothing, and which are never asked about again. A poll
+  that Ember's failure or the directory's ended adds nothing to the count: the
+  pass goes on from before it, and what it stored or claimed is in the store.
 - **A poller that follows a recorder hears what is new.** Its first pass begins
   `OVERLAP` ago and a call older than `MAX_AGE` is passed over, so that lifting a
   spending stop does not buy a backlog. Each later pass begins `OVERLAP` before the
@@ -103,11 +113,11 @@ The poller reads the calls on the talkgroups it was given, has Ember hear each
   that was not ready is looked at again for as long as that reaches it. A call that
   becomes ready later than that is missed.
 - **A poller that is given a backlog makes passes over everything there is**
-  (`backlog=True`, which is how a day of recordings is run through): oldest first,
-  however old. What a pass could not use it counts as unreadable and leaves
-  unclaimed, and every later pass looks at it again: nothing gives a call up, so a
-  run over a backlog is over when a pass ends that counted nothing unreadable, or
-  when its operator says so.
+  (`backlog=True`, which is how a day of recordings is run through): the oldest
+  second first, however old. A call that is not ready is left unclaimed, and every
+  later pass looks at it again: nothing gives such a call up, so a run over a
+  backlog is over when a pass has ended with nothing `unready` in any of its polls
+  (`last_pass.unready == 0`), or when its operator says so.
 - **Shutting down admits nothing new.** `close` closes the poller's Ember client
   and its converter. A call that was being read, converted, or counted is dropped
   unpaid, and waits for the next run. A call that Ember's client had already
@@ -119,6 +129,7 @@ The poller reads the calls on the talkgroups it was given, has Ember hear each
 import contextlib
 import errno
 import heapq
+import itertools
 import json
 import logging
 import os
@@ -200,8 +211,9 @@ _MAX_DAY_ENTRIES = 200_000
 # trunk-recorder's short name for a system, which is the directory its calls are in.
 _SYSTEM = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,39}")
 # `<talkgroup>-<start>_<freq>-call_<n>`, as trunk-recorder names a call's files:
-# the start in seconds, with milliseconds after a dot since v5, and the frequency
-# in hertz, with a TDMA slot after a dot where there is one.
+# the start in seconds, with milliseconds after a dot in v5.2.1 and without in
+# earlier versions, and the frequency in hertz, with a TDMA slot after a dot where
+# there is one.
 _STEM = re.compile(r"(\d{1,8})-(\d{9,11})(?:\.\d{1,3})?_(\d{1,12}(?:\.\d{1,6})?)-call_(\d{1,9})")
 _NUMBER = re.compile(r"\d{1,4}")
 # The kinds of audio file a call can have, in the order they are looked for.
@@ -351,9 +363,7 @@ class Directory:
         with _opened(self._root, self._system) as system:
             if system < 0:
                 return [], False
-            for when, names in _days(system):
-                if not first <= when <= last:
-                    continue
+            for when, names in _days(system, first, last):
                 if len(found) > limit and _earliest_in(when) > found[-1].start_s:
                     # Nothing in this day's directory or a later one comes before
                     # the calls that are already more than a page.
@@ -361,9 +371,12 @@ class Directory:
                 with _opened(system, *names) as day:
                     if day < 0:
                         continue
-                    found += _calls_of(day, self._system, names, after, upto_s, talkgroups)
-                # Kept to a page and one more, whatever a day holds.
-                found = heapq.nsmallest(limit + 1, found, key=lambda call: call.place)
+                    # Kept to a page and one more while the day is gone through,
+                    # whatever a day holds.
+                    of_day = _calls_of(day, self._system, names, after, upto_s, talkgroups)
+                    found = heapq.nsmallest(
+                        limit + 1, itertools.chain(found, of_day), key=lambda call: call.place
+                    )
         return found[:limit], len(found) > limit
 
     def details(self, call: Filed) -> bytes | None:
@@ -380,7 +393,8 @@ class Directory:
         """One of a call's files, or None when it is not there, is no regular file,
         is reached through a symbolic link, or is longer than `most`.
 
-        Raises SourceError when it is there and could not be read, which may pass."""
+        Raises SourceError when it is there and could not be read, which may pass,
+        and when the directory's mark is not what it was when it was opened."""
         if call.system != self._system or filed_as(call.system, call.day, call.stem) != call:
             # Not a call a listing of this directory gives.
             return None
@@ -396,6 +410,10 @@ class Directory:
             failed = True
         if failed:
             raise_bare(SourceError(SOURCE, _UNREADABLE))
+        if body is not None and _marked(self._root) is not self.generated:
+            # Marked, or unmarked, since the listing: these bytes are not handed
+            # on as what the directory was taken for when it was opened.
+            raise_bare(SourceError(SOURCE, _CHANGED))
         return body
 
 
@@ -436,6 +454,27 @@ class _Progress(Hold):
         return {"after_s": self.after_s} | self.hold_state()
 
 
+@dataclass(frozen=True)
+class PassCount:
+    """What one pass over the listing came to, over the polls of it that ended. A
+    poll that was ended by a failure, Ember's or the directory's, adds nothing: the
+    pass goes on from before that poll, and what it stored or claimed is in the
+    evidence store."""
+
+    # Calls Ember heard, each a row.
+    stored: int = 0
+    # Calls whose JSON or audio could not be used as it was. Nobody claimed them,
+    # and a later pass looks at each again.
+    unready: int = 0
+    # Calls that were claimed, and Ember's answer came to nothing: it was no form,
+    # or the call is more than Ember takes. They are never asked about again.
+    unusable: int = 0
+
+
+# What `RecordedRadio._take` answers for a call whose audio it read.
+_AUDIO_READ = frozenset({"unready", "lost", "nothing", "stored"})
+
+
 class RecordedRadio:
     name = SOURCE
     interval_seconds = INTERVAL_SECONDS
@@ -460,7 +499,8 @@ class RecordedRadio:
         streets a row may name. `backlog` has the poller make passes over every
         call on the shelf, however old, where it otherwise follows a recorder and
         passes over what is older than `MAX_AGE`; `calls_per_poll` is the most
-        calls whose audio one poll reads, and so the most it has Ember hear.
+        calls whose audio one poll reads, whatever comes of them, and so the most
+        it has Ember hear.
         `transcoder` decodes a call that is M4A or MP3; without one only a WAV
         call is heard, and any other is counted as unreadable. `wall_clock` is the
         time a hold is counted by, which is the real time even while the mock
@@ -501,6 +541,10 @@ class RecordedRadio:
         # when the next poll begins one. It is not kept: a new process begins a
         # pass, and what was claimed costs it nothing.
         self._pass_at: Place | None = None
+        # What the pass under way has come to in the polls that ended, and what
+        # the last pass that ended came to.
+        self._counted = PassCount()
+        self._last_pass: PassCount | None = None
         # What every poller that pays Ember keeps to: `beacon.ingest.paid`.
         self._paid = PaidDesk(
             ember, poller="radio", items="calls", scope=SCOPE, wall_clock=wall_clock
@@ -512,6 +556,12 @@ class RecordedRadio:
         be set: `live` only for a `Directory` on this machine that is not marked as
         generated."""
         return self._origin
+
+    @property
+    def last_pass(self) -> PassCount | None:
+        """What the last pass over the listing that ended came to, over all its
+        polls, or None when none has ended in this process."""
+        return self._last_pass
 
     def close(self) -> None:
         """Admit no more paid work, and call off a conversion that is running. A
@@ -549,7 +599,7 @@ class RecordedRadio:
         if not self._backlog:
             # Never further back than `MAX_AGE`, however long a pass has taken.
             after = max(after, (now_s - _seconds(MAX_AGE), ""))
-        added = unreadable = worked = 0
+        stored = unready = unusable = read = 0
         ended = False
         for _ in range(MAX_PAGES):
             page, more = self._shelf.listed(after, now_s, self._talkgroups, MAX_LISTED)
@@ -570,53 +620,78 @@ class RecordedRadio:
             full = False
             for filed in page:
                 if filed.ref not in taken:
-                    if worked >= self._calls_per_poll:
-                        # This one and the ones after it wait for the next poll.
+                    outcome = self._take(
+                        store, filed, progress, now, may_read=read < self._calls_per_poll
+                    )
+                    if outcome == "full":
+                        # Its audio would be one more than a poll reads: this call
+                        # and the ones after it wait for the next poll.
                         full = True
                         break
-                    outcome = self._take(store, filed, progress, now)
-                    # A call that is passed over by what its JSON says cost a
-                    # small file's reading, and takes no place in the poll.
-                    worked += outcome != "passed"
-                    added += outcome == "stored"
-                    unreadable += outcome in ("not ready", "nothing")
+                    # What a poll is held to is the audio it reads, whatever came
+                    # of the call: a call that was passed over by its JSON, or
+                    # whose JSON could not be read, cost a small file's reading.
+                    read += outcome in _AUDIO_READ
+                    stored += outcome == "stored"
+                    unready += outcome in ("unread", "unready")
+                    unusable += outcome == "nothing"
                 after = filed.place
             if full or not more or not page:
                 ended = not full and not more
                 break
         # At the end of a pass the next begins again, with what was not ready.
         self._pass_at = None if ended else after
+        self._counted = PassCount(
+            stored=self._counted.stored + stored,
+            unready=self._counted.unready + unready,
+            unusable=self._counted.unusable + unusable,
+        )
+        if ended:
+            self._last_pass, self._counted = self._counted, PassCount()
         if not self._backlog:
             # Everything up to here was looked at: up to now, when the listing was
             # read to its end.
             progress.after_s = max(progress.after_s, now_s if ended else after[0])
         store.add([], state=(self.name, progress.as_state()), now=now)
-        return PollReport(added=added, unreadable=unreadable, partial=not ended)
+        return PollReport(added=stored, unreadable=unready + unusable, partial=not ended)
 
-    def _take(self, store: EvidenceStore, filed: Filed, progress: _Progress, now: datetime) -> str:
+    def _take(
+        self,
+        store: EvidenceStore,
+        filed: Filed,
+        progress: _Progress,
+        now: datetime,
+        *,
+        may_read: bool,
+    ) -> str:
         """Look at one call that is not taken, and have Ember hear it when it is
-        ready and worth hearing. Says what came of it: `passed` when nothing was
-        asked of Ember and nothing is wrong (not worth hearing, not yet its time,
-        or another process's), `not ready` when its files cannot be used as they
-        are and it is left unclaimed, and, for a call Ember was asked about,
-        `stored` or `nothing`.
+        ready and worth hearing. Says what came of it. With no audio read: `unread`
+        when its JSON cannot be read, `passed` when its JSON says it is not worth
+        hearing or not yet its time, and `full` when its audio would have been
+        read and `may_read` says the poll reads no more. With its audio read
+        (`_AUDIO_READ`): `unready` when the audio cannot be used as it is, `lost`
+        when another process claimed the call meanwhile, and, for a call Ember was
+        asked about, `stored` or `nothing`. A call that was `unread` or `unready`
+        is left unclaimed.
 
         Raises what `_audio` and `_hear` raise, which ends the poll."""
         call = self._details(filed)
         if call is None:
-            return "not ready"
+            return "unread"
         if call.encrypted or not MIN_CALL_SECONDS <= call.seconds <= MAX_CALL_SECONDS:
             return "passed"
         if call.time > now:
             return "passed"
+        if not may_read:
+            return "full"
         # Free, and done before the claim: a call whose audio is not whole yet is
         # not claimed, and is looked at again.
         audio = self._audio(call)
         if audio is None:
-            return "not ready"
+            return "unready"
         if not store.claim(SOURCE, call.ref, now=now):
             # Another process took it between the listing and now.
-            return "passed"
+            return "lost"
         # From here to the row, a shutdown waits (`drain`). A shutdown that falls
         # between the claim and here finds a closed Ember, and at worst the claim
         # cannot be given up: the call is lost, and nothing was paid.
@@ -920,17 +995,29 @@ def _marked(root: int) -> bool | None:
     return True if stat.S_ISREG(found.st_mode) else None
 
 
-def _days(system: int) -> list[tuple[date, tuple[str, str, str]]]:
-    """The directories of days under a system's open directory, in the order of
-    their dates, each with the names that lead to it. Raises OSError."""
+def _days(system: int, first: date, last: date) -> list[tuple[date, tuple[str, str, str]]]:
+    """The directories of the days from `first` to `last` under a system's open
+    directory, in the order of their dates, each with the names that lead to it. A
+    year or a month outside those days is not opened. Raises OSError."""
     days: list[tuple[date, tuple[str, str, str]]] = []
     for year in _directories(system):
+        if not first.year <= int(year) <= last.year:
+            continue
         with _opened(system, year) as of_year:
             for month in _directories(of_year) if of_year >= 0 else []:
+                if (
+                    not (first.year, first.month)
+                    <= (int(year), int(month))
+                    <= (
+                        last.year,
+                        last.month,
+                    )
+                ):
+                    continue
                 with _opened(of_year, month) as of_month:
                     for day in _directories(of_month) if of_month >= 0 else []:
                         when = _date(year, month, day)
-                        if when is not None:
+                        if when is not None and first <= when <= last:
                             days.append((when, (year, month, day)))
     return sorted(days)
 
@@ -953,13 +1040,12 @@ def _calls_of(
     after: Place,
     upto_s: int,
     talkgroups: Collection[int],
-) -> list[Filed]:
+) -> Iterator[Filed]:
     """The calls of one day's open directory that are asked for, by their JSON
-    files' names.
+    files' names, one at a time: nothing here holds a day's calls.
 
     Raises _TooMany when the directory has more entries than are looked at: a part
     of it is not an answer, and OSError when it cannot be listed."""
-    calls: list[Filed] = []
     looked = 0
     with os.scandir(day) as entries:
         for entry in entries:
@@ -974,8 +1060,7 @@ def _calls_of(
             if filed.place <= after or filed.start_s > upto_s:
                 continue
             if entry.is_file(follow_symlinks=False):
-                calls.append(filed)
-    return calls
+                yield filed
 
 
 def _file(directory: int, name: str, most: int) -> bytes | None:

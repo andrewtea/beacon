@@ -229,14 +229,32 @@ def test_a_redirect_is_reported_and_not_followed(server: Server) -> None:
         ("https://user@s3.broadcastify.com/calls", True),
         ("api.openmhz.com", True),
         ("Broadcastify.com", True),
+        # Spellings the client that sends the request takes for the same host: an
+        # ideographic full stop, and an international name's ASCII form.
+        ("https://openmhz\u3002com/", True),
+        ("https://api\u3002OpenMHz\uff0ecom/calls", True),
+        ("xn--openmhz-.com", False),
+        # A host the client cannot read is not asked either.
+        ("https://\uff4f\uff50\uff45\uff4e\uff4d\uff48\uff5a.com/", True),
+        ("https://[", True),
+        ("https://exa\u00admple.org/", True),
+        ("https://%6fpenmhz.com/", True),
+        ("https://exa mple.org/", True),
+        # The host is what follows the last @, as the client reads an address.
+        ("https://example.org@api.openmhz.com/", True),
+        ("https://openmhz.com:80@example.org/", False),
+        ("https://example.org/#@openmhz.com", False),
         # Another service whose name only ends the same way, and one that names it
         # somewhere that is not its host.
         ("https://notopenmhz.com/", False),
         ("https://openmhz.com.example.org/", False),
         ("https://example.org/openmhz.com", False),
         ("https://api.weather.gov/alerts", False),
+        ("api.weather.gov", False),
+        ("https://127.0.0.1:8443/feed", False),
+        # Nothing is named, so nothing would be asked.
         ("", False),
-        ("https://[", False),
+        ("  ", False),
     ],
 )
 def test_the_services_beacon_requests_nothing_from_are_told_by_their_names(
@@ -247,7 +265,12 @@ def test_the_services_beacon_requests_nothing_from_are_told_by_their_names(
 
 @pytest.mark.parametrize(
     "address",
-    ["https://api.openmhz.com/sfp25/calls", "https://calls.broadcastify.com/api/v1/calls"],
+    [
+        "https://api.openmhz.com/sfp25/calls",
+        "https://calls.broadcastify.com/api/v1/calls",
+        "https://api.openmhz\u3002com/sfp25/calls",
+        "https://\uff4f\uff50\uff45\uff4e\uff4d\uff48\uff5a.com/",
+    ],
 )
 def test_no_poller_sends_a_request_to_a_service_beacon_requests_nothing_from(address: str) -> None:
     sent: list[httpx2.Request] = []
@@ -265,7 +288,8 @@ def test_no_poller_sends_a_request_to_a_service_beacon_requests_nothing_from(add
     # Refused before anything was sent, in a sentence that names no address.
     assert sent == []
     assert str(failure.value) == (
-        "notices names an address of a service Beacon requests nothing from, and was not asked."
+        "notices names an address of a service Beacon requests nothing from, or one whose "
+        "host cannot be read, and was not asked."
     )
     assert (failure.value.__context__, failure.value.__cause__) == (None, None)
 

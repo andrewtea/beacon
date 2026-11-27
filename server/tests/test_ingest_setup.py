@@ -728,15 +728,25 @@ def test_a_directory_whose_mark_cannot_be_told_and_a_link_to_a_directory_are_ref
         {"BEACON_NOTICES_FEED_URL": "https://OpenMHz.com./feed.json"},
         {"BEACON_NOTICES_HOSTS": "media.openmhz.com"},
         {"BEACON_NOTICES_HOSTS": "files.example.org, s3.Broadcastify.com"},
+        # As the client that would send the request reads the host.
+        {"BEACON_NOTICES_FEED_URL": "https://api.openmhz\u3002com/feed.json"},
+        {"BEACON_NOTICES_FEED_URL": "https://\uff4f\uff50\uff45\uff4e\uff4d\uff48\uff5a.com/"},
     ],
 )
+@pytest.mark.parametrize("with_radio", [False, True])
 def test_no_feed_of_notices_is_on_a_service_beacon_requests_nothing_from(
-    env: dict[str, str], monkeypatch: pytest.MonkeyPatch, settings: dict[str, str]
+    env: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    settings: dict[str, str],
+    with_radio: bool,
 ) -> None:
     monkeypatch.setenv("EMBER_SPENT_BEFORE_USD", "0")
+    # With radio named too, whose client would open the ledger before the notices
+    # are looked at: the address is refused before any client is made.
+    others = RADIO | {"BEACON_LIVE_SOURCES": "recordings,notices"} if with_radio else {}
 
     with pytest.raises(IngestConfigError, match="a service Beacon requests nothing from"):
-        build(env | NOTICES | settings)
+        build(env | NOTICES | others | settings)
 
     assert not (Path(env["BEACON_DATA_DIR"]) / "ember").exists()
     assert not (Path(env["BEACON_DATA_DIR"]) / "evidence").exists()

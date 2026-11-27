@@ -38,9 +38,10 @@ Beacon may use its API and said not to, so `openmhz` is no source and no setting
 makes it one (`live_sources` says so to whoever names it), and no poller is sent to
 an address of its, whoever names the address (`beacon.ingest.http.never_asked`).
 
-Radio and notices are the sources that cost money: every call is heard by Ember, and
-every document read by it. In mock mode the calls are tones and the documents are
-invented, and a stand-in for Ember "hears" and "reads" them, which costs nothing.
+Radio and notices are the sources that cost money: a call that is ready and worth
+hearing is heard by Ember, and a document read by it, each at most once. In mock
+mode the calls are tones and the documents are invented, and a stand-in for Ember
+"hears" and "reads" them, which costs nothing.
 
 The mock scenario is played on a clock of its own. Its story begins twenty minutes
 before a mock store is first opened and runs in real time from there, in steps of ten
@@ -373,6 +374,10 @@ def source_pollers(
     source's however the request was made, and there is no way to say otherwise.
 
     Raises IngestConfigError when a source lacks a setting it needs."""
+    if "notices" in sources:
+        # Before any poller is made, and so before a client that can spend opens
+        # its ledger: an address Beacon does not ask stops the whole server.
+        _refuse_never_asked(env)
     pollers: list[Poller] = []
     if "nws" in sources:
         pollers.append(NwsAlerts(http))
@@ -536,6 +541,20 @@ def read_known(env: Mapping[str, str]) -> Known:
     return known
 
 
+def _refuse_never_asked(env: Mapping[str, str]) -> None:
+    """Raises IngestConfigError when the notices' feed, or a host a document may be
+    on, is an address Beacon does not ask (`beacon.ingest.http.never_asked`)."""
+    feed_url = env.get(NOTICES_FEED_VARIABLE, "").strip()
+    hosts = _hosts(env, NOTICES_HOSTS_VARIABLE)
+    if never_asked(feed_url) or any(never_asked(host) for host in hosts):
+        raise IngestConfigError(
+            f"{LIVE_SOURCES_VARIABLE} names notices, and {NOTICES_FEED_VARIABLE} or "
+            f"{NOTICES_HOSTS_VARIABLE} names an address of a service Beacon requests "
+            "nothing from (OpenMHz, which said not to use its API, or Broadcastify, "
+            "from which Beacon has no license), or a host that cannot be read."
+        )
+
+
 def _notice_poller(env: Mapping[str, str], http: SourceHttp) -> NoticeFeed:
     """The poller for a real feed of notices, read by a live Ember under a budget
     of its own.
@@ -543,14 +562,9 @@ def _notice_poller(env: Mapping[str, str], http: SourceHttp) -> NoticeFeed:
     Raises IngestConfigError when the feed, the budget, or a live Ember is missing,
     and when a crash of this process could hand a document to a core collector."""
     names = f"{LIVE_SOURCES_VARIABLE} names notices"
+    _refuse_never_asked(env)
     feed_url = env.get(NOTICES_FEED_VARIABLE, "").strip()
     hosts = _hosts(env, NOTICES_HOSTS_VARIABLE)
-    if never_asked(feed_url) or any(never_asked(host) for host in hosts):
-        raise IngestConfigError(
-            f"{names}, and {NOTICES_FEED_VARIABLE} or {NOTICES_HOSTS_VARIABLE} names an "
-            "address of a service Beacon requests nothing from: OpenMHz, which said not "
-            "to use its API, or Broadcastify, from which Beacon has no license."
-        )
     scope = _scope(env, NOTICES_SCOPE, NOTICES_BUDGET_VARIABLE)
     if scope is None:
         raise IngestConfigError(
