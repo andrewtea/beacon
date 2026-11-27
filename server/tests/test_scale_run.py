@@ -342,6 +342,22 @@ class Meta:
         return self.api.paths().count("/v1/responses")
 
 
+def hearer(
+    layout: run.Layout,
+    settings: run.Settings,
+    env: dict[str, str],
+    make: Callable[[SpendScope], EmberClient],
+) -> EmberClient:
+    """The paying client that hears a run, made as the command makes it: beside a
+    paying client of the taps', from whose ledger file the other scope is read."""
+    most = run.TAPS_BUDGET_NANOUSD
+    beside = run.paid_ember(env, run.TAPS_SCOPE, most, most, make)
+    try:
+        return run.radio_ember(layout, settings, env, run.RADIO_BUDGET_NANOUSD, make, beside=beside)
+    finally:
+        beside.close()
+
+
 def _digest(body: dict[str, Any]) -> str:
     (message,) = body["input"]
     return hashlib.sha256(
@@ -388,7 +404,7 @@ def test_a_paid_run_of_generated_speech_reports_what_the_ledger_holds_and_says_w
     assert numbers["radio_cost_usd"] == pytest.approx(CALLS * 0.00015)
     assert numbers["radio_cost_per_1000_usd"] == pytest.approx(0.15)
     assert "generated speech, not radio" in texts["radio_cost_usd"]
-    assert "not of real radio" in texts["found"]
+    assert "no measure of Beacon on real radio" in texts["found"]
     # Generated calls are placed at DataSF's times, paid for or not.
     assert numbers["heard_after_dispatch_s"] is None
     # The taps were investigated by the paid client too, under their own scope.
@@ -415,7 +431,12 @@ def test_a_run_that_stops_at_its_cap_says_so_and_pays_for_nothing_past_it(
     status, said = command(env, site, *PAID, "--radio-budget", "0.001", paid=meta.client(env))
 
     assert status == 1
-    assert "The run is not finished. Give the same command again" in said
+    # The hold the refusal put on is ten minutes, and the command says what is
+    # left of it as it is now.
+    assert (
+        "The run is not finished, and a hold is on. The hold has about 10 more "
+        "minutes to run. Give the same command again after that"
+    ) in said
     made = results.read(layout)
     assert made is not None
     assert made["complete"] is False
@@ -442,7 +463,13 @@ def test_a_run_that_stops_at_its_cap_says_so_and_pays_for_nothing_past_it(
     status, said = command(env, site, *PAID, "--radio-budget", "0.001", paid=meta.client(env))
     assert status == 1
     assert meta.paid == heard
-    assert "leaving Muse Ember alone for ten minutes" in said
+    # The result, which is read long after, names no length for the hold.
+    assert (
+        "leaving Muse Ember alone after a refusal or a failure, until the hold that "
+        "was put on has run out"
+    ) in said
+    assert "ten minutes" not in said
+    assert "The hold has about 10 more minutes to run." in said
 
 
 def test_a_run_that_failed_goes_on_without_paying_for_a_call_twice(
@@ -461,7 +488,7 @@ def test_a_run_that_failed_goes_on_without_paying_for_a_call_twice(
     noon = datetime(2026, 3, 10, 20, 0, tzinfo=UTC)
 
     def hear(at: datetime) -> run.Heard:
-        ember = run.radio_ember(layout, settings, env, run.RADIO_BUDGET_NANOUSD, meta.client(env))
+        ember = hearer(layout, settings, env, meta.client(env))
         return run.hear(layout, settings, store, ember, env, now=noon, wall_clock=lambda: at)
 
     first = hear(noon)
@@ -514,7 +541,7 @@ def test_a_replay_that_ember_fails_on_leaves_the_run_unfinished_and_counts_no_an
 
     # Every call was heard, and the run is not complete: the replay stopped.
     assert status == 1
-    assert "The run is not finished." in said
+    assert "The run is not finished, and a hold is on." in said
     made = results.read(layout)
     assert made is not None
     assert (made["heard_complete"], made["complete"]) == (True, False)
@@ -540,7 +567,10 @@ def test_a_replay_that_ember_fails_on_leaves_the_run_unfinished_and_counts_no_an
     # a call or for a tap, and what the run came to is left as it was.
     status, said = command(env, site, *PAID, paid=meta.client(env))
     assert (status, meta.paid) == (1, paid)
-    assert "leaving Ember alone after a refusal or a failure in the replay of taps" in said
+    assert (
+        "leaving Muse Ember alone after a refusal or a failure in the replay of taps. "
+        "The hold has about 10 more minutes to run."
+    ) in said
     assert layout.results.read_bytes() == kept
 
 
@@ -756,7 +786,7 @@ def test_recordings_of_a_day_are_heard_from_two_hours_after_its_end_by_the_citys
     http.close()
     meta = Meta(layout, heard_by(by_digest))
     store = run.open_store(layout, settings)
-    ember = run.radio_ember(layout, settings, env, run.RADIO_BUDGET_NANOUSD, meta.client(env))
+    ember = hearer(layout, settings, env, meta.client(env))
 
     # A minute before the two hours are over, the day's last calls can still come:
     # a pass that ended now would be taken for the whole day's.
@@ -1345,7 +1375,7 @@ def test_the_cost_of_recorded_radio_is_never_mixed_with_generated_speechs_and_th
     settings = run.read_settings(layout)
     assert settings is not None
     store = run.open_store(layout, settings)
-    ember = run.radio_ember(layout, settings, allowed, run.RADIO_BUDGET_NANOUSD, meta.client(env))
+    ember = hearer(layout, settings, allowed, meta.client(env))
     heard = run.hear(
         layout, settings, store, ember, allowed, recordings=root, wall_clock=lambda: held
     )
@@ -1359,6 +1389,115 @@ def test_the_cost_of_recorded_radio_is_never_mixed_with_generated_speechs_and_th
     assert ledger.scope_spend(run.SPEECH_SCOPE).calls == CALLS
     assert numbers_of(env, "speech")["radio_paid_calls"] == CALLS
     assert "scale:speech" in texts_of(env, "speech")["radio_cost_usd"]
+
+
+def test_the_other_scopes_spend_is_read_from_the_ledger_the_hearing_client_is_made_on(
+    env: dict[str, str],
+    site: DataSf,
+    speech: None,
+    recorder: tuple[Path, dict[str, Any]],
+) -> None:
+    root, by_digest = recorder
+    # Generated speech was paid for, twelve requests: $0.0018 under its scope.
+    spoken = Meta(run.Layout.under(env, "speech"))
+    assert command(env, site, *PAID, "--taps", "0", paid=spoken.client(env), name="speech")[0] == 0
+    ledger = Storage.under(Path(env["BEACON_DATA_DIR"])).ledger_db
+    copy = ledger.with_name("copy.sqlite3")
+    with sqlite3.connect(ledger) as source, sqlite3.connect(copy) as target:
+        source.backup(target)
+    # The ledger is gone, so the one at its path holds nothing under either scope.
+    _delete_ledger(env)
+    allowed = env | {"BEACON_RECORDINGS_PERMITTED": "1"}
+    meta = Meta(run.Layout.under(env, "radio"), heard_by(by_digest))
+    make = meta.client(env)
+
+    def restored_first(scope: SpendScope) -> EmberClient:
+        if scope.label == run.RADIO_SCOPE:
+            # After the other scope's spend was read as nothing, and before the
+            # client that hears is made: the ledger that holds the speech is put back.
+            for beside in ("-wal", "-shm"):
+                ledger.with_name(ledger.name + beside).unlink(missing_ok=True)
+            os.replace(copy, ledger)
+        return make(scope)
+
+    # A budget the speech has all but used up: of $0.0020, $0.0002 is left, which
+    # is one request's worth and not the two recordings'.
+    status, said = command(
+        allowed,
+        site,
+        *RECORDED[:-1],
+        "0",
+        "--recordings",
+        str(root),
+        "--radio-budget",
+        "0.002",
+        paid=restored_first,
+        name="radio",
+    )
+
+    # The client that hears was made on another file than the one that was read:
+    # the run is refused before anything is heard, and nothing is paid.
+    assert (status, meta.paid) == (2, 0)
+    assert run.LEDGER_REPLACED in said
+    held = EmberClient.replay_only(Storage.under(Path(env["BEACON_DATA_DIR"])))
+    assert held.scope_spend(run.RADIO_SCOPE).calls == 0
+    assert held.scope_spend(run.SPEECH_SCOPE).calls == CALLS
+
+
+def test_a_run_whose_hearing_is_closed_needs_nothing_left_of_the_hearings_budget(
+    env: dict[str, str],
+    site: DataSf,
+    speech: None,
+    recorder: tuple[Path, dict[str, Any]],
+) -> None:
+    root, by_digest = recorder
+    layout = run.Layout.under(env, "day")
+    meta = Meta(layout, heard_by(by_digest))
+    allowed = env | {"BEACON_RECORDINGS_PERMITTED": "1"}
+    recorded = (*RECORDED[:-1], "2", "--recordings", str(root), "--radio-budget", "0.001")
+    # Two recordings are heard and two taps answered, which closes the hearing.
+    assert command(allowed, site, *recorded, paid=meta.client(env))[0] == 0
+    assert (numbers_of(env)["taps"], len(meta.audio)) == (2, 2)
+    # Then generated speech takes more of the shared budget than this run's option
+    # allows for hearing: $0.0018 of its $0.0010.
+    spoken = Meta(run.Layout.under(env, "speech"))
+    assert command(env, site, *PAID, "--taps", "0", paid=spoken.client(env), name="speech")[0] == 0
+
+    # The run is gone on with for more taps. It hears nothing, so it is not refused
+    # for a hearing budget that is used up: only its taps are paid for.
+    more = (*RECORDED, "--recordings", str(root), "--radio-budget", "0.001")
+    status, said = command(allowed, site, *more, paid=meta.client(env))
+
+    assert status == 0, said
+    numbers = numbers_of(env)
+    assert (numbers["taps"], len(meta.audio)) == (5, 2)
+    # What its hearing cost is still its own scope's, read from the taps' client.
+    assert (numbers["radio_paid_calls"], numbers["radio_cost_usd"]) == (
+        2,
+        pytest.approx(2 * 0.00015),
+    )
+
+
+def test_what_a_paid_run_of_generated_speech_says_of_a_match_is_that_it_is_a_fit_by_rule(
+    env: dict[str, str], site: DataSf, speech: None
+) -> None:
+    meta = Meta(run.Layout.under(env, "day"))
+
+    assert command(env, site, *PAID, "--taps", "0", paid=meta.client(env))[0] == 0
+
+    made = results.read(run.Layout.under(env, "day"))
+    assert made is not None
+    texts = texts_of(env)
+    # A record with no generated call can fit an incident, so a match is not said
+    # to show that Ember made a call out.
+    assert "a match says" not in made["basis_text"]
+    assert "is no proof that Ember made out a call" in made["basis_text"]
+    assert "is no proof that Ember made out the call it is counted for" in texts["found"]
+    assert "measures Ember" not in texts["found"]
+    # A paid hearer can answer with a listed block the dispatch never said, so the
+    # count of calls generated with no block says only what the generator left out.
+    if "unplaced" in texts:
+        assert texts["unplaced"].endswith("names units and no place.")
 
 
 def test_once_taps_are_replayed_nothing_more_is_heard_so_every_answer_is_of_one_evidence(

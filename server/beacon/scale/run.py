@@ -30,9 +30,13 @@ held to `RADIO_BUDGET_NANOUSD`, which a setting can lower and not raise: a run's
 scope gets that budget less what the other scope holds when the run starts
 (`radio_ember`). That reading is safe because one invocation is made at a time
 under a data directory (`alone`), and because a paid run goes on only in the ledger
-it began to pay in (`pin_ledger`): both paying clients are made before anything is
-heard, so a ledger that is replaced part of the way stops the taps as it stops the
-hearing, and the run is then not gone on with.
+it began to pay in (`pin_ledger`): the taps' client is made first and the ledger
+pinned with it, the other scope's spend is read from that client's file, and the
+hearing client has to have been made on the same file. Both are made before
+anything is heard, so a ledger that is replaced part of the way stops the taps as
+it stops the hearing, and the run is then not gone on with. A run whose hearing is
+closed makes no hearing client and needs nothing left of the hearing's budget: it
+can only pay for taps.
 
 **The hearing is closed when the replay of taps first begins** (`close_hearing`), so
 that every tap of a run is answered against the same evidence.
@@ -63,14 +67,15 @@ from beacon.ember import (
     LedgerReplacedError,
     SpendScope,
     Storage,
-    read_scope_spend,
 )
 from beacon.ember.client import default_data_dir
 from beacon.ember.ledger import ScopeSpend
 from beacon.evidence import EvidenceStore, EvidenceStoreError
 from beacon.incident.places import Blocks, read_blocks
 from beacon.ingest.http import SourceError, SourceHttp
+from beacon.ingest.paid import read_hold
 from beacon.ingest.recordings import MAX_LISTED, Directory, PassCount, RecordedRadio
+from beacon.ingest.recordings import SOURCE as RADIO_SOURCE
 from beacon.ingest.runner import PollerHeldError
 from beacon.radio import Ffmpeg, Known, core_dump_problem, forbid_core_dumps
 from beacon.radio.vocabulary import read_names
@@ -265,15 +270,36 @@ def _pinned(layout: Layout) -> str | None:
     return said["file"]
 
 
-def hearing_spend(settings: Settings, ember: EmberClient) -> tuple[ScopeSpend | None, bool]:
-    """What the ledger a paying client was made on holds under the run's hearing
-    scope, and whether that ledger was replaced, in which case nothing is known of
-    the spend: what the file at its path holds now is another file's."""
+def scope_spend(ember: EmberClient, label: str) -> tuple[ScopeSpend | None, bool]:
+    """What the ledger a paying client was made on holds under a scope, and whether
+    that ledger was replaced, in which case nothing is known of the spend: what the
+    file at its path holds now is another file's."""
     if ember.ledger_replaced():
         return None, True
-    spend = ember.scope_spend(hearing_scope(settings))
+    spend = ember.scope_spend(label)
     # Once more, after the read: the file can have been replaced between the two.
     return (None, True) if ember.ledger_replaced() else (spend, False)
+
+
+def hearing_spend(settings: Settings, ember: EmberClient) -> tuple[ScopeSpend | None, bool]:
+    """What the ledger a paying client was made on holds under the run's hearing
+    scope, and whether that ledger was replaced (`scope_spend`). The client is any
+    of the run's that pays: the taps' reads it for a run whose hearing is closed."""
+    return scope_spend(ember, hearing_scope(settings))
+
+
+def held_for(
+    store: EvidenceStore, wall_clock: Callable[[], datetime] | None = None
+) -> float | None:
+    """How many seconds the hearing's hold still has to run, or None when none is
+    on: the hold the poller put on after a refusal or a failure and kept in the
+    run's evidence store, which is ten minutes or longer."""
+    held_until, _ = read_hold(store.state(RADIO_SOURCE))
+    if held_until is None:
+        return None
+    now = datetime.now(UTC) if wall_clock is None else wall_clock()
+    left = (held_until - now).total_seconds()
+    return left if left > 0 else None
 
 
 def close_hearing(layout: Layout, last_pass: PassCount) -> None:
@@ -450,32 +476,51 @@ def radio_ember(
     env: Mapping[str, str],
     budget_nanousd: int,
     make: PaidClient | None = None,
+    *,
+    beside: EmberClient | None = None,
 ) -> EmberClient:
     """The client that hears a run's calls: a stand-in that reads the generated
     calls' script, or Muse Ember under the scope of the run's kind of audio
     (`hearing_scope`), whose budget is `budget_nanousd` less what the other kind's
-    scope holds in the ledger now, so that hearing is held to one budget over both.
+    scope holds, so that hearing is held to one budget over both.
+
+    A paying client is made `beside` the paying client the run's ledger was pinned
+    with (`pin_ledger`), and what the other scope holds is read from that client's
+    ledger file and no other: the file is seen to be the same one before the read
+    and after it, and the new client has to have been made on that same file. A
+    ledger put in its place between the read and the making, which could hold more
+    under the other scope than was read, is refused here, before anything is heard.
 
     Raises ScaleError when the budget is more than the plan's or none of it is
-    left, when a paid run is asked for without a live Ember, and when the script
-    cannot be read."""
+    left, when a paid run is asked for without a live Ember, when the ledger is not
+    the one that was pinned, and when the script cannot be read. Raises ValueError
+    for a paid run with no client to be made beside."""
     if settings.hearer == "fake":
         try:
             script = generate.read_script(layout.calls)
         except generate.GenerateError as error:
             raise ScaleError(str(error)) from None
         return EmberClient.fake(Storage.under(default_data_dir(env)), script.hearer)
+    if beside is None or beside.mode != "live":
+        raise ValueError("A paying hearer is made beside the client the ledger was pinned with.")
     label = hearing_scope(settings)
     check_budget(label, budget_nanousd, RADIO_BUDGET_NANOUSD)
     other = SPEECH_SCOPE if label == RADIO_SCOPE else RADIO_SCOPE
-    held = read_scope_spend(Storage.under(default_data_dir(env)), other)
-    left = budget_nanousd - (0 if held is None else held.spent_nanousd)
+    held, lost = scope_spend(beside, other)
+    if lost or held is None:
+        raise ScaleError(LEDGER_REPLACED)
+    left = budget_nanousd - held.spent_nanousd
     if left <= 0:
         raise ScaleError(
             f"Nothing is left of the budget for hearing: the scope {other} holds it "
             "all, and the two kinds of paid run share one budget."
         )
-    return paid_ember(env, label, left, RADIO_BUDGET_NANOUSD, make)
+    ember = paid_ember(env, label, left, RADIO_BUDGET_NANOUSD, make)
+    if ember.ledger_file() != beside.ledger_file() or beside.ledger_replaced():
+        # Made on another file than the one the other scope's spend was read from.
+        ember.close()
+        raise ScaleError(LEDGER_REPLACED)
+    return ember
 
 
 def hearing_scope(settings: Settings) -> str:

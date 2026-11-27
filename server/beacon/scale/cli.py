@@ -26,6 +26,7 @@ good (`run.close_hearing`), so every tap of a run is answered against one eviden
 
 import argparse
 import contextlib
+import math
 import os
 import sys
 from collections.abc import Mapping, Sequence
@@ -59,6 +60,7 @@ from beacon.scale.run import (
     hear,
     hearing_scope,
     hearing_spend,
+    held_for,
     lose_ledger,
     open_store,
     paid_ember,
@@ -181,20 +183,29 @@ def _run(
         # What the run is, first: a run that was begun as another is refused before
         # a paying client is made for it.
         settings = begin(layout, settings)
+        # Once the replay of taps has begun, nothing more is heard in the run: it
+        # then makes no client to hear with, and needs none of the hearing's budget.
+        closed = closed_hearing(layout)
         if live:
-            # Both paying clients are made now, on the ledger file as it is before
+            # Every paying client is made now, on the ledger file as it is before
             # anything is heard: a client refuses to pay once the file it was made on
             # is replaced, so a ledger that is replaced between the hearing and the
-            # taps is not taken for one in which nothing was spent.
-            radio = opened.enter_context(
-                contextlib.closing(radio_ember(layout, settings, env, radio_budget, paid))
-            )
+            # taps is not taken for one in which nothing was spent. The taps' is
+            # first, and the ledger is pinned with it; what the other kind of
+            # hearing spent is then read from that file, and the hearing's client
+            # has to be on the same one (`radio_ember`).
             tap_ember = opened.enter_context(
                 contextlib.closing(
                     paid_ember(env, TAPS_SCOPE, taps_budget, TAPS_BUDGET_NANOUSD, paid)
                 )
             )
-            pin_ledger(layout, radio)
+            pin_ledger(layout, tap_ember)
+            if closed is None:
+                radio = opened.enter_context(
+                    contextlib.closing(
+                        radio_ember(layout, settings, env, radio_budget, paid, beside=tap_ember)
+                    )
+                )
         print(results.basis(settings), file=out)
         prepare(layout, settings, http)
         records, unread = read_day(layout)
@@ -203,11 +214,12 @@ def _run(
             file=out,
         )
         known_blocks = read_lists(layout)[1]
-        if radio is None or tap_ember is None:
+        if tap_ember is None:
             # The stand-ins: one reads the generated calls' script, one investigates by rule.
-            radio = opened.enter_context(
-                contextlib.closing(radio_ember(layout, settings, env, radio_budget, None))
-            )
+            if closed is None:
+                radio = opened.enter_context(
+                    contextlib.closing(radio_ember(layout, settings, env, radio_budget, None))
+                )
             tap_ember = opened.enter_context(
                 contextlib.closing(
                     EmberClient.fake(Storage.under(default_data_dir(env)), stand_in_investigator)
@@ -219,8 +231,8 @@ def _run(
             # A refusal or a failure on a tap holds the whole run: nothing is heard
             # either, and what the run came to so far is left as it is.
             print(
-                "The run is leaving Ember alone after a refusal or a failure in the "
-                f"replay of taps, for about {held / 60:.0f} more minutes. Nothing was "
+                f"The run is leaving {results.who(live=live)} alone after a refusal or "
+                f"a failure in the replay of taps. {_hold_left(held)} Nothing was "
                 "asked, and the run's results are as they were. Give the same command "
                 "again after that.",
                 file=out,
@@ -228,13 +240,14 @@ def _run(
             return 1
         store = open_store(layout, settings)
         opened.callback(store.close)
-        closed = closed_hearing(layout)
-        if closed is None:
+        if radio is not None:
             heard = hear(layout, settings, store, radio, env, recordings=options.recordings)
         else:
-            # The replay of taps has begun, so nothing more is heard in this run.
-            radio.close()
-            spend, lost = hearing_spend(settings, radio) if live else (None, False)
+            # The replay of taps has begun, so nothing more is heard in this run. What
+            # its hearing cost is read from the ledger the taps' client is on, which
+            # is the one the run is pinned to.
+            assert closed is not None
+            spend, lost = hearing_spend(settings, tap_ember) if live else (None, False)
             heard = Heard(last_pass=closed, stopped=None, spend=spend, ledger_lost=lost)
         heard_complete = (
             heard.stopped is None and heard.last_pass is not None and heard.last_pass.unready == 0
@@ -255,7 +268,7 @@ def _run(
         standing = taps.kept(replays, tap_runs) if heard_complete else []
         if live and (
             taps_stopped == "ledger_replaced"
-            or radio.ledger_replaced()
+            or (radio is not None and radio.ledger_replaced())
             or tap_ember.ledger_replaced()
         ):
             # Asked of both clients when everything is done, whether or not either
@@ -288,6 +301,9 @@ def _run(
         # Published under the lock: a later invocation's results are not written
         # over by an earlier one's.
         results.write(layout, made)
+        # A hold that is on now, in the hearing or in the replay, as it stands at
+        # this moment: the results, which are kept, name no length for one.
+        hold_left = max(held_for(store) or 0.0, taps.held_for(tap_runs) or 0.0)
     print("", file=out)
     for line in results.lines(made):
         print(line, file=out)
@@ -296,9 +312,25 @@ def _run(
         print(LEDGER_REPLACED, file=out)
         return 1
     if not made["complete"]:
-        print("The run is not finished. Give the same command again to go on with it.", file=out)
+        if hold_left > 0:
+            print(
+                f"The run is not finished, and a hold is on. {_hold_left(hold_left)} "
+                "Give the same command again after that to go on with it.",
+                file=out,
+            )
+        else:
+            print(
+                "The run is not finished. Give the same command again to go on with it.",
+                file=out,
+            )
         return 1
     return 0
+
+
+def _hold_left(seconds: float) -> str:
+    """How long a hold still has to run, as it was read just now."""
+    minutes = math.ceil(seconds / 60)
+    return f"The hold has about {minutes} more minute{'' if minutes == 1 else 's'} to run."
 
 
 def _settings(options: argparse.Namespace, env: Mapping[str, str]) -> Settings:

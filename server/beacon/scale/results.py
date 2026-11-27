@@ -17,8 +17,9 @@ Three kinds of run, told apart by the run's own settings (`beacon.scale.run`):
   time, because it has none to report.
 - **generated speech, heard by Muse Ember**: Ember is paid, so the cost is a real
   cost, of clean synthetic speech. The calls were generated from the records they
-  are scored against, so a match says Ember made out synthetic speech of those
-  records, not that Beacon finds a real city's calls.
+  are scored against, and a match is a fit by rule between a record and an
+  incident: it is no proof that Ember made out a call (a record whose call was
+  never generated can fit too), and not that Beacon finds a real city's calls.
 - **recorded radio, heard by Muse Ember**: the one kind whose numbers are about
   Beacon on real radio, scored against DataSF's record of the same day.
 
@@ -67,9 +68,10 @@ GENERATED_BY_EMBER = (
     "Generated speech, for Muse Ember to hear. The calls are synthesized speech "
     "generated from DataSF's own records of this day, and Muse Ember is paid for each "
     "one it is asked to hear; the numbers below say how many that was. They are scored "
-    "against the records they were generated from, so a match says Ember made out "
-    "clean synthetic speech of those records. It does not measure Beacon on real "
-    "radio, which is noisy, clipped, and says things no record holds."
+    "against the records they were generated from. A match is a fit by rule between "
+    "a record and an incident, and is no proof that Ember made out a call: a record "
+    "whose call was never generated can fit an incident too. Nothing below measures "
+    "Beacon on real radio, which is noisy, clipped, and says things no record holds."
 )
 RECORDED_BY_EMBER = (
     "Recorded radio, for Muse Ember to hear. The calls are recordings of dispatch "
@@ -98,26 +100,37 @@ LEDGER_LOST = (
 )
 
 
+def who(*, live: bool) -> str:
+    """Who a run asks: Muse Ember, which is paid, or the stand-in, which is not."""
+    return "Muse Ember" if live else "the stand-in for Ember"
+
+
+# A hold is ten minutes from the failure or longer (as long as Meta asked, and never
+# shorter than one that was already on), and a result is read long after it was
+# written: so a result names no length for one, and the command says how long the
+# hold has to run when it is given.
+_UNTIL = "until the hold that was put on has run out"
+
+
 def _taps_stopped(stopped: str | None, *, live: bool) -> str:
-    """Why a replay stopped, in words that name who was asked: Muse Ember, which
-    is paid, or the stand-in, which is not."""
-    who = "Muse Ember" if live else "the stand-in for Ember"
+    """Why a replay stopped, in words that name who was asked."""
+    asked = who(live=live)
     paid = ", each of them paid for" if live else ""
     return {
         "held": (
-            f"It is leaving {who} alone after a refusal or a failure: ten minutes, or "
-            "as long as was asked. Give the same command again after that."
+            f"It is leaving {asked} alone after a refusal or a failure, {_UNTIL}. "
+            "Give the same command again after that."
         ),
         "unusable": (
-            f"Answers of {who}'s were not the form, several times in a row{paid}. It "
-            "is asking nothing more for ten minutes."
+            f"Answers of {asked}'s were not the form, several times in a row{paid}. "
+            f"It is asking nothing more {_UNTIL}."
         ),
         "budget": (
             "Its spending scope has less left than one tap may cost, or the spending "
             "stop refused. The taps that were not begun are not claimed."
         ),
         "ledger_replaced": "The Ember ledger was replaced under it.",
-        "ember": f"A call to {who} failed. It is asking nothing more for ten minutes.",
+        "ember": f"A call to {asked} failed. It is asking nothing more {_UNTIL}.",
         "store": "The investigations file could not be written.",
     }.get(stopped or "", "The replay stopped early.")
 
@@ -127,18 +140,18 @@ PARTIAL_READING = "The incident engine left rows out of a reading, so an inciden
 
 def _stopped(stopped: str, *, live: bool) -> str:
     """Why a hearing stopped, in words that name who was asked."""
-    who = "Muse Ember" if live else "the stand-in for Ember"
+    asked = who(live=live)
     return {
         "budget": "The run stopped at its spending cap or the spending stop.",
         "held": (
-            f"The run stopped because it is leaving {who} alone for ten minutes after "
-            "a refusal or a failure. Give the same command again after that."
+            f"The run stopped because it is leaving {asked} alone after a refusal or "
+            f"a failure, {_UNTIL}. Give the same command again after that."
         ),
         "ledger_replaced": (
             "The run stopped because the Ember ledger was replaced under it. Compare "
             "Meta's Usage page with the ledger before anything more is paid for."
         ),
-        "ember": f"The run stopped because a call to {who} failed.",
+        "ember": f"The run stopped because a call to {asked} failed.",
         "source": "The run stopped because the directory of calls could not be read.",
         "store": "The run stopped because its evidence store could not be written.",
     }.get(stopped, "The run stopped early.")
@@ -403,8 +416,9 @@ def _match_numbers(
         )
     elif generated:
         meaning = (
-            "The calls were generated from these records, so this measures Ember's "
-            "hearing of clean synthetic speech and the pipeline, not of real radio."
+            "The calls were generated from these records and are clean synthetic "
+            "speech, so this is no measure of Beacon on real radio; and a fit by the "
+            "rule is no proof that Ember made out the call it is counted for."
         )
     else:
         meaning = "This is Beacon on recorded radio, by the matching rule stated above."
@@ -519,7 +533,7 @@ def _place_numbers(
     dispatch = (
         "A generated dispatch names the listed block nearest DataSF's point when one "
         f"is within {BLOCK_REACH_M:.0f} m, and an arrival or a clearing names no place; "
-        "an incident's point is of a block some call grouped into it named"
+        "an incident's point is of a block some call grouped into it was heard to name"
     )
     if generated and not live:
         meaning = (
@@ -530,8 +544,9 @@ def _place_numbers(
         )
     elif generated:
         meaning = (
-            f"{measured} {dispatch}, as Muse Ember made it out. Nothing checks that a "
-            "pair is right. It is no location error on real radio."
+            f"{measured} {dispatch}: the block Muse Ember answered with, which "
+            "nothing checks the call said. Nothing checks that a pair is right. It is "
+            "no location error on real radio."
         )
     else:
         meaning = (
@@ -549,9 +564,7 @@ def _place_numbers(
                 "calls",
                 "DataSF calls for which neither street of the intersection has a "
                 f"listed block within {BLOCK_REACH_M:.0f} m of DataSF's point, so the "
-                "dispatch generated for them names units and no place. The incident "
-                "such a call is paired with has a point only when another call "
-                "grouped into it named a block.",
+                "dispatch generated for them names units and no place.",
             )
         ]
     return [
