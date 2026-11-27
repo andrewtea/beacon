@@ -8,6 +8,7 @@ from beacon.incident import Engine, Incident
 from beacon.incident.build import CREDIT_511, STATUS_WORDS, label_of, weakest
 from beacon.investigate import Runs
 from beacon.investigate import card as words
+from beacon.mapping import NO_MAP_OF_MEDICAL, NO_POINT, Feature, drawn
 from beacon.radio.vocabulary import MEDICAL_EVENT
 from beacon.story import StoryDesk
 
@@ -287,6 +288,54 @@ class IncidentDetail(IncidentSummary):
     story: StoryOut | None = None
 
 
+class PositionOut(BaseModel):
+    lat: float
+    lon: float
+    at: datetime
+
+
+class FeatureOut(BaseModel):
+    """One thing on the map of an incident: what a source said, and where it is.
+    Show `text`, the confidence, and the sources with it, as with a line of the
+    timeline: a source's `credit` is 511's, and goes wherever the feature is shown."""
+
+    # `place` is the point Beacon has for the incident; `traffic_event` a 511 event
+    # as its version in force has it; `aircraft` an aircraft of the timeline's;
+    # `alert_area` the area an authority drew for an alert that is in force here.
+    kind: Literal["place", "traffic_event", "aircraft", "alert_area"]
+    # Written by code. For a traffic event, an aircraft, and an alert it is the
+    # line the timeline has for it, word for word.
+    text: str
+    at: datetime
+    confidence: Literal["official", "high", "medium", "low"]
+    sources: list[SourceOut]
+    # A place and a traffic event are a point.
+    point: PointOut | None
+    # An aircraft is the positions it was seen at, oldest first.
+    path: list[PositionOut]
+    # An alert's area is polygons, each a list of closed rings: its outline first,
+    # then the holes in it. A place is in the area when it is inside the outline
+    # of some polygon and in none of that polygon's holes. Draw each polygon with
+    # its own holes: all the rings read together by parity are another area.
+    polygons: list[list[list[PointOut]]]
+    # What is not drawn of it, in a sentence: show it with `text`. Null otherwise.
+    note: str | None
+
+
+class MapAnswer(BaseModel):
+    """The map of one incident. It shows that incident and nothing else: no tap,
+    no other incident, and no notice, which has no place."""
+
+    mode: Literal["live", "mock"]
+    as_of: datetime
+    partial: bool
+    incident: IncidentSummary
+    # The place first, when there is one. Empty for an incident with no point.
+    features: list[FeatureOut]
+    # Why nothing is drawn, in a sentence, when nothing is. Null otherwise.
+    text: str | None
+
+
 class Incidents(BaseModel):
     # `mock` when the evidence is the invented scenario's.
     mode: Literal["live", "mock"]
@@ -447,4 +496,48 @@ def incident(request: Request, incident_id: str) -> IncidentAnswer:
         as_of=snapshot.as_of,
         partial=snapshot.partial,
         incident=detail,
+    )
+
+
+def _feature_out(feature: Feature) -> FeatureOut:
+    return FeatureOut(
+        kind=feature.kind,
+        text=feature.text,
+        at=feature.at,
+        confidence=feature.confidence,
+        sources=[SourceOut.model_validate(source) for source in feature.sources],
+        point=None if feature.point is None else PointOut.model_validate(feature.point),
+        path=[
+            PositionOut(lat=seen.point.lat, lon=seen.point.lon, at=seen.at) for seen in feature.path
+        ],
+        polygons=[
+            [[PointOut.model_validate(point) for point in ring] for ring in rings]
+            for rings in feature.polygons
+        ],
+        note=feature.note,
+    )
+
+
+@router.get("/incidents/{incident_id}/map")
+def incident_map(request: Request, incident_id: str) -> MapAnswer:
+    """What Beacon can place of one incident, each thing with its sentence, its
+    confidence, and its sources. Opened from the incident's card: there is no map
+    of every incident. A medical response has none, and is answered 404."""
+    engine = _engine(request)
+    snapshot = engine.snapshot()
+    found: Incident | None = snapshot.get(incident_id)
+    if found is None:
+        raise HTTPException(404, "There is no such incident.")
+    if found.category == MEDICAL_EVENT:
+        raise HTTPException(404, NO_MAP_OF_MEDICAL)
+    # A row is never changed, so one read by its id after the reading is the row
+    # the reading had.
+    features = drawn(found, engine.store.get)
+    return MapAnswer(
+        mode=engine.mode,
+        as_of=snapshot.as_of,
+        partial=snapshot.partial,
+        incident=summary_of(request, found),
+        features=[_feature_out(feature) for feature in features],
+        text=None if features else NO_POINT,
     )

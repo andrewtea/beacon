@@ -3,6 +3,8 @@ import { fetchIncident, type IncidentSummary } from '../api/incidents.ts'
 import { crisisLeads, incidentCadence } from '../lib/cadence.ts'
 import { isMedical } from '../lib/labels.ts'
 import { usePolled } from '../lib/poll.ts'
+import { href } from '../lib/router.ts'
+import { Icon } from './Icon.tsx'
 import { IncidentBody, IncidentLead } from './IncidentBody.tsx'
 import { IncidentCard } from './IncidentCard.tsx'
 
@@ -43,6 +45,15 @@ export function IncidentLive({
   return (
     <>
       {shown !== null && <IncidentCard incident={shown} heading={heading} />}
+      {/* The map is secondary, and is opened from here: only for an incident
+          Beacon has a point for, and never for a medical response. */}
+      {shown !== null && !isMedical(shown) && shown.point !== null && (
+        <a className="action map-link" href={href.map(shown.id)}>
+          <Icon name="map" />
+          Open the map of this incident
+          <Icon name="forward" size={16} />
+        </a>
+      )}
       {gone && (
         <>
           {heading === 'h1' && <h1>Beacon has no incident at this address</h1>}

@@ -124,3 +124,17 @@ export function isMedical(incident: IncidentSummary): boolean {
 export function recordState(incident: IncidentSummary): string {
   return incident.open ? 'Open in Beacon’s record' : 'Closed in Beacon’s record'
 }
+
+// What a thing on an incident's map is. A 511 event is not called a closure:
+// its version in force can list the road as open, and its own headline says
+// which.
+const FEATURE: Record<string, string> = {
+  place: 'Where Beacon draws this incident',
+  traffic_event: 'Traffic event listed by 511',
+  aircraft: 'Aircraft, where it was seen',
+  alert_area: 'Area drawn for an alert in force',
+}
+
+export function featureName(kind: string): string {
+  return FEATURE[kind] ?? humanize(kind)
+}

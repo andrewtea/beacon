@@ -138,7 +138,7 @@ test('a place with nothing near it says so in the server’s sentence, which is 
   expect(within(home).queryByText(NOTHING)).not.toBeInTheDocument()
 })
 
-test('a distance measured from where 511 listed a closure shows that row’s confidence and 511’s credit, beside that distance only', async () => {
+test('a distance measured from a point taken from a 511 event shows that row’s confidence and 511’s credit, beside that distance only', async () => {
   await savePlace('Home', FIRE)
   const credit = { text: 'Data provided by 511.org', url: 'https://511.org' }
   const closure: Source = {
@@ -153,7 +153,7 @@ test('a distance measured from where 511 listed a closure shows that row’s con
     model: null,
     credit,
   }
-  // Two incidents near one place: one where its block is, one where 511 listed
+  // Two incidents near one place: one where its block is, one at a point taken from a 511 event that listed
   // a closure on its street.
   const other: IncidentSummary = {
     ...fire,
@@ -163,7 +163,7 @@ test('a distance measured from where 511 listed a closure shows that row’s con
     point_source: closure,
   }
   const BY_511 =
-    'Beacon has this incident about 300 m from this place, going by where 511 listed a road closure on its street.'
+    'Beacon has this incident about 300 m from this place, measured from an approximate point Beacon took from a 511 event that listed a road closure on its street.'
   expect(fire.point_source).toBeNull()
   serve({
     'GET /api/health': MOCK_HEALTH,
