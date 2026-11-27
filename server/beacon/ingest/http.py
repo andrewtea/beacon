@@ -373,11 +373,17 @@ def fetch(
     `read_body=False` the reply's status is the whole answer: a 2xx reply returns
     nothing as soon as its status is read, and its body is not read at all.
 
+    An address of a service Beacon asks nothing, and one whose host cannot be read
+    (`never_asked`), is refused here, before anything is sent, whichever poller
+    asks and whoever named the address.
+
     Raises SourceError when the source cannot be reached, answers with anything but
     2xx, sends more than `max_bytes`, packs its reply in a way Beacon does not read
     or does not finish it, takes longer than `max_seconds` (`MAX_SECONDS` when none
     is given) over the whole exchange, or when the client is closed, before or
     during the exchange."""
+    if never_asked(url):
+        raise_bare(SourceError(source, _NEVER_ASKED))
     outcome = http._run(
         http._exchange(
             method,
@@ -396,6 +402,41 @@ def fetch(
     if isinstance(outcome, SourceError):
         raise_bare(outcome)
     return outcome
+
+
+# The services Beacon requests nothing from, by domain: OpenMHz, which was asked
+# whether Beacon may use its API and said not to, and Broadcastify, from which Beacon
+# has no license. Every subdomain of one is the service's too.
+NEVER_ASKED_DOMAINS = ("openmhz.com", "broadcastify.com")
+# A host as the client writes one it can ask: a name, or an address in numbers.
+_PLAIN_HOST = re.compile(r"[a-z0-9._:-]+")
+_NEVER_ASKED = (
+    "names an address of a service Beacon requests nothing from, or one whose host "
+    "cannot be read, and was not asked"
+)
+
+
+def never_asked(address: str) -> bool:
+    """Whether an address, or a bare host name, is one Beacon does not ask: of a
+    service Beacon requests nothing from, or with a host that cannot be read.
+
+    The host is read as the client that would send the request reads it (lower
+    case, and the ASCII form of an international name), so that two spellings the
+    client takes for one host are one host here. An address whose host that client
+    cannot read is not asked either. It goes by the name: a host that is named by a
+    number, or by another name for the same machine, is not known to be one."""
+    if not address.strip():
+        # Nothing is named, so there is nothing to ask.
+        return False
+    try:
+        host = httpx2.URL(address if "//" in address else f"https://{address}").raw_host
+    except (httpx2.InvalidURL, ValueError, TypeError):
+        return True
+    name = host.decode("ascii", "replace").rstrip(".").lower()
+    if _PLAIN_HOST.fullmatch(name) is None:
+        # Escapes and the like, which no name of a host has: not one to compare.
+        return True
+    return any(name == domain or name.endswith(f".{domain}") for domain in NEVER_ASKED_DOMAINS)
 
 
 def read_json(body: bytes, source: str) -> Any:

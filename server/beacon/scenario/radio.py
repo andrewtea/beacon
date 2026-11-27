@@ -1,10 +1,11 @@
-"""The radio of the mock scenario: invented dispatch calls, as OpenMHz would list them.
+"""The radio of the mock scenario: invented dispatch calls, as a recorder would leave them.
 
 Nothing here was ever said on a radio. A call is a tone, generated here, and what "was
 said" in it is a form that a stand-in for Ember fills in when it is handed that tone
-(`stand_in_ember`). So the real poller runs on this unchanged: it asks for the calls,
-downloads each one's audio, and has Ember hear it. The Ember it has is the stand-in,
-and the rows it stores say so (`model == "fake"`).
+(`stand_in_ember`). So the real poller runs on this unchanged: it lists the calls
+(`StoryShelf`, which stands where a directory of recordings would be), reads each
+one's JSON and audio, and has Ember hear it. The Ember it has is the stand-in, and
+the rows it stores say so (`model == "fake"`).
 
 The calls tell the fire of `beacon.scenario.fire` from the radio's side, with what a
 real feed would also carry: a medical call nearby and one across town, an alarm
@@ -13,8 +14,7 @@ stand-in's forms are untidy in the ways a model's can be, with a house number wh
 the block belongs, details on a medical call, and a name that is no street, so that
 what Beacon strips is seen to be stripped.
 
-The talkgroup numbers are invented too. OpenMHz's real ones for San Francisco are
-set through `BEACON_OPENMHZ_TALKGROUPS` when permission to use them exists.
+The system's name, the talkgroup numbers, and the frequency are invented too.
 """
 
 import base64
@@ -24,15 +24,17 @@ import io
 import json
 import math
 import wave
-from collections.abc import Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
 from beacon.ember import fake_response
+from beacon.ingest.recordings import Filed, Place
 from beacon.radio.vocabulary import Known
 
-SYSTEM = "sfp25"
+# What the story's recorder calls its system: the directory its calls would be in.
+SYSTEM = "invented"
 FIRE_DISPATCH = 9101
 FIRE_TACTICAL = 9102
 EMS = 9103
@@ -50,8 +52,8 @@ KNOWN = Known.of(
     ),
 )  # fmt: skip
 
-# Where a call's audio is served from, in the mock scenario.
-AUDIO_HOST = "media.openmhz.com"
+# The frequency the story's calls are on, which no system uses.
+_FREQUENCY = 851000000
 
 _SAMPLE_RATE = 8_000
 
@@ -231,56 +233,79 @@ CALLS: tuple[RadioCall, ...] = (
 )
 
 
-# How many calls one answer of the story's listing holds at most. The poller is told
-# this number, which is known of a listing Beacon wrote and of no other.
-PAGE_SIZE = 50
+class StoryShelf:
+    """The story's calls, as a shelf of recordings lists them (`beacon.ingest.recordings`):
+    by the moment `now()`, the calls that have been made, each with the JSON file
+    trunk-recorder would have written for it and its tone. It is no directory, and
+    so its calls are a stand-in's whoever reads them."""
 
+    def __init__(self, start: datetime, now: Callable[[], datetime]) -> None:
+        self._start = start
+        self._now = now
 
-def call_id(index: int) -> str:
-    return f"mock-call-{index:04d}"
+    def listed(
+        self, after: Place, upto_s: int, talkgroups: Collection[int], limit: int
+    ) -> tuple[list[Filed], bool]:
+        at = self._now()
+        calls = [
+            filed
+            for index, call in enumerate(CALLS)
+            if self._time(index) <= at
+            and call.talkgroup in talkgroups
+            and (filed := self._filed(index)).place > after
+            and filed.start_s <= upto_s
+        ]
+        calls.sort(key=lambda filed: filed.place)
+        return calls[:limit], len(calls) > limit
 
-
-def calls_answer(
-    start: datetime, at: datetime, after_ms: int, talkgroups: set[int]
-) -> dict[str, Any]:
-    """What OpenMHz would answer to `/calls/newer?time=<after_ms>` at the moment
-    `at`, for a story that began at `start`: the calls after that time that have
-    been made by now, at most `PAGE_SIZE` of them, newest first, as its site lists
-    them."""
-    calls = []
-    for index, call in enumerate(CALLS):
-        time = start + timedelta(minutes=call.minute)
-        if time > at or round(time.timestamp() * 1000) <= after_ms:
-            continue
-        if call.talkgroup not in talkgroups:
-            continue
-        calls.append(
+    def details(self, call: Filed) -> bytes | None:
+        index = self._index(call)
+        if index is None:
+            return None
+        made, start_s = CALLS[index], call.start_s
+        return json.dumps(
             {
-                "_id": call_id(index),
-                "talkgroupNum": call.talkgroup,
-                "url": f"https://{AUDIO_HOST}/mock/{call_id(index)}.wav",
-                "filename": f"/mock/{call_id(index)}.wav",
-                "time": time.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                "freq": _FREQUENCY,
+                "start_time": start_s,
+                "stop_time": start_s + math.ceil(made.seconds),
+                "start_time_ms": start_s * 1000,
+                "stop_time_ms": start_s * 1000 + round(made.seconds * 1000),
+                "emergency": 0,
+                "encrypted": 0,
+                "call_length": round(made.seconds),
+                "call_length_ms": round(made.seconds * 1000),
+                "talkgroup": made.talkgroup,
+                "talkgroup_tag": "",
+                "audio_type": "digital",
+                "short_name": SYSTEM,
+                "freqList": [],
                 "srcList": [],
-                "star": 0,
-                "freq": 0,
-                "len": call.seconds,
-                "emergency": False,
-                "patches": [],
             }
+        ).encode()
+
+    def audio(self, call: Filed) -> bytes | None:
+        index = self._index(call)
+        return None if index is None else _tone(index)
+
+    def _time(self, index: int) -> datetime:
+        return self._start + timedelta(minutes=CALLS[index].minute)
+
+    def _filed(self, index: int) -> Filed:
+        time = self._time(index)
+        start_s = int(time.timestamp())
+        return Filed(
+            system=SYSTEM,
+            day=(str(time.year), str(time.month), str(time.day)),
+            stem=f"{CALLS[index].talkgroup}-{start_s}.000_{_FREQUENCY}-call_{index}",
+            talkgroup=CALLS[index].talkgroup,
+            start_s=start_s,
         )
-    # The calls nearest after the moment asked about, and no more than a page of them.
-    calls.sort(key=lambda listed: listed["time"])
-    return {"calls": calls[:PAGE_SIZE][::-1], "direction": "newer"}
 
-
-def call_audio(name: str) -> bytes | None:
-    """The audio of the call whose file is `name`, such as `mock-call-0003.wav`, or
-    None when there is no such call."""
-    for index in range(len(CALLS)):
-        if name == f"{call_id(index)}.wav":
-            return _tone(index)
-    return None
+    def _index(self, call: Filed) -> int | None:
+        for index in range(len(CALLS)):
+            if self._filed(index) == call:
+                return index
+        return None
 
 
 @functools.cache

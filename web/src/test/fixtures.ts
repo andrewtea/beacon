@@ -47,7 +47,7 @@ export const fireAnswer: TapAnswer = {
       sources: [
         {
           kind: 'radio',
-          source: 'openmhz',
+          source: 'recordings',
           label: 'Fire and EMS dispatch radio',
           confidence: 'medium',
           at: '2026-11-26T22:52:54Z',
@@ -59,7 +59,7 @@ export const fireAnswer: TapAnswer = {
         },
         {
           kind: 'radio',
-          source: 'openmhz',
+          source: 'recordings',
           label: 'Fire and EMS dispatch radio',
           confidence: 'medium',
           at: '2026-11-26T22:53:30Z',
@@ -71,7 +71,7 @@ export const fireAnswer: TapAnswer = {
         },
         {
           kind: 'radio',
-          source: 'openmhz',
+          source: 'recordings',
           label: 'Fire and EMS dispatch radio',
           confidence: 'medium',
           at: '2026-11-26T22:55:54Z',
@@ -83,7 +83,7 @@ export const fireAnswer: TapAnswer = {
         },
         {
           kind: 'radio',
-          source: 'openmhz',
+          source: 'recordings',
           label: 'Fire and EMS dispatch radio',
           confidence: 'medium',
           at: '2026-11-26T22:57:06Z',
@@ -95,7 +95,7 @@ export const fireAnswer: TapAnswer = {
         },
         {
           kind: 'radio',
-          source: 'openmhz',
+          source: 'recordings',
           label: 'Fire and EMS dispatch radio',
           confidence: 'medium',
           at: '2026-11-26T22:58:54Z',
@@ -107,7 +107,7 @@ export const fireAnswer: TapAnswer = {
         },
         {
           kind: 'radio',
-          source: 'openmhz',
+          source: 'recordings',
           label: 'Fire and EMS dispatch radio',
           confidence: 'medium',
           at: '2026-11-26T23:04:54Z',
@@ -119,7 +119,7 @@ export const fireAnswer: TapAnswer = {
         },
         {
           kind: 'radio',
-          source: 'openmhz',
+          source: 'recordings',
           label: 'Fire and EMS dispatch radio',
           confidence: 'medium',
           at: '2026-11-26T23:06:54Z',
@@ -131,7 +131,7 @@ export const fireAnswer: TapAnswer = {
         },
         {
           kind: 'radio',
-          source: 'openmhz',
+          source: 'recordings',
           label: 'Fire and EMS dispatch radio',
           confidence: 'medium',
           at: '2026-11-26T23:10:54Z',
@@ -178,7 +178,7 @@ export const fireAnswer: TapAnswer = {
         sources: [
           {
             kind: 'radio',
-            source: 'openmhz',
+            source: 'recordings',
             label: 'Fire and EMS dispatch radio',
             confidence: 'medium',
             at: '2026-11-26T23:10:54Z',
@@ -197,7 +197,7 @@ export const fireAnswer: TapAnswer = {
         sources: [
           {
             kind: 'radio',
-            source: 'openmhz',
+            source: 'recordings',
             label: 'Fire and EMS dispatch radio',
             confidence: 'medium',
             at: '2026-11-26T23:06:54Z',
@@ -216,7 +216,7 @@ export const fireAnswer: TapAnswer = {
         sources: [
           {
             kind: 'radio',
-            source: 'openmhz',
+            source: 'recordings',
             label: 'Fire and EMS dispatch radio',
             confidence: 'medium',
             at: '2026-11-26T22:52:54Z',
@@ -228,7 +228,7 @@ export const fireAnswer: TapAnswer = {
           },
           {
             kind: 'radio',
-            source: 'openmhz',
+            source: 'recordings',
             label: 'Fire and EMS dispatch radio',
             confidence: 'medium',
             at: '2026-11-26T22:58:54Z',
@@ -240,7 +240,7 @@ export const fireAnswer: TapAnswer = {
           },
           {
             kind: 'radio',
-            source: 'openmhz',
+            source: 'recordings',
             label: 'Fire and EMS dispatch radio',
             confidence: 'medium',
             at: '2026-11-26T23:10:54Z',
@@ -392,7 +392,7 @@ export const fireAnswer: TapAnswer = {
           sources: [
             {
               kind: 'radio',
-              source: 'openmhz',
+              source: 'recordings',
               label: 'Fire and EMS dispatch radio',
               confidence: 'medium',
               at: '2026-11-26T23:10:54Z',
@@ -411,7 +411,7 @@ export const fireAnswer: TapAnswer = {
           sources: [
             {
               kind: 'radio',
-              source: 'openmhz',
+              source: 'recordings',
               label: 'Fire and EMS dispatch radio',
               confidence: 'medium',
               at: '2026-11-26T23:06:54Z',
@@ -512,7 +512,7 @@ export const fireAnswer: TapAnswer = {
         sources: [
           {
             kind: 'radio',
-            source: 'openmhz',
+            source: 'recordings',
             label: 'Fire and EMS dispatch radio',
             confidence: 'medium',
             at: '2026-11-26T23:01:24Z',
@@ -803,7 +803,7 @@ export const fireIncident: IncidentAnswer = {
       sources: [
         {
           kind: 'radio',
-          source: 'openmhz',
+          source: 'recordings',
           label: 'Fire and EMS dispatch radio',
           confidence: 'medium',
           at: '2026-11-26T22:52:54Z',
@@ -815,7 +815,7 @@ export const fireIncident: IncidentAnswer = {
         },
         {
           kind: 'radio',
-          source: 'openmhz',
+          source: 'recordings',
           label: 'Fire and EMS dispatch radio',
           confidence: 'medium',
           at: '2026-11-26T22:53:30Z',
@@ -827,7 +827,7 @@ export const fireIncident: IncidentAnswer = {
         },
         {
           kind: 'radio',
-          source: 'openmhz',
+          source: 'recordings',
           label: 'Fire and EMS dispatch radio',
           confidence: 'medium',
           at: '2026-11-26T22:55:54Z',
@@ -839,7 +839,7 @@ export const fireIncident: IncidentAnswer = {
         },
         {
           kind: 'radio',
-          source: 'openmhz',
+          source: 'recordings',
           label: 'Fire and EMS dispatch radio',
           confidence: 'medium',
           at: '2026-11-26T22:57:06Z',
@@ -851,7 +851,7 @@ export const fireIncident: IncidentAnswer = {
         },
         {
           kind: 'radio',
-          source: 'openmhz',
+          source: 'recordings',
           label: 'Fire and EMS dispatch radio',
           confidence: 'medium',
           at: '2026-11-26T22:58:54Z',
@@ -863,7 +863,7 @@ export const fireIncident: IncidentAnswer = {
         },
         {
           kind: 'radio',
-          source: 'openmhz',
+          source: 'recordings',
           label: 'Fire and EMS dispatch radio',
           confidence: 'medium',
           at: '2026-11-26T23:04:54Z',
@@ -875,7 +875,7 @@ export const fireIncident: IncidentAnswer = {
         },
         {
           kind: 'radio',
-          source: 'openmhz',
+          source: 'recordings',
           label: 'Fire and EMS dispatch radio',
           confidence: 'medium',
           at: '2026-11-26T23:06:54Z',
@@ -887,7 +887,7 @@ export const fireIncident: IncidentAnswer = {
         },
         {
           kind: 'radio',
-          source: 'openmhz',
+          source: 'recordings',
           label: 'Fire and EMS dispatch radio',
           confidence: 'medium',
           at: '2026-11-26T23:10:54Z',
@@ -934,7 +934,7 @@ export const fireIncident: IncidentAnswer = {
         sources: [
           {
             kind: 'radio',
-            source: 'openmhz',
+            source: 'recordings',
             label: 'Fire and EMS dispatch radio',
             confidence: 'medium',
             at: '2026-11-26T23:10:54Z',
@@ -953,7 +953,7 @@ export const fireIncident: IncidentAnswer = {
         sources: [
           {
             kind: 'radio',
-            source: 'openmhz',
+            source: 'recordings',
             label: 'Fire and EMS dispatch radio',
             confidence: 'medium',
             at: '2026-11-26T23:06:54Z',
@@ -972,7 +972,7 @@ export const fireIncident: IncidentAnswer = {
         sources: [
           {
             kind: 'radio',
-            source: 'openmhz',
+            source: 'recordings',
             label: 'Fire and EMS dispatch radio',
             confidence: 'medium',
             at: '2026-11-26T22:52:54Z',
@@ -984,7 +984,7 @@ export const fireIncident: IncidentAnswer = {
           },
           {
             kind: 'radio',
-            source: 'openmhz',
+            source: 'recordings',
             label: 'Fire and EMS dispatch radio',
             confidence: 'medium',
             at: '2026-11-26T22:58:54Z',
@@ -996,7 +996,7 @@ export const fireIncident: IncidentAnswer = {
           },
           {
             kind: 'radio',
-            source: 'openmhz',
+            source: 'recordings',
             label: 'Fire and EMS dispatch radio',
             confidence: 'medium',
             at: '2026-11-26T23:10:54Z',
@@ -1148,7 +1148,7 @@ export const fireIncident: IncidentAnswer = {
           sources: [
             {
               kind: 'radio',
-              source: 'openmhz',
+              source: 'recordings',
               label: 'Fire and EMS dispatch radio',
               confidence: 'medium',
               at: '2026-11-26T23:10:54Z',
@@ -1167,7 +1167,7 @@ export const fireIncident: IncidentAnswer = {
           sources: [
             {
               kind: 'radio',
-              source: 'openmhz',
+              source: 'recordings',
               label: 'Fire and EMS dispatch radio',
               confidence: 'medium',
               at: '2026-11-26T23:06:54Z',
@@ -1234,7 +1234,7 @@ export const fireIncident: IncidentAnswer = {
         sources: [
           {
             kind: 'radio',
-            source: 'openmhz',
+            source: 'recordings',
             label: 'Fire and EMS dispatch radio',
             confidence: 'medium',
             at: '2026-11-26T22:52:54Z',
@@ -1263,7 +1263,7 @@ export const fireIncident: IncidentAnswer = {
         sources: [
           {
             kind: 'radio',
-            source: 'openmhz',
+            source: 'recordings',
             label: 'Fire and EMS dispatch radio',
             confidence: 'medium',
             at: '2026-11-26T22:53:30Z',
@@ -1292,7 +1292,7 @@ export const fireIncident: IncidentAnswer = {
         sources: [
           {
             kind: 'radio',
-            source: 'openmhz',
+            source: 'recordings',
             label: 'Fire and EMS dispatch radio',
             confidence: 'medium',
             at: '2026-11-26T22:55:54Z',
@@ -1321,7 +1321,7 @@ export const fireIncident: IncidentAnswer = {
         sources: [
           {
             kind: 'radio',
-            source: 'openmhz',
+            source: 'recordings',
             label: 'Fire and EMS dispatch radio',
             confidence: 'medium',
             at: '2026-11-26T22:57:06Z',
@@ -1350,7 +1350,7 @@ export const fireIncident: IncidentAnswer = {
         sources: [
           {
             kind: 'radio',
-            source: 'openmhz',
+            source: 'recordings',
             label: 'Fire and EMS dispatch radio',
             confidence: 'medium',
             at: '2026-11-26T22:58:54Z',
@@ -1467,7 +1467,7 @@ export const fireIncident: IncidentAnswer = {
         sources: [
           {
             kind: 'radio',
-            source: 'openmhz',
+            source: 'recordings',
             label: 'Fire and EMS dispatch radio',
             confidence: 'medium',
             at: '2026-11-26T23:04:54Z',
@@ -1496,7 +1496,7 @@ export const fireIncident: IncidentAnswer = {
         sources: [
           {
             kind: 'radio',
-            source: 'openmhz',
+            source: 'recordings',
             label: 'Fire and EMS dispatch radio',
             confidence: 'medium',
             at: '2026-11-26T23:06:54Z',
@@ -1555,7 +1555,7 @@ export const fireIncident: IncidentAnswer = {
         sources: [
           {
             kind: 'radio',
-            source: 'openmhz',
+            source: 'recordings',
             label: 'Fire and EMS dispatch radio',
             confidence: 'medium',
             at: '2026-11-26T23:10:54Z',
@@ -1770,7 +1770,7 @@ export const fireIncident: IncidentAnswer = {
           sources: [
             {
               kind: 'radio',
-              source: 'openmhz',
+              source: 'recordings',
               label: 'Fire and EMS dispatch radio',
               confidence: 'medium',
               at: '2026-11-26T23:10:54Z',
@@ -1790,7 +1790,7 @@ export const fireIncident: IncidentAnswer = {
           sources: [
             {
               kind: 'radio',
-              source: 'openmhz',
+              source: 'recordings',
               label: 'Fire and EMS dispatch radio',
               confidence: 'medium',
               at: '2026-11-26T23:10:54Z',
@@ -1810,7 +1810,7 @@ export const fireIncident: IncidentAnswer = {
           sources: [
             {
               kind: 'radio',
-              source: 'openmhz',
+              source: 'recordings',
               label: 'Fire and EMS dispatch radio',
               confidence: 'medium',
               at: '2026-11-26T23:06:54Z',

@@ -818,6 +818,26 @@ def test_the_feed_is_named_by_an_https_address(site: Site, storage: Storage, fee
         build(site, storage, feed_url=feed_url)
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"feed_url": "https://api.openmhz.com/feed.json"},
+        {"feed_url": "https://www.Broadcastify.com/feed.json"},
+        {"document_hosts": ["media.openmhz.com"]},
+        {"document_hosts": ["files.elsewhere.example", "S3.Broadcastify.com."]},
+        {"feed_url": "https://api.openmhz\u3002com/feed.json"},
+        {"document_hosts": ["media\u3002openmhz\u3002com"]},
+    ],
+)
+def test_no_feed_and_no_document_is_on_a_service_beacon_requests_nothing_from(
+    site: Site, storage: Storage, options: dict[str, Any]
+) -> None:
+    with pytest.raises(ValueError, match="on a service Beacon requests nothing from"):
+        build(site, storage, **options)
+
+    assert site.requests == []
+
+
 def test_the_pollers_origin_is_its_clients_and_a_stand_ins_feed_is_kept_out_of_the_live_store(
     tmp_path: Path, site: Site, poller: NoticeFeed
 ) -> None:
@@ -994,7 +1014,7 @@ def test_a_poller_that_can_spend_has_a_budget_of_its_own(
     )
 
     radio = EmberClient.live(
-        storage, api_key="test-key", scope=SpendScope("ingest:openmhz", 500_000_000)
+        storage, api_key="test-key", scope=SpendScope("ingest:recordings", 500_000_000)
     )
 
     # Without one, all that holds its spending is the stop on everything.

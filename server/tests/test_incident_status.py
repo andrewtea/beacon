@@ -47,10 +47,10 @@ def test_an_incidents_status_is_said_as_what_the_radio_said_and_a_medical_one_ha
         if source["model"] is not None
     }
     assert labels <= {
-        ("openmhz", "fake", "Fire and EMS dispatch radio"),
+        ("recordings", "fake", "Fire and EMS dispatch radio"),
         ("notices", "fake", "Official notice"),
     }
-    assert ("openmhz", "fake", "Fire and EMS dispatch radio") in labels
+    assert ("recordings", "fake", "Fire and EMS dispatch radio") in labels
     assert "Ember" not in str(one["official"]) + str(one["story"]) + str(fire["radio"])
     calls = [line for line in one["timeline"] if line["kind"] == "radio"]
     assert [source["evidence_id"] for source in fire["radio"]["sources"]] == [
@@ -94,7 +94,7 @@ def test_a_source_a_stand_in_wrote_is_not_labeled_as_embers_whatever_label_was_k
     # A story that was kept holds the labels its sources had when it was written.
     kept = {
         "kind": "radio",
-        "source": "openmhz",
+        "source": "recordings",
         "label": "Fire and EMS dispatch radio, as Ember heard it",
         "confidence": "medium",
         "at": at(0),

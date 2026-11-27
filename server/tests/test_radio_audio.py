@@ -65,7 +65,8 @@ def tone(seconds: float, rate: int = SAMPLE_RATE) -> bytes:
 
 
 def as_m4a(wav: bytes, directory: Path) -> bytes:
-    """The clip as ffmpeg writes an M4A file, which is how OpenMHz serves a call."""
+    """The clip as ffmpeg writes an M4A file, which is how a recorder that compresses
+    its calls keeps one."""
     target = directory / "call.m4a"
     subprocess.run(
         ["ffmpeg", "-loglevel", "quiet", "-y", "-f", "wav", "-i", "pipe:0", "-c:a", "aac", target],

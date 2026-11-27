@@ -14,14 +14,18 @@ A source needs no code change to go live, only its name in that list and what it
     adsblol   nothing; optionally BEACON_ADSBLOL_API_KEY, a key of adsb.lol's, and
               with it BEACON_ADSBLOL_REQUESTS_PER_DAY, what the key allows, without
               which a key is taken to allow the 500 a day that no key does
-    openmhz   BEACON_OPENMHZ_PERMITTED=1, which says OpenMHz has given Beacon
-              permission to use its audio; BEACON_OPENMHZ_TALKGROUPS, the channels
-              to hear; BEACON_OPENMHZ_BUDGET_USD, the most hearing them may cost;
-              a live Ember (REPLAY=0, MODEL_API_KEY, EMBER_SPENT_BEFORE_USD); and
-              ffmpeg and bubblewrap, on Linux. BEACON_RADIO_STREETS_FILE and
+    recordings  BEACON_RECORDINGS_DIR, a directory of recorded radio calls on this
+              machine, as trunk-recorder leaves them; BEACON_RECORDINGS_SYSTEM, the
+              short name of the one system in it whose calls are read;
+              BEACON_RECORDINGS_PERMITTED=1, which says the operator has the right
+              to use the recordings; BEACON_RECORDINGS_TALKGROUPS, the channels to
+              hear, by that system's numbers;
+              BEACON_RECORDINGS_BUDGET_USD, the most hearing them may cost; a live
+              Ember (REPLAY=0, MODEL_API_KEY, EMBER_SPENT_BEFORE_USD); and ffmpeg
+              and bubblewrap, on Linux. BEACON_RADIO_STREETS_FILE and
               BEACON_RADIO_UNITS_FILE name the lists of streets and units a row
-              may name, and without one a row names none. BEACON_OPENMHZ_EMS_TALKGROUPS
-              and BEACON_OPENMHZ_MEDIA_HOSTS are optional.
+              may name, and without one a row names none.
+              BEACON_RECORDINGS_EMS_TALKGROUPS is optional.
     notices   BEACON_NOTICES_FEED_URL, the https address of a JSON Feed that lists
               an authority's notices as PDF attachments; BEACON_NOTICES_BUDGET_USD,
               the most reading them may cost; and a live Ember (REPLAY=0,
@@ -29,9 +33,15 @@ A source needs no code change to go live, only its name in that list and what it
               hosts a document may be on besides the feed's own. Refused where the
               process cannot be kept from handing a core dump to a collector.
 
-Radio and notices are the sources that cost money: every call is heard by Ember, and
-every document read by it. In mock mode the calls are tones and the documents are
-invented, and a stand-in for Ember "hears" and "reads" them, which costs nothing.
+There is no source that asks anybody for radio audio. OpenMHz was asked whether
+Beacon may use its API and said not to, so `openmhz` is no source and no setting
+makes it one (`live_sources` says so to whoever names it), and no poller is sent to
+an address of its, whoever names the address (`beacon.ingest.http.never_asked`).
+
+Radio and notices are the sources that cost money: a call that is ready and worth
+hearing is heard by Ember, and a document read by it, each at most once. In mock
+mode the calls are tones and the documents are invented, and a stand-in for Ember
+"hears" and "reads" them, which costs nothing.
 
 The mock scenario is played on a clock of its own. Its story begins twenty minutes
 before a mock store is first opened and runs in real time from there, in steps of ten
@@ -41,6 +51,7 @@ is not finished: it is played again, ten seconds later by the real clock, and on
 the pollers that failed in it poll again.
 """
 
+import contextlib
 import logging
 import re
 import threading
@@ -54,13 +65,12 @@ from beacon.ember.client import REQUEST_TIMEOUT_SECONDS, default_data_dir
 from beacon.ember.pricing import parse_usd
 from beacon.evidence import EvidenceStore, Mode
 from beacon.ingest.adsblol import MAX_REQUESTS_PER_DAY, MOCK_INTERVAL_SECONDS, AdsbLolAircraft
-from beacon.ingest.http import SourceHttp
+from beacon.ingest.http import SourceHttp, never_asked
 from beacon.ingest.notices import SCOPE as NOTICES_SCOPE
 from beacon.ingest.notices import NoticeFeed
 from beacon.ingest.nws import NwsAlerts
-from beacon.ingest.openmhz import PAGE_SIZE as OPENMHZ_PAGE_SIZE
-from beacon.ingest.openmhz import SCOPE as RADIO_SCOPE
-from beacon.ingest.openmhz import OpenMhzRadio
+from beacon.ingest.recordings import SCOPE as RADIO_SCOPE
+from beacon.ingest.recordings import Directory, RecordedRadio
 from beacon.ingest.runner import Clock, PaidWork, Poller, PollerStatus, Runner
 from beacon.ingest.traffic511 import Traffic511
 from beacon.radio import Ffmpeg, Known, core_dump_problem, forbid_core_dumps
@@ -70,17 +80,24 @@ from beacon.scenario import notices as scenario_notices
 from beacon.scenario import radio as scenario_radio
 
 # The sources that can be named in BEACON_LIVE_SOURCES.
-SOURCES = ("nws", "adsblol", "511", "openmhz", "notices")
+SOURCES = ("nws", "adsblol", "511", "recordings", "notices")
 
 LIVE_SOURCES_VARIABLE = "BEACON_LIVE_SOURCES"
 KEY_511_VARIABLE = "BEACON_511_API_KEY"
 ADSBLOL_KEY_VARIABLE = "BEACON_ADSBLOL_API_KEY"
 ADSBLOL_REQUESTS_VARIABLE = "BEACON_ADSBLOL_REQUESTS_PER_DAY"
-OPENMHZ_PERMITTED_VARIABLE = "BEACON_OPENMHZ_PERMITTED"
-OPENMHZ_TALKGROUPS_VARIABLE = "BEACON_OPENMHZ_TALKGROUPS"
-OPENMHZ_EMS_TALKGROUPS_VARIABLE = "BEACON_OPENMHZ_EMS_TALKGROUPS"
-OPENMHZ_MEDIA_HOSTS_VARIABLE = "BEACON_OPENMHZ_MEDIA_HOSTS"
-OPENMHZ_BUDGET_VARIABLE = "BEACON_OPENMHZ_BUDGET_USD"
+RECORDINGS_DIR_VARIABLE = "BEACON_RECORDINGS_DIR"
+RECORDINGS_SYSTEM_VARIABLE = "BEACON_RECORDINGS_SYSTEM"
+RECORDINGS_PERMITTED_VARIABLE = "BEACON_RECORDINGS_PERMITTED"
+RECORDINGS_TALKGROUPS_VARIABLE = "BEACON_RECORDINGS_TALKGROUPS"
+RECORDINGS_EMS_TALKGROUPS_VARIABLE = "BEACON_RECORDINGS_EMS_TALKGROUPS"
+RECORDINGS_BUDGET_VARIABLE = "BEACON_RECORDINGS_BUDGET_USD"
+# What is said to whoever names OpenMHz as a source.
+NO_OPENMHZ = (
+    "OpenMHz is not a source: it was asked whether Beacon may use its API and said not "
+    "to, so Beacon has no client for it and requests nothing from it. Radio comes from "
+    "recorded calls on this machine (recordings)."
+)
 RADIO_STREETS_VARIABLE = "BEACON_RADIO_STREETS_FILE"
 RADIO_UNITS_VARIABLE = "BEACON_RADIO_UNITS_FILE"
 NOTICES_FEED_VARIABLE = "BEACON_NOTICES_FEED_URL"
@@ -276,6 +293,8 @@ def live_sources(env: Mapping[str, str]) -> tuple[str, ...]:
 
     Raises IngestConfigError for a name that is not a source."""
     named = {name.strip() for name in env.get(LIVE_SOURCES_VARIABLE, "").split(",")} - {""}
+    if "openmhz" in {name.lower() for name in named}:
+        raise IngestConfigError(f"{LIVE_SOURCES_VARIABLE} names openmhz. {NO_OPENMHZ}")
     unknown = sorted(named - set(SOURCES))
     if unknown:
         raise IngestConfigError(
@@ -317,13 +336,12 @@ def build(env: Mapping[str, str], clock: Clock | None = None) -> Ingest:
     # tones is the story's own. Its rows say `model == "fake"`.
     storage = Storage.under(default_data_dir(env))
     ember = EmberClient.fake(storage, stand_in_ember)
-    radio = OpenMhzRadio(
-        http,
+    radio = RecordedRadio(
+        # The story's calls, where a directory of recordings would be.
+        scenario_radio.StoryShelf(scenario.start, clock.now),
         ember,
         talkgroups=scenario_radio.TALKGROUPS,
         ems_talkgroups=scenario_radio.EMS_TALKGROUPS,
-        system=scenario_radio.SYSTEM,
-        page_size=scenario_radio.PAGE_SIZE,
         # The story's own streets and units, where real radio has the city's.
         known=scenario_radio.KNOWN,
     )
@@ -356,6 +374,10 @@ def source_pollers(
     source's however the request was made, and there is no way to say otherwise.
 
     Raises IngestConfigError when a source lacks a setting it needs."""
+    if "notices" in sources:
+        # Before any poller is made, and so before a client that can spend opens
+        # its ledger: an address Beacon does not ask stops the whole server.
+        _refuse_never_asked(env)
     pollers: list[Poller] = []
     if "nws" in sources:
         pollers.append(NwsAlerts(http))
@@ -368,8 +390,8 @@ def source_pollers(
                 f"{LIVE_SOURCES_VARIABLE} names 511, which needs {KEY_511_VARIABLE}."
             )
         pollers.append(Traffic511(http, api_key=token))
-    if "openmhz" in sources:
-        pollers.append(_radio_poller(env, http))
+    if "recordings" in sources:
+        pollers.append(_radio_poller(env))
     if "notices" in sources:
         pollers.append(_notice_poller(env, http))
     return pollers
@@ -405,36 +427,58 @@ def _aircraft_poller(env: Mapping[str, str], http: SourceHttp) -> AdsbLolAircraf
     )
 
 
-def _radio_poller(env: Mapping[str, str], http: SourceHttp) -> OpenMhzRadio:
-    """The poller for real radio, heard by a live Ember under a budget of its own.
+def _radio_poller(env: Mapping[str, str]) -> RecordedRadio:
+    """The poller for recorded radio, heard by a live Ember under a budget of its own.
 
-    Raises IngestConfigError when permission, the talkgroups, the budget, a live
-    Ember, or a confined ffmpeg is missing, when the host hands core dumps to a
-    collector, or when a list of names cannot be read."""
-    names = f"{LIVE_SOURCES_VARIABLE} names openmhz"
-    if env.get(OPENMHZ_PERMITTED_VARIABLE) != "1":
+    Raises IngestConfigError when the directory, the operator's word that the
+    recordings may be used, the talkgroups, the budget, a live Ember, or a confined
+    ffmpeg is missing, when the directory holds generated audio, when the host hands
+    core dumps to a collector, or when a list of names cannot be read."""
+    names = f"{LIVE_SOURCES_VARIABLE} names recordings"
+    where, system = env.get(RECORDINGS_DIR_VARIABLE, ""), env.get(RECORDINGS_SYSTEM_VARIABLE, "")
+    shelf = None
+    if where and system:
+        # Not the error itself, which would be chained to a setting.
+        with contextlib.suppress(ValueError, OSError):
+            shelf = Directory(Path(where), system)
+    if shelf is None:
         raise IngestConfigError(
-            f"{names}, and using OpenMHz's audio needs its permission. Ask the contact "
-            f"on its San Francisco page, and set {OPENMHZ_PERMITTED_VARIABLE}=1 once "
-            "permission is given."
+            f"{names}, which needs {RECORDINGS_DIR_VARIABLE}: the absolute path of a "
+            "directory of recorded calls, as trunk-recorder leaves them (the directory "
+            f"itself, not a link to it), and {RECORDINGS_SYSTEM_VARIABLE}: the short name "
+            "of the one system in it whose calls are read, which is the name of its "
+            "directory there. Talkgroup numbers are a system's own. A file named "
+            "BEACON-GENERATED at the directory's top marks generated audio, and anything "
+            "else of that name is refused."
         )
-    talkgroups = _talkgroups(env, OPENMHZ_TALKGROUPS_VARIABLE)
+    if shelf.generated:
+        raise IngestConfigError(
+            f"{names}, and the directory {RECORDINGS_DIR_VARIABLE} names is marked as "
+            "generated audio, which is no radio and no live source."
+        )
+    if env.get(RECORDINGS_PERMITTED_VARIABLE) != "1":
+        raise IngestConfigError(
+            f"{names}, and a recording of radio is used only with the right to: set "
+            f"{RECORDINGS_PERMITTED_VARIABLE}=1 when the recordings are your own, or you "
+            "have the permission of whoever made them. Beacon does not use OpenMHz's "
+            "recordings, and has no license from Broadcastify."
+        )
+    talkgroups = _talkgroups(env, RECORDINGS_TALKGROUPS_VARIABLE)
     if not talkgroups:
         raise IngestConfigError(
-            f"{names}, which needs {OPENMHZ_TALKGROUPS_VARIABLE}: the numbers of the "
+            f"{names}, which needs {RECORDINGS_TALKGROUPS_VARIABLE}: the numbers of the "
             "fire and EMS talkgroups to hear. Every call on them is paid for."
         )
-    ems_talkgroups = _talkgroups(env, OPENMHZ_EMS_TALKGROUPS_VARIABLE)
+    ems_talkgroups = _talkgroups(env, RECORDINGS_EMS_TALKGROUPS_VARIABLE)
     if not set(ems_talkgroups) <= set(talkgroups):
         raise IngestConfigError(
-            f"{OPENMHZ_EMS_TALKGROUPS_VARIABLE} names a talkgroup that "
-            f"{OPENMHZ_TALKGROUPS_VARIABLE} does not."
+            f"{RECORDINGS_EMS_TALKGROUPS_VARIABLE} names a talkgroup that "
+            f"{RECORDINGS_TALKGROUPS_VARIABLE} does not."
         )
-    hosts = _hosts(env, OPENMHZ_MEDIA_HOSTS_VARIABLE)
-    scope = _scope(env, RADIO_SCOPE, OPENMHZ_BUDGET_VARIABLE)
+    scope = _scope(env, RADIO_SCOPE, RECORDINGS_BUDGET_VARIABLE)
     if scope is None:
         raise IngestConfigError(
-            f"{names}, which needs {OPENMHZ_BUDGET_VARIABLE}: the most, in dollars, that "
+            f"{names}, which needs {RECORDINGS_BUDGET_VARIABLE}: the most, in dollars, that "
             "hearing radio may cost over every run. It has no default, because every "
             "call is paid for."
         )
@@ -454,15 +498,12 @@ def _radio_poller(env: Mapping[str, str], http: SourceHttp) -> OpenMhzRadio:
     # This process will hold real radio audio in memory. It writes no core file,
     # and the host was just seen not to hand cores to a collector.
     forbid_core_dumps()
-    return OpenMhzRadio(
-        http,
+    return RecordedRadio(
+        shelf,
         ember,
         talkgroups=talkgroups,
         ems_talkgroups=ems_talkgroups,
         known=known,
-        media_hosts=hosts,
-        # Not known of the real API yet, so a poll that ends in a call says "partial".
-        page_size=OPENMHZ_PAGE_SIZE,
         transcoder=transcoder,
     )
 
@@ -500,6 +541,20 @@ def read_known(env: Mapping[str, str]) -> Known:
     return known
 
 
+def _refuse_never_asked(env: Mapping[str, str]) -> None:
+    """Raises IngestConfigError when the notices' feed, or a host a document may be
+    on, is an address Beacon does not ask (`beacon.ingest.http.never_asked`)."""
+    feed_url = env.get(NOTICES_FEED_VARIABLE, "").strip()
+    hosts = _hosts(env, NOTICES_HOSTS_VARIABLE)
+    if never_asked(feed_url) or any(never_asked(host) for host in hosts):
+        raise IngestConfigError(
+            f"{LIVE_SOURCES_VARIABLE} names notices, and {NOTICES_FEED_VARIABLE} or "
+            f"{NOTICES_HOSTS_VARIABLE} names an address of a service Beacon requests "
+            "nothing from (OpenMHz, which said not to use its API, or Broadcastify, "
+            "from which Beacon has no license), or a host that cannot be read."
+        )
+
+
 def _notice_poller(env: Mapping[str, str], http: SourceHttp) -> NoticeFeed:
     """The poller for a real feed of notices, read by a live Ember under a budget
     of its own.
@@ -507,6 +562,7 @@ def _notice_poller(env: Mapping[str, str], http: SourceHttp) -> NoticeFeed:
     Raises IngestConfigError when the feed, the budget, or a live Ember is missing,
     and when a crash of this process could hand a document to a core collector."""
     names = f"{LIVE_SOURCES_VARIABLE} names notices"
+    _refuse_never_asked(env)
     feed_url = env.get(NOTICES_FEED_VARIABLE, "").strip()
     hosts = _hosts(env, NOTICES_HOSTS_VARIABLE)
     scope = _scope(env, NOTICES_SCOPE, NOTICES_BUDGET_VARIABLE)

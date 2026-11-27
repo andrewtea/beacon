@@ -6,7 +6,7 @@
     ingest.run(stop)             # polls until the threading.Event is set
 
 See `setup` for how a source goes live, `runner` for the loop, a source's own module
-(`nws`, `adsblol`, `traffic511`, `openmhz`, `notices`) for what its rows hold, and
+(`nws`, `adsblol`, `traffic511`, `recordings`, `notices`) for what its rows hold, and
 `paid` for what the pollers that pay Ember for each item keep to.
 """
 

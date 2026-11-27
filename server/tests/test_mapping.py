@@ -68,7 +68,7 @@ def test_the_place_is_the_block_named_on_the_radio_and_rests_on_the_calls(rows: 
     )
     # Trusted as the radio calls are, and no more.
     assert place.confidence == "medium"
-    assert {source.source for source in place.sources} == {"openmhz"}
+    assert {source.source for source in place.sources} == {"recordings"}
     assert len(place.sources) == 3
     assert all(source.credit is None for source in place.sources)
 

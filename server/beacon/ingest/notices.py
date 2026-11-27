@@ -75,7 +75,7 @@ from urllib.parse import urlsplit
 from beacon.ember import EmberClient, EmberClosedError, EmberError, InputTooLargeError
 from beacon.errors import raise_bare
 from beacon.evidence import EvidenceStore, EvidenceStoreError, NewEvidence, Origin
-from beacon.ingest.http import SourceError, SourceHttp, fetch, read_json
+from beacon.ingest.http import SourceError, SourceHttp, fetch, never_asked, read_json
 from beacon.ingest.paid import Hold, PaidDesk, read_hold
 from beacon.ingest.runner import PollReport
 from beacon.notice import MAX_PDF_BYTES, Notice, NoticeError, is_pdf, read_notice
@@ -142,6 +142,11 @@ class NoticeFeed:
             raise ValueError("The notices feed is named by an https address, with no port.")
         if not all(isinstance(named, str) and named for named in document_hosts):
             raise ValueError("A host a document may be on is named by its name.")
+        if any(never_asked(named) for named in (host, *document_hosts)):
+            raise ValueError(
+                "No feed or document is on a service Beacon requests nothing from, or on a "
+                "host that cannot be read."
+            )
         if ember.mode != ("live" if http.origin == "live" else "fake"):
             # A real notice is not handed to a stand-in for Ember, whose answer
             # would be an invention about a real order, and a real Ember is not

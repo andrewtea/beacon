@@ -69,7 +69,7 @@ class Source:
     """Where a claim comes from: one evidence row, or the taps counted together."""
 
     kind: Kind
-    # The feed, as the evidence store names it: `openmhz`, `nws`, `511`, `notices`,
+    # The feed, as the evidence store names it: `recordings`, `nws`, `511`, `notices`,
     # `adsblol`, `app`.
     source: str
     # The feed in words, for a person.

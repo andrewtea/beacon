@@ -30,7 +30,7 @@ def test_sources_says_the_data_is_mock_and_how_each_pollers_last_poll_went(
         "mode": "mock",
         "sources": [
             {"name": name, "polled_at": None, "ok": None, "partial": False, "rows": 0}
-            for name in ("nws", "adsblol", "511", "openmhz", "notices")
+            for name in ("nws", "adsblol", "511", "recordings", "notices")
         ],
     }
 
@@ -61,7 +61,7 @@ def test_sources_says_the_data_is_mock_and_how_each_pollers_last_poll_went(
                 "rows": 3,
             },
             {
-                "name": "openmhz",
+                "name": "recordings",
                 "polled_at": "2026-11-27T20:00:00Z",
                 "ok": True,
                 "partial": False,
@@ -95,7 +95,7 @@ def test_the_server_runs_the_pollers_on_the_mock_scenario_while_it_is_up() -> No
         "nws",
         "adsblol",
         "511",
-        "openmhz",
+        "recordings",
         "notices",
     ]
     # When the server has shut down, the pollers have stopped and can ask nothing more.
