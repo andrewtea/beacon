@@ -1,18 +1,20 @@
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from beacon.evidence import Evidence
 from beacon.incident import Engine, Incident
 from beacon.incident.build import (
     CREDIT_511,
-    CREDIT_ADSBLOL,
     STATUS_WORDS,
+    credit_of,
     label_of,
     weakest,
 )
-from beacon.investigate import Runs
+from beacon.investigate import Cited, Runs
 from beacon.investigate import card as words
 from beacon.mapping import NO_MAP_OF_MEDICAL, NO_POINT, Feature, drawn
 from beacon.radio.vocabulary import MEDICAL_EVENT
@@ -35,10 +37,21 @@ class PointOut(_Read):
     lon: float
 
 
+class CreditPartOut(_Read):
+    text: str
+    # Where these words link to, or null for words that are no link.
+    url: str | None
+
+
 class CreditOut(_Read):
     # Words a source's terms require beside anything shown from it, and their link.
     text: str
     url: str
+    # The same words in pieces, for a credit whose terms ask for several links
+    # (adsb.lol's: the database, its license, and how Beacon's rows differ). Show
+    # the pieces in order, each with its own link, in place of `text` linked to
+    # `url`. Empty for a credit that is one link.
+    parts: list[CreditPartOut] = []
 
 
 class SourceOut(_Read):
@@ -150,10 +163,10 @@ class CitedOut(BaseModel):
     # How the incident has a signal of that kind now: `same` when it rests on those
     # rows still, `changed` when it rests on others, `gone` when it has none.
     now: Literal["same", "changed", "gone"]
-    # The credit the signal's source requires beside what is shown from it: 511's
-    # for a `closure`, adsb.lol's for `aircraft_circling`. It is here, and not only
-    # on the signal the incident has now, because that signal can be gone while
-    # this is still shown.
+    # The credit the feed requires that the rows it rested on are from, beside
+    # what is shown of it: 511's for a closure, and adsb.lol's for an aircraft
+    # adsb.lol answered with. It is here, and not only on the signal the incident
+    # has now, because that signal can be gone while this is still shown.
     credit: CreditOut | None
 
 
@@ -379,6 +392,8 @@ def crisis_of(request: Request, incident: Incident) -> CrisisOut | None:
     }
     having = [signal for signal in incident.signals if signal.kind in kinds]
     by_model = decision.model == "live"
+    engine: Engine | None = getattr(request.app.state, "incidents", None)
+    get = _no_row if engine is None else engine.store.get
     return CrisisOut(
         active=incident.open,
         decided_at=decision.decided_at,
@@ -395,7 +410,7 @@ def crisis_of(request: Request, incident: Incident) -> CrisisOut | None:
                 else "same"
                 if set(cited.evidence_ids) <= now[cited.kind]
                 else "changed",
-                credit=cited_credit(cited.kind),
+                credit=cited_credit(cited, get),
             )
             for cited in decision.cited
         ],
@@ -409,16 +424,28 @@ def crisis_of(request: Request, incident: Incident) -> CrisisOut | None:
     )
 
 
-# The credit a signal of a kind carries, whichever rows it rested on: a closure is
-# a 511 event, and a circling aircraft is positions from adsb.lol.
-_SIGNAL_CREDITS = {"closure": CREDIT_511, "aircraft_circling": CREDIT_ADSBLOL}
+def _no_row(_evidence_id: int) -> Evidence | None:
+    return None
 
 
-def cited_credit(kind: str) -> CreditOut | None:
-    """The credit that goes with a signal a decision cited: a closure is 511's, and
-    a circling aircraft is adsb.lol's."""
-    credit = _SIGNAL_CREDITS.get(kind)
-    return None if credit is None else CreditOut.model_validate(credit)
+def cited_credit(cited: Cited, get: Callable[[int], Evidence | None]) -> CreditOut | None:
+    """The credit that goes with a signal a decision cited: that of the feed the
+    rows it rested on are from, which `get` reads. A row is never changed or
+    deleted, so it says where the signal came from long after the signal is gone.
+    Nothing is concluded from the signal's kind about a feed: an aircraft of the
+    invented scenario, or of a store from before Beacon asked adsb.lol, carries no
+    notice of adsb.lol's.
+
+    A closure whose rows cannot be read keeps 511's credit: the only rows a
+    closure rests on are 511 events, and 511's agreement asks for the credit."""
+    read = [row for row in map(get, cited.evidence_ids) if row is not None]
+    for row in read:
+        credit = credit_of(row)
+        if credit is not None:
+            return CreditOut.model_validate(credit)
+    if cited.kind == "closure" and not read:
+        return CreditOut.model_validate(CREDIT_511)
+    return None
 
 
 def status_text_of(incident: Incident) -> str | None:

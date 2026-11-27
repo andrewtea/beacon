@@ -8,31 +8,51 @@ speeds in knots, and `seen_pos`, how many seconds before `now` its position is f
 The API and its limits are at https://www.adsb.lol/docs/open-data/api, and the
 interactive schema at https://api.adsb.lol/docs.
 
-**What its terms ask, as read on Nov 27, 2026**, and what Beacon does about each:
+**What its terms ask, as read on Nov 27, 2026**, and what Beacon does about each. The
+license is the Open Database License 1.0
+(https://opendatacommons.org/licenses/odbl/1-0/), and the section numbers are its own:
 
-- The API "is available to everyone", and its data is under the Open Database License
-  1.0 (https://opendatacommons.org/licenses/odbl/1-0/). No permission is asked for,
-  so no setting stands in for one. An older page of adsb.lol's asks people who use it
-  "for production purposes" to get in touch (info@adsb.lol): do that before Beacon is
-  run for the public and not for a demo.
-- **A notice wherever something made from the data is shown** (ODbL 4.3): that it
-  holds information from adsb.lol, available under the ODbL. That is `CREDIT`, which
-  `beacon.incident.build.source_of` puts on every row of this source, as 511's credit
-  is on 511's, so it goes wherever a line, a signal, a ground, a tool's count, or a
-  mark on the map rests on an aircraft's position.
-- **The method by which Beacon's copy differs from the database, offered to whoever
-  is shown something made from it** (ODbL 4.6 b). Beacon's rows are a derivative
-  database: a selection, converted to SI units. The whole method is `parse_aircraft`
-  below, in a public repository: positions inside the city's box, of aircraft that are
-  airborne below `MAX_ALTITUDE_M`, with an ICAO address, seen in the last
-  `MAX_POSITION_AGE_SECONDS`. Beacon hands nobody a copy of its rows, so the
-  share-alike terms for conveying a database (4.2, 4.4) are not met with; if it ever
-  publishes its aircraft rows, they go out under the ODbL.
-- **500 requests a day for each address with no key**, more with a free key, sent as
-  `x-api-key` (1,000 a day for one asked for with a form, 7,200 for somebody who
-  feeds the network). Over the limit the API answers `429` with `Retry-After`, which
-  the runner keeps to. The poller asks no more often than the limit it is told
-  allows, less a margin for restarts: every three minutes with no key.
+- The API "is available to everyone". No permission is asked for, so no setting stands
+  in for one. An older page of adsb.lol's asks people who use it "for production
+  purposes" to get in touch (info@adsb.lol): do that before Beacon is run for the
+  public and not for a demo.
+- **Beacon's aircraft rows are a Derivative Database, and what it shows from them are
+  Produced Works shown to the public**: a line, a signal, a ground, a count, a mark
+  on the map. Three things follow, and `docs/aircraft-data.md` is where each is said
+  to whoever is shown one:
+  - **A notice with each of them** (4.3): that it contains information from adsb.lol,
+    made available under the ODbL, with a link to adsb.lol and a link to the license
+    of their own. That is `CREDIT_PARTS`, which `beacon.incident.build.credit_of`
+    puts on every row adsb.lol answered, and on nothing else: a position of the
+    invented scenario contains no information from adsb.lol, and says so instead.
+  - **The rows are under the ODbL themselves** (4.4 a and c): a Derivative Database
+    is Publicly Used when a Produced Work made from it is, and may then be under no
+    other terms. Beacon licenses its aircraft rows under the ODbL 1.0, and says so in
+    `docs/aircraft-data.md` and in the notice.
+  - **An offer of how the rows differ from adsb.lol's database, to whoever is shown
+    something made from them** (4.6 b): the notice links `docs/aircraft-data.md`,
+    which is free, is versioned with the code it describes, and gives the whole
+    method: what is asked for and how often, what is kept of an answer, how it is
+    converted, and how a row is stored. The method is `parse_aircraft` below; keep
+    the document in step with it.
+  Beacon hands nobody a copy of its rows, so the terms for conveying a database (4.2)
+  are not met with. If it ever does, the copy goes out under the ODbL with the
+  license's address in it.
+- **500 requests a day for each address with no key**, and the same for a key had
+  without an account. A key asked for with adsb.lol's form allows 1,000, one for
+  somebody who feeds the network 7,200, and the daily window begins at 00:00 UTC. A
+  key is sent as `x-api-key`, and what it allows is not in the key, so the poller
+  takes any key to allow 500 until it is told more (`requests_per_day`). Over the
+  limit the API answers `429` with `Retry-After`.
+- **The allowance is kept to across restarts.** Before it asks, a live poller writes
+  into the evidence store the moment before which it will not ask again
+  (`not_before`): one interval on, where the interval is a day divided by the
+  allowance less `_SPARE_REQUESTS`, so no twenty-four hours hold more requests of
+  Beacon's than that. A `429`
+  moves that moment to the end of the wait adsb.lol asked for. A process that starts
+  reads it before it asks anything. It is one process's promise: two that share an
+  address and not a data directory each keep their own, which is one more reason to
+  run one server for each data directory.
 
 Each position of an aircraft is one row. Only aircraft a person on the street could
 notice are kept: airborne and below `MAX_ALTITUDE_M`. An airliner at cruise is not
@@ -49,31 +69,47 @@ A row's `data`, in SI units:
     climb_mps        or null
     squawk           or null
     position_source  how the position was had: `adsb`, `adsr`, `tisb`, `adsc`,
-                     `mlat`, or `other`
+                     `mlat`, or `other`. An answer says which of an aircraft's
+                     fields were worked out by multilateration or relayed by a ground
+                     station (`mlat`, `tisb`), and that outranks the aircraft's
+                     `type`, which is its best source for anything.
     category         one of `AIRCRAFT_CATEGORIES`, such as `rotorcraft`, or null
 """
 
 import math
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from beacon.errors import raise_bare
 from beacon.evidence import Confidence, EvidenceStore, NewEvidence, Origin, Point
 from beacon.ingest.area import SAN_FRANCISCO, Bounds
 from beacon.ingest.http import SourceError, SourceHttp, fetch, read_json
-from beacon.ingest.runner import PollReport
+from beacon.ingest.runner import PollerHeldError, PollReport
 
 SOURCE = "adsblol"
 API = "https://api.adsb.lol"
 
-# The words the Open Database License asks for wherever something made from the data
-# is shown (4.3), with the license's address in them because a credit has one link,
-# which is adsb.lol's.
-CREDIT_TEXT = (
-    "Contains information from adsb.lol, which is made available here under the "
-    "Open Database License (ODbL): https://opendatacommons.org/licenses/odbl/1-0/"
+DATABASE_URL = "https://www.adsb.lol"
+LICENSE_URL = "https://opendatacommons.org/licenses/odbl/1-0/"
+# Where Beacon says that its aircraft rows are under the ODbL and how they differ from
+# adsb.lol's database (ODbL 4.4 and 4.6 b): a document in Beacon's public repository.
+METHOD_URL = "https://github.com/andrewtea/beacon/blob/main/docs/aircraft-data.md"
+# The notice the license asks for wherever something made from the data is shown
+# (4.3 a), in pieces: the words, and for the name of the database and of the license
+# a link of its own, as the license's example has them.
+CREDIT_PARTS: tuple[tuple[str, str | None], ...] = (
+    ("Contains information from ", None),
+    ("adsb.lol", DATABASE_URL),
+    (", which is made available here under the ", None),
+    ("Open Database License (ODbL)", LICENSE_URL),
+    (". Beacon's aircraft rows are under the same license: ", None),
+    ("what Beacon keeps of adsb.lol's data, and how", METHOD_URL),
+    (".", None),
 )
-CREDIT_URL = "https://www.adsb.lol"
+CREDIT_TEXT = "".join(words for words, _ in CREDIT_PARTS)
+# The one address of a credit that has no pieces, for a reader that shows only that.
+CREDIT_URL = DATABASE_URL
 
 # Above this an aircraft is passing over, not circling a block.
 MAX_ALTITUDE_M = 3_000.0
@@ -81,18 +117,24 @@ MAX_ALTITUDE_M = 3_000.0
 # not where it is.
 MAX_POSITION_AGE_SECONDS = 60.0
 
-# What adsb.lol allows an address with no key, and a key that was asked for with
-# its form, in requests a day. A key that allows more is said with `requests_per_day`.
-ANONYMOUS_REQUESTS_PER_DAY = 500
-KEYED_REQUESTS_PER_DAY = 1_000
+# What adsb.lol allows an address with no key, and a key had without an account, in
+# requests a day. A key that allows more is said with `requests_per_day`: 1,000 for
+# one asked for with adsb.lol's form.
+DEFAULT_REQUESTS_PER_DAY = 500
 MAX_REQUESTS_PER_DAY = 360_000
-# The part of a day's allowance the poller plans to use. The rest is for the polls a
-# restart makes at once.
-_SHARE_OF_ALLOWANCE = 0.96
+# How many requests of a day's allowance the poller plans not to use: adsb.lol
+# counts a request when it arrives and by its own clock, so one that Beacon sent
+# just before midnight UTC can be counted in the day after.
+_SPARE_REQUESTS = 4
 # However much a key allows, the sky over a city is not asked for more often.
 MIN_INTERVAL_SECONDS = 10.0
 # The mock scenario has no allowance to keep to, and is asked this often.
 MOCK_INTERVAL_SECONDS = 30.0
+# The longest a live poller leaves adsb.lol alone because of what it wrote down or
+# was told: the daily window begins again within a day, and a moment further off
+# than that is a clock that was wrong.
+MAX_HOLD_SECONDS = 86_400.0
+_HELD = "adsb.lol is not asked again yet: Beacon keeps to its allowance across restarts."
 
 _MAX_BYTES = 5_000_000
 _MAX_RADIUS_NM = 250
@@ -141,12 +183,17 @@ class AdsbLolAircraft:
         requests_per_day: int | None = None,
         bounds: Bounds = SAN_FRANCISCO,
         interval_seconds: float | None = None,
+        wall_clock: Callable[[], datetime] | None = None,
     ) -> None:
         """`api_key` is an adsb.lol key, sent as `x-api-key`. `requests_per_day` is
-        what that key allows when it is not the 1,000 of a key asked for with the
-        form; it cannot be said without a key, because with none the limit is
-        adsb.lol's 500 for the address. `interval_seconds` is for the mock
-        scenario, which has no allowance to keep to and sets its own."""
+        what that key allows when it is more than the 500 of a key had without an
+        account; it cannot be said without a key, because with none the limit is
+        adsb.lol's 500 for the address. `interval_seconds` is for a stand-in for
+        adsb.lol that is played on a clock of its own, as the mock scenario is: a
+        poller given one keeps to no allowance and writes no moment down, and a
+        poller that asks the network is refused one, since its interval is the
+        allowance's to say. `wall_clock` is the time a wait adsb.lol asked for is
+        counted from, which is when it answered."""
         if api_key is not None and not (
             0 < len(api_key) <= 200 and set(api_key) <= _KEY_CHARACTERS
         ):
@@ -158,16 +205,24 @@ class AdsbLolAircraft:
                 1 <= requests_per_day <= MAX_REQUESTS_PER_DAY
             ):
                 raise ValueError("A key's requests a day are a number from 1 to 360,000.")
+        if interval_seconds is not None:
+            if http.origin == "live":
+                raise ValueError("How often adsb.lol itself is asked is its allowance's to say.")
+            if isinstance(interval_seconds, bool) or not 0 < interval_seconds <= MAX_HOLD_SECONDS:
+                raise ValueError("An interval is a number of seconds, up to a day.")
         self._http = http
         self._api_key = api_key
         self._bounds = bounds
         self._centre, self._radius_nm = _circle_around(bounds)
-        allowed = requests_per_day or (
-            ANONYMOUS_REQUESTS_PER_DAY if api_key is None else KEYED_REQUESTS_PER_DAY
+        allowed = DEFAULT_REQUESTS_PER_DAY if requests_per_day is None else requests_per_day
+        # Every poller keeps to the allowance but one that was given an interval.
+        self._keeps_allowance = interval_seconds is None
+        self.interval_seconds = (
+            max(MIN_INTERVAL_SECONDS, 86_400 / max(1, allowed - _SPARE_REQUESTS))
+            if interval_seconds is None
+            else float(interval_seconds)
         )
-        self.interval_seconds = interval_seconds or max(
-            MIN_INTERVAL_SECONDS, 86_400 / (allowed * _SHARE_OF_ALLOWANCE)
-        )
+        self._wall_clock = (lambda: datetime.now(UTC)) if wall_clock is None else wall_clock
 
     @property
     def origin(self) -> Origin:
@@ -178,17 +233,69 @@ class AdsbLolAircraft:
 
     def poll(self, store: EvidenceStore, now: datetime) -> PollReport:
         store.refuse_stand_in(self.origin)
-        body = fetch(
-            self._http,
-            "GET",
-            f"{API}/v2/point/{self._centre.lat:.4f}/{self._centre.lon:.4f}/{self._radius_nm}",
-            source=SOURCE,
-            max_bytes=_MAX_BYTES,
-            headers={} if self._api_key is None else {"x-api-key": self._api_key},
-        )
+        # The mock scenario has no allowance: it is played on a clock of its own,
+        # and a step of it that failed is played again at the same moment.
+        if self._keeps_allowance:
+            self._reserve(store, now)
+        try:
+            body = fetch(
+                self._http,
+                "GET",
+                f"{API}/v2/point/{self._centre.lat:.4f}/{self._centre.lon:.4f}/{self._radius_nm}",
+                source=SOURCE,
+                max_bytes=_MAX_BYTES,
+                headers={} if self._api_key is None else {"x-api-key": self._api_key},
+            )
+        except SourceError as error:
+            if self._keeps_allowance and _is_wait(error.retry_after):
+                self._wait(store, now, min(float(error.retry_after), MAX_HOLD_SECONDS))
+            raise
         aircraft, unreadable = parse_aircraft(read_json(body, SOURCE), self.origin, self._bounds)
         added = store.add(aircraft, now=now)
         return PollReport(added=len(added), unreadable=unreadable)
+
+    def _reserve(self, store: EvidenceStore, now: datetime) -> None:
+        """Write down, before adsb.lol is asked, the moment before which it is not
+        asked again, so that a process that starts later keeps to it. When the
+        moment an earlier request wrote down has not come, nothing is asked.
+
+        Raises PollerHeldError in that case, and what the store raises when the
+        moment could not be written: then nothing is asked either."""
+        held = _not_before(store.state(self.name), now)
+        if held is not None and now < held:
+            raise_bare(PollerHeldError(_HELD, (held - now).total_seconds()))
+        self._save(store, now, now + timedelta(seconds=self.interval_seconds))
+
+    def _wait(self, store: EvidenceStore, now: datetime, seconds: float) -> None:
+        """Keep the wait adsb.lol asked for, counted from when it answered, when it
+        ends later than the moment already written down."""
+        until = self._wall_clock() + timedelta(seconds=seconds)
+        held = _not_before(store.state(self.name), now)
+        if held is None or until > held:
+            self._save(store, now, until)
+
+    def _save(self, store: EvidenceStore, now: datetime, not_before: datetime) -> None:
+        store.add([], state=(self.name, {"not_before": not_before.isoformat()}), now=now)
+
+
+def _not_before(saved: dict[str, Any], now: datetime) -> datetime | None:
+    """The moment a poller wrote down before which adsb.lol is not asked again, or
+    None when it wrote none that can be read. Never more than `MAX_HOLD_SECONDS`
+    from now: a moment further off is from a clock that has since been set back."""
+    text = saved.get("not_before")
+    if not isinstance(text, str) or len(text) > 40:
+        return None
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if moment.utcoffset() is None:
+        return None
+    return min(moment, now + timedelta(seconds=MAX_HOLD_SECONDS))
+
+
+def _is_wait(seconds: Any) -> bool:
+    return _is_number(seconds) and seconds > 0
 
 
 def parse_aircraft(
@@ -250,7 +357,7 @@ def _aircraft(
         return None
     if not bounds.holds(point):
         return None
-    position_source = _POSITION_SOURCES.get(entry.get("type"), "other")
+    position_source = _position_source(entry)
     # A position the aircraft broadcast itself is better than one worked out from
     # when its signal reached several receivers, or relayed by a ground station.
     confidence: Confidence = "high" if position_source == "adsb" else "medium"
@@ -265,7 +372,7 @@ def _aircraft(
         origin=origin,
         data={
             "icao24": address,
-            "callsign": callsign.strip() or None if isinstance(callsign, str) else None,
+            "callsign": _callsign(callsign),
             "altitude_m": round(altitude_m, 1),
             "speed_mps": _scaled(entry.get("gs"), _MPS_PER_KNOT),
             # Degrees clockwise from north.
@@ -281,6 +388,31 @@ def _aircraft(
             "category": _CATEGORIES.get(category) if isinstance(category, str) else None,
         },
     )
+
+
+def _position_source(entry: dict[str, Any]) -> str:
+    """How an aircraft's position was had. An answer lists the fields that were
+    worked out from when a signal reached several receivers (`mlat`) and the ones a
+    ground station relayed (`tisb`), and a position on either list is that, whatever
+    the aircraft's `type` says of its best source. A list that cannot be read says
+    nothing either way, and the position is then `other`."""
+    for listed, source in (("mlat", "mlat"), ("tisb", "tisb")):
+        fields = entry.get(listed)
+        if fields is None:
+            continue
+        if not isinstance(fields, list):
+            return "other"
+        if any(name in ("lat", "lon") for name in fields if isinstance(name, str)):
+            return source
+    kind = entry.get("type")
+    return _POSITION_SOURCES.get(kind, "other") if isinstance(kind, str) else "other"
+
+
+def _callsign(callsign: Any) -> str | None:
+    """A callsign as broadcast, which is eight characters, or None."""
+    if not isinstance(callsign, str) or len(callsign) > 16:
+        return None
+    return callsign.strip() or None
 
 
 def _circle_around(bounds: Bounds) -> tuple[Point, int]:
@@ -302,4 +434,11 @@ def _scaled(value: Any, factor: float) -> float | None:
 
 
 def _is_number(value: Any) -> bool:
-    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+    """Whether a value of an answer is a number arithmetic can be done with. JSON
+    has whole numbers too large to be one, and those are not."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False

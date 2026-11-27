@@ -41,6 +41,7 @@ from beacon.evidence import EvidenceStore, Point
 from beacon.incident import Incident, Snapshot
 from beacon.incident.aircraft import NEAR_M as AIRCRAFT_NEAR_M
 from beacon.incident.aircraft import Track, tracks
+from beacon.incident.build import credited
 from beacon.incident.model import SignalKind
 from beacon.ingest.adsblol import AIRCRAFT_CATEGORIES
 from beacon.notice import NOTICE_TYPES
@@ -360,12 +361,31 @@ def _nearby_incidents(
                 "distance_m": _rounded(distance),
                 "point_from": incident.point_from,
             }
+            | _overhead_kept(scene, incident)
             for distance, incident in near
         ],
         "more": more,
         "unlocated": unlocated,
     }
     return told, kept, None
+
+
+def _overhead_kept(scene: Scene, incident: Incident) -> dict[str, Any]:
+    """Which feeds, among those with a credit of their own, the positions are from
+    of the aircraft the ground `aircraft_overhead` would rest on, and of the
+    rotorcraft among them, which a helicopter made out in a clip or a photo is
+    checked against. It is kept because a ground keeps no rows: what is shown of
+    the ground carries the credit of the feed it rested on then, and of no other.
+    Names from `beacon.incident.build.CREDITS`, and nothing for a medical response."""
+    if incident.category == MEDICAL_EVENT:
+        return {}
+    over = overhead(incident, scene)
+    return {
+        "aircraft_credits": credited(row for track in over for row in track.rows),
+        "rotorcraft_credits": credited(
+            row for track in over if track.category == "rotorcraft" for row in track.rows
+        ),
+    }
 
 
 def _incident_told(scene: Scene, incident: Incident, distance: float) -> dict[str, Any]:
@@ -394,9 +414,12 @@ def _incident_told(scene: Scene, incident: Incident, distance: float) -> dict[st
     }
 
 
-def overhead(
-    incident: Incident, scene: Scene, *, since: timedelta = timedelta(minutes=15)
-) -> list[Track]:
+# How long before a tap an aircraft over an incident has to have been in reach of
+# the tap, for the two to be tied by it.
+OVERHEAD_SINCE = timedelta(minutes=15)
+
+
+def overhead(incident: Incident, scene: Scene, *, since: timedelta = OVERHEAD_SINCE) -> list[Track]:
     """The aircraft that circled or came low over `incident` and were, shortly
     before the tap, also within reach of where the tap came from: one track that
     is over both, not one over each."""
@@ -499,6 +522,8 @@ def _get_aircraft(
         "circling": sum(track.circling for track in seen),
         "low": sum(track.low for track in seen),
         "more": more,
+        # The feeds whose credit goes with these counts, from the positions counted.
+        "credits": credited(row for track in seen for row in track.rows),
     }
     return told, kept, None
 
@@ -519,6 +544,7 @@ def _get_official(
             "closures": 0,
             "conflicts": [],
             "signals": [],
+            "credits": [],
         }
         return {"incident": incident.id, "official": [], "signals": []}, nothing, None
     # The rows the engine's own closure signal rests on: the version in force of
@@ -555,6 +581,16 @@ def _get_official(
         "closures": len(closures),
         "conflicts": [conflict.kind for conflict in incident.conflicts],
         "signals": [signal.kind for signal in incident.signals],
+        # The feeds whose credit goes with the signals named here, from the rows
+        # each signal rests on.
+        "credits": sorted(
+            {
+                source.source
+                for signal in incident.signals
+                for source in signal.sources
+                if source.credit is not None
+            }
+        ),
     }
     return told, kept, None
 

@@ -73,9 +73,26 @@ function webAddress(url: string | null): string | null {
 }
 
 /** The words a source's terms require beside what is shown from it. The words
- * are shown whether or not their address is one a link may open. */
+ * are shown whether or not their address is one a link may open. A credit that
+ * comes in pieces is shown piece by piece, each link going where its own words
+ * say: a license's name to the license, and not to the database beside it. */
 export function CreditLine({ credit }: { credit: Credit | null }) {
   if (credit === null) return null
+  if (credit.parts.length > 0)
+    return (
+      <span className="credit">
+        {credit.parts.map((part, index) => {
+          const address = webAddress(part.url)
+          return address === null ? (
+            <span key={index}>{part.text}</span>
+          ) : (
+            <a key={index} href={address} target="_blank" rel="noreferrer">
+              {part.text}
+            </a>
+          )
+        })}
+      </span>
+    )
   const address = webAddress(credit.url)
   if (address === null) return <span className="credit">{credit.text}</span>
   return (

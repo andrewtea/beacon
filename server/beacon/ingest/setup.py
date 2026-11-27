@@ -12,7 +12,8 @@ A source needs no code change to go live, only its name in that list and what it
     nws       nothing
     511       BEACON_511_API_KEY
     adsblol   nothing; optionally BEACON_ADSBLOL_API_KEY, a key of adsb.lol's, and
-              with it BEACON_ADSBLOL_REQUESTS_PER_DAY, what the key allows
+              with it BEACON_ADSBLOL_REQUESTS_PER_DAY, what the key allows, without
+              which a key is taken to allow the 500 a day that no key does
     openmhz   BEACON_OPENMHZ_PERMITTED=1, which says OpenMHz has given Beacon
               permission to use its audio; BEACON_OPENMHZ_TALKGROUPS, the channels
               to hear; BEACON_OPENMHZ_BUDGET_USD, the most hearing them may cost;

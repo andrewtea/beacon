@@ -1,21 +1,23 @@
 """The adsb.lol aircraft poller, against hand-written answers in the API's format."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import httpx2
 import pytest
 
-from beacon.evidence import EvidenceStore, Point
+from beacon.evidence import EvidenceStore, EvidenceStoreError, Point
 from beacon.ingest.adsblol import (
     MAX_ALTITUDE_M,
+    MAX_HOLD_SECONDS,
     MAX_POSITION_AGE_SECONDS,
     AdsbLolAircraft,
     parse_aircraft,
 )
 from beacon.ingest.area import SAN_FRANCISCO
 from beacon.ingest.http import SourceError, SourceHttp
+from beacon.ingest.runner import PollerHeldError
 
 NOON = datetime(2026, 11, 27, 20, 0, tzinfo=UTC)
 # 2026-11-27T20:00:00Z in milliseconds of Unix time.
@@ -45,6 +47,10 @@ def craft(address: str = "a1b2c3", **changes: Any) -> dict[str, Any]:
         "seen_pos": 2.0,
         "seen": 0.4,
         "messages": 1900,
+        # The fields that were worked out by multilateration, and the ones a ground
+        # station relayed.
+        "mlat": [],
+        "tisb": [],
         "rssi": -9.5,
     }
     assert set(changes) <= set(fields)
@@ -104,24 +110,29 @@ def test_with_no_key_the_poller_asks_for_a_circle_that_holds_the_city_within_the
         Point(SAN_FRANCISCO.north, SAN_FRANCISCO.east),
     ):
         assert middle.distance_m(corner) < 7 * 1852
-    # 500 requests a day for an address with no key, with some left for restarts.
-    assert 470 <= 86_400 / poller.interval_seconds <= 490
+    # 500 requests a day for an address with no key, less a few: adsb.lol counts by
+    # its own clock.
+    assert round(86_400 / poller.interval_seconds) == 496
 
 
 def test_a_key_is_sent_and_lets_the_poller_ask_as_often_as_the_key_allows(
     store: EvidenceStore, api: Api
 ) -> None:
     http = SourceHttp(httpx2.MockTransport(api))
-    asked_for = AdsbLolAircraft(http, api_key="key-of-ours")
+    unsaid = AdsbLolAircraft(http, api_key="key-of-ours")
+    asked_for = AdsbLolAircraft(http, api_key="key-of-ours", requests_per_day=1_000)
     feeder = AdsbLolAircraft(http, api_key="key-of-ours", requests_per_day=7_200)
     sponsor = AdsbLolAircraft(http, api_key="key-of-ours", requests_per_day=360_000)
 
-    asked_for.poll(store, NOON)
+    unsaid.poll(store, NOON)
 
     assert api.requests[0].headers["x-api-key"] == "key-of-ours"
-    # A key asked for with adsb.lol's form allows 1,000 requests a day.
-    assert 940 <= 86_400 / asked_for.interval_seconds <= 1_000
-    assert 6_800 <= 86_400 / feeder.interval_seconds <= 7_200
+    # What a key allows is not in the key. A key had without an account allows the
+    # 500 an address has with none, so that is what a key is taken to allow until
+    # the poller is told more: 1,000 for one asked for with adsb.lol's form.
+    assert round(86_400 / unsaid.interval_seconds) == 496
+    assert round(86_400 / asked_for.interval_seconds) == 996
+    assert round(86_400 / feeder.interval_seconds) == 7_196
     # However much a key allows, the city's sky is asked for every ten seconds at most.
     assert sponsor.interval_seconds == 10.0
 
@@ -145,6 +156,150 @@ def test_a_key_or_an_allowance_that_is_not_one_is_refused(settings: dict[str, An
         AdsbLolAircraft(SourceHttp(httpx2.MockTransport(Api())), **settings)
 
 
+def test_how_often_adsb_lol_itself_is_asked_cannot_be_set() -> None:
+    # Asks nothing: a poller that would ask the network is refused an interval.
+    with SourceHttp() as network, pytest.raises(ValueError, match="its allowance's to say"):
+        AdsbLolAircraft(network, interval_seconds=2.0)
+    stand_in = SourceHttp(httpx2.MockTransport(Api()))
+    # A stand-in played on a clock of its own has no allowance, and is given one.
+    assert AdsbLolAircraft(stand_in, interval_seconds=30.0).interval_seconds == 30.0
+    for interval in (0, -1.0, True, 86_401.0):
+        with pytest.raises(ValueError, match="An interval"):
+            AdsbLolAircraft(stand_in, interval_seconds=interval)
+
+
+def test_a_process_that_starts_again_keeps_to_the_allowance(store: EvidenceStore, api: Api) -> None:
+    http = SourceHttp(httpx2.MockTransport(api))
+    first = AdsbLolAircraft(http)
+    first.poll(store, NOON)
+
+    # Another process, begun a minute later, with nothing in memory of the first.
+    again = AdsbLolAircraft(http)
+    with pytest.raises(PollerHeldError, match="not asked again yet") as held:
+        again.poll(store, NOON + timedelta(seconds=60))
+
+    assert len(api.requests) == 1
+    # It is told how long is left of the interval, and asks when it is over.
+    assert held.value.retry_after == pytest.approx(first.interval_seconds - 60)
+    assert (held.value.__cause__, held.value.__context__) == (None, None)
+    again.poll(store, NOON + timedelta(seconds=first.interval_seconds))
+    assert len(api.requests) == 2
+
+
+def test_the_moment_is_written_down_before_adsb_lol_is_asked(
+    store: EvidenceStore, api: Api
+) -> None:
+    poller = AdsbLolAircraft(SourceHttp(httpx2.MockTransport(api)))
+    seen: list[Any] = []
+
+    def looked(request: httpx2.Request) -> httpx2.Response:
+        seen.append(store.state("adsblol"))
+        return api(request)
+
+    AdsbLolAircraft(SourceHttp(httpx2.MockTransport(looked))).poll(store, NOON)
+
+    until = NOON + timedelta(seconds=poller.interval_seconds)
+    assert seen == [{"not_before": until.isoformat()}]
+
+    # A request that fails has still been made, and counts.
+    def down(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(503)
+
+    failing = AdsbLolAircraft(SourceHttp(httpx2.MockTransport(down)))
+    with pytest.raises(SourceError):
+        failing.poll(store, until)
+    with pytest.raises(PollerHeldError):
+        poller.poll(store, until + timedelta(seconds=1))
+    # Only the first of the three reached the stand-in that answers.
+    assert len(api.requests) == 1
+
+
+def test_when_the_moment_cannot_be_written_down_nothing_is_asked(
+    store: EvidenceStore, api: Api
+) -> None:
+    poller = AdsbLolAircraft(SourceHttp(httpx2.MockTransport(api)))
+    store.close()
+
+    with pytest.raises(EvidenceStoreError):
+        poller.poll(store, NOON)
+
+    assert api.requests == []
+
+
+def test_the_wait_adsb_lol_asks_for_is_kept_across_a_restart(
+    store: EvidenceStore, api: Api
+) -> None:
+    def spent(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(429, headers={"Retry-After": "5400"})
+
+    # It answered three seconds after the poll began, and the wait is from then.
+    answered = NOON + timedelta(seconds=3)
+    poller = AdsbLolAircraft(SourceHttp(httpx2.MockTransport(spent)), wall_clock=lambda: answered)
+    with pytest.raises(SourceError):
+        poller.poll(store, NOON)
+
+    again = AdsbLolAircraft(SourceHttp(httpx2.MockTransport(api)))
+    with pytest.raises(PollerHeldError) as held:
+        again.poll(store, NOON + timedelta(hours=1))
+    assert held.value.retry_after == pytest.approx(1803.0)
+    assert api.requests == []
+    again.poll(store, answered + timedelta(seconds=5400))
+    assert len(api.requests) == 1
+
+
+def test_a_wait_is_never_made_shorter_and_never_longer_than_a_day(
+    store: EvidenceStore, api: Api
+) -> None:
+    waits = iter(["1", "99999999"])
+    clock = [NOON]
+
+    def spent(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(429, headers={"Retry-After": next(waits)})
+
+    poller = AdsbLolAircraft(SourceHttp(httpx2.MockTransport(spent)), wall_clock=lambda: clock[0])
+    with pytest.raises(SourceError):
+        poller.poll(store, NOON)
+    # A wait of a second ends before the interval that was written down does.
+    until = NOON + timedelta(seconds=poller.interval_seconds)
+    assert store.state("adsblol") == {"not_before": until.isoformat()}
+
+    clock[0] = until
+    with pytest.raises(SourceError):
+        poller.poll(store, until)
+    # The daily window begins again within a day, whatever the answer says.
+    day = until + timedelta(seconds=MAX_HOLD_SECONDS)
+    assert store.state("adsblol") == {"not_before": day.isoformat()}
+
+
+@pytest.mark.parametrize("saved", ["soon", 7, None, "2026-11-27T20:00:00", "9" * 41])
+def test_a_moment_that_cannot_be_read_holds_nothing_and_one_too_far_off_holds_a_day(
+    store: EvidenceStore, api: Api, saved: Any
+) -> None:
+    poller = AdsbLolAircraft(SourceHttp(httpx2.MockTransport(api)))
+    store.add([], state=("adsblol", {"not_before": saved}), now=NOON)
+
+    poller.poll(store, NOON)
+
+    assert len(api.requests) == 1
+    # A moment a year off is from a clock that has since been set back.
+    far = NOON + timedelta(days=365)
+    store.add([], state=("adsblol", {"not_before": far.isoformat()}), now=NOON)
+    with pytest.raises(PollerHeldError) as held:
+        poller.poll(store, NOON)
+    assert held.value.retry_after == MAX_HOLD_SECONDS
+
+
+def test_the_mock_scenarios_poller_keeps_no_allowance(store: EvidenceStore, api: Api) -> None:
+    poller = AdsbLolAircraft(SourceHttp(httpx2.MockTransport(api)), interval_seconds=30.0)
+
+    # A step of the scenario that failed is played again at the same moment.
+    poller.poll(store, NOON)
+    poller.poll(store, NOON)
+
+    assert len(api.requests) == 2
+    assert store.state("adsblol") == {}
+
+
 def test_an_aircraft_becomes_a_row_named_by_its_address_and_the_time_of_its_position(
     store: EvidenceStore, api: Api
 ) -> None:
@@ -154,7 +309,7 @@ def test_an_aircraft_becomes_a_row_named_by_its_address_and_the_time_of_its_posi
     first = poller.poll(store, NOON)
     # An aircraft that was not heard from again is listed with the same position.
     api.aircraft = [craft(seen_pos=2.0)]
-    second = poller.poll(store, NOON)
+    second = poller.poll(store, NOON + timedelta(minutes=3))
 
     assert (first.added, second.added) == (1, 0)
     (aircraft,) = store.search()
@@ -247,6 +402,74 @@ def test_only_a_position_the_aircraft_broadcast_itself_is_trusted_highly(
     assert (aircraft.data["position_source"], aircraft.confidence) == (source, confidence)
 
 
+@pytest.mark.parametrize(
+    ("flags", "source", "confidence"),
+    [
+        # The aircraft broadcasts, and this position was still worked out from when
+        # its signal reached several receivers, or relayed by a ground station.
+        ({"mlat": ["lat", "lon", "nic", "rc"]}, "mlat", "medium"),
+        ({"mlat": ["lon"]}, "mlat", "medium"),
+        ({"tisb": ["lat", "lon"]}, "tisb", "medium"),
+        ({"mlat": ["lat"], "tisb": ["lat"]}, "mlat", "medium"),
+        # Other fields were, and the position is the aircraft's own.
+        ({"mlat": ["gs", "track", "baro_rate"]}, "adsb", "high"),
+        ({"mlat": ..., "tisb": ...}, "adsb", "high"),
+        # A list that cannot be read says nothing either way.
+        ({"mlat": "lat"}, "other", "medium"),
+        ({"tisb": {"lat": True}}, "other", "medium"),
+        ({"mlat": [["lat"], 7, None]}, "adsb", "high"),
+    ],
+)
+def test_how_a_position_was_had_outranks_the_aircrafts_best_source(
+    flags: dict[str, Any], source: str, confidence: str
+) -> None:
+    (aircraft,), _ = parse_aircraft(answer(craft(type="adsb_icao", **flags)), "live")
+
+    assert (aircraft.data["position_source"], aircraft.confidence) == (source, confidence)
+
+
+HUGE = 10**400
+
+
+def test_one_entry_that_is_not_as_expected_does_not_cost_the_others() -> None:
+    kept, unreadable = parse_aircraft(
+        answer(
+            craft("ccccc1", type=["adsb_icao"]),
+            craft("ccccc2", type={"best": "mlat"}),
+            # Whole numbers too large for arithmetic, which JSON allows.
+            craft("ccccc3", gs=HUGE, track=HUGE, baro_rate=-HUGE),
+            craft("ccccc4", alt_geom=HUGE),
+            craft("ccccc5", alt_geom=..., alt_baro=HUGE),
+            craft("ccccc6", seen_pos=HUGE),
+            craft("ccccc7", lat=HUGE),
+            craft("ccccc8", flight="N" * 500, squawk=["1200"], category=["A7"]),
+            craft("ccccc9"),
+        ),
+        "live",
+    )
+
+    assert unreadable == 0
+    assert [(row.data["icao24"], row.data["position_source"]) for row in kept] == [
+        ("ccccc1", "other"),
+        ("ccccc2", "other"),
+        ("ccccc3", "adsb"),
+        ("ccccc4", "adsb"),
+        ("ccccc8", "adsb"),
+        ("ccccc9", "adsb"),
+    ]
+    by_address = {row.data["icao24"]: row.data for row in kept}
+    assert by_address["ccccc3"] | {"icao24": ""} == by_address["ccccc9"] | {
+        "icao24": "",
+        "speed_mps": None,
+        "track_deg": None,
+        "climb_mps": None,
+    }
+    # With no height it can use, the barometric one is the height.
+    assert by_address["ccccc4"]["altitude_m"] == round(950 * FEET, 1)
+    assert (by_address["ccccc8"]["callsign"], by_address["ccccc8"]["squawk"]) == (None, None)
+    assert by_address["ccccc8"]["category"] is None
+
+
 def test_an_entry_beacon_cannot_read_is_counted_or_passed_over() -> None:
     kept, unreadable = parse_aircraft(
         answer(
@@ -298,6 +521,7 @@ def test_an_empty_sky_is_not_an_error(store: EvidenceStore, api: Api) -> None:
         {"ac": [], "now": "today"},
         {"ac": [], "now": 0},
         {"ac": [], "now": True},
+        {"ac": [], "now": HUGE},
     ],
 )
 def test_an_answer_that_is_not_a_list_of_aircraft_made_at_a_moment_is_an_error(

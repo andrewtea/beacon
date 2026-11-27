@@ -56,6 +56,11 @@ _WAIT_SECONDS = 5.0
 _FORMAT = 2
 # 0 is a file that says no shape, which a new file is too. 1 kept a decision's
 # signals as their kinds only, and of `nearby_incidents` only the ids.
+#
+# A key added to what a tool keeps (`Call.returned`) that a reader takes as absent
+# when it is not there is no new shape: the feeds a count or a ground rested on
+# (`credits`, `aircraft_credits`, `rotorcraft_credits`) are read that way, so a run
+# kept before they were written names none and is kept, with the decision it made.
 _EARLIER = frozenset({0, 1})
 _SCHEMA = (
     """

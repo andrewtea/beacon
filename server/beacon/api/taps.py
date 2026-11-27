@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
@@ -10,7 +10,7 @@ from beacon.api.body import read_body
 from beacon.api.incidents import CreditOut, IncidentSummary, cited_credit, summary_of
 from beacon.evidence import Evidence
 from beacon.incident import Engine, Snapshot
-from beacon.incident.build import CREDIT_511, CREDIT_ADSBLOL
+from beacon.incident.build import CREDIT_511, CREDITS
 from beacon.investigate import KEPT, Accounting, InvestigationDesk, Outcome, Run, Runs
 from beacon.investigate import card as words
 from beacon.investigate.tools import Call
@@ -87,7 +87,10 @@ class GroundOut(BaseModel):
     # `incident_aircraft` for the incident's own aircraft in the run's reading.
     basis: str
     # The credit a source's terms require beside it: 511's, when the incident's
-    # place was taken from a closure 511 lists, and adsb.lol's for an aircraft.
+    # place was taken from a closure 511 lists, and adsb.lol's, when the ground
+    # rests on an aircraft whose positions adsb.lol answered with (an aircraft
+    # overhead, or a helicopter made out in a clip or a photo). It is from what the
+    # run kept of where the positions came from: an invented aircraft has none.
     # Show it with the ground.
     credit: CreditOut | None
 
@@ -202,8 +205,9 @@ class CallOut(BaseModel):
     returned: dict[str, Any]
     returned_text: str
     # The credits the sources of what came back require: 511's, when a count of
-    # road closures or an incident's place is from 511, and adsb.lol's, when
-    # aircraft were found. Show them with the call.
+    # road closures or an incident's place is from 511, and adsb.lol's, when the
+    # aircraft counted, or a signal named, rest on positions adsb.lol answered
+    # with. Show them with the call.
     credits: list[CreditOut]
     # The call to Ember a clip or a photo was given to. Null for the other tools.
     ember: EmberCallOut | None
@@ -222,8 +226,9 @@ class CitedThen(BaseModel):
     kind: str
     confidence: Literal["official", "high", "medium", "low"]
     evidence_ids: list[int]
-    # 511's credit for a `closure` and adsb.lol's for `aircraft_circling`, to be
-    # shown with it: the incident may have no such signal now to carry it.
+    # The credit of the feed the rows it rested on are from, to be shown with it:
+    # 511's for a closure, and adsb.lol's for an aircraft adsb.lol answered with.
+    # The incident may have no such signal now to carry it.
     credit: CreditOut | None
 
 
@@ -233,6 +238,9 @@ class OutcomeOut(BaseModel):
     text: str
     incident_id: str | None
     grounds: list[str]
+    # The credits the feeds require that the grounds rested on, each once, to be
+    # shown with the grounds: the same as each ground carries in the tap's answer.
+    credits: list[CreditOut]
     grounds_dropped: int
     confidence: Literal["medium", "low"] | None
     # Whether the investigator decided on crisis mode and the decision stood, the
@@ -504,8 +512,6 @@ def _gone(outcome: Outcome | None, matched: object) -> bool:
 def _match(run: Run, outcome: Outcome) -> MatchOut | None:
     if outcome.status != "incident" or outcome.confidence is None:
         return None
-    then = words.found_then(run, outcome.incident_id)
-    from_511 = then is not None and then.get("point_from") == "closure"
     return MatchOut(
         confidence=outcome.confidence,
         text=words.MATCHED,
@@ -514,7 +520,7 @@ def _match(run: Run, outcome: Outcome) -> MatchOut | None:
                 kind=ground,
                 text=words.ground_text(ground, run),
                 basis=words.GROUND_BASIS.get(ground, "unknown"),
-                credit=_ground_credit(ground, from_511),
+                credit=next(iter(_ground_credits(ground, run)), None),
             )
             for ground in outcome.grounds
         ],
@@ -526,21 +532,27 @@ def _credit() -> CreditOut:
     return CreditOut.model_validate(CREDIT_511)
 
 
-def _ground_credit(ground: str, from_511: bool) -> CreditOut | None:
-    """The credit a ground requires where it is shown: 511's when how far the
-    incident was is measured from a point of 511's, and adsb.lol's for a ground
-    that rests on an aircraft's positions."""
-    if ground == "near" and from_511:
-        return _credit()
-    if ground == "aircraft_overhead":
-        return CreditOut.model_validate(CREDIT_ADSBLOL)
-    return None
+def _of_feeds(feeds: Iterable[object]) -> list[CreditOut]:
+    """The credits of feeds a run kept the names of, each once, in the order of
+    `CREDITS`. A name that is no feed's with a credit is passed over."""
+    named = {feed for feed in feeds if isinstance(feed, str)}
+    return [CreditOut.model_validate(credit) for feed, credit in CREDITS.items() if feed in named]
+
+
+def _ground_credits(ground: str, run: Run) -> list[CreditOut]:
+    """The credits a ground requires where it is shown: 511's when how far the
+    incident was is measured from a point of 511's, and for a ground that rests on
+    an aircraft's positions, the credit of the feed they were from. Which feed is
+    what the run kept then (`card.ground_feeds`), not what a ground of the kind
+    usually rests on."""
+    return _of_feeds(words.ground_feeds(ground, run))
 
 
 def _credits(call: Call) -> list[CreditOut]:
     """The credits a call's answer requires where it is shown: 511's for a count
     of the closures it lists, and for an incident whose place is one of them, and
-    adsb.lol's for the aircraft it found."""
+    the credit of each feed the call kept the name of, for the aircraft it counted
+    or the signals it named (`credits`)."""
     got = call.returned
     found = got.get("incidents")
     placed_by_511 = call.tool == "nearby_incidents" and any(
@@ -548,10 +560,10 @@ def _credits(call: Call) -> list[CreditOut]:
         for item in (found if isinstance(found, list) else [])
     )
     counted = call.tool == "get_official" and bool(got.get("closures"))
-    credits = [_credit()] if placed_by_511 or counted else []
-    if call.tool == "get_aircraft" and got.get("tracks"):
-        credits.append(CreditOut.model_validate(CREDIT_ADSBLOL))
-    return credits
+    kept = got.get("credits") if call.tool in ("get_aircraft", "get_official") else None
+    return _of_feeds(
+        (["511"] if placed_by_511 or counted else []) + (kept if isinstance(kept, list) else [])
+    )
 
 
 def _nearby(run: Run, snapshot: Snapshot) -> list[Any]:
@@ -662,6 +674,9 @@ def tap_run(request: Request, tap_id: str) -> TapRun:
             text=words.status_text(run.outcome),
             incident_id=run.outcome.incident_id,
             grounds=list(run.outcome.grounds),
+            credits=_of_feeds(
+                feed for ground in run.outcome.grounds for feed in words.ground_feeds(ground, run)
+            ),
             grounds_dropped=run.outcome.grounds_dropped,
             confidence=run.outcome.confidence,
             crisis=run.outcome.crisis,
@@ -671,7 +686,7 @@ def tap_run(request: Request, tap_id: str) -> TapRun:
                     kind=cited.kind,
                     confidence=cited.confidence,  # type: ignore[arg-type]
                     evidence_ids=list(cited.evidence_ids),
-                    credit=cited_credit(cited.kind),
+                    credit=cited_credit(cited, taps.store.get),
                 )
                 for cited in run.outcome.crisis_cited
             ],

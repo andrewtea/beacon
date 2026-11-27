@@ -26,6 +26,16 @@ def area(middle: Point, half_m: float = 400.0, *, hole_m: float | None = None) -
     return {"type": "Polygon", "coordinates": rings}
 
 
+def credit_json(credit: Any) -> dict[str, Any]:
+    """A credit as a route answers with it: its words, its link, and its words in
+    pieces when its terms ask for several links."""
+    return {
+        "text": credit.text,
+        "url": credit.url,
+        "parts": [{"text": part.text, "url": part.url} for part in credit.parts],
+    }
+
+
 def mock_store(tmp_path: Path) -> EvidenceStore:
     return EvidenceStore(tmp_path / "evidence" / "mock.sqlite3", "mock")
 
@@ -222,10 +232,15 @@ class Rows:
         altitude_m: float = 300.0,
         category: str | None = "rotorcraft",
         confidence: str = "high",
+        origin: str = "mock",
+        source: str = "adsblol",
     ) -> Evidence:
+        """`origin` is `live` for a position adsb.lol itself answered with, which a
+        mock store takes too, and `mock` for one of an invented scenario."""
         return self._add(
             kind="aircraft",
-            source="adsblol",
+            source=source,
+            origin=origin,
             ref=f"{icao24}@{at(minute).timestamp()}",
             occurred_at=at(minute),
             confidence=confidence,

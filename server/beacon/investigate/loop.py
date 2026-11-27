@@ -520,7 +520,7 @@ def _holds(ground: str, incident: Incident, distance: float, scene: Scene, found
     if ground == "aircraft_overhead":
         # One aircraft that was over the incident and, shortly before the tap,
         # within reach of the tap. Not one over each.
-        return bool(overhead(incident, scene, since=RECENT))
+        return bool(overhead(incident, scene))
     if ground == "other_taps":
         return found.other_taps >= 1
     return False
@@ -531,9 +531,7 @@ def _fits(tag: str, incident: Incident, scene: Scene) -> bool:
     incident: smoke of a fire, and not of a medical response."""
     if tag == "helicopter":
         # Only a helicopter that was over the incident and in reach of the tap.
-        return any(
-            track.category == "rotorcraft" for track in overhead(incident, scene, since=RECENT)
-        )
+        return any(track.category == "rotorcraft" for track in overhead(incident, scene))
     if tag == "road_blocked":
         return incident.category == "collision" or any(
             signal.kind == "closure" for signal in incident.signals

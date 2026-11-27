@@ -39,7 +39,8 @@ from beacon.investigate import (
     investigate_tap,
 )
 from beacon.investigate import card as words
-from beacon.investigate.loop import MAX_CALLS_PER_ROUND
+from beacon.investigate.loop import MAX_CALLS_PER_ROUND, Round
+from beacon.investigate.tools import Accounting, Call
 from beacon.redact import Names
 from tests.incident_rows import HAYES, NOON, Rows, at, mock_store
 from tests.test_ember_client import MetaApi
@@ -731,6 +732,83 @@ def test_the_aircraft_over_the_incident_has_to_be_the_one_in_reach_of_the_tap(
     made = investigate_tap(EmberClient.fake(storage, script), scene)
     assert told(script.requests[2])[0]["incidents"][0]["aircraft_over_it_in_reach_of_the_tap"] == 1
     assert made.run.outcome.grounds == ("going_on", "heard_in_clip", "aircraft_overhead")
+
+
+@pytest.mark.parametrize(("origin", "feeds"), [("live", ["adsblol"]), ("mock", [])])
+def test_a_helicopter_made_out_in_a_clip_rests_on_the_aircraft_that_was_recorded_overhead(
+    rows: Rows, storage: Storage, origin: str, feeds: list[str]
+) -> None:
+    city(rows)
+    # A helicopter circles over the fire, and a light plane with it whose positions
+    # are the invented scenario's whichever the helicopter's are.
+    circle(rows, HAYES, 300, minutes=5.5, icao24="heli01", origin=origin)
+    circle(rows, HAYES, 350, minutes=5.5, icao24="plane1", category="light")
+    tap = rows.tap(6, offset(HAYES, 700, 0), ref=TAP, clip=True)
+    scene = scene_of(rows, tap, lambda *_: CLIP)
+    fire = of_category(scene, "fire")
+    script = Script(
+        [
+            asks(("nearby_incidents", {"radius_m": 2000, "minutes": 15}), ("listen_clip", {})),
+            fake_response(text=json.dumps({"heard": ["helicopter"]})),
+            # The match names the clip and not the aircraft.
+            form(fire.id, ("going_on", "heard_in_clip")),
+        ]
+    )
+
+    run = investigate_tap(EmberClient.fake(storage, script), scene).run
+
+    assert run.outcome.grounds == ("going_on", "heard_in_clip")
+    # The helicopter fits the fire only by the rotorcraft recorded over it, so what
+    # is shown of the ground carries the credit of the feed its positions are from,
+    # and the run keeps which feed that was: names, and nothing of the rows.
+    then = words.found_then(run, fire.id)
+    assert then is not None
+    assert (then["aircraft_credits"], then["rotorcraft_credits"]) == (feeds, feeds)
+    assert words.ground_feeds("heard_in_clip", run) == feeds
+    assert words.ground_feeds("going_on", run) == []
+    # A sound that is checked against no aircraft rests on none.
+    siren = replace(
+        run,
+        rounds=tuple(
+            replace(
+                round_,
+                calls=tuple(
+                    replace(call, returned={"heard": ["siren"]})
+                    if call.tool == "listen_clip"
+                    else call
+                    for call in round_.calls
+                ),
+            )
+            for round_ in run.rounds
+        ),
+    )
+    assert words.ground_feeds("heard_in_clip", siren) == []
+
+
+def test_a_run_kept_before_feeds_were_written_down_names_none() -> None:
+    kept = {
+        "incidents": [{"id": "inc-0000000000000001", "distance_m": 100, "point_from": "blocks"}]
+    }
+    call = Call("nearby_incidents", "no_lead", None, "look_for_a_lead", {}, True, kept)
+    nothing_spent = Accounting("fake", 0, 0, 0, 0, 0, 0, ("", 0, ""))
+    run = Run(
+        tap_id=TAP,
+        started_at=at(6),
+        finished_at=at(6),
+        outcome=Outcome(
+            status="incident",
+            incident_id="inc-0000000000000001",
+            grounds=("near", "aircraft_overhead"),
+            confidence="low",
+        ),
+        rounds=(Round(1, nothing_spent, (call,)),),
+        model="fake",
+        stand_in=True,
+    )
+
+    # Nothing is concluded from the kind of ground about where its aircraft came from.
+    assert words.ground_feeds("aircraft_overhead", run) == []
+    assert words.ground_feeds("near", run) == []
 
 
 def test_a_helicopter_in_the_clip_fits_only_where_the_aircraft_overhead_was_one(

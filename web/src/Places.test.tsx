@@ -140,7 +140,11 @@ test('a place with nothing near it says so in the server’s sentence, which is 
 
 test('a distance measured from a point taken from a 511 event shows that row’s confidence and 511’s credit, beside that distance only', async () => {
   await savePlace('Home', FIRE)
-  const credit = { text: 'Data provided by 511.org', url: 'https://511.org' }
+  const credit = {
+    text: 'Data provided by 511.org',
+    url: 'https://511.org',
+    parts: [],
+  }
   const closure: Source = {
     kind: 'traffic',
     source: '511',

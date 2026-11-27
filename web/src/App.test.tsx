@@ -466,25 +466,113 @@ test('shows 511’s credit beside every line that is from 511', async () => {
   expect(credits[0]).toHaveAttribute('href', 'https://511.org')
 })
 
-test('shows the notice adsb.lol’s license asks for beside every line that rests on an aircraft’s positions', async () => {
+// The notice adsb.lol's license asks for, as the server gives it for a position
+// adsb.lol answered with: its words in pieces, three of them links.
+const SKY_CREDIT = {
+  text: "Contains information from adsb.lol, which is made available here under the Open Database License (ODbL). Beacon's aircraft rows are under the same license: what Beacon keeps of adsb.lol's data, and how.",
+  url: 'https://www.adsb.lol',
+  parts: [
+    { text: 'Contains information from ', url: null },
+    { text: 'adsb.lol', url: 'https://www.adsb.lol' },
+    { text: ', which is made available here under the ', url: null },
+    {
+      text: 'Open Database License (ODbL)',
+      url: 'https://opendatacommons.org/licenses/odbl/1-0/',
+    },
+    {
+      text: ". Beacon's aircraft rows are under the same license: ",
+      url: null,
+    },
+    {
+      text: "what Beacon keeps of adsb.lol's data, and how",
+      url: 'https://github.com/andrewtea/beacon/blob/main/docs/aircraft-data.md',
+    },
+    { text: '.', url: null },
+  ],
+}
+
+test('the invented scenario’s aircraft are not said to contain information from adsb.lol', async () => {
   serve(fireRoutes)
   window.location.hash = `#/incident/${FIRE_ID}`
   render(<App />)
 
   const timeline = await screen.findByRole('region', { name: /timeline/i })
   const fromTheSky = fireIncident.incident.timeline.filter((entry) =>
-    entry.sources.some((source) => source.source === 'adsblol'),
+    entry.sources.some((source) => source.kind === 'aircraft'),
   )
   expect(fromTheSky.length).toBeGreaterThan(0)
-  const credits = within(timeline).getAllByRole('link', {
-    name: /^Contains information from adsb\.lol, which is made available here under the Open Database License \(ODbL\)/,
+  expect(
+    within(timeline).getAllByText('Aircraft positions').length,
+  ).toBeGreaterThan(0)
+  expect(screen.queryByText(/adsb\.lol/)).not.toBeInTheDocument()
+})
+
+test('the notice adsb.lol’s license asks for links the database, the license, and how Beacon’s rows differ, each to its own address', async () => {
+  const incident = {
+    ...fireIncident.incident,
+    timeline: fireIncident.incident.timeline.map((entry) => ({
+      ...entry,
+      sources: entry.sources.map((source) =>
+        source.kind === 'aircraft'
+          ? {
+              ...source,
+              label: 'adsb.lol aircraft positions',
+              stand_in: false,
+              credit: SKY_CREDIT,
+            }
+          : source,
+      ),
+    })),
+  }
+  serve({
+    ...fireRoutes,
+    [`GET /api/incidents/${FIRE_ID}`]: { ...fireIncident, incident },
   })
-  expect(credits).toHaveLength(fromTheSky.length)
-  expect(credits[0]).toHaveAttribute('href', 'https://www.adsb.lol')
-  // The license's own address is in the words, since a credit has one link.
-  expect(credits[0]).toHaveTextContent(
-    'https://opendatacommons.org/licenses/odbl/1-0/',
+  window.location.hash = `#/incident/${FIRE_ID}`
+  render(<App />)
+
+  const timeline = await screen.findByRole('region', { name: /timeline/i })
+  const fromTheSky = incident.timeline.filter((entry) =>
+    entry.sources.some((source) => source.kind === 'aircraft'),
   )
+  expect(fromTheSky.length).toBeGreaterThan(0)
+  for (const [name, address] of [
+    ['adsb.lol', 'https://www.adsb.lol'],
+    [
+      'Open Database License (ODbL)',
+      'https://opendatacommons.org/licenses/odbl/1-0/',
+    ],
+    [
+      "what Beacon keeps of adsb.lol's data, and how",
+      'https://github.com/andrewtea/beacon/blob/main/docs/aircraft-data.md',
+    ],
+  ]) {
+    const links = within(timeline).getAllByRole('link', { name })
+    expect(links.length).toBeGreaterThanOrEqual(fromTheSky.length)
+    for (const link of links) expect(link).toHaveAttribute('href', address)
+  }
+  // The whole notice is there, the words that are no link included.
+  const notice = within(timeline)
+    .getAllByRole('link', { name: 'adsb.lol' })[0]
+    .closest('.credit')
+  expect(notice).toHaveTextContent(SKY_CREDIT.text)
+})
+
+test('the trace shows the credit of what the grounds of a match rested on', async () => {
+  serve({
+    ...fireRoutes,
+    [`GET /api/taps/${FIRE_TAP}/run`]: {
+      ...fireRun,
+      outcome: { ...fireRun.outcome, credits: [SKY_CREDIT] },
+    },
+  })
+  window.location.hash = `#/tap/${FIRE_TAP}/trace`
+  render(<App />)
+
+  await screen.findByRole('heading', { name: 'Totals' })
+  expect(
+    screen.getByRole('link', { name: 'Open Database License (ODbL)' }),
+  ).toHaveAttribute('href', 'https://opendatacommons.org/licenses/odbl/1-0/')
 })
 
 test('the trace shows each tool call in the server’s words and never calls the stand-in Muse Ember', async () => {
@@ -773,7 +861,11 @@ test('takes no tap and no second picture while a chosen photo is still being dra
 })
 
 test('incidents listed because of where they are carry 511’s credit when the place is 511’s', async () => {
-  const credit = { text: 'data provided by 511.org', url: 'https://511.org' }
+  const credit = {
+    text: 'data provided by 511.org',
+    url: 'https://511.org',
+    parts: [],
+  }
   const since = { ...fireAnswer.incident!, crisis: null }
   serve({
     'GET /api/health': MOCK_HEALTH,
@@ -826,7 +918,11 @@ test('a source is linked only at a web address, and its credit is shown either w
   const source = {
     ...fireIncident.incident.official[0].source,
     url: 'javascript:alert(1)',
-    credit: { text: 'data provided by 511.org', url: 'javascript:alert(2)' },
+    credit: {
+      text: 'data provided by 511.org',
+      url: 'javascript:alert(2)',
+      parts: [],
+    },
   }
 
   render(<Sources sources={[source]} />)

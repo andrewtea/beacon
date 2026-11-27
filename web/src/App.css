@@ -254,6 +254,17 @@ p {
   color: var(--text-soft);
 }
 
+/* A credit in pieces: each link is in the credit's own colour, and underlined,
+   so that where one link ends and the next begins can be seen. */
+.credit a {
+  color: inherit;
+  text-decoration: underline;
+}
+
+.credits .credit {
+  display: block;
+}
+
 /* Actions */
 
 .action {
