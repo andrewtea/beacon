@@ -48,4 +48,5 @@ export const MOCK_HEALTH = {
   mode: 'mock',
   repeats_text: null,
   front_text: null,
+  front_more_text: null,
 }

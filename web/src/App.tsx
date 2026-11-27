@@ -71,6 +71,7 @@ export default function App() {
   const mode = unreachable ? null : (health.data?.mode ?? null)
   const repeatsText = unreachable ? null : (health.data?.repeats_text ?? null)
   const frontText = unreachable ? null : (health.data?.front_text ?? null)
+  const frontMore = unreachable ? null : (health.data?.front_more_text ?? null)
   // A tap the server no longer answers for is deleted from this device.
   useEffect(() => sweepTaps(), [])
   const askAgain = useCallback(() => setAsked((count) => count + 1), [])
@@ -104,7 +105,15 @@ export default function App() {
           scenario. What is sent is theirs even when the incidents are made up. */}
       {frontText !== null &&
         (route.view === 'home' || route.view === 'places') && (
-          <p className="note front-note">{frontText}</p>
+          <div className="note front-note">
+            <p>{frontText}</p>
+            {frontMore !== null && (
+              <details>
+                <summary>More about this</summary>
+                <p>{frontMore}</p>
+              </details>
+            )}
+          </div>
         )}
       {unreachable && (
         <p className="note problem" role="status">

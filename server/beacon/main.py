@@ -45,15 +45,20 @@ WEB_VARIABLE = "BEACON_WEB_DIR"
 # operator's. The server then says so to every visitor (`front_text` of
 # `GET /api/health`). Unset or `verified`, it says nothing.
 FRONT_VARIABLE = "BEACON_FRONT_END"
+# The first is what a visitor reads before they send anything; the second is the
+# rest of it, which the app shows when it is asked for.
 FRONT_UNVERIFIED = (
-    "What you send here is real, whatever the scenario: a tap sends where you are, "
-    "rounded to about a block, with any clip or photo you add, and a saved place and "
-    "a notification send what their page says. This server is reached through a "
-    "hosting service whose records Beacon can neither read nor set, and nobody has "
-    "checked what it writes down. It may keep the address of each request, when it "
-    "came, and where from. The address a tap's answer is read at holds the tap's id, "
-    "and whoever has that id can read the answer for as long as this server keeps "
-    "it. Beacon's own server writes no log of those requests."
+    "What you send here is real, whatever the scenario, and nobody has checked what "
+    "the hosting service this server is reached through writes down of a request."
+)
+FRONT_UNVERIFIED_MORE = (
+    "A tap sends where you are, rounded to about a block, with any clip or photo you "
+    "add, and a saved place and a notification send what their page says. The "
+    "hosting service's records are not Beacon's to read or set. It may keep the "
+    "address of each request, when it came, and where from. The address a tap's "
+    "answer is read at holds the tap's id, and whoever has that id can read the "
+    "answer for as long as this server keeps it. Beacon's own server writes no log "
+    "of those requests."
 )
 # How often the photos and clips whose hour is over are deleted.
 SWEEP_SECONDS = 60.0
@@ -567,9 +572,10 @@ def _web_directory() -> Path | None:
     return directory
 
 
-def _front_text() -> str | None:
+def _front_text() -> tuple[str, str] | None:
     """What a visitor is told of what stands in front of this server, by
-    `BEACON_FRONT_END`, or None.
+    `BEACON_FRONT_END`: the sentence shown before they send anything and the rest
+    of it, or None.
 
     Raises ServerSetupError for a setting that is neither word."""
     setting = os.environ.get(FRONT_VARIABLE, "")
@@ -577,7 +583,7 @@ def _front_text() -> str | None:
         return None
     if setting != "unverified":
         raise ServerSetupError(f"{FRONT_VARIABLE} is verified or unverified.")
-    return FRONT_UNVERIFIED
+    return FRONT_UNVERIFIED, FRONT_UNVERIFIED_MORE
 
 
 def create_app() -> FastAPI:
@@ -617,7 +623,7 @@ def create_app() -> FastAPI:
     app.include_router(sources.router, prefix="/api")
     app.include_router(taps.router, prefix="/api")
     # Read when the app is made, so that a setting that is no word stops the server.
-    app.state.front_text = _front_text()
+    app.state.front_text, app.state.front_more_text = _front_text() or (None, None)
     web = _web_directory()
     if web is not None:
         # After every route, and for no path under /api (`_WebMount`), so that

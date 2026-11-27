@@ -4,7 +4,13 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
-from beacon.main import FRONT_UNVERIFIED, ServerSetupError, app, create_app
+from beacon.main import (
+    FRONT_UNVERIFIED,
+    FRONT_UNVERIFIED_MORE,
+    ServerSetupError,
+    app,
+    create_app,
+)
 
 
 def test_health_reports_ok_and_the_package_version() -> None:
@@ -20,6 +26,7 @@ def test_health_reports_ok_and_the_package_version() -> None:
         "mode": None,
         "repeats_text": None,
         "front_text": None,
+        "front_more_text": None,
     }
 
 
@@ -37,19 +44,25 @@ def test_a_server_behind_a_front_end_nobody_checked_says_so_to_every_visitor(
 ) -> None:
     # Only the incidents are invented. What a visitor sends is theirs, and a host
     # in front of the server can write down the address a tap's answer is read at.
-    assert TestClient(create_app()).get("/api/health").json()["front_text"] is None
+    plain = TestClient(create_app()).get("/api/health").json()
+    assert (plain["front_text"], plain["front_more_text"]) == (None, None)
     monkeypatch.setenv("BEACON_FRONT_END", "verified")
     assert TestClient(create_app()).get("/api/health").json()["front_text"] is None
 
     monkeypatch.setenv("BEACON_FRONT_END", "unverified")
-    said = TestClient(create_app()).get("/api/health").json()["front_text"]
+    health = TestClient(create_app()).get("/api/health").json()
 
+    # The sentence a visitor reads before they send anything says both things.
+    said = health["front_text"]
     assert said == FRONT_UNVERIFIED
     assert "What you send here is real" in said
-    assert "nobody has checked what it writes down" in said
-    assert "holds the tap's id" in said
+    assert "nobody has checked" in said
+    # And the rest says what is sent and what a tap's id in an address is good for.
+    more = health["front_more_text"]
+    assert more == FRONT_UNVERIFIED_MORE
+    assert "holds the tap's id" in more
     # It does not say what the host keeps, which nobody knows.
-    assert "may keep" in said
+    assert "may keep" in more
 
     monkeypatch.setenv("BEACON_FRONT_END", "probably fine")
     with pytest.raises(ServerSetupError, match="is verified or unverified"):

@@ -14,6 +14,8 @@ export type Health = {
   // out of its records: the server's sentence that says so, shown wherever a
   // person is about to send something. Null on every other server.
   front_text: string | null
+  // The rest of that, shown when it is asked for. Null whenever that one is.
+  front_more_text: string | null
 }
 
 export function fetchHealth(signal?: AbortSignal): Promise<Health> {

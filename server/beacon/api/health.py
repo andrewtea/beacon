@@ -24,6 +24,10 @@ class Health(BaseModel):
     # out of its records (`BEACON_FRONT_END=unverified`): a sentence that says so,
     # shown wherever a person is about to send something. Null on every other.
     front_text: str | None = None
+    # The rest of that: what is sent, what the host may keep, and what a tap's id
+    # in a request's address lets its holder read. Shown when it is asked for,
+    # beside the sentence above. Null whenever that one is.
+    front_more_text: str | None = None
 
 
 @router.get("/health")
@@ -35,4 +39,5 @@ def health(request: Request) -> Health:
         mode=None if engine is None else engine.mode,
         repeats_text=getattr(request.app.state, "repeats_text", None),
         front_text=getattr(request.app.state, "front_text", None),
+        front_more_text=getattr(request.app.state, "front_more_text", None),
     )

@@ -86,10 +86,17 @@ test('says, in the server’s sentence, that the invented scenario is told again
   expect(banner).toHaveTextContent(repeats)
 })
 
-test('says, in the server’s sentence, that nobody has checked what the host in front of it writes down', async () => {
+test('says, in the server’s sentences, that nobody has checked what the host in front of it writes down', async () => {
   const front =
-    'What you send here is real, whatever the scenario. Nobody has checked what the hosting service writes down.'
-  serve({ 'GET /api/health': { ...MOCK_HEALTH, front_text: front } })
+    'What you send here is real, whatever the scenario, and nobody has checked what the hosting service writes down.'
+  const more = 'The address a tap’s answer is read at holds the tap’s id.'
+  serve({
+    'GET /api/health': {
+      ...MOCK_HEALTH,
+      front_text: front,
+      front_more_text: more,
+    },
+  })
 
   render(<App />)
 
@@ -97,6 +104,9 @@ test('says, in the server’s sentence, that nobody has checked what the host in
   // the scenario is invented: it is about what a person sends, not the incidents.
   expect(await screen.findByText(front)).toBeInTheDocument()
   expect(screen.getByText(INVENTED)).not.toHaveTextContent(front)
+  // The rest is the server's too, and is there for whoever opens it.
+  expect(screen.getByText('More about this')).toBeInTheDocument()
+  expect(screen.getByText(more)).toBeInTheDocument()
 })
 
 test('a tap that is gone says the most an answer is kept, and on a server that tells its story again, that', async () => {

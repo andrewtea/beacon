@@ -162,6 +162,23 @@ p {
   border-style: dashed;
 }
 
+.front-note p {
+  margin: 0;
+}
+
+.front-note details {
+  margin-top: 0.5rem;
+}
+
+.front-note summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.front-note details p {
+  margin-top: 0.5rem;
+}
+
 .note.problem {
   border-color: var(--error);
   color: var(--text-strong);
