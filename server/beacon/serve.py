@@ -382,17 +382,47 @@ _ASIDE_NOTE = (
 )
 
 
+_ASIDE_EARLIER = (
+    "The investigations kept under investigate/ are in a shape an earlier Beacon "
+    "wrote, or the file was never written to. Where a store is set aside, its "
+    "investigations are deleted when their day is over only from a file in a shape "
+    "this Beacon deletes from as it is. Nothing was moved. Start a server on this "
+    "data directory once and stop it, which makes the file this shape, and give the "
+    "command again."
+)
+_ASIDE_UNCONFIRMED = (
+    "The move is finished, and the note of it was taken away, so a server can start. "
+    "The disk did not confirm that it kept that last step: if the machine stops "
+    "before it has, the note can be there again when it starts, no server starts "
+    "while it is, and this command, given again, takes it away."
+)
+
+
+@dataclass(frozen=True)
+class SetAside:
+    """Where a mock store's files went, relative to the data directory."""
+
+    where: PurePath
+    # False when every file went and the note was taken away, and the disk then
+    # did not confirm that it kept the note's going.
+    confirmed: bool = True
+
+    def __str__(self) -> str:
+        return str(self.where)
+
+
 class PartlyAsideError(ServeError):
     """A mock store's files were set aside only in part. The note of the move is
     left (`beacon.datadir.PENDING`), so nothing opens a store until the command
     is given again and finishes. The text is fixed."""
 
 
-def set_aside(env: Mapping[str, str], now: datetime, lock: DataLock) -> PurePath | None:
+def set_aside(env: Mapping[str, str], now: datetime, lock: DataLock) -> SetAside | None:
     """Move the mock store's files out of the way, into a directory of their own
     under `told/` in the data directory, so that the server that starts next
     begins the story anew. Answers where they went, relative to the data
-    directory, or None, with nothing changed, when there is no mock store.
+    directory, and whether the disk confirmed the last step, or None, with nothing
+    changed, when there is no mock store.
 
     **Nothing of the store is deleted**, a store Muse Ember worked on included:
     its files hold the claims on what was paid for, and are kept as they are. The
@@ -432,8 +462,11 @@ def set_aside(env: Mapping[str, str], now: datetime, lock: DataLock) -> PurePath
     log is emptied, before one is moved.
 
     Raises ServeError, with nothing moved, for a file that was not seen to be the
-    mock store's own of its kind, for one something has open, when something has
-    the taps' media, and when there is nowhere to move them to; PartlyAsideError
+    mock store's own of its kind, for investigations in a shape that is not swept
+    as it is (`investigations.SWEPT_SHAPES`: what is set aside is still deleted
+    when its day is over, and only from such a file), for a file something has
+    open, when something has the taps' media, and when there is nowhere to move
+    them to; PartlyAsideError
     when the move was begun and is not finished; and EmberConfigError for a
     relative `BEACON_DATA_DIR`."""
     data = default_data_dir(env)
@@ -450,7 +483,7 @@ def set_aside(env: Mapping[str, str], now: datetime, lock: DataLock) -> PurePath
         return PartlyAsideError(_ASIDE_PARTLY.format(began.name))
 
     there: list[Path] = []
-    forgets = False
+    forgets = earlier = False
     refused: str | None = None
     try:
         for directory, name in MOCK_FILES:
@@ -459,11 +492,15 @@ def set_aside(env: Mapping[str, str], now: datetime, lock: DataLock) -> PurePath
             if path is not None:
                 _mock_stores(path)
                 there.append(path)
+                if directory == _INVESTIGATIONS and not _swept_as_it_is(path):
+                    earlier = True
         forgets = _sent_kept(data)
     except NotTheMockStoresError as error:
         refused = error.directory
     if refused is not None:
         raise refusal(_NOT_SET_ASIDE.format(refused))
+    if earlier:
+        raise refusal(_ASIDE_EARLIER)
     if not there and began is None:
         return None
     busy = False
@@ -487,6 +524,7 @@ def set_aside(env: Mapping[str, str], now: datetime, lock: DataLock) -> PurePath
         if aside is None:
             raise ServeError(_ASIDE_NOWHERE)
         gone = 0
+        finished = False
         try:
             # The evidence store first: it is what says there is a story.
             kinds = [(data / directory / name, aside / directory) for directory, name in MOCK_FILES]
@@ -507,11 +545,15 @@ def set_aside(env: Mapping[str, str], now: datetime, lock: DataLock) -> PurePath
                         # Never over a file that was moved before.
                         raise FileExistsError
                     named.append(each)
-            # Kept, by the disk too, before a name is taken away.
+            # Kept, by the disk too, before a name is taken away: each new name,
+            # and every directory above it up to the data directory, whose own
+            # listing is what holds `told/`.
             for _, to in kinds:
                 if _seen(to) is not None:
                     _kept(to)
             _kept(aside)
+            _kept(data / ASIDE)
+            _kept(data)
             for each in named:
                 os.unlink(each)
                 gone += 1
@@ -525,18 +567,38 @@ def set_aside(env: Mapping[str, str], now: datetime, lock: DataLock) -> PurePath
                 raise _NotForgottenError
             # The last thing: from here on a server starts again.
             os.unlink(data / ASIDE / PENDING)
+            finished = True
             _kept(data / ASIDE)
         except (OSError, sqlite3.Error, _NotForgottenError):
             busy = True
+        if finished:
+            # The note is gone, and nothing is kept out. All that can have failed
+            # is the disk's word that it kept the note's going, which is not an
+            # unfinished move and is not said to be one.
+            return SetAside(PurePath(ASIDE) / aside.name, confirmed=not busy)
         if busy and began is None and gone == 0 and _unbegin(data, aside):
             # Not one file went, and nothing is left of the try.
             raise ServeError(_ASIDE_NOWHERE)
         if busy:
             # Outside the handler, so that nothing of a path is under the error.
             raise PartlyAsideError(_ASIDE_PARTLY.format(aside.name))
-        return PurePath(ASIDE) / aside.name
+        raise AssertionError("A move ends finished, unbegun, or unfinished.")
     finally:
         held.close()
+
+
+_INVESTIGATIONS = "investigate"
+
+
+def _swept_as_it_is(path: Path) -> bool:
+    """Whether an investigations file `_mock_stores` passed is in a shape that
+    `beacon.investigate.aside` deletes from as it is. A file of an earlier shape,
+    and one nothing was written to, is not: set aside, what it holds would outlast
+    its day."""
+    said = None
+    with suppress(sqlite3.Error):
+        said = files.look(path)
+    return said is not None and said.shape in investigations.SWEPT_SHAPES
 
 
 class _NotForgottenError(Exception):
@@ -659,7 +721,8 @@ def _move_begun(data: Path) -> Path | None:
     with suppress(OSError, UnicodeDecodeError):
         root = data / ASIDE
         if stat.S_ISDIR(os.lstat(root).st_mode):
-            note = os.open(root / PENDING, os.O_RDONLY | os.O_NOFOLLOW)
+            # Not waited for: a pipe of the name would never answer.
+            note = os.open(root / PENDING, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             try:
                 found = os.fstat(note)
                 if (
@@ -705,14 +768,19 @@ def _a_place_aside(data: Path, now: datetime) -> Path | None:
                 os.unlink(part)
             note = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             try:
-                os.write(note, made.name.encode("ascii"))
+                name = made.name.encode("ascii")
+                if os.write(note, name) != len(name):
+                    # A part of a name is no note, and is not given the note's name.
+                    raise OSError
                 os.fsync(note)
             finally:
                 os.close(note)
             # No note is there to be written over: a move that had begun is gone
             # on with, and never begun again.
             os.replace(part, root / PENDING)
+            # `told/` itself is an entry of the data directory's.
             _kept(root)
+            _kept(data)
             return made
     except OSError:
         pass
@@ -746,10 +814,11 @@ def aside(env: Mapping[str, str], clock: Callable[[], datetime] | None = None) -
         lock.close()
     if went is None:
         return "There is no mock store under the data directory: nothing was moved."
-    return (
+    moved = (
         f"The mock store's files were moved to {went}/ under the data directory, as "
         "they were. The server that is started next begins the invented story anew."
     )
+    return moved if went.confirmed else f"{moved} {_ASIDE_UNCONFIRMED}"
 
 
 def _own(data: Path, directory: str, name: str, *, also: Path | None = None) -> Path | None:

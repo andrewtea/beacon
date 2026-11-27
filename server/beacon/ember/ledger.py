@@ -31,6 +31,7 @@ compare the ledger with Meta's Usage page before starting them again.
 
 import json
 import os
+import re
 import secrets
 import sqlite3
 import stat
@@ -440,19 +441,33 @@ def _generation(db: sqlite3.Connection) -> str:
 _ACCOUNTING = frozenset({"id", "source", "status", "cost_nanousd", "scope", "token"})
 
 
-def kept_generation(path: Path) -> str | None:
-    """The generation of the ledger file at `path`, read through a connection that
+# A generation as `_connect` draws one. Nothing else is taken for one, whatever a
+# file holds where a generation would be.
+_A_GENERATION = re.compile(r"[0-9a-f]{32}")
+# A ledger file's name as `Ledger.opened_file` gives it.
+FILE_NAME = re.compile(r"[0-9a-f]{32}:[0-9]{1,20}:[0-9]{1,20}")
+
+
+def kept_file(path: Path) -> str | None:
+    """The name of the ledger file at `path` as `Ledger.opened_file` would give it
+    (its generation, its device, and its inode), read through a connection that
     cannot write, or None when no ledger that was begun is there: nothing at the
     path, a link, an empty file, a file that is no SQLite database, or one without
-    the accounting table or a generation.
+    the accounting table or a generation of the shape one is drawn in.
 
     `Ledger` begins a file when it finds none, or an empty one, which is right for a
     first call and wrong for whoever means to go on paying from the ledger that was
     paid from before: a ledger begun anew counts nothing of what was spent. This is
-    how that is asked before anything is made. It says that a ledger is there and
-    which; it cannot say that it is the one its operator means."""
+    how that is asked before anything is made. The name tells a file from a copy of
+    it put in its place, which has the generation and can lack rows. **What it
+    cannot tell** is a ledger rolled back in place, as a copy written over the same
+    file is, or that the ledger is the one its operator means.
+
+    What it answers matches `FILE_NAME`, whatever the file holds: it is put on a
+    command line by whoever asks (`scripts/film`)."""
     try:
-        if not stat.S_ISREG(os.lstat(path).st_mode):
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode):
             return None
         address = f"file:{quote(str(path))}?mode=ro"
         with closing(sqlite3.connect(address, uri=True, timeout=30)) as db:
@@ -460,11 +475,15 @@ def kept_generation(path: Path) -> str | None:
             if not columns >= _ACCOUNTING:
                 return None
             found = db.execute(_GENERATION).fetchone()
+        after = os.lstat(path)
     except (OSError, sqlite3.Error):
         return None
-    if found is None or not isinstance(found[0], str) or not found[0]:
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        # Another file was put there while this one was read.
         return None
-    return found[0]
+    if found is None or not isinstance(found[0], str) or not _A_GENERATION.fullmatch(found[0]):
+        return None
+    return f"{found[0]}:{after.st_dev}:{after.st_ino}"
 
 
 def _identity(path: Path) -> tuple[int, int] | None:

@@ -36,15 +36,18 @@
 #                                  This script never reads, passes on, or prints it.
 # And with `live` the data directory has to hold a ledger that was begun
 # (ember/ledger.sqlite3): one begun anew would count none of what was spent. The
-# ledger that is there when the script looks is named to the server, which pays
-# from that one or not at all, at every start (BEACON_MOCK_EMBER_LEDGER).
+# ledger file that is there when the script looks is named to the server, which
+# pays from that file or not at all, at every start (BEACON_MOCK_EMBER_LEDGER).
+# When this shell names one already, it has to be the one that is there.
 #   EMBER_STOP_USD                 when set, the stop the server keeps.
 #   FILM_PORT                      the port, 8010 unless set (1024 to 65535).
 #
 # The server runs as an orb service, in the orb's environment and not in this
-# shell's. When the orb's environment has a spending setting of its own
-# (EMBER_SPENT_BEFORE_USD, EMBER_STOP_USD) that is not what this shell has, the
-# server is not started: the two are made to agree by whoever set them.
+# shell's. When the orb's environment has a spending setting or a ledger of its
+# own (EMBER_SPENT_BEFORE_USD, EMBER_STOP_USD, BEACON_MOCK_EMBER_LEDGER) that is
+# not what this shell has, the server is not started: the two are made to agree
+# by whoever set them. An EMBER_STOP_USD the orb has and this shell has not is
+# such a difference: this shell's looks were made for the default stop.
 #
 # The server is always the invented scenario's, with its pollers, told once,
 # whatever either environment says of that. Everything a command is given, and
@@ -82,7 +85,7 @@ serve() {
   # The invented scenario, with its pollers, told once, taking only the invented
   # places, whatever the orb's environment says of them.
   unset BEACON_LIVE_SOURCES BEACON_MOCK_STORY_MINUTE BEACON_SCALE_RUN BEACON_MOCK_EMBER \
-    BEACON_MOCK_EMBER_BUDGET_USD BEACON_MOCK_EMBER_LEDGER
+    BEACON_MOCK_EMBER_BUDGET_USD
   export BEACON_INGEST=1 BEACON_MOCK_REPEAT=0 BEACON_FRONT_END=unverified
   export BEACON_DATA_DIR="$data" BEACON_WEB_DIR="$root/web/dist" BEACON_VAPID_SUBJECT="$subject"
   [ -z "$run" ] || export BEACON_SCALE_RUN="$run"
@@ -92,14 +95,21 @@ serve() {
     if [ -n "${EMBER_SPENT_BEFORE_USD-}" ] && [ "$EMBER_SPENT_BEFORE_USD" != "$spent" ]; then
       refuse "The filming server was not started: EMBER_SPENT_BEFORE_USD in the orb's environment is not what the shell that started it has. Make the two the same."
     fi
-    if [ -n "${EMBER_STOP_USD-}" ] && [ -n "$stop" ] && [ "$EMBER_STOP_USD" != "$stop" ]; then
+    # One the orb has and the shell has not is a difference too: what the shell
+    # looked at was the default stop, and the orb's can be higher.
+    if [ -n "${EMBER_STOP_USD-}" ] && [ "$EMBER_STOP_USD" != "$stop" ]; then
       refuse "The filming server was not started: EMBER_STOP_USD in the orb's environment is not what the shell that started it has. Make the two the same."
     fi
+    if [ -n "${BEACON_MOCK_EMBER_LEDGER-}" ] && [ "$BEACON_MOCK_EMBER_LEDGER" != "$ledger" ]; then
+      refuse "The filming server was not started: BEACON_MOCK_EMBER_LEDGER in the orb's environment names another ledger file than the one the shell that started it looked at."
+    fi
+    [ -n "$ledger" ] || refuse "The filming server was not started: it was given no ledger file to pay from."
     export EMBER_SPENT_BEFORE_USD="$spent"
     [ -z "$stop" ] || export EMBER_STOP_USD="$stop"
     # The server pays from the ledger that was looked at, or not at all.
     export REPLAY=0 BEACON_MOCK_EMBER=live BEACON_MOCK_EMBER_BUDGET_USD="$budget" BEACON_MOCK_EMBER_LEDGER="$ledger"
   else
+    unset BEACON_MOCK_EMBER_LEDGER
     export REPLAY=1
   fi
   cd "$root/server"
@@ -148,24 +158,42 @@ settings() {
   fi
   # Who tells the story, and for Muse Ember: REPLAY=0, a budget every scope takes,
   # spending settings a client can read, and a ledger that was begun, whose
-  # generation it prints. It makes nothing. Its own sentence says what is wrong.
+  # file's name it prints. It makes nothing. Its own sentence says what is wrong.
   (cd "$root/server" && uv sync --locked >/dev/null 2>&1) || refuse "The server's dependencies could not be installed (uv sync --locked)."
-  ledger="$(cd "$root/server" && env -u BEACON_LIVE_SOURCES -u BEACON_MOCK_EMBER_LEDGER uv run --no-sync python -m beacon.telling)" \
+  # A ledger this shell names already is looked at there too, and is the one
+  # that is there or the command is refused.
+  ledger="$(cd "$root/server" && env -u BEACON_LIVE_SOURCES uv run --no-sync python -m beacon.telling)" \
     || refuse "Nothing was stopped, moved, or started."
+  # What was printed goes on a command line: a ledger file's name (a generation,
+  # a device, an inode) and nothing else, whatever printed it.
+  if [ "$teller" = ember ]; then
+    [[ "$ledger" =~ ^[0-9a-f]{32}:[0-9]{1,20}:[0-9]{1,20}$ ]] \
+      || refuse "What python -m beacon.telling printed is no ledger file's name. Nothing was stopped, moved, or started."
+  else
+    [ -z "$ledger" ] || refuse "What python -m beacon.telling printed for a stand-in's telling is not nothing. Nothing was stopped, moved, or started."
+  fi
 }
 
 # The service's command line. It holds settings and no key: the server reads
 # MODEL_API_KEY from the environment its service is given.
 command_line() {
   local minute="$1" line
-  line="exec $(printf %q "$root/scripts/film") _serve port=$port data=$BEACON_DATA_DIR teller=$teller"
+  # Each value was seen to be plain (`plain`, and the ledger's and the minute's
+  # own shapes), and is quoted all the same.
+  word() { line+=" $1=$(printf %q "$2")"; }
+  line="exec $(printf %q "$root/scripts/film") _serve"
+  word port "$port"
+  word data "$BEACON_DATA_DIR"
+  word teller "$teller"
   # Whom a push service may write to about this server: the repository's page.
-  line+=" subject=${BEACON_VAPID_SUBJECT-https://github.com/andrewtea/beacon}"
-  [ -z "${BEACON_SCALE_RUN-}" ] || line+=" run=$BEACON_SCALE_RUN"
-  [ -z "$minute" ] || line+=" minute=$minute"
+  word subject "${BEACON_VAPID_SUBJECT-https://github.com/andrewtea/beacon}"
+  [ -z "${BEACON_SCALE_RUN-}" ] || word run "$BEACON_SCALE_RUN"
+  [ -z "$minute" ] || word minute "$minute"
   if [ "$teller" = ember ]; then
-    line+=" ledger=$ledger budget=$BEACON_MOCK_EMBER_BUDGET_USD spent=$EMBER_SPENT_BEFORE_USD"
-    [ -z "${EMBER_STOP_USD-}" ] || line+=" stop=$EMBER_STOP_USD"
+    word ledger "$ledger"
+    word budget "$BEACON_MOCK_EMBER_BUDGET_USD"
+    word spent "$EMBER_SPENT_BEFORE_USD"
+    [ -z "${EMBER_STOP_USD-}" ] || word stop "$EMBER_STOP_USD"
   fi
   printf '%s' "$line"
 }

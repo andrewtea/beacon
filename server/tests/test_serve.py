@@ -888,6 +888,125 @@ def test_a_file_that_could_not_be_looked_at_is_not_taken_to_be_gone(
     assert not (data_dir() / "told" / PENDING).exists()
 
 
+def test_a_note_that_is_a_pipe_is_refused_and_not_waited_for() -> None:
+    served()
+    (data_dir() / ASIDE_IN).mkdir(parents=True)
+    os.mkfifo(data_dir() / "told" / PENDING)
+    done: list[BaseException | None] = []
+
+    def give() -> None:
+        try:
+            set_aside(ASIDE_AT)
+        except BaseException as error:
+            done.append(error)
+        else:
+            done.append(None)
+
+    thread = threading.Thread(target=give, daemon=True)
+    thread.start()
+    thread.join(10)
+
+    assert not thread.is_alive()
+    assert isinstance(done[0], serve.PartlyAsideError)
+    assert "does not name a directory" in str(done[0])
+
+
+def test_a_note_of_which_only_a_part_was_written_is_never_given_the_notes_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    served()
+    before = kept()
+    write = os.write
+
+    def short(descriptor: int, data: bytes) -> int:
+        return write(descriptor, data[:4])
+
+    monkeypatch.setattr(serve.os, "write", short)
+    with pytest.raises(serve.ServeError, match="Nothing was moved"):
+        set_aside(ASIDE_AT)
+
+    assert kept() == before
+    assert list((data_dir() / "told").iterdir()) == []
+    with alone():
+        pass
+
+
+def test_the_disk_is_asked_to_keep_every_new_name_before_a_name_is_taken_away(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `told/` is an entry of the data directory's: its listing is kept too.
+    served()
+    steps: list[tuple[str, Path]] = []
+    keep, unlink = serve._kept, os.unlink
+
+    def kept_(directory: Path) -> None:
+        steps.append(("kept", directory))
+        keep(directory)
+
+    def unlink_(path: Path, *more: object, **how: object) -> None:
+        steps.append(("unlink", Path(path)))
+        unlink(path, *more, **how)
+
+    monkeypatch.setattr(serve, "_kept", kept_)
+    monkeypatch.setattr(serve.os, "unlink", unlink_)
+    assert set_aside(ASIDE_AT) is not None
+
+    first = next(
+        index
+        for index, (what, path) in enumerate(steps)
+        if what == "unlink" and path.name == "mock.sqlite3"
+    )
+    asked = [path for what, path in steps[:first] if what == "kept"]
+    told = data_dir() / "told"
+    assert {data_dir(), told, told / "20261201T183005Z"} <= set(asked)
+    assert {told / "20261201T183005Z" / kind for kind, _ in serve.MOCK_FILES} <= set(asked)
+
+
+def test_a_move_that_is_finished_is_not_said_to_be_unfinished_when_the_disk_does_not_confirm(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    served()
+    keep = serve._kept
+    note = data_dir() / "told" / PENDING
+
+    def fails_once_the_note_is_gone(directory: Path) -> None:
+        if directory == data_dir() / "told" and not note.exists() and any(directory.iterdir()):
+            raise OSError("no")
+        keep(directory)
+
+    monkeypatch.setattr(serve, "_kept", fails_once_the_note_is_gone)
+    assert serve.main(["--set-aside"], plain()) == 0
+    said = capsys.readouterr()
+    assert "were moved to told/" in said.out
+    assert "The disk did not confirm that it kept that last step" in said.out
+    assert "only in part" not in said.out + said.err
+    # What it says is so: nothing is kept out, and nothing is left to move.
+    assert not note.exists()
+    with alone():
+        pass
+    assert not any(f"{d}/{n}" in files() for d, n in serve.MOCK_FILES)
+
+
+@pytest.mark.parametrize("shape", [0, 1])
+def test_investigations_in_a_shape_that_is_not_swept_as_it_is_are_not_set_aside(shape: int) -> None:
+    # Set aside, an expired run in such a file would never be deleted.
+    served()
+    file = data_dir() / "investigate" / "mock.sqlite3"
+    _claimed(file, "tap-old", ASIDE_AT - timedelta(days=3))
+    with closing(sqlite3.connect(file)) as db:
+        db.execute(f"PRAGMA user_version = {shape}")
+    before = kept()
+
+    with pytest.raises(serve.ServeError, match=r"a shape an earlier Beacon.*Nothing was moved"):
+        set_aside(ASIDE_AT)
+
+    assert kept() == before
+    assert not (data_dir() / "told").exists()
+    # A server makes the file this shape, as the sentence says, and then it goes.
+    served()
+    assert set_aside(ASIDE_AT) is not None
+
+
 def test_a_story_begun_anew_is_not_kept_from_a_device_by_what_the_last_telling_sent() -> None:
     # An incident's id is made from its first call's start, to the second: two
     # tellings that count their first minute from the same second share it.

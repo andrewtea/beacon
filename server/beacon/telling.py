@@ -40,7 +40,6 @@ tells the story again by deleting the store refuses one that was paid for.
 """
 
 import os
-import re
 import sys
 from collections.abc import Callable, Mapping
 from typing import Literal
@@ -48,19 +47,20 @@ from typing import Literal
 from beacon.ember import EmberClient, SpendScope
 from beacon.ember.client import Storage, default_data_dir
 from beacon.ember.errors import EmberConfigError
-from beacon.ember.ledger import kept_generation
+from beacon.ember.ledger import FILE_NAME, kept_file
 from beacon.ember.pricing import SPENT_BEFORE_VARIABLE, parse_usd, read_stop_settings
 
 MOCK_EMBER_VARIABLE = "BEACON_MOCK_EMBER"
 BUDGET_VARIABLE = "BEACON_MOCK_EMBER_BUDGET_USD"
-# The generation of the ledger a telling by Muse Ember pays from. When it is set,
-# no paying client is made unless the ledger under the data directory is there and
-# is of this generation, at every start of a server: a client begins a ledger where
-# it finds none, and a ledger begun anew counts nothing of what was spent. It only
-# refuses. `python -m beacon.telling` prints the generation of the ledger that is
-# there, for whoever starts a server to hand it on (`scripts/film`).
+# The ledger file a telling by Muse Ember pays from, by the name a client gives the
+# file it is open on (`EmberClient.ledger_file`: generation, device, inode). When
+# it is set, no paying client is made unless the ledger under the data directory
+# is there and is that file, at every start of a server: a client begins a ledger
+# where it finds none, and a ledger begun anew, or a copy put in its place, counts
+# less than was spent. It only refuses. `python -m beacon.telling` prints the name
+# of the ledger that is there, for whoever starts a server to hand it on
+# (`scripts/film`). What it cannot tell is a ledger rolled back in place.
 LEDGER_VARIABLE = "BEACON_MOCK_EMBER_LEDGER"
-_GENERATION = re.compile(r"[0-9a-f]{32}")
 
 # Who does the model's work on the invented story.
 Teller = Literal["stand_in", "ember"]
@@ -161,32 +161,33 @@ def check(env: Mapping[str, str], make: PaidClient | None = None) -> None:
 
 
 def pinned_ledger(env: Mapping[str, str]) -> str | None:
-    """The generation `BEACON_MOCK_EMBER_LEDGER` names, seen to be that of the
-    ledger under the data directory, or None when the setting is not there. The
-    ledger is read through a connection that cannot write, and nothing is made.
+    """The ledger file `BEACON_MOCK_EMBER_LEDGER` names, seen to be the one under
+    the data directory, or None when the setting is not there. The ledger is read
+    through a connection that cannot write, and nothing is made.
 
-    Raises TellingConfigError when the setting is no generation, and when the
-    ledger that is there is not of it or no ledger is there; EmberConfigError for
-    a relative `BEACON_DATA_DIR`."""
+    Raises TellingConfigError when the setting is no ledger file's name, and when
+    the ledger that is there is another file or no ledger is there;
+    EmberConfigError for a relative `BEACON_DATA_DIR`."""
     if LEDGER_VARIABLE not in env:
         return None
     named = env[LEDGER_VARIABLE]
-    if _GENERATION.fullmatch(named) is None:
+    if FILE_NAME.fullmatch(named) is None:
         raise TellingConfigError(
-            f"{LEDGER_VARIABLE} is the generation of the ledger that is paid from, as "
+            f"{LEDGER_VARIABLE} is the name of the ledger file that is paid from, as "
             "`python -m beacon.telling` prints it."
         )
-    if kept_generation(Storage.under(default_data_dir(env)).ledger_db) != named:
+    if kept_file(Storage.under(default_data_dir(env)).ledger_db) != named:
         raise TellingConfigError(OTHER_LEDGER)
     return named
 
 
 OTHER_LEDGER = (
-    f"{LEDGER_VARIABLE} names the ledger this telling is paid from, and the ledger "
-    "under the data directory (ember/ledger.sqlite3) is not that one, or no ledger is "
-    "there. Nothing was paid for, and no ledger was begun: one begun anew would count "
-    "nothing of what was spent. Find out what became of the ledger before a server "
-    "is started here, and compare Meta's Usage page with what the ledger held."
+    f"{LEDGER_VARIABLE} names the ledger file this telling is paid from, and what is "
+    "under the data directory (ember/ledger.sqlite3) is not that file: it is another "
+    "ledger, a copy that was put in its place, or no ledger. Nothing was paid for, "
+    "and no ledger was begun: one begun anew, or an older copy, would count less than "
+    "was spent. Find out what became of the ledger before a server is started here, "
+    "and compare Meta's Usage page with what the ledger held."
 )
 NO_LEDGER = (
     f"{MOCK_EMBER_VARIABLE}=live is to go on paying from the ledger that was paid from "
@@ -201,8 +202,9 @@ def preflight(env: Mapping[str, str]) -> str | None:
     server can be started on `env` to tell the invented story: who tells it, and,
     for Muse Ember, that paid requests are asked for by name (`REPLAY=0`), that the
     budget is one every scope takes, and that a ledger that was begun is under the
-    data directory. Answers that ledger's generation, to be handed to the server
-    as `BEACON_MOCK_EMBER_LEDGER`, or None for a stand-in's telling.
+    data directory, which is the one `BEACON_MOCK_EMBER_LEDGER` names when that is
+    set. Answers that ledger file's name, to be handed to the server as
+    `BEACON_MOCK_EMBER_LEDGER`, or None for a stand-in's telling.
 
     The spending settings in `env` (`EMBER_SPENT_BEFORE_USD`, which has to be
     there, and `EMBER_STOP_USD`) are read as the client reads them, so that one it
@@ -227,12 +229,15 @@ def preflight(env: Mapping[str, str]) -> str | None:
             f"{MOCK_EMBER_VARIABLE}=live needs {SPENT_BEFORE_VARIABLE}: what Meta's Usage "
             "page showed as spent before the ledger began. It has no default."
         )
-    generation = kept_generation(Storage.under(default_data_dir(env)).ledger_db)
-    if generation is None:
+    # A ledger that is named already is that one, or this is refused: never
+    # replaced by the one that happens to be there.
+    named = pinned_ledger(env)
+    if named is not None:
+        return named
+    there = kept_file(Storage.under(default_data_dir(env)).ledger_db)
+    if there is None:
         raise TellingConfigError(NO_LEDGER)
-    if LEDGER_VARIABLE in env:
-        pinned_ledger(env)
-    return generation
+    return there
 
 
 def paying(env: Mapping[str, str], label: str, make: PaidClient | None = None) -> EmberClient:
@@ -247,7 +252,7 @@ def paying(env: Mapping[str, str], label: str, make: PaidClient | None = None) -
     refusal = None
     if ember.mode != "live":
         refusal = _NO_LIVE_EMBER
-    elif LEDGER_VARIABLE in env and ember.ledger_generation() != env[LEDGER_VARIABLE]:
+    elif LEDGER_VARIABLE in env and ember.ledger_file() != env[LEDGER_VARIABLE]:
         # The file the client is open on, which is the one it pays in from here on.
         refusal = OTHER_LEDGER
     if refusal is not None:
@@ -271,15 +276,15 @@ def other_teller(began: Teller, now: Teller) -> str:
 
 def main(env: Mapping[str, str], out: Callable[[str], None] = print) -> int:
     """`python -m beacon.telling`: look before a server is started to tell the
-    invented story (`preflight`), and print the generation of the ledger a telling
+    invented story (`preflight`), and print the name of the ledger file a telling
     by Muse Ember would pay from, or nothing for a stand-in's. It makes nothing."""
     try:
-        generation = preflight(env)
+        ledger = preflight(env)
     except (TellingConfigError, EmberConfigError) as error:
         print(str(error), file=sys.stderr)
         return 2
-    if generation is not None:
-        out(generation)
+    if ledger is not None:
+        out(ledger)
     return 0
 
 
