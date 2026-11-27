@@ -47,16 +47,24 @@ license is the Open Database License 1.0
 - **The allowance is kept to across restarts, and by every process on one data
   directory.** Before it asks, a live poller promises in the evidence store not to
   ask again before a moment (`EvidenceStore.reserve`, kept as `not_before`): one
-  interval on from the real time just before the request, where the interval is a
-  day divided by the allowance less `_SPARE_REQUESTS`, so no twenty-four hours hold
-  more requests of Beacon's than that. The look and the write are one transaction,
-  so two processes on one store cannot both find the time come. A wait adsb.lol asks
-  for (`Retry-After`, on a `429` or any other answer) moves the moment on to its end
-  (`postpone`), up to the week the runner waits at most, and never back. A process
-  that starts keeps the promise before it asks anything, and a poll that finds the
-  time not come asks nothing and says when it will (`PollReport.again_in`). Two
-  servers that share an address and not a data directory each keep their own
-  promise, which is one more reason to run one for each address.
+  interval on from the real time at which the store let it write, where the interval
+  is a day divided by the allowance less `_SPARE_REQUESTS`, so no twenty-four hours
+  hold more requests of Beacon's than that. The clock is read inside the write
+  transaction, after any wait for the file, and the look and the write are that one
+  transaction, so two processes on one store cannot both find the time come. A wait
+  adsb.lol asks for (`Retry-After` on an answer that is no success, as the `429` of
+  a spent allowance is) moves the moment on to its end (`postpone`), up to the week
+  the runner waits at most, and never back. A process that starts keeps the promise
+  before it asks anything, and a poll that finds the time not come asks nothing and
+  says when it will (`PollReport.again_in`). Two servers that share an address and
+  not a data directory each keep their own promise, which is one more reason to run
+  one for each address.
+- **A wait that could not be written down is still kept by the process that was
+  told of it.** When the store fails as the wait is written, the error is adsb.lol's
+  all the same, so the runner waits as it was asked; the poller keeps the moment
+  and writes it before it asks adsb.lol anything again, and asks nothing until it
+  is written. A process that dies before then has lost it: across a restart the
+  promise is as good as the store.
 
 Each position of an aircraft is one row. Only aircraft a person on the street could
 notice are kept: airborne and below `MAX_ALTITUDE_M`. An airliner at cruise is not
@@ -80,13 +88,22 @@ A row's `data`, in SI units:
     category         one of `AIRCRAFT_CATEGORIES`, such as `rotorcraft`, or null
 """
 
+import logging
 import math
+import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from beacon.errors import raise_bare
-from beacon.evidence import Confidence, EvidenceStore, NewEvidence, Origin, Point
+from beacon.evidence import (
+    Confidence,
+    EvidenceStore,
+    EvidenceStoreError,
+    NewEvidence,
+    Origin,
+    Point,
+)
 from beacon.ingest.area import SAN_FRANCISCO, Bounds
 from beacon.ingest.http import SourceError, SourceHttp, fetch, read_json
 from beacon.ingest.runner import MAX_WAIT_SECONDS, PollReport
@@ -140,6 +157,8 @@ MOCK_INTERVAL_SECONDS = 30.0
 _LONGEST_HOLD = timedelta(seconds=MAX_WAIT_SECONDS)
 # An interval a stand-in is given is no longer than a day.
 _MAX_INTERVAL_SECONDS = 86_400.0
+
+logger = logging.getLogger("beacon.ingest")
 
 _MAX_BYTES = 5_000_000
 _MAX_RADIUS_NM = 250
@@ -218,6 +237,8 @@ class AdsbLolAircraft:
                 0 < interval_seconds <= _MAX_INTERVAL_SECONDS
             ):
                 raise ValueError("An interval is a number of seconds, up to a day.")
+        # The end of a wait adsb.lol asked for that the store has not been told of.
+        self._pending: datetime | None = None
         self._http = http
         self._api_key = api_key
         self._bounds = bounds
@@ -244,19 +265,23 @@ class AdsbLolAircraft:
         # The mock scenario has no allowance: it is played on a clock of its own,
         # and a step of it that failed is played again at the same moment.
         if self._keeps_allowance:
-            # By the real time at this moment, and not `now`, which is when the
-            # runner's step began: the pollers before this one may have taken a while.
-            asked_at = self._wall_clock()
+            # A wait adsb.lol asked for that could not be written down then is
+            # written first. When it still cannot be, nothing is asked.
+            self._write_pending(store)
+            # By the real time, and not `now`, which is when the runner's step
+            # began; and read by the store once it may write, since the pollers
+            # before this one and the wait for the file may each have taken a while.
             standing = store.reserve(
                 self.name,
-                now=asked_at,
-                until=asked_at + timedelta(seconds=self.interval_seconds),
+                clock=self._wall_clock,
+                seconds=self.interval_seconds,
                 longest=_LONGEST_HOLD,
             )
             if standing is not None:
                 # Not yet time, by what this process or one before it wrote down.
                 # Nothing is asked, and that is no failure of adsb.lol's.
-                return PollReport(added=0, again_in=(standing - asked_at).total_seconds())
+                left = (standing - self._wall_clock()).total_seconds()
+                return PollReport(added=0, again_in=max(left, 0.0))
         try:
             body = fetch(
                 self._http,
@@ -270,18 +295,35 @@ class AdsbLolAircraft:
             if self._keeps_allowance and _is_wait(error.retry_after):
                 # The wait adsb.lol asked for, counted from when it answered, is
                 # kept across a restart as the runner keeps it within a process.
-                answered = self._wall_clock()
                 wait = min(float(error.retry_after), MAX_WAIT_SECONDS)
-                store.postpone(
-                    self.name,
-                    now=answered,
-                    until=answered + timedelta(seconds=wait),
-                    longest=_LONGEST_HOLD,
-                )
+                until = self._wall_clock() + timedelta(seconds=wait)
+                self._pending = until if self._pending is None else max(self._pending, until)
+                try:
+                    self._write_pending(store)
+                except (EvidenceStoreError, sqlite3.Error) as failure:
+                    # The error raised stays adsb.lol's, with the wait it asked
+                    # for, which the runner keeps. The moment is kept here and
+                    # written before adsb.lol is asked again.
+                    logger.error(
+                        "The wait adsb.lol asked for could not be written down (%s). This "
+                        "process keeps it, and asks adsb.lol nothing until it is written.",
+                        type(failure).__name__,
+                    )
             raise
         aircraft, unreadable = parse_aircraft(read_json(body, SOURCE), self.origin, self._bounds)
         added = store.add(aircraft, now=now)
         return PollReport(added=len(added), unreadable=unreadable)
+
+    def _write_pending(self, store: EvidenceStore) -> None:
+        """Write down the wait adsb.lol asked for that is not written yet, if there
+        is one. Raises what the store raises when it cannot be written: the moment
+        is then kept, and the caller asks adsb.lol nothing."""
+        if self._pending is None:
+            return
+        store.postpone(
+            self.name, until=self._pending, clock=self._wall_clock, longest=_LONGEST_HOLD
+        )
+        self._pending = None
 
 
 def _is_wait(seconds: Any) -> bool:

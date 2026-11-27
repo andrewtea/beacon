@@ -1,5 +1,6 @@
 """The adsb.lol aircraft poller, against hand-written answers in the API's format."""
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -314,7 +315,7 @@ def test_the_wait_adsb_lol_asks_for_is_kept_across_a_restart(
 def test_a_wait_is_never_made_shorter_and_is_kept_for_as_long_as_the_runner_keeps_one(
     store: EvidenceStore, wall: list[datetime]
 ) -> None:
-    # Whatever the status: a server that is down can ask for a wait as well.
+    # Any answer that is no success: a server that is down can ask for a wait as well.
     answers = iter([(429, "1"), (503, "172800"), (429, "99999999")])
 
     def waiting(request: httpx2.Request) -> httpx2.Response:
@@ -361,6 +362,55 @@ def test_a_moment_that_cannot_be_read_holds_nothing_and_one_too_far_off_holds_a_
     store.add([], state=("adsblol", {"not_before": far.isoformat()}), now=NOON)
     assert poller.poll(store, NOON).again_in == MAX_WAIT_SECONDS
     assert len(api.requests) == 1
+    # The week is counted from that look, and not again from each one after it.
+    wall[0] = NOON + timedelta(days=6)
+    assert poller.poll(store, wall[0]).again_in == 86_400.0
+    wall[0] = NOON + timedelta(seconds=MAX_WAIT_SECONDS)
+    assert poller.poll(store, wall[0]).again_in is None
+    assert len(api.requests) == 2
+
+
+def test_a_wait_that_could_not_be_written_down_is_still_kept_and_written_before_the_next_request(
+    store: EvidenceStore, api: Api, wall: list[datetime], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    waits = [httpx2.Response(503, headers={"Retry-After": "172800"})]
+
+    def answered(request: httpx2.Request) -> httpx2.Response:
+        return waits.pop() if waits else api(request)
+
+    poller = poller_of(answered, wall)
+    postpone = store.postpone
+    failing = [True]
+
+    def postponed(*args: Any, **options: Any) -> None:
+        if failing[0]:
+            raise sqlite3.OperationalError("database is locked")
+        postpone(*args, **options)
+
+    monkeypatch.setattr(store, "postpone", postponed)
+
+    # The error is adsb.lol's, with the wait it asked for, which the runner keeps:
+    # not the store's, which would be tried again after an interval.
+    with pytest.raises(SourceError) as failure:
+        poller.poll(store, NOON)
+    assert failure.value.retry_after == 172_800.0
+    assert failure.value.__context__ is None
+    interval = NOON + timedelta(seconds=poller.interval_seconds)
+    assert store.state("adsblol") == {"not_before": interval.isoformat()}
+
+    # While it cannot be written, nothing is asked, though the interval is over.
+    wall[0] = interval
+    with pytest.raises(sqlite3.OperationalError):
+        poller.poll(store, interval)
+    assert api.requests == []
+
+    # Once the store takes it, it is written before anything is asked, and holds.
+    failing[0] = False
+    held = poller.poll(store, interval)
+    two_days = NOON + timedelta(days=2)
+    assert store.state("adsblol") == {"not_before": two_days.isoformat()}
+    assert held.again_in == pytest.approx(172_800.0 - poller.interval_seconds)
+    assert api.requests == []
 
 
 def test_the_mock_scenarios_poller_keeps_no_allowance(store: EvidenceStore, api: Api) -> None:

@@ -31,7 +31,7 @@ import math
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -344,40 +344,48 @@ class EvidenceStore:
             raise_bare(EvidenceStoreError(_CLOSED))
 
     def reserve(
-        self, name: str, *, now: datetime, until: datetime, longest: timedelta
+        self, name: str, *, clock: Callable[[], datetime], seconds: float, longest: timedelta
     ) -> datetime | None:
-        """Have a poller promise to leave its source alone until `until`, unless a
-        promise it made before still stands at `now`. Returns None when the promise
+        """Have a poller promise to leave its source alone for `seconds` from now,
+        unless a promise it made before still stands. Returns None when the promise
         is made, and the moment of the standing one when it is not: the caller then
         asks its source nothing.
 
-        The look and the write are one write transaction, so of two processes on
-        one file that both find the time come, one makes the promise and the other
-        is told of it. The promise is kept in the poller's state as `not_before`,
-        beside whatever else the poller saved. A standing promise is never read as
-        further off than `longest` from `now`: one that is, is from a clock that
-        has since been set back.
+        `clock` is read once the write transaction has begun, and not before:
+        waiting for the file can take as long as an interval, and a promise counted
+        from before the wait could be over when it is made. The look and the write
+        are that one transaction, so of two processes on one file that both find
+        the time come, one makes the promise and the other is told of it. The
+        promise is kept in the poller's state as `not_before`, beside whatever else
+        the poller saved. One that is further off than `longest` is from a clock
+        that has since been set back: it is written down as `longest` from now,
+        once, and stands until then.
 
         Raises EvidenceStoreError when the store is closed. Nothing is promised
         then, and the caller asks its source nothing."""
         with self._writing() as db:
+            now = clock()
             saved = _saved_state(db, name)
-            standing = _not_before(saved, now, longest)
+            standing = _standing(db, name, saved, now, longest)
             if standing is not None and now < standing:
                 return standing
-            _save_not_before(db, name, saved, min(until, now + longest), now)
+            until = now + min(timedelta(seconds=seconds), longest)
+            _save_not_before(db, name, saved, until, now)
             return None
 
-    def postpone(self, name: str, *, now: datetime, until: datetime, longest: timedelta) -> None:
+    def postpone(
+        self, name: str, *, until: datetime, clock: Callable[[], datetime], longest: timedelta
+    ) -> None:
         """Move a poller's promise on to `until`, when that is later than the one
         that stands, and never the other way: a wait a source asked for is not cut
-        short by one that ends sooner. One write transaction, as `reserve` is, and
-        no further off than `longest` from `now`.
+        short by one that ends sooner. One write transaction, as `reserve` is, with
+        `clock` read inside it, and no further off than `longest` from then.
 
         Raises EvidenceStoreError when the store is closed."""
         with self._writing() as db:
+            now = clock()
             saved = _saved_state(db, name)
-            standing = _not_before(saved, now, longest)
+            standing = _standing(db, name, saved, now, longest)
             moment = min(until, now + longest)
             if standing is None or moment > standing:
                 _save_not_before(db, name, saved, moment, now)
@@ -665,9 +673,13 @@ def _saved_state(db: sqlite3.Connection, name: str) -> dict[str, Any]:
     return saved if isinstance(saved, dict) else {}
 
 
-def _not_before(saved: Mapping[str, Any], now: datetime, longest: timedelta) -> datetime | None:
+def _standing(
+    db: sqlite3.Connection, name: str, saved: Mapping[str, Any], now: datetime, longest: timedelta
+) -> datetime | None:
     """The moment a poller promised to leave its source alone until, or None when
-    it wrote none that can be read."""
+    it wrote none that can be read. One further off than `longest` from now is
+    written down as that, here, so that the longest wait is counted from the first
+    time it is seen and does not begin again at every look."""
     text = saved.get("not_before")
     if not isinstance(text, str) or len(text) > 40:
         return None
@@ -677,7 +689,10 @@ def _not_before(saved: Mapping[str, Any], now: datetime, longest: timedelta) -> 
         return None
     if moment.utcoffset() is None:
         return None
-    return min(moment, now + longest)
+    if moment > now + longest:
+        moment = now + longest
+        _save_not_before(db, name, saved, moment, now)
+    return moment
 
 
 def _save_not_before(
