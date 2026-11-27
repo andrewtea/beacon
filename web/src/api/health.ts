@@ -17,6 +17,10 @@ export type Health = {
   // says so, and that the story is still made up. Shown with what says the
   // scenario is invented. Null on every other server.
   teller_text: string | null
+  // Where a clip or a photo added to a tap can be sent to Meta, for Muse Ember
+  // to say what is in it: the server's sentence that says so, shown where one
+  // is added. Null where nothing of the kind is sent.
+  media_text: string | null
   // On a server that tells the invented scenario again when it is over: the
   // server's sentence that says so, and what becomes of the taps sent before.
   // Shown with what says the scenario is invented. Null on every other server.

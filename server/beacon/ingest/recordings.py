@@ -933,11 +933,17 @@ _HEARERS = {
 
 def _kind_of(shelf: Shelf) -> str:
     """What a shelf's calls are. Only `Directory` itself reads a directory on this
-    machine: anything else, a class made from it included, is a stand-in, whose
-    calls are no recording however they are read, and there is no way to say
-    otherwise."""
+    machine: anything else, a class made from it included, is a stand-in for one,
+    whose calls are no recording however they are read and whose rows are `mock`
+    ones, and there is no way to say otherwise.
+
+    What a stand-in can say of its calls is that they are synthesized speech and
+    not tones (`spoken`, as the invented story's shelf for Muse Ember does): a paid
+    Ember may then hear them, as it may a directory of generated audio, where it is
+    never paid to hear a tone. That changes who may hear them and nothing about
+    whose rows they are."""
     if type(shelf) is not Directory:
-        return "stand-in"
+        return "generated" if getattr(shelf, "spoken", None) is True else "stand-in"
     return "generated" if shelf.generated else "recorded"
 
 

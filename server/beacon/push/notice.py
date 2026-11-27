@@ -5,15 +5,14 @@ when it subscribed (`notice_of`) and kept for its service worker. It says what a
 push means and no more: that the investigator's decision turned crisis mode on for
 an incident Beacon has near a place the device named. It is the investigator's
 reading, and the sentence says so; it tells nobody what to do. On the mock store it
-says first that the incident is invented, and who decided: a stand-in, or, where
-Muse Ember works on the invented story (`beacon.telling`), a model.
+says first that the incident is invented, and not who decided, a stand-in or a
+model (`beacon.telling`): the words on a device can be older than the telling.
 """
 
 from dataclasses import dataclass
 
 from beacon.files import Mode
 from beacon.push.store import KEPT, PERMIT_LIFE, SENT_KEPT
-from beacon.telling import Teller
 
 
 @dataclass(frozen=True)
@@ -33,24 +32,19 @@ _LIVE = Notice(
         "Beacon to read what each source said."
     ),
 )
+# On the mock store. **It does not say who decided**: the words are kept on the
+# device from when it last opened the app, a push carries nothing, and a mock
+# store's investigator can be a stand-in for one telling of the invented story and
+# a model for the next (`beacon.telling`). So they say what is true of both, and
+# send the person to the app, which says who investigated beside the answer.
 _MOCK = Notice(
     title="Beacon: invented scenario",
     text=(
-        "Invented scenario, not a real event. A stand-in for Beacon's investigator "
-        "turned crisis mode on for an invented incident that Beacon has within about a "
-        "kilometre of a place you get notifications for. Open Beacon to read it."
-    ),
-)
-
-# On a server whose invented story Muse Ember works on: the investigator was a
-# model, and the incident is as invented as on any other mock store.
-_MOCK_BY_EMBER = Notice(
-    title="Beacon: invented scenario",
-    text=(
-        "Invented scenario, not a real event. Beacon's investigator, a model, turned "
-        "crisis mode on for an invented incident that Beacon has within about a "
-        "kilometre of a place you get notifications for. That is the investigator's "
-        "reading and no authority's. Open Beacon to read it."
+        "Invented scenario, not a real event. Beacon's investigator, which the app "
+        "names as a model or a stand-in for one, turned crisis mode on for an invented "
+        "incident that Beacon has within about a kilometre of a place you get "
+        "notifications for. That is the investigator's reading and no authority's. "
+        "Open Beacon to read it."
     ),
 )
 
@@ -87,10 +81,6 @@ ABOUT = (
 OFF = "This server sends no notifications."
 
 
-def notice_of(mode: Mode, teller: Teller = "stand_in") -> Notice:
-    """The words for a server in `mode`. `teller` is who does the model's work on
-    the invented story, and so who investigates on the mock store; it says nothing
-    of the live store, where the investigator is Muse Ember."""
-    if mode != "mock":
-        return _LIVE
-    return _MOCK_BY_EMBER if teller == "ember" else _MOCK
+def notice_of(mode: Mode) -> Notice:
+    """The words for a server in `mode`."""
+    return _MOCK if mode == "mock" else _LIVE

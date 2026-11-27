@@ -7,6 +7,10 @@ said" in it is a form that a stand-in for Ember fills in when it is handed that 
 one's JSON and audio, and has Ember hear it. The Ember it has is the stand-in, and
 the rows it stores say so (`model == "fake"`).
 
+Where Muse Ember itself is to hear the story (`beacon.telling`), the calls are
+synthesized speech of invented words instead (`SpokenShelf`, of each call's `said`):
+a tone says nothing, and is never sent to a paid Ember.
+
 The calls tell the fire of `beacon.scenario.fire` from the radio's side, with what a
 real feed would also carry: a medical call nearby and one across town, an alarm
 elsewhere, a call nobody could make out, and a click of a microphone. Some of the
@@ -23,6 +27,7 @@ import hashlib
 import io
 import json
 import math
+import random
 import wave
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
@@ -31,6 +36,8 @@ from typing import Any
 
 from beacon.ember import fake_response
 from beacon.ingest.recordings import Filed, Place
+from beacon.radio.audio import SAMPLE_RATE, pcm_to_wav, wav_seconds
+from beacon.radio.speech import synthesize
 from beacon.radio.vocabulary import Known
 
 # What the story's recorder calls its system: the directory its calls would be in.
@@ -68,7 +75,7 @@ class RadioCall:
     # call nothing is made of.
     heard: dict[str, Any] | None = field(default=None, hash=False)
     # What is said in the call when it is synthesized speech for Muse Ember to hear
-    # (`beacon.scenario.recorder`): invented words, as a dispatcher or a crew might
+    # (`SpokenShelf`): invented words, as a dispatcher or a crew might
     # say them. None for a call in which nothing is said: a click, or wind.
     said: str | None = None
 
@@ -336,18 +343,21 @@ class StoryShelf:
         index = self._index(call)
         if index is None:
             return None
+        seconds = self._seconds(index)
+        if seconds is None:
+            return None
         made, start_s = CALLS[index], call.start_s
         return json.dumps(
             {
                 "freq": _FREQUENCY,
                 "start_time": start_s,
-                "stop_time": start_s + math.ceil(made.seconds),
+                "stop_time": start_s + math.ceil(seconds),
                 "start_time_ms": start_s * 1000,
-                "stop_time_ms": start_s * 1000 + round(made.seconds * 1000),
+                "stop_time_ms": start_s * 1000 + round(seconds * 1000),
                 "emergency": 0,
                 "encrypted": 0,
-                "call_length": round(made.seconds),
-                "call_length_ms": round(made.seconds * 1000),
+                "call_length": round(seconds),
+                "call_length_ms": round(seconds * 1000),
                 "talkgroup": made.talkgroup,
                 "talkgroup_tag": "",
                 "audio_type": "digital",
@@ -359,7 +369,15 @@ class StoryShelf:
 
     def audio(self, call: Filed) -> bytes | None:
         index = self._index(call)
-        return None if index is None else _tone(index)
+        return None if index is None else self._audio(index)
+
+    def _audio(self, index: int) -> bytes | None:
+        """The audio of the call at `index` of `CALLS`: its tone."""
+        return _tone(index)
+
+    def _seconds(self, index: int) -> float | None:
+        """How long that audio plays, which is what the call's JSON says."""
+        return CALLS[index].seconds
 
     def _time(self, index: int) -> datetime:
         return self._start + timedelta(minutes=CALLS[index].minute)
@@ -380,6 +398,70 @@ class StoryShelf:
             if self._filed(index) == call:
                 return index
         return None
+
+
+# How words become a WAV file: `beacon.radio.speech.synthesize`, unless a test
+# hands in something that needs no ffmpeg.
+Voice = Callable[[str], bytes]
+
+
+class SpokenShelf(StoryShelf):
+    """The story's calls as **synthesized speech of invented words**, for Muse Ember
+    to hear (`beacon.telling`): each call's `said`, by ffmpeg's `flite` voice.
+
+    A tone says nothing, so a paid Ember is never sent one; this shelf says of
+    itself that its calls are speech (`spoken`), which is what lets a live Ember
+    hear them (`beacon.ingest.recordings`). Nothing here was said on a radio, and
+    nothing here is a recording of anybody: like the shelf of tones it is no
+    directory, so its rows are `mock` rows whoever hears them and the live store
+    refuses them. A call in which nothing is said (wind across a microphone) is
+    noise made here, which Ember is to find unintelligible; a click is too short
+    to be heard at all.
+
+    **Nothing is written anywhere.** A call's audio is made when it is first asked
+    for and kept in memory for as long as the shelf is: there is no directory of
+    calls to own, to list, or to empty. A call that could not be synthesized just
+    now is not there (`details` answers None), so it is neither claimed nor paid
+    for, and is asked for again at the next poll."""
+
+    # Its calls are synthesized speech and no tones.
+    spoken = True
+
+    def __init__(
+        self, start: datetime, now: Callable[[], datetime], voice: Voice | None = None
+    ) -> None:
+        super().__init__(start, now)
+        self._voice = synthesize if voice is None else voice
+        # The audio made so far, by the call's place in `CALLS`.
+        self._made: dict[int, bytes] = {}
+
+    def _audio(self, index: int) -> bytes | None:
+        made = self._made.get(index)
+        if made is None:
+            call = CALLS[index]
+            try:
+                made = _noise(index, call.seconds) if call.said is None else self._voice(call.said)
+            except OSError:
+                # Only that it failed is known, and the next poll asks again.
+                return None
+            if wav_seconds(made) is None:
+                return None
+            self._made[index] = made
+        return made
+
+    def _seconds(self, index: int) -> float | None:
+        audio = self._audio(index)
+        return None if audio is None else wav_seconds(audio)
+
+
+def _noise(index: int, seconds: float) -> bytes:
+    """Noise as long as the call, the same for a call every time: wind across a
+    microphone, in which nothing is said."""
+    drawn = random.Random(index)
+    samples = bytearray()
+    for _ in range(round(seconds * SAMPLE_RATE)):
+        samples += drawn.randint(-3000, 3000).to_bytes(2, "little", signed=True)
+    return pcm_to_wav(bytes(samples))
 
 
 @functools.cache

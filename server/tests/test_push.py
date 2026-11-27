@@ -623,6 +623,9 @@ _TIMED = (
         (1, *_TIMED),
         # The second: as now, and an address taken without a permit.
         (2, *_TIMED),
+        # The third: as now, from when a device was handed words for the invented
+        # scenario that said who decided.
+        (3, *_TIMED),
     ],
 )
 def test_a_file_of_the_earlier_shape_has_its_subscriptions_deleted_and_stays_its_modes(
@@ -654,7 +657,7 @@ def test_a_file_of_the_earlier_shape_has_its_subscriptions_deleted_and_stays_its
 
     assert (kept.all(), kept.tries()) == ((), {})
     with sqlite3.connect(path) as db:
-        assert db.execute("PRAGMA user_version").fetchone() == (3,)
+        assert db.execute("PRAGMA user_version").fetchone() == (4,)
     # It is a file of this shape from then on, and keeps what it is given.
     kept.put(FCM, [NEAR], at(0))
     assert kept.claim(FCM, "inc-1", near(0), at(1))
@@ -1157,16 +1160,19 @@ def test_the_words_of_a_notification_say_whose_decision_it_is_and_tell_nobody_wh
 
     assert live.title == "Beacon: crisis mode near a saved place"
     assert "the investigator's reading and no authority's" in live.text
-    # On the invented scenario it says so first, and that a stand-in decided.
+    # On the invented scenario it says so first. It does not say who decided: the
+    # words on a device can be older than the telling, whose investigator is a
+    # stand-in or a model, and the app says which.
     assert mock.title == "Beacon: invented scenario"
-    assert mock.text.startswith("Invented scenario, not a real event. A stand-in for")
+    assert mock.text.startswith("Invented scenario, not a real event. Beacon's investigator,")
+    assert "which the app names as a model or a stand-in for one" in mock.text
+    assert "no authority's" in mock.text
     for text in (live.title, live.text, mock.title, mock.text, ABOUT):
         said = text.lower()
         for word in ("stay", "leave", "evacuate", " go ", "shelter", "safe", "danger"):
             assert word not in said
-    # A model is not called a stand-in, nor a stand-in a model.
+    # On real sources nothing is a stand-in's.
     assert "stand-in" not in live.text
-    assert "model" not in mock.text
     assert "30 days" in ABOUT
     assert timedelta(days=30) == KEPT
     assert "2 days at most" in ABOUT

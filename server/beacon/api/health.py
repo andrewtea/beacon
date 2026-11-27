@@ -24,6 +24,11 @@ class Health(BaseModel):
     # that the story is still made up. Shown with what says the scenario is
     # invented. Null on every other server.
     teller_text: str | None = None
+    # Where a clip or a photo added to a tap can be sent to Meta, for Muse Ember
+    # to say what is in it (`beacon.investigate.setup.MEDIA_SENT`): a sentence
+    # that says so, shown where one is added. Null where the investigator is a
+    # stand-in, where no tap is investigated, and where no clip or photo is taken.
+    media_text: str | None = None
     # On a server that tells the invented scenario again when it is over
     # (`beacon.serve`, `BEACON_MOCK_REPEAT=1`): a sentence that says so, and what
     # becomes of the taps sent before. Shown with what says the scenario is
@@ -56,6 +61,7 @@ def health(request: Request) -> Health:
         mode=None if engine is None else engine.mode,
         teller=teller,
         teller_text=telling.TOLD_BY_EMBER if teller == "ember" else None,
+        media_text=getattr(request.app.state, "media_text", None),
         repeats_text=getattr(request.app.state, "repeats_text", None),
         input=takes,
         front_text=front.INVENTED if takes == "invented" else None,

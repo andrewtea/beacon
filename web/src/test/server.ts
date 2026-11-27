@@ -48,6 +48,7 @@ export const MOCK_HEALTH = {
   mode: 'mock',
   teller: 'stand_in',
   teller_text: null,
+  media_text: null,
   repeats_text: null,
   input: 'own',
   front_text: null,

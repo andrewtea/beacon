@@ -277,6 +277,37 @@ class EvidenceStore:
                 )
         return added
 
+    def amend(
+        self,
+        name: str,
+        change: Callable[[dict[str, Any]], Mapping[str, Any] | None],
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Read what is saved under `name` and save what `change` makes of it, in
+        one write transaction, and return what is saved when it ends. `change` is
+        handed a copy and answers the state to save, or None to leave it as it is.
+
+        The look and the write are that one transaction, so of two processes on
+        one file that both find something missing, one writes it and the other is
+        handed what the first wrote.
+
+        Raises EvidenceStoreError when the state is not JSON or the store is
+        closed."""
+        recorded_ms = _to_ms(datetime.now(UTC) if now is None else now)
+        with self._writing() as db:
+            saved = _saved_state(db, name)
+            changed = change(dict(saved))
+            if changed is None:
+                return saved
+            db.execute(
+                "INSERT INTO poller_state (name, state, updated_ms) VALUES (?, ?, ?) "
+                "ON CONFLICT (name) DO UPDATE SET state = excluded.state, "
+                "updated_ms = excluded.updated_ms",
+                (name, _json(changed, "A poller's state"), recorded_ms),
+            )
+            return dict(changed)
+
     def claim(self, source: str, ref: str, *, now: datetime | None = None) -> bool:
         """Claim an item of a source's, and say whether the claim is this caller's.
         It is True for the one caller that claims an item first, and False for every

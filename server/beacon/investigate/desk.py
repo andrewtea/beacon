@@ -126,6 +126,12 @@ class InvestigationDesk:
         """Whether a tap that is handed in now will be looked into."""
         return not self._closing.is_set()
 
+    @property
+    def investigator(self) -> str:
+        """What investigates for this desk: `live` for Muse Ember, `fake` for a
+        stand-in. It says where a tap's clip or photo can be sent."""
+        return self._ember.mode
+
     def state_of(self, tap_id: str) -> str | None:
         """`queued` for a tap that waits for a worker, `running` for one a run is
         being made for, and None for any other: its run is kept, or none is coming

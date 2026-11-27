@@ -85,8 +85,13 @@ function YourTaps() {
 export function Home({
   mode,
   input,
+  mediaText = null,
   onOtherMode,
 }: {
+  // Where a clip or a photo added to a tap can be sent to Meta for a model to
+  // say what is in it: the server's sentence about that, shown beside the
+  // controls that add one, before one is added.
+  mediaText?: string | null
   // What the server said it takes from a visitor at the latest asking, or null
   // when that is not known, and then no tap is taken. When it is only the
   // invented scenario's two places, the button sends a tap from the first of
@@ -304,6 +309,7 @@ export function Home({
               {photoProblem}
             </p>
           )}
+          {mediaText !== null && <p className="note media-note">{mediaText}</p>}
           <p className="meta privacy">
             A tap sends where you are, rounded to about a block, and whatever
             you add. A clip or a photo goes only with the tap, as evidence for

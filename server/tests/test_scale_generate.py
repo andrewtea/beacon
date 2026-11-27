@@ -236,20 +236,20 @@ def test_calls_that_sound_the_same_say_the_same_so_a_medical_arrival_is_never_he
     monkeypatch.setattr(
         generate,
         "_speech",
-        lambda root, words: pcm_to_wav(hashlib.sha256(words.encode()).digest() * 1000),
+        lambda words: pcm_to_wav(hashlib.sha256(words.encode()).digest() * 1000),
     )
     root = tmp_path / "calls"
     generate.write_calls(root, script, "speech")
     hearer = generate.read_script(root).hearer
     heard = []
     for line in arrivals:
-        audio = base64.b64encode(plain_wav(generate._speech(root, line.words))).decode()
+        audio = base64.b64encode(plain_wav(generate._speech(line.words))).decode()
         body = {"input": [{"content": [{"type": "input_audio", "input_audio": {"data": audio}}]}]}
         heard.append(json.loads(hearer(body)["output"][0]["content"][0]["text"])["category"])
     assert heard == ["fire", "medical"]
 
     # Were two calls that say different things ever to sound the same, nothing is written.
-    monkeypatch.setattr(generate, "_speech", lambda root, words: pcm_to_wav(b"\x01\x00" * 16000))
+    monkeypatch.setattr(generate, "_speech", lambda words: pcm_to_wav(b"\x01\x00" * 16000))
     with pytest.raises(generate.GenerateError, match="could not be written"):
         generate.write_calls(tmp_path / "same", script, "speech")
     assert not (tmp_path / "same" / generate.SCRIPT_FILE).exists()

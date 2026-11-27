@@ -21,8 +21,9 @@ It is `uvicorn beacon.main:app` with three things a deployment wants:
 **What `begin_again` deletes, and what it does not.** The mock evidence store with
 every tap sent to it, the stand-in's investigations of those taps, and the
 stand-in's stories: `MOCK_FILES`. Nothing in them was paid for: the setting is
-refused where Muse Ember works on the invented story (`beacon.telling`), whose
-store holds the claims on what it was paid for. It never touches a
+refused where Muse Ember works on the invented story (`beacon.telling`), and a
+store that says Muse Ember worked on it is not deleted whatever the setting
+(`PAID_FOR`), because it holds the claims on what was paid for. It never touches a
 live store's files, the Ember ledger, a scale run, or the push subscriptions, which
 are devices' and have their own lifetimes. A tap's photo or clip is left to the
 server's sweep, which deletes one once its hour is over and sooner once its tap
@@ -83,6 +84,7 @@ from beacon.ingest.setup import (
     MOCK_HEAD_START,
     IngestConfigError,
     live_sources,
+    teller_kept,
 )
 from beacon.investigate import store as investigations
 from beacon.scenario import DURATION
@@ -201,6 +203,16 @@ def repeats(env: Mapping[str, str]) -> bool:
     return True
 
 
+# Said of a mock store Muse Ember worked on, by a server that would delete it.
+PAID_FOR = (
+    "The mock store under this data directory is one Muse Ember worked on: it holds "
+    "the claims on what was paid for. A server that tells the invented story again "
+    f"({REPEAT_VARIABLE}=1) deletes the mock store between tellings, and does not run "
+    "on this one. Nothing was deleted. Start the server as the store was begun: "
+    f"{MOCK_EMBER_VARIABLE}=live with its budget, and without {REPEAT_VARIABLE}=1."
+)
+
+
 def over_at(start: datetime) -> datetime:
     """When a story that began at `start` has been played to its end."""
     return start + PLAYED_FOR
@@ -235,8 +247,11 @@ def begin_again(env: Mapping[str, str], now: datetime, lock: DataLock) -> bool:
     no mock store or its story is not over. Only `MOCK_FILES` are deleted, and
     none of them before every one that is there was seen to be the mock store's.
 
-    Raises NotTheMockStoresError for a file that was not seen to be the mock
-    store's own of its kind, StillOpenError for one something has open,
+    Raises ServeError, with nothing changed, for a mock store Muse Ember worked
+    on (`beacon.telling`), whatever this server is set to: its files hold the
+    claims on what was paid for. NotTheMockStoresError for a file that was not
+    seen to be the mock store's own of its kind, StillOpenError for one something
+    has open,
     sqlite3.Error when its log could not be emptied, MediaLockedError when
     something has the taps' media, EvidenceStoreError when the mock store cannot
     be read as one, EmberConfigError for a relative `BEACON_DATA_DIR`, and OSError
@@ -262,9 +277,14 @@ def begin_again(env: Mapping[str, str], now: datetime, lock: DataLock) -> bool:
     try:
         store = EvidenceStore(evidence, "mock")
         try:
-            start = store.state(_SCENARIO_STATE).get("start")
+            state = store.state(_SCENARIO_STATE)
         finally:
             store.close()
+        if teller_kept(state) == "ember":
+            # Whatever this server is set to: what the store says, read under the
+            # lock, before anything is changed.
+            raise ServeError(PAID_FOR)
+        start = state.get("start")
         if not isinstance(start, str) or now < over_at(datetime.fromisoformat(start)):
             return False
         # Every log is emptied before any file goes: one that is busy stops it all.
@@ -460,9 +480,10 @@ def run(
     whole**: after any other, a thread may still have a store open, and the lock
     is kept until the process is gone.
 
-    Raises ServeError and IngestConfigError as `repeats` does, DataLockedError
-    when another process has the data directory's stores, and
-    NotTheMockStoresError when a file kept as the mock store's is not that."""
+    Raises ServeError and IngestConfigError as `repeats` does, ServeError as
+    `begin_again` does for a store Muse Ember worked on, DataLockedError when
+    another process has the data directory's stores, and NotTheMockStoresError
+    when a file kept as the mock store's is not that."""
     from beacon.main import create_app
 
     clock = (lambda: datetime.now(UTC)) if clock is None else clock

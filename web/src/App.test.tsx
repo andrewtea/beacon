@@ -108,6 +108,30 @@ test('says, in the server’s sentence, that a model works on the invented scena
   expect(banner).toHaveTextContent(teller)
 })
 
+test('says, in the server’s sentence, where a clip or a photo is sent, beside the controls that add one', async () => {
+  const media =
+    'A clip or a photo you add to a tap is sent to Meta’s Model API when the investigator asks what is in it.'
+  serve({ 'GET /api/health': { ...MOCK_HEALTH, media_text: media } })
+
+  render(<App />)
+
+  // Before one is added: with the controls, and above what a tap sends.
+  const said = await screen.findByText(media)
+  const extras = screen.getByRole('group', { name: 'Add to your tap' })
+  expect(
+    extras.compareDocumentPosition(said) & Node.DOCUMENT_POSITION_FOLLOWING,
+  ).toBeTruthy()
+})
+
+test('says nothing of Meta where no clip or photo is sent there', async () => {
+  serve({ 'GET /api/health': MOCK_HEALTH })
+
+  render(<App />)
+
+  await screen.findByRole('group', { name: 'Add to your tap' })
+  expect(screen.queryByText(/Meta/)).not.toBeInTheDocument()
+})
+
 const FRONT =
   'On this server a tap is sent from one of two invented places, not from where you are.'
 const FRONT_MORE = 'The address a tap’s answer is read at holds the tap’s id.'

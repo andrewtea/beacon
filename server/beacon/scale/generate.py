@@ -219,7 +219,7 @@ def write_calls(root: Path, lines: Sequence[Line], voice: Voice, *, unplaced: in
         shutil.rmtree(root / SYSTEM, ignore_errors=True)
         heard: dict[str, Any] = {}
         for index, line in enumerate(lines):
-            audio = _tone(index, line) if voice == "tones" else _speech(root, line.words)
+            audio = _tone(index, line) if voice == "tones" else _speech(line.words)
             talkgroup = _talkgroup(line)
             stem = _stem(index, line.at, talkgroup)
             day = root.joinpath(SYSTEM, str(line.at.year), str(line.at.month), str(line.at.day))

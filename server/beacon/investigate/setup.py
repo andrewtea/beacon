@@ -22,6 +22,18 @@ class InvestigateConfigError(Exception):
     """The environment asks for an investigation desk that cannot be built."""
 
 
+# What a person reads where a clip or a photo is added to a tap, on a server whose
+# investigator is Muse Ember and which takes a visitor's own: the one thing of a
+# person's that leaves Beacon for Meta. It says when it is sent and no more than
+# Beacon knows of what becomes of it there.
+MEDIA_SENT = (
+    "On this server the investigator is a model, Muse Ember, on Meta's Model API. A "
+    "clip or a photo you add to a tap is sent there when the investigator asks what "
+    "can be heard or seen in it, and Beacon keeps only which of a short list of "
+    "things the model named. Beacon cannot say what Meta keeps of a request."
+)
+
+
 def open_investigations(
     env: Mapping[str, str],
     engine: Engine,

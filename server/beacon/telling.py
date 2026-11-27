@@ -1,16 +1,17 @@
 """Who does a model's work on the invented story: a stand-in for Muse Ember, or Muse Ember.
 
-    BEACON_MOCK_EMBER=live BEACON_MOCK_EMBER_BUDGET_USD=0.10 \\
+    BEACON_DATA_DIR=/the/one/data/directory BEACON_FRONT_END=unverified \\
+      BEACON_MOCK_EMBER=live BEACON_MOCK_EMBER_BUDGET_USD=0.10 \\
       REPLAY=0 MODEL_API_KEY=... EMBER_SPENT_BEFORE_USD=... python -m beacon.serve
 
 By default (`stand-in`) every Ember client of a server on the mock store is a
 stand-in that works by rule and costs nothing, and everything it had a part in says
 so. `BEACON_MOCK_EMBER=live` has Muse Ember itself do the four things a model does
-in Beacon, **on the invented story and on nothing else**:
+in Beacon, on the invented story's evidence:
 
-- hear its radio calls, which are then left as files of synthesized speech where a
-  recorder would leave them (`beacon.scenario.recorder`): a tone says nothing, and
-  is never sent to a paid Ember;
+- hear its radio calls, which are then synthesized speech of invented words, made
+  in memory (`beacon.scenario.radio.SpokenShelf`): a tone says nothing, and is
+  never sent to a paid Ember;
 - read its notices, the invented PDFs;
 - pick the points an incident's story is told by;
 - and investigate taps.
@@ -22,12 +23,20 @@ thing says of itself: a row's `model`, a story's, and a run's are `live`, and a
 sentence about one says a model did it. Nothing here makes an invented row a live
 one, and the live store still refuses every one of them.
 
+**A tap is a person's, whatever the story is.** On a server that takes a visitor's
+own (`beacon.front`), a clip or a photo that was added to a tap is sent to Muse
+Ember when the investigator asks what is in it, as on real sources, and the app
+says so where one is added (`beacon.investigate.setup.MEDIA_SENT`). A server that
+is to send Meta nothing but invented material takes only the invented places
+(`BEACON_FRONT_END=unverified`), which takes no clip and no photo.
+
 **It is paid for, under a budget with no default**, split among four spending
 scopes of its own (`SCOPES`), so that what the invented story cost is in the ledger
 apart from what real sources cost, and so that the investigator is not starved by
-the story desk. A story is told by one or the other for as long as its store is
-kept (`TELLER_STATE`): a stand-in does not go on with a story Ember began, nor Ember
-with a stand-in's.
+the story desk. **A mock store is one teller's for as long as it is kept**
+(`beacon.ingest.setup.keep_teller`): a stand-in does not go on with a store Ember
+worked on, nor Ember with a stand-in's, with the pollers or without them, and what
+tells the story again by deleting the store refuses one that was paid for.
 """
 
 from collections.abc import Callable, Mapping
@@ -114,21 +123,35 @@ def scope_of(env: Mapping[str, str], label: str) -> SpendScope:
     )
 
 
+def check(env: Mapping[str, str], make: PaidClient | None = None) -> None:
+    """Refuse a telling by Muse Ember that has no live Ember to ask, **before
+    anything is made**: a client, even one that only replays, makes the ledger's
+    file, and a store that was opened for a telling is that telling's from then on.
+
+    Raises TellingConfigError when `REPLAY` is not 0 or there is no key. A test
+    that hands in what makes its clients (`make`) is asked for nothing here."""
+    if make is None and (env.get("REPLAY", "1") != "0" or not env.get("MODEL_API_KEY")):
+        raise TellingConfigError(_NO_LIVE_EMBER)
+
+
 def paying(env: Mapping[str, str], label: str, make: PaidClient | None = None) -> EmberClient:
     """A live Ember client that pays under the scope `label`, one of `SCOPES`.
 
     Raises TellingConfigError when the budget is not one or there is no live Ember,
     and EmberConfigError as `EmberClient.from_env` does."""
     scope = scope_of(env, label)
+    check(env, make)
     ember = EmberClient.from_env(env, scope=scope) if make is None else make(scope)
     if ember.mode != "live":
         ember.close()
-        raise TellingConfigError(
-            f"{MOCK_EMBER_VARIABLE}=live needs a live Ember: set REPLAY=0, MODEL_API_KEY, "
-            "and EMBER_SPENT_BEFORE_USD. Its calls are sensitive ones and cannot be "
-            "replayed."
-        )
+        raise TellingConfigError(_NO_LIVE_EMBER)
     return ember
+
+
+_NO_LIVE_EMBER = (
+    f"{MOCK_EMBER_VARIABLE}=live needs a live Ember: set REPLAY=0, MODEL_API_KEY, and "
+    "EMBER_SPENT_BEFORE_USD. Its calls are sensitive ones and cannot be replayed."
+)
 
 
 def other_teller(began: Teller, now: Teller) -> str:

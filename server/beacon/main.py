@@ -24,8 +24,9 @@ from beacon.datadir import DataLock
 from beacon.ember.client import default_data_dir
 from beacon.incident import Engine, open_engine
 from beacon.ingest import IngestConfigError, build
-from beacon.ingest.setup import PAID_SECONDS, STOP_SECONDS, Ingest
+from beacon.ingest.setup import PAID_SECONDS, STOP_SECONDS, Ingest, keep_teller
 from beacon.investigate import InvestigationDesk, Runs, RunsError, open_investigations
+from beacon.investigate.setup import MEDIA_SENT
 from beacon.places import Admission
 from beacon.push import Push, SubscriptionsError, open_push
 from beacon.radio import core_dump_problem, forbid_core_dumps
@@ -307,8 +308,15 @@ async def _running(app: FastAPI, setting: str) -> AsyncIterator[None]:
             raise ServerSetupError(front.NOT_WITH_A_REAL_SOURCE)
         app.state.incidents = engine
         # Who does the model's work on the invented story, which the server says
-        # of itself (`GET /api/health`) and the words of a notification name.
-        app.state.teller = teller_of(os.environ) if engine.mode == "mock" else None
+        # of itself (`GET /api/health`). The mock store is that teller's or
+        # nobody's yet, with the pollers or without them, **before a desk is
+        # opened on it**: a stand-in's desks write nothing into a store Muse
+        # Ember worked on, and the other way round.
+        app.state.teller = None
+        if engine.mode == "mock":
+            teller = teller_of(os.environ)
+            keep_teller(taps.store, teller, datetime.now(UTC))
+            app.state.teller = teller
         # What Ember writes about an incident: a stand-in's on the mock store, and
         # on the live store written only under a budget somebody set.
         stories = open_stories(os.environ, engine)
@@ -322,6 +330,15 @@ async def _running(app: FastAPI, setting: str) -> AsyncIterator[None]:
         app.state.runs = runs
         if investigations is not None:
             app.state.investigations = investigations
+        # Where the investigator is Muse Ember and a visitor's own clip or photo is
+        # taken, one that is added to a tap is sent to Meta: said where one is added.
+        app.state.media_text = (
+            MEDIA_SENT
+            if investigations is not None
+            and investigations.investigator == "live"
+            and app.state.input == "own"
+            else None
+        )
         sweeping_runs = asyncio.create_task(_sweep_runs(runs, stop))
         sweeping = asyncio.create_task(_sweep_tap_media(taps, stop))
         # Notifications, for the devices that asked for them: sent when a decision

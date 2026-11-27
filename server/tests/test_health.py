@@ -21,6 +21,7 @@ def test_health_reports_ok_and_the_package_version() -> None:
         "mode": None,
         "teller": None,
         "teller_text": None,
+        "media_text": None,
         "repeats_text": None,
         "input": "own",
         "front_text": None,
