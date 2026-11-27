@@ -1,9 +1,14 @@
 """Scoring a scale run: which of DataSF's calls Beacon has an incident for.
 
 The incidents are the incident engine's, read from the run's evidence store as the
-server reads its own (`Engine.at`), at moments through the day and after it, because
-the engine looks back twelve hours and no further. An incident that is read at
-several of those moments is counted once, as its fullest reading.
+server reads its own (`Engine.at`), at moments from the run's first radio row to its
+last, because the engine looks back twelve hours and no further. The moments are
+the rows' own and not DataSF's: a call heard long after the day's last dispatch is
+read too. An incident that is read at several of those moments is counted once, as
+its fullest reading, and two readings are of one incident when they share a row or
+are joined by readings between them that do: an incident that goes on for longer
+than the engine looks back is never read whole, and is still one incident. It is
+then scored by its fullest reading, which lacks the calls the engine no longer saw.
 
 **How an incident is taken to be a record's** (`fits`), which is plain code and the
 same for generated audio and for recordings:
@@ -55,7 +60,6 @@ NEAR_M = 300.0
 # How far apart the moments are at which the engine is read, and for how long after
 # the last dispatch: less than the engine's twelve hours, so nothing is passed by.
 STEP = timedelta(hours=6)
-AFTER = timedelta(hours=12)
 
 
 @dataclass(frozen=True)
@@ -101,38 +105,57 @@ class Matched:
         return dict(self.inside).get(number)
 
 
-def read_incidents(store: EvidenceStore, blocks: Blocks, records: Sequence[Record]) -> Reading:
-    """Every incident the engine makes of the run's rows, from the first dispatch
-    of the day to `AFTER` past the last."""
+def read_incidents(store: EvidenceStore, blocks: Blocks) -> Reading:
+    """Every incident the engine makes of the run's radio rows, read at moments
+    from the first row's time to the last row's, which the last reading is at."""
     engine = Engine(store, blocks)
-    if not records:
+    oldest = store.search(kinds=["radio"], limit=1)
+    newest = store.search(kinds=["radio"], newest_first=True, limit=1)
+    if not oldest or not newest:
         return Reading((), {}, False)
-    first = min(record.dispatched_at for record in records)
-    last = max(record.dispatched_at for record in records) + AFTER
+    first, last = oldest[0].occurred_at, newest[0].occurred_at
     read: list[Incident] = []
     partial = False
     moment = first + STEP
     while True:
+        # Both ends of a reading are included, so the one at `last` has the last row.
         snapshot = engine.at(min(moment, last))
         partial = partial or snapshot.partial
         read += snapshot.incidents
         if moment >= last:
             break
         moment += STEP
-    # The fullest reading of each incident is kept. A reading that shares a row
-    # with one that is kept is the same incident, read at another moment.
-    read.sort(key=lambda incident: (-len(incident.evidence_ids), incident.opened_at, incident.id))
-    kept: list[Incident] = []
-    owner: dict[int, str] = {}
-    kept_as: dict[str, str] = {}
+    # Readings that share a row are of one incident, read at different moments, and
+    # so are readings that are joined by others between them: the rows are put into
+    # sets that way, and each set is one incident.
+    joined: dict[int, int] = {}
+
+    def group(row: int) -> int:
+        while joined.setdefault(row, row) != row:
+            joined[row] = joined[joined[row]]
+            row = joined[row]
+        return row
+
     for incident in read:
-        same = next((owner[row] for row in incident.evidence_ids if row in owner), None)
-        if same is None:
-            kept.append(incident)
-            same = incident.id
-            for row in incident.evidence_ids:
-                owner[row] = same
-        kept_as.setdefault(incident.id, same)
+        for row in incident.evidence_ids[1:]:
+            one, other = sorted((group(incident.evidence_ids[0]), group(row)))
+            joined[other] = one
+    readings: dict[object, list[Incident]] = {}
+    for incident in read:
+        rows = incident.evidence_ids
+        # An incident with no row, which the engine does not make, is its own.
+        readings.setdefault(group(rows[0]) if rows else incident.id, []).append(incident)
+    kept: list[Incident] = []
+    kept_as: dict[str, str] = {}
+    for same in readings.values():
+        # The fullest reading of each incident is kept.
+        fullest = min(
+            same,
+            key=lambda incident: (-len(incident.evidence_ids), incident.opened_at, incident.id),
+        )
+        kept.append(fullest)
+        for incident in same:
+            kept_as[incident.id] = fullest.id
     kept.sort(key=lambda incident: (incident.opened_at, incident.id))
     return Reading(tuple(kept), kept_as, partial)
 

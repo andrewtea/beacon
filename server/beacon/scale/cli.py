@@ -277,7 +277,7 @@ def _run(
         if ledger_lost:
             # Kept, so that the command given again is refused and pays nothing.
             lose_ledger(layout)
-        reading = score.read_incidents(store, known_blocks, records)
+        reading = score.read_incidents(store, known_blocks)
         script = generate.read_script(layout.calls) if settings.audio == "generated" else None
         made = results.build(
             options.name,

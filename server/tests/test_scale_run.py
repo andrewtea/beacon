@@ -5,6 +5,7 @@ results say a number is. Nothing here is DataSF's data, and nothing is a recordi
 import base64
 import fcntl
 import hashlib
+import itertools
 import json
 import os
 import sqlite3
@@ -851,7 +852,7 @@ def scored(env: dict[str, str], site: DataSf) -> tuple[run.Layout, score.Reading
     layout = run.Layout.under(env, "day")
     records = run.read_records(layout)
     store = EvidenceStore(layout.evidence, "mock")
-    reading = score.read_incidents(store, run.read_lists(layout)[1], records)
+    reading = score.read_incidents(store, run.read_lists(layout)[1])
     return layout, reading, score.match(records, reading.incidents)
 
 
@@ -906,7 +907,7 @@ def test_an_incident_no_call_of_the_day_fits_is_counted_as_one(
             ]
         )  # fmt: skip
 
-    reading = score.read_incidents(store, run.read_lists(layout)[1], records)
+    reading = score.read_incidents(store, run.read_lists(layout)[1])
     matched = score.match(records, reading.incidents)
 
     # Neither is the fire's, though one names its engine: it opened hours after.
@@ -951,7 +952,7 @@ def test_a_call_is_taken_to_be_inside_only_an_incident_of_its_kind_that_is_anoth
     late = record("260620102", "alarm", datetime(2026, 3, 3, 23, 25, tzinfo=UTC))
     day = [*records, medical, late]
 
-    reading = score.read_incidents(store, run.read_lists(layout)[1], day)
+    reading = score.read_incidents(store, run.read_lists(layout)[1])
     matched = score.match(day, reading.incidents)
 
     # Neither is inside anything: the fire is no medical response, and the late
@@ -984,6 +985,113 @@ def test_a_tap_away_from_every_call_is_away_from_them_where_it_is_put_after_roun
 
     assert busy is None
     assert quiet == Point(37.780, -122.476)
+
+
+def test_fewer_taps_than_calls_are_spread_over_the_whole_day_and_not_its_first_calls() -> None:
+    start = datetime(2026, 3, 3, 8, 0, tzinfo=UTC)
+    day = [
+        datasf.Record(
+            number=f"{index:03}", kind="alarm", received_at=start + timedelta(minutes=5 * index),
+            dispatched_at=start + timedelta(minutes=5 * index), on_scene_at=None, cleared_at=None,
+            streets=(), point=Point(37.75 + index / 10_000, -122.45), units=("E31",), alarms=None,
+        )
+        for index in range(190)
+    ]  # fmt: skip
+
+    # Given in another order than the day's, which the plan does not depend on.
+    planned = taps.plan(day[::-1], 100)
+
+    chosen = [int(tap.near) for tap in planned if tap.near is not None]
+    # A hundred of a hundred and ninety: the first call and the last are among
+    # them, and no two that follow one another are more than two calls apart.
+    placed = sorted(
+        {round((tap.at - start - taps.AFTER_DISPATCH) / timedelta(minutes=5)) for tap in planned}
+    )
+    assert len(placed) == len(planned) > 80
+    assert (placed[0], placed[-1]) == (0, 189)
+    assert max(later - earlier for earlier, later in itertools.pairwise(placed)) <= 3
+    assert set(chosen) <= set(placed)
+    assert max(chosen) > 180
+
+
+def test_a_tap_is_not_away_from_a_call_whose_unit_datasf_says_is_on_scene_then() -> None:
+    dispatched = datetime(2026, 3, 3, 18, 0, tzinfo=UTC)
+    on_scene = datetime(2026, 3, 3, 20, 30, tzinfo=UTC)
+
+    def at(number: str, lat: float, arrived: datetime | None) -> datasf.Record:
+        return datasf.Record(
+            number=number, kind="alarm", received_at=dispatched, dispatched_at=dispatched,
+            on_scene_at=arrived, cleared_at=None, streets=(), point=Point(lat, -122.476),
+            units=("E31",), alarms=None,
+        )  # fmt: skip
+
+    # A call with no time of clearing, whose unit DataSF says was on scene two and
+    # a half hours after the dispatch, and a place 57 m from it.
+    here = at("1", 37.7800, None)
+    going = at("2", 37.7805, on_scene)
+
+    # At the moment the unit is on scene, and for an hour after, the place is not
+    # away from the call: the last time the record gives is the arrival.
+    assert taps._away_from_all([here, going], [here], on_scene, 0) is None
+    assert taps._away_from_all([here, going], [here], on_scene + timedelta(minutes=59), 0) is None
+    # More than an hour past the last time the record gives for either, it is.
+    assert taps._away_from_all([here, going], [here], on_scene + timedelta(minutes=61), 0) == Point(
+        37.78, -122.476
+    )
+
+
+def _heard(store: EvidenceStore, ref: str, at: datetime, unit: str = "E36") -> None:
+    store.add(
+        [
+            NewEvidence(
+                kind="radio", source="recordings", ref=ref, occurred_at=at, confidence="medium",
+                origin="mock", model="fake",
+                data={"event": "fire", "category": "fire", "clarity": "clear",
+                      "status": "working", "details": [], "units": [unit], "alarm": None,
+                      "street": None, "block": None, "cross_street": None},
+            )
+        ]
+    )  # fmt: skip
+
+
+def test_an_incident_that_goes_on_for_longer_than_the_engine_looks_back_is_one_incident(
+    env: dict[str, str], site: DataSf, tmp_path: Path
+) -> None:
+    layout, _, _ = scored(env, site)
+    store = EvidenceStore(tmp_path / "long.sqlite3", "mock")
+    start = datetime(2026, 3, 3, 8, 0, tzinfo=UTC)
+    # One engine heard from every half hour for a day and a half: one radio group,
+    # which no reading of twelve hours holds whole, and whose last readings share
+    # no row with its first.
+    for index in range(72):
+        _heard(store, f"call-{index}", start + timedelta(minutes=30 * index))
+
+    reading = score.read_incidents(store, run.read_lists(layout)[1])
+
+    # The readings at the ends share no row, and are joined by the ones between.
+    assert len(reading.incidents) == 1
+    assert len(set(reading.kept_as)) > 1
+    assert set(reading.kept_as.values()) == {reading.incidents[0].id}
+
+
+def test_the_incidents_are_read_to_the_last_row_heard_whenever_the_last_dispatch_was(
+    env: dict[str, str], site: DataSf, tmp_path: Path
+) -> None:
+    layout, _, _ = scored(env, site)
+    store = EvidenceStore(tmp_path / "late.sqlite3", "mock")
+    # A call dispatched at one in the morning, and its unit heard from again
+    # thirteen hours on, which is another incident and the last row of the store.
+    _heard(store, "dispatch", datetime(2026, 3, 3, 9, 0, tzinfo=UTC))
+    _heard(store, "arrival", datetime(2026, 3, 3, 22, 0, tzinfo=UTC))
+
+    reading = score.read_incidents(store, run.read_lists(layout)[1])
+
+    assert [incident.opened_at.hour for incident in reading.incidents] == [9, 22]
+    rows = [row for incident in reading.incidents for row in incident.evidence_ids]
+    assert sorted(rows) == [1, 2]
+    # A store with no radio row has no incident.
+    empty = EvidenceStore(tmp_path / "empty.sqlite3", "mock")
+    assert score.read_incidents(empty, run.read_lists(layout)[1]).incidents == ()
 
 
 def test_an_incident_read_at_several_moments_of_a_day_is_counted_once(
@@ -1025,9 +1133,12 @@ def test_taps_are_planned_from_the_days_calls_by_rule_and_none_at_a_medical_call
     # tap's name, and so its claim and its answer, to another.
     assert len({tap.id for tap in planned}) == 5
     assert all(tap.id.startswith("replay-") and len(tap.id) == 23 for tap in planned)
-    fewer = taps.plan(records, 2)
-    assert [tap.near for tap in fewer] == ["260620001", "260620004"]
-    assert [tap.id for tap in fewer] == [planned[0].id, planned[2].id]
+    # Fewer are spread over the whole day's calls, the first and the last among them.
+    fewer = taps.plan(records, 3)
+    assert [tap.near for tap in fewer] == ["260620001", "260620004", "260620006"]
+    assert [tap.id for tap in fewer[:2]] == [planned[0].id, planned[2].id]
+    assert fewer[2].id not in {tap.id for tap in planned}
+    assert [tap.near for tap in taps.plan(records, 1)] == ["260620004"]
     assert planned[0].at == datetime(2026, 3, 3, 16, 4, 30, tzinfo=UTC)
     assert (planned[0].point.lat, planned[0].point.lon) == (37.777, -122.423)
     # The fifth is away from every call: at the alarms' corner, hours after them,
@@ -1050,7 +1161,8 @@ def test_replayed_taps_are_investigated_once_and_counted_by_what_they_were_answe
     assert "Of 4 answered taps placed at a DataSF call's point" in texts["taps_near_matched"]
     assert (numbers["taps_unanswered"], numbers["taps_lost"]) == (0, 0)
     assert numbers["taps_away_unconfirmed"] == 1
-    assert "Of 1 answered taps placed where DataSF lists" in texts["taps_away_unconfirmed"]
+    assert "Of 1 answered taps placed at a place and a moment" in texts["taps_away_unconfirmed"]
+    assert "the last time DataSF records for it" in texts["taps_away_unconfirmed"]
     assert "No person tapped, and none is stored as a tap." in texts["taps"]
     # Nothing in the run's evidence says a person tapped.
     layout = run.Layout.under(env, "day")
@@ -1058,22 +1170,23 @@ def test_replayed_taps_are_investigated_once_and_counted_by_what_they_were_answe
     assert store.search(kinds=["tap"]) == []
     assert all(
         incident.taps == 0
-        for incident in score.read_incidents(
-            store, run.read_lists(layout)[1], run.read_records(layout)
-        ).incidents
+        for incident in score.read_incidents(store, run.read_lists(layout)[1]).incidents
     )
 
 
 def test_a_run_given_again_with_more_taps_investigates_only_the_new_ones(
     env: dict[str, str], site: DataSf
 ) -> None:
-    command(env, site, "--taps", "2")
+    command(env, site, "--taps", "3")
     layout = run.Layout.under(env, "day")
     planned = taps.plan(run.read_records(layout), 300)
     runs = Runs(layout.taps, "mock")
     first = {tap.id: made.started_at for tap, _, made in taps.kept(planned, runs) if made}
     runs.close()
-    assert (numbers_of(env)["taps"], len(first)) == (2, 2)
+    # Three were investigated. Two of them are taps of the plan of every call too;
+    # the third, at the day's last call, is one that plan asks another way (it puts
+    # the tap there away from every call), so it stays in the file and is not counted.
+    assert (numbers_of(env)["taps"], len(first)) == (3, 2)
 
     command(env, site)
 

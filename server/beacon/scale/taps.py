@@ -14,8 +14,13 @@ it, so the same records give the same taps:
   about a block as the app rounds a tap, `AFTER_DISPATCH` after the call was
   dispatched. A medical call gets none: the investigator is told only that a
   medical response is near, and matches no tap to one.
-- **away from every call**: at a call's point, at a moment when DataSF lists no
-  call within `CLEAR_M` of it for `CLEAR_FOR` either side.
+- **away from every call DataSF records there then**: at a call's point, at a
+  moment that, for every call DataSF lists within `CLEAR_M` of it, is more than
+  `CLEAR_FOR` before the call was received or more than `CLEAR_FOR` after the last
+  time DataSF records for it: its dispatch, a unit on scene, or its last unit
+  available (`_last_recorded`). That is what the record says and no more: a call
+  whose record ends at its dispatch can have gone on long after, and a call DataSF
+  does not list is not known of at all.
 
 **A replayed tap is investigated once, over every invocation.** It is claimed in the
 run's own investigations file before Ember is asked and the claim is never given up,
@@ -109,13 +114,27 @@ class Replayed:
 
 def plan(records: Sequence[Record], count: int) -> list[Replay]:
     """Up to `count` replayed taps for a day's records, spread evenly over the
-    day's calls, one in `AWAY_EVERY` of them away from every call."""
+    day's calls in the order they were dispatched, from the first to the last, one
+    in `AWAY_EVERY` of them away from every call."""
     count = max(0, min(count, MAX_TAPS))
-    placed = [record for record in records if not record.medical and record.point is not None]
+    placed = sorted(
+        (record for record in records if not record.medical and record.point is not None),
+        key=lambda record: (record.dispatched_at, record.number),
+    )
     if not placed or not count:
         return []
-    step = max(1, len(placed) // count)
-    chosen = placed[::step][:count]
+    last = len(placed) - 1
+    if count >= len(placed):
+        chosen = placed
+    elif count == 1:
+        # One tap is at the middle of the day's calls.
+        chosen = [placed[last // 2]]
+    else:
+        # The first call, the last, and the ones at even steps between them, each
+        # step rounded to the nearest call: with fewer taps than calls a step is
+        # more than one call, so no call is chosen twice.
+        between = count - 1
+        chosen = [placed[(2 * index * last + between) // (2 * between)] for index in range(count)]
     replays: list[Replay] = []
     for index, record in enumerate(chosen):
         assert record.point is not None
@@ -286,9 +305,10 @@ def kept(replays: Sequence[Replay], runs: Runs) -> list[tuple[Replay, Standing, 
 def _away_from_all(
     records: Sequence[Record], placed: Sequence[Record], at: datetime, index: int
 ) -> Point | None:
-    """A call's point, rounded as a tap is, that no call of the day is within
-    `CLEAR_M` of for `CLEAR_FOR` either side of `at`, looked for from a place in the
-    list that depends on `index` alone."""
+    """A call's point, rounded as a tap is, such that for every call of the day
+    within `CLEAR_M` of it, `at` is more than `CLEAR_FOR` before the call was
+    received or more than `CLEAR_FOR` after the last time DataSF records for it,
+    looked for from a place in the list that depends on `index` alone."""
     for offset in range(len(placed)):
         given = placed[(index * 7 + offset) % len(placed)].point
         assert given is not None
@@ -297,17 +317,21 @@ def _away_from_all(
         if not any(
             other.point is not None
             and other.point.distance_m(point) <= CLEAR_M
-            and other.received_at - CLEAR_FOR <= at <= _until(other) + CLEAR_FOR
+            and other.received_at - CLEAR_FOR <= at <= _last_recorded(other) + CLEAR_FOR
             for other in records
         ):
             return point
     return None
 
 
-def _until(record: Record) -> datetime:
-    if record.cleared_at is not None and record.cleared_at >= record.dispatched_at:
-        return record.cleared_at
-    return record.dispatched_at
+def _last_recorded(record: Record) -> datetime:
+    """The last time DataSF records for a call: the latest of its dispatch, a unit
+    on scene, and its last unit available, of those the record has. It is not when
+    the call ended, which a record that lacks the later times does not say."""
+    later = (record.on_scene_at, record.cleared_at)
+    return max(
+        [record.dispatched_at, *(at for at in later if at is not None)],
+    )
 
 
 def _rounded(point: Point) -> Point:
