@@ -47,7 +47,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from beacon.evidence import EvidenceStore
-from beacon.incident import Engine
+from beacon.incident import Engine, incident_id
 from beacon.incident.model import Incident
 from beacon.incident.places import Blocks
 from beacon.radio.vocabulary import MEDICAL_EVENT
@@ -67,7 +67,8 @@ class Reading:
     """The incidents of a run, each once, and the ids each was read under."""
 
     incidents: tuple[Incident, ...]
-    # Every id an incident was read under at some moment, to the id it is kept by.
+    # Every id an incident can be read under at some moment (one for each of its
+    # rows, which can be the first of them in view), to the id it is kept by.
     kept_as: dict[str, str]
     # Whether any reading left rows out (`Snapshot.partial`).
     partial: bool
@@ -156,6 +157,14 @@ def read_incidents(store: EvidenceStore, blocks: Blocks) -> Reading:
         kept.append(fullest)
         for incident in same:
             kept_as[incident.id] = fullest.id
+        # An incident is named by the row of its that was stored first, of the rows
+        # in view, so at a moment between two readings it can have a name that none
+        # of them has: a tap's investigation is at such a moment. Every name a row
+        # of the incident can give it is the incident's.
+        for row in sorted({row for incident in same for row in incident.evidence_ids}):
+            evidence = store.get(row)
+            if evidence is not None:
+                kept_as.setdefault(incident_id(evidence), fullest.id)
     kept.sort(key=lambda incident: (incident.opened_at, incident.id))
     return Reading(tuple(kept), kept_as, partial)
 
@@ -213,11 +222,11 @@ def match(records: Sequence[Record], incidents: Sequence[Incident]) -> Matched:
     taken_records: set[str] = set()
     taken_incidents: set[str] = set()
     found: list[Pair] = []
-    for _, _, number, incident_id, record, incident in candidates:
-        if number in taken_records or incident_id in taken_incidents:
+    for _, _, number, taken_id, record, incident in candidates:
+        if number in taken_records or taken_id in taken_incidents:
             continue
         taken_records.add(number)
-        taken_incidents.add(incident_id)
+        taken_incidents.add(taken_id)
         found.append(
             Pair(
                 record=record,

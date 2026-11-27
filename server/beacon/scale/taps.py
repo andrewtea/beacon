@@ -113,9 +113,9 @@ class Replayed:
 
 
 def plan(records: Sequence[Record], count: int) -> list[Replay]:
-    """Up to `count` replayed taps for a day's records, spread evenly over the
-    day's calls in the order they were dispatched, from the first to the last, one
-    in `AWAY_EVERY` of them away from every call."""
+    """Up to `count` replayed taps for a day's records, each a different question,
+    spread evenly over the day's calls in the order they were dispatched, from the
+    first to the last, one in `AWAY_EVERY` of them away from every call."""
     count = max(0, min(count, MAX_TAPS))
     placed = sorted(
         (record for record in records if not record.medical and record.point is not None),
@@ -136,6 +136,11 @@ def plan(records: Sequence[Record], count: int) -> list[Replay]:
         between = count - 1
         chosen = [placed[(2 * index * last + between) // (2 * between)] for index in range(count)]
     replays: list[Replay] = []
+    # A tap is named by what it asks, and one question is put once: two controls
+    # of one moment can find the same place away from every call, and are then one
+    # tap, so that a plan can hold fewer taps than were asked for and never the
+    # same one twice.
+    named: set[str] = set()
     for index, record in enumerate(chosen):
         assert record.point is not None
         at = record.dispatched_at + AFTER_DISPATCH
@@ -146,7 +151,10 @@ def plan(records: Sequence[Record], count: int) -> list[Replay]:
             if away is None:
                 continue
             point, near = away, None
-        replays.append(_replay(at, _rounded(point), near))
+        tap = _replay(at, _rounded(point), near)
+        if tap.id not in named:
+            named.add(tap.id)
+            replays.append(tap)
     return replays
 
 

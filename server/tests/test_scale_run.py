@@ -20,6 +20,7 @@ import pytest
 
 from beacon.ember import EmberClient, SpendScope, Storage, fake_response
 from beacon.evidence import EvidenceStore, NewEvidence, Point
+from beacon.incident import Engine
 from beacon.ingest.recordings import GENERATED_MARK
 from beacon.investigate import Runs, stand_in_investigator
 from beacon.radio import Ffmpeg
@@ -1014,6 +1015,31 @@ def test_fewer_taps_than_calls_are_spread_over_the_whole_day_and_not_its_first_c
     assert max(chosen) > 180
 
 
+def test_two_controls_that_ask_the_same_thing_are_one_tap() -> None:
+    early = datetime(2026, 3, 3, 15, 0, tzinfo=UTC)
+    later = datetime(2026, 3, 3, 18, 0, tzinfo=UTC)
+
+    def at(number: int, when: datetime, lat: float) -> datasf.Record:
+        return datasf.Record(
+            number=f"{number:02}", kind="alarm", received_at=when, dispatched_at=when,
+            on_scene_at=None, cleared_at=None, streets=(), point=Point(lat, -122.45),
+            units=("E31",), alarms=None,
+        )  # fmt: skip
+
+    # Four calls at one corner in the afternoon, and six at once at another, three
+    # kilometres off, three hours on. The fifth tap and the tenth are controls of
+    # one moment, and the place away from every call then is the first corner for both.
+    day = [*(at(n, early, 37.75) for n in range(4)), *(at(n, later, 37.78) for n in range(4, 10))]
+
+    planned = taps.plan(day, 300)
+
+    away = [tap for tap in planned if tap.near is None]
+    assert [(tap.at, tap.point) for tap in away] == [
+        (later + taps.AFTER_DISPATCH, Point(37.75, -122.45))
+    ]
+    assert len(planned) == len({tap.id for tap in planned}) == 9
+
+
 def test_a_tap_is_not_away_from_a_call_whose_unit_datasf_says_is_on_scene_then() -> None:
     dispatched = datetime(2026, 3, 3, 18, 0, tzinfo=UTC)
     on_scene = datetime(2026, 3, 3, 20, 30, tzinfo=UTC)
@@ -1072,6 +1098,12 @@ def test_an_incident_that_goes_on_for_longer_than_the_engine_looks_back_is_one_i
     assert len(reading.incidents) == 1
     assert len(set(reading.kept_as)) > 1
     assert set(reading.kept_as.values()) == {reading.incidents[0].id}
+    # At a moment between two readings the incident is named by another row, the
+    # first of its rows in view then, which is how a tap's investigation names it.
+    between = Engine(store, run.read_lists(layout)[1]).at(start + timedelta(hours=15, minutes=3))
+    (then,) = between.incidents
+    assert then.id not in {incident.id for incident in reading.incidents}
+    assert reading.kept_as[then.id] == reading.incidents[0].id
 
 
 def test_the_incidents_are_read_to_the_last_row_heard_whenever_the_last_dispatch_was(
