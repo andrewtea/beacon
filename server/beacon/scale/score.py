@@ -18,16 +18,18 @@ same for generated audio and for recordings:
 Each record takes one incident and each incident one record, the pairs closest in
 time first (`match`). What is left over is told apart as far as code can:
 
-- a record is `merged` when it has no incident of its own and some incident that
+- a record is `merged` when it has no incident of its own and some incident that is
+  another record's own, of the same medical-or-not kind, that
   names one of its units, or lies near it, has a radio call within the record's
   time. That is taken to mean Beacon heard the call and put it in another call's
   incident, as it does for a second call at one block and for a call that names
   units and no place; nothing checks it, and an incident that was only near by at
   the time is counted the same;
 - any other record without an incident is `missed`;
-- an incident that fits a record and is not that record's own is `split`: Beacon
-  made more than one incident of one call, as it does when a unit is heard from
-  after its incident has gone quiet; and
+- an incident that fits a record and was paired with none is `split`. That is what
+  Beacon leaves when it makes more than one incident of one call, as it does when a
+  unit is heard from after its incident has gone quiet; the rule cannot tell that
+  from an incident that merely fits a call by its time and a unit or its place; and
 - an incident that fits no record is `extra`.
 
 What the rule cannot know: two calls that share a unit and overlap in time can be
@@ -144,8 +146,10 @@ def fits(record: Record, incident: Incident) -> bool:
 
 
 def _heard_in(record: Record, incident: Incident) -> bool:
-    """Whether an incident that names one of the record's units, or lies near it,
-    has a radio call within the record's time."""
+    """Whether an incident of the record's medical-or-not kind that names one of the
+    record's units, or lies near it, has a radio call within the record's time."""
+    if record.medical != (incident.category == MEDICAL_EVENT):
+        return False
     if not _same_call(record, incident):
         return False
     first, last = _span(record)
@@ -204,7 +208,11 @@ def match(records: Sequence[Record], incidents: Sequence[Incident]) -> Matched:
     in_order = sorted(incidents, key=lambda incident: (incident.opened_at, incident.id))
     inside: dict[str, str] = {}
     for record in left:
-        holder = next((of for of in in_order if _heard_in(record, of)), None)
+        # Only an incident that is some other call's own can hold this one: an
+        # incident that is nobody's is counted as that, and never as both.
+        holder = next(
+            (of for of in in_order if of.id in taken_incidents and _heard_in(record, of)), None
+        )
         if holder is not None:
             inside[record.number] = holder.id
     return Matched(

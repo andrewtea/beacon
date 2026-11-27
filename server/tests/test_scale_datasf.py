@@ -144,6 +144,21 @@ def test_what_cannot_be_read_is_counted_and_what_is_not_an_intersection_has_no_s
     assert (no_place.units, no_place.streets, no_place.point) == ((), (), None)
 
 
+def test_a_field_that_only_looks_like_a_number_or_a_time_is_left_out_and_raises_nothing() -> None:
+    # A digit `int` cannot read, and times at the edges of what a date can hold.
+    odd = call("260620007", "Alarms", "10:00:00", HAYES_GOUGH, ("E36",), alarms="\u00b2")
+    late = call("260620008", "Alarms", "10:00:00", HAYES_GOUGH, ("E36",))
+    late[0]["received_dttm"] = "9999-12-31T23:59:59"
+    early = call("260620009", "Alarms", "10:00:00", HAYES_GOUGH, ("E36",))
+    early[0]["dispatch_dttm"] = "0001-01-01T00:00:00+14:00"
+    numbered = call("\u0662\u0666\u0660", "Alarms", "10:00:00", HAYES_GOUGH, ("E36",))
+
+    records, unreadable = datasf.read_records([*odd, *late, *early, *numbered])
+
+    assert [(record.number, record.alarms) for record in records] == [("260620007", None)]
+    assert unreadable == 3
+
+
 def test_the_records_a_run_keeps_are_read_back_as_they_were() -> None:
     rows = [
         *call("260620001", "Structure Fire / Smoke in Building", "08:01:30", HAYES_GOUGH,

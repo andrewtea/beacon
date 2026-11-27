@@ -3,6 +3,7 @@ run that is stopped and gone on with, the matching, the replayed taps, and what 
 results say a number is. Nothing here is DataSF's data, and nothing is a recording."""
 
 import base64
+import fcntl
 import hashlib
 import json
 from collections.abc import Callable
@@ -14,13 +15,13 @@ from typing import Any
 import httpx2
 import pytest
 
-from beacon.ember import EmberClient, SpendScope, Storage
-from beacon.evidence import EvidenceStore, NewEvidence
+from beacon.ember import EmberClient, SpendScope, Storage, fake_response
+from beacon.evidence import EvidenceStore, NewEvidence, Point
 from beacon.ingest.recordings import GENERATED_MARK
 from beacon.investigate import Runs, stand_in_investigator
 from beacon.radio import Ffmpeg
 from beacon.radio.audio import pcm_to_wav, plain_wav
-from beacon.scale import generate, results, run, score, taps
+from beacon.scale import datasf, generate, results, run, score, taps
 from beacon.scale.cli import main
 from tests.scale_day import (
     DAY,
@@ -104,11 +105,12 @@ def test_a_stand_in_run_goes_from_datasfs_record_to_results_that_say_what_they_a
     assert made is not None
     # What the run is comes first, on the terminal and in the file.
     assert said.startswith(results.GENERATED_BY_STAND_IN)
-    assert (made["basis_text"], made["stand_in"], made["complete"]) == (
-        results.GENERATED_BY_STAND_IN,
-        True,
-        True,
-    )
+    assert (made["basis_text"], made["stand_in"]) == (results.GENERATED_BY_STAND_IN, True)
+    assert (made["heard_complete"], made["complete"]) == (True, True)
+    said_of = texts_of(env)
+    assert "0 of them are counted above as found and 0 as taken" in said_of["not_generated"]
+    assert "nothing checks that it is right" in said_of["found"]
+    assert "DataSF's number for the call" in said_of["records"]
     assert (made["audio"], made["voice"], made["hearer"]) == ("generated", "tones", "fake")
     assert made["scored_against"]["url"] == "https://data.sf.gov/d/nuek-vuh3"
     numbers = numbers_of(env)
@@ -234,6 +236,7 @@ def test_a_run_is_one_kind_for_good(env: dict[str, str], site: DataSf) -> None:
         (["--voice", "speech", "--paid", "--radio-budget", "1.26"], "at most $1.25"),
         (["--voice", "speech", "--paid", "--radio-budget", "0"], "more than nothing"),
         (["--voice", "speech", "--paid", "--radio-budget", "lots"], "A budget is a dollar amount"),
+        (["--voice", "speech", "--paid", "--taps-budget", "0.51"], "at most $0.50"),
         (["--taps", "301"], "From 0 to 300 taps"),
         (["--voice", "speech", "--paid"], "A paid run needs a live Ember"),
     ],
@@ -253,7 +256,8 @@ def test_a_run_that_cannot_be_what_was_asked_for_is_not_made(
     assert status == 2
     assert said.splitlines()[-1].startswith("The scale run was not made.")
     assert problem in said
-    # Nothing was heard, and nothing can have been paid.
+    # Nothing was fetched or heard, and nothing can have been paid.
+    assert site.requests == []
     layout = run.Layout.under(env, "day")
     assert not layout.evidence.exists() or EvidenceStore(layout.evidence, "mock").last_id() == 0
     assert not layout.results.exists()
@@ -294,11 +298,21 @@ class Meta:
         self.heard = heard
         self.audio: list[str] = []
         self.fail_on: int | None = None
+        # Requests of the taps' investigations, which can fail on one, and what is
+        # done before one is answered.
+        self.tap_requests = 0
+        self.fail_tap_on: int | None = None
+        self.before_tap: Callable[[], None] | None = None
         self.api = MetaApi(input_tokens=1_000, create=self.create)
 
     def create(self, request: httpx2.Request) -> httpx2.Response:
         body = json.loads(request.content)
         if body.get("text", {}).get("format", {}).get("name") != "transmission":
+            self.tap_requests += 1
+            if self.before_tap is not None:
+                self.before_tap()
+            if self.fail_tap_on == self.tap_requests:
+                return httpx2.Response(500, json={"error": {"message": "It failed."}})
             answer = dict(stand_in_investigator(body))
         else:
             digest = _digest(body)
@@ -466,6 +480,241 @@ def test_a_run_that_failed_goes_on_without_paying_for_a_call_twice(
     assert (last.spend.calls, last.spend.unanswered) == (CALLS, 1)
 
 
+def test_one_scale_run_is_made_at_a_time_under_a_data_directory(
+    env: dict[str, str], site: DataSf
+) -> None:
+    directory = Path(env["BEACON_DATA_DIR"]) / "scale"
+    directory.mkdir(parents=True)
+    with open(directory / ".lock", "a", encoding="utf-8") as another:
+        # Another invocation, of this name or any other, is under way.
+        fcntl.flock(another, fcntl.LOCK_EX)
+        status, said = command(env, site)
+        assert status == 2
+        assert "Another scale run is under way under this data directory" in said
+        assert site.requests == []
+        assert not run.Layout.under(env, "day").root.exists()
+
+    # Its lock went with its file, and the run is made.
+    assert command(env, site)[0] == 0
+
+
+def test_a_replay_that_ember_fails_on_leaves_the_run_unfinished_and_counts_no_answer(
+    env: dict[str, str], site: DataSf, speech: None
+) -> None:
+    layout = run.Layout.under(env, "day")
+    meta = Meta(layout)
+    meta.fail_tap_on = 1
+
+    status, said = command(env, site, *PAID, paid=meta.client(env))
+
+    # Every call was heard, and the run is not complete: the replay stopped.
+    assert status == 1
+    assert "The run is not finished." in said
+    made = results.read(layout)
+    assert made is not None
+    assert (made["heard_complete"], made["complete"]) == (True, False)
+    assert results.INCOMPLETE not in made["caveats"]
+    assert any("4 planned taps have not been put to the investigator" in c for c in made["caveats"])
+    numbers, texts = numbers_of(env), texts_of(env)
+    # The tap Ember failed on is kept as cut short, and is no answer: not for the
+    # count of answers, and not for the cost or the time of one.
+    assert (numbers["taps"], numbers["taps_unanswered"], numbers["taps_lost"]) == (0, 1, 0)
+    assert (numbers["taps_near_matched"], numbers["taps_away_unconfirmed"]) == (0, 0)
+    assert (numbers["tap_cost_usd"], numbers["tap_seconds_p95"]) == (None, None)
+    assert (
+        "1 requests ended in an error after they may have been sent"
+        in (texts["tap_cost_total_usd"])
+    )
+    paid = meta.paid
+
+    # Given again at once, the replay is leaving Ember alone: no tap is claimed.
+    status, _ = command(env, site, *PAID, paid=meta.client(env))
+    assert (status, meta.paid) == (1, paid)
+    made = results.read(layout)
+    assert made is not None
+    assert any("leaving Ember alone after a refusal or a failure" in c for c in made["caveats"])
+    assert numbers_of(env)["taps_unanswered"] == 1
+
+
+def test_a_tap_is_not_begun_when_its_scope_has_less_left_than_a_tap_may_cost(
+    env: dict[str, str], site: DataSf, speech: None
+) -> None:
+    layout = run.Layout.under(env, "day")
+    meta = Meta(layout)
+
+    status, _ = command(env, site, *PAID, "--taps-budget", "0.005", paid=meta.client(env))
+
+    # Half a cent is less than the cent one tap is held to: none is claimed.
+    assert (status, meta.tap_requests) == (1, 0)
+    made = results.read(layout)
+    assert made is not None
+    assert any("less left than one tap may cost" in caveat for caveat in made["caveats"])
+    planned = taps.plan(run.read_records(layout), 300)
+    runs = Runs(layout.taps, "mock")
+    assert [state for _, state, _ in taps.kept(planned, runs)] == ["waiting"] * 5
+    runs.close()
+
+    # With the whole budget, the same taps are investigated.
+    assert command(env, site, *PAID, paid=meta.client(env))[0] == 0
+    assert numbers_of(env)["taps"] == 5
+
+
+def _delete_ledger(env: dict[str, str]) -> None:
+    ledger = Storage.under(Path(env["BEACON_DATA_DIR"])).ledger_db
+    for path in (
+        ledger,
+        ledger.with_name(ledger.name + "-wal"),
+        ledger.with_name(ledger.name + "-shm"),
+    ):
+        path.unlink(missing_ok=True)
+
+
+def test_a_ledger_replaced_between_the_hearing_and_the_taps_is_not_trusted_as_empty(
+    env: dict[str, str], site: DataSf, speech: None
+) -> None:
+    layout = run.Layout.under(env, "day")
+    meta = Meta(layout)
+    # The ledger is deleted when the first tap's first request is out.
+    meta.before_tap = lambda: _delete_ledger(env)
+
+    status, said = command(env, site, *PAID, paid=meta.client(env))
+
+    assert status == 1
+    assert said.rstrip().endswith(run.LEDGER_REPLACED)
+    assert "Give the same command again" not in said
+    made = results.read(layout)
+    assert made is not None
+    assert made["complete"] is False
+    assert results.LEDGER_LOST in made["caveats"]
+    # The taps' client was made on the ledger the hearing paid in, so it paid for
+    # one request and no more: it did not begin a count from nothing in a new file.
+    assert meta.tap_requests == 1
+    numbers, texts = numbers_of(env), texts_of(env)
+    assert numbers["radio_cost_usd"] is None
+    assert texts["radio_cost_usd"].startswith("Not known: the Ember ledger was replaced")
+    assert "radio_paid_calls" not in numbers
+    paid = meta.paid
+
+    # And the run is not gone on with, in the new ledger or any other.
+    status, said = command(env, site, *PAID, paid=meta.client(env))
+    assert (status, meta.paid) == (2, paid)
+    assert run.LEDGER_REPLACED in said
+
+
+def test_a_paid_run_goes_on_only_in_the_ledger_it_began_to_pay_in(
+    env: dict[str, str], site: DataSf, speech: None
+) -> None:
+    layout = run.Layout.under(env, "day")
+    meta = Meta(layout)
+    # Stopped at its cap part of the way.
+    assert command(env, site, *PAID, "--radio-budget", "0.001", paid=meta.client(env))[0] == 1
+    paid = meta.paid
+    assert 0 < paid < CALLS
+
+    # The ledger is deleted, and with it the count the cap is held by.
+    _delete_ledger(env)
+    status, said = command(env, site, *PAID, paid=meta.client(env))
+
+    assert (status, meta.paid) == (2, paid)
+    assert run.LEDGER_REPLACED in said
+
+
+def test_a_medical_call_of_generated_speech_is_kept_as_medical_whatever_ember_made_of_it(
+    env: dict[str, str], site: DataSf, speech: None
+) -> None:
+    layout = run.Layout.under(env, "day")
+    # An Ember that hears a working fire with an alarm level in every call.
+    fire = form("working", units=["M552"], alarm=3, details=["evacuation"])
+    meta = Meta(layout, lambda body: fake_response(text=json.dumps(fire)))
+
+    command(env, site, *PAID, "--taps", "0", paid=meta.client(env))
+
+    rows = EvidenceStore(layout.evidence, "mock").search(limit=1000)
+    medical = [row for row in rows if row.data["talkgroup"] == generate.EMS_TALKGROUP]
+    # The medical call's dispatch, arrival, and clearing were on the EMS-only talkgroup.
+    assert len(medical) == 3
+    assert {
+        (row.data["event"], row.data["status"], row.data["alarm"], tuple(row.data["details"]))
+        for row in medical
+    } == {("medical response", "unknown", None, ())}
+    assert len(rows) == CALLS
+
+
+def test_recordings_of_a_day_are_heard_from_two_hours_after_its_end_by_the_citys_clock(
+    env: dict[str, str], site: DataSf, recorder: tuple[Path, dict[str, Any]]
+) -> None:
+    # The day the clocks go forward is 23 hours long, and the day they go back 25.
+    assert run.day_window(datasf.date(2026, 3, 8)) == (
+        datetime(2026, 3, 8, 8, 0, tzinfo=UTC),
+        datetime(2026, 3, 9, 9, 0, tzinfo=UTC),
+    )
+    assert run.day_window(datasf.date(2026, 11, 1)) == (
+        datetime(2026, 11, 1, 7, 0, tzinfo=UTC),
+        datetime(2026, 11, 2, 10, 0, tzinfo=UTC),
+    )
+    root, by_digest = recorder
+    layout = run.Layout.under(env, "day")
+    settings = run.begin(
+        layout,
+        run.Settings(
+            day=DAY, audio="recorded", voice=None, hearer="live", system="sfd", talkgroups=(1201,),
+            ems_talkgroups=(),
+        ),
+    )  # fmt: skip
+    http = site.http()
+    run.prepare(layout, settings, http)
+    http.close()
+    meta = Meta(layout, heard_by(by_digest))
+    store = run.open_store(layout, settings)
+    ember = run.radio_ember(layout, settings, env, run.RADIO_BUDGET_NANOUSD, meta.client(env))
+
+    # A minute before the two hours are over, the day's last calls can still come:
+    # a pass that ended now would be taken for the whole day's.
+    with pytest.raises(run.ScaleError, match="The day's last calls can still be recorded"):
+        run.hear(
+            layout, settings, store, ember, env, recordings=root,
+            now=datetime(2026, 3, 4, 9, 59, tzinfo=UTC),
+        )  # fmt: skip
+    assert meta.paid == 0
+
+
+def test_what_a_run_fetched_is_whole_or_fetched_again(env: dict[str, str], site: DataSf) -> None:
+    command(env, site, "--taps", "0")
+    layout = run.Layout.under(env, "day")
+    assert not list(layout.root.rglob("*.part"))
+    # A preparation that was stopped part of the way: the file that says the lists
+    # are all there, and the one that says the calls are, were never put in place.
+    blocks = layout.lists / "blocks.csv"
+    whole = blocks.read_text()
+    blocks.unlink()
+    (layout.lists / "blocks.csv.part").write_text(whole[:200])
+    (layout.calls / generate.SCRIPT_FILE).unlink()
+    asked = len(site.requests)
+
+    assert command(env, site, "--taps", "0")[0] == 0
+
+    assert len(site.requests) > asked
+    assert blocks.read_text() == whole
+    assert generate.read_script(layout.calls).calls == CALLS
+    # The calls are the same ones under the same names, so none is heard again.
+    assert EvidenceStore(layout.evidence, "mock").last_id() == CALLS
+
+
+def test_a_call_of_datasfs_that_cannot_be_read_is_counted_and_said_to_be_in_no_count(
+    env: dict[str, str],
+) -> None:
+    unread = call("260620099", "Alarms", "12:00:00", FELL_GOUGH, ("E36",))
+    del unread[0]["dispatch_dttm"]
+    site = DataSf([*ROWS, *unread])
+
+    command(env, site, "--taps", "0")
+
+    numbers, texts = numbers_of(env), texts_of(env)
+    assert (numbers["records"], numbers["records_unreadable"]) == (6, 1)
+    assert "They are in no count below" in texts["records_unreadable"]
+    assert numbers["found_share"] == 66.7
+
+
 # Matching, on the run's own incidents.
 
 
@@ -537,6 +786,78 @@ def test_an_incident_no_call_of_the_day_fits_is_counted_as_one(
     assert len(matched.found) == 4
 
 
+def test_a_call_is_taken_to_be_inside_only_an_incident_of_its_kind_that_is_anothers_own(
+    env: dict[str, str], site: DataSf
+) -> None:
+    layout, _, _ = scored(env, site)
+    store = EvidenceStore(layout.evidence, "mock")
+    records = run.read_records(layout)
+    # An incident that is no call's: one engine heard from twice, late in the day.
+    for ref, minute in (("late-1", 0), ("late-2", 30)):
+        store.add(
+            [
+                NewEvidence(
+                    kind="radio",
+                    source="recordings",
+                    ref=ref,
+                    occurred_at=datetime(2026, 3, 3, 23, minute, tzinfo=UTC),
+                    confidence="medium",
+                    origin="mock",
+                    model="fake",
+                    data={"event": "fire", "category": "fire", "clarity": "clear",
+                          "status": "working", "details": [], "units": ["E36"], "alarm": None,
+                          "street": None, "block": None, "cross_street": None},
+                )
+            ]
+        )  # fmt: skip
+
+    def record(number: str, kind: str, at: datetime) -> datasf.Record:
+        return datasf.Record(
+            number=number, kind=kind, received_at=at, dispatched_at=at, on_scene_at=None,
+            cleared_at=None, streets=(), point=None, units=("E36",), alarms=None,
+        )  # fmt: skip
+
+    # A medical call of that engine's while the day's fire was going, and another
+    # call of its while the late incident was, which opened before the call came.
+    medical = record("260620101", "medical", datetime(2026, 3, 3, 16, 3, tzinfo=UTC))
+    late = record("260620102", "alarm", datetime(2026, 3, 3, 23, 25, tzinfo=UTC))
+    day = [*records, medical, late]
+
+    reading = score.read_incidents(store, run.read_lists(layout)[1], day)
+    matched = score.match(day, reading.incidents)
+
+    # Neither is inside anything: the fire is no medical response, and the late
+    # incident is counted as fitting no call, and so not as holding one.
+    assert {"260620101", "260620102"} <= {missed.number for missed in matched.missed}
+    assert [incident.units for incident in matched.extra] == [("E36",)]
+    assert [inside.number for inside in matched.merged] == ["260620004"]
+
+
+def test_a_tap_away_from_every_call_is_away_from_them_where_it_is_put_after_rounding() -> None:
+    def at(number: str, lat: float, lon: float) -> datasf.Record:
+        when = datetime(2026, 3, 3, 18, 0, tzinfo=UTC)
+        return datasf.Record(
+            number=number, kind="alarm", received_at=when, dispatched_at=when, on_scene_at=None,
+            cleared_at=None, streets=(), point=Point(lat, lon), units=("E31",), alarms=None,
+        )  # fmt: skip
+
+    # A point 1,030 m north of a call, which rounding moves 44 m towards it.
+    north = at("1", 37.7804, -122.4760)
+    south = at("2", 37.7804 - 1030 / 111_195, -122.4760)
+    assert north.point is not None
+    assert south.point is not None
+    assert north.point.distance_m(south.point) > taps.CLEAR_M
+    assert Point(37.780, -122.476).distance_m(south.point) < taps.CLEAR_M
+    hours_on = datetime(2026, 3, 3, 23, 0, tzinfo=UTC)
+
+    # While the call to the south is going, the northern point is not away from it.
+    busy = taps._away_from_all([north, south], [north], south.dispatched_at, 0)
+    quiet = taps._away_from_all([north, south], [north], hours_on, 0)
+
+    assert busy is None
+    assert quiet == Point(37.780, -122.476)
+
+
 def test_an_incident_read_at_several_moments_of_a_day_is_counted_once(
     env: dict[str, str], site: DataSf
 ) -> None:
@@ -598,9 +919,10 @@ def test_replayed_taps_are_investigated_once_and_counted_by_what_they_were_answe
     # At the fire, at the first alarm, and at the second, which is inside the
     # first's incident. The tap at the call nobody heard has no incident to match.
     assert numbers["taps_near_matched"] == 3
-    assert "Of 4 taps placed at a DataSF call's point" in texts["taps_near_matched"]
+    assert "Of 4 answered taps placed at a DataSF call's point" in texts["taps_near_matched"]
+    assert (numbers["taps_unanswered"], numbers["taps_lost"]) == (0, 0)
     assert numbers["taps_away_unconfirmed"] == 1
-    assert "Of 1 taps placed where DataSF lists no call" in texts["taps_away_unconfirmed"]
+    assert "Of 1 answered taps placed where DataSF lists" in texts["taps_away_unconfirmed"]
     assert "No person tapped, and none is stored as a tap." in texts["taps"]
     # Nothing in the run's evidence says a person tapped.
     layout = run.Layout.under(env, "day")
@@ -654,10 +976,16 @@ def test_a_replay_that_ember_fails_on_stops_and_goes_on_with_the_taps_nobody_cla
             raise RuntimeError("Ember is down")
         return stand_in_investigator(body)
 
-    first = taps.replay(planned, EmberClient.fake(storage, failing), store, blocks, runs)
+    now = [datetime(2026, 3, 10, 20, 0, tzinfo=UTC)]
+
+    def replay(responder: Any) -> taps.Replayed:
+        ember = EmberClient.fake(storage, responder)
+        return taps.replay(planned, ember, store, blocks, runs, wall_clock=lambda: now[0])
+
+    first = replay(failing)
 
     # The run it failed in is kept, as cut short, and nothing more was asked.
-    assert (first.made, first.stopped) == (1, "EmberError")
+    assert (first.made, first.stopped) == (1, "ember")
     assert asked == 3
     ((_, state, cut), *rest) = taps.kept(planned, runs)
     assert state == "made"
@@ -665,15 +993,59 @@ def test_a_replay_that_ember_fails_on_stops_and_goes_on_with_the_taps_nobody_cla
     assert cut.cut_short == "EmberError"
     assert [state for _, state, _ in rest] == ["waiting"] * 4
 
-    again = taps.replay(
-        planned, EmberClient.fake(storage, stand_in_investigator), store, blocks, runs
-    )
+    # Given again at once, and nine minutes on, the replay leaves Ember alone: no
+    # tap is claimed and nothing is asked. The hold is kept in the file.
+    for minutes in (0, 9):
+        now[0] = datetime(2026, 3, 10, 20, minutes, tzinfo=UTC)
+        held = replay(failing)
+        assert (held.made, held.stopped, asked) == (0, "held", 3)
+    assert [state for _, state, _ in taps.kept(planned, runs)][1:] == ["waiting"] * 4
+
+    now[0] = datetime(2026, 3, 10, 20, 11, tzinfo=UTC)
+    again = replay(stand_in_investigator)
 
     assert (again.made, again.stopped) == (4, None)
     assert [state for _, state, _ in taps.kept(planned, runs)] == ["made"] * 5
     # And a third replay finds every tap claimed, and asks nothing.
-    idle = taps.replay(planned, EmberClient.fake(storage, failing), store, blocks, runs)
-    assert (idle.made, asked) == (0, 3)
+    idle = replay(failing)
+    assert (idle.made, idle.stopped, asked) == (0, None, 3)
+    # Every claim has one stamp, so the file's sweep of what is a day old, which
+    # goes by the stamp of a new claim, deletes none however much later a run goes on.
+    assert {found[0] for tap in planned if (found := runs.get(tap.id))} == {taps._CLAIMED_AT}
+    runs.close()
+
+
+def test_paid_answers_that_are_no_form_three_times_running_hold_the_replay(
+    env: dict[str, str], site: DataSf
+) -> None:
+    layout, reading, matched = scored(env, site)
+    planned = taps.plan(run.read_records(layout), 300)
+    store = EvidenceStore(layout.evidence, "mock")
+    blocks = run.read_lists(layout)[1]
+    runs = Runs(layout.taps, "mock")
+    storage = Storage.under(Path(env["BEACON_DATA_DIR"]))
+    asked = 0
+
+    def babbling(body: dict[str, Any]) -> Any:
+        nonlocal asked
+        asked += 1
+        return fake_response(text="No form at all.")
+
+    first = taps.replay(planned, EmberClient.fake(storage, babbling), store, blocks, runs)
+
+    assert (first.made, first.stopped, asked) == (3, "unusable", 3)
+    again = taps.replay(planned, EmberClient.fake(storage, babbling), store, blocks, runs)
+    assert (again.made, again.stopped, asked) == (0, "held", 3)
+    # An answer that was no form is kept as "unconfirmed", and is nobody's answer:
+    # the last planned tap, away from every call, is not counted as answered so.
+    standing = taps.kept(planned, runs)
+    numbers = {
+        number.key: number
+        for number in results._tap_numbers(standing, reading, matched, live=False, generated=True)
+    }
+    assert (numbers["taps"].value, numbers["taps_unanswered"].value) == (0, 3)
+    assert numbers["taps_away_unconfirmed"].value == 0
+    assert "Of 0 answered taps" in numbers["taps_near_matched"].text
     runs.close()
 
 
@@ -777,8 +1149,6 @@ def recorder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dic
 
 
 def heard_by(by_digest: dict[str, Any]) -> Callable[[dict[str, Any]], Any]:
-    from beacon.ember import fake_response
-
     return lambda body: fake_response(text=json.dumps(by_digest[_digest(body)]))
 
 
@@ -923,7 +1293,9 @@ def test_the_lines_for_a_terminal_put_what_the_run_is_before_any_number(
 
     assert lines[2] == results.GENERATED_BY_STAND_IN
     first_number = next(
-        index for index, line in enumerate(lines) if line.startswith("Calls DataSF")
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("DataSF calls Beacon could read")
     )
     assert first_number > 2
     # Every number is followed by its sentence, and one with no value says "none".

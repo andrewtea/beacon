@@ -31,6 +31,8 @@ Two kinds of audio (`Voice`):
 A medical call is generated as DataSF lists it: its units, the block nearest its
 intersection, and the word "medical". DataSF publishes no more about it, and the
 row Beacon keeps of it is a medical response with its crews and block, as for radio.
+Medical calls are on a talkgroup of their own (`EMS_TALKGROUP`), which a run hears
+as an EMS-only one, so that is what is kept whatever a hearer made of the audio.
 """
 
 import base64
@@ -58,6 +60,11 @@ Voice = Literal["tones", "speech"]
 # What the generated recorder calls its system, its one talkgroup, and its frequency.
 SYSTEM = "generated"
 TALKGROUP = 1
+# Medical calls are generated on a talkgroup of their own, which a run hears as an
+# EMS-only one: every call on it is kept as a medical response whatever its hearer
+# made of it, as for a real EMS channel, so a paid Ember that mishears generated
+# speech cannot have a medical call kept as anything else.
+EMS_TALKGROUP = 2
 _FREQUENCY = 851000000
 SCRIPT_FILE = "script.json"
 _MARK_TEXT = (
@@ -213,7 +220,8 @@ def write_calls(root: Path, lines: Sequence[Line], voice: Voice, *, unplaced: in
         heard: dict[str, Any] = {}
         for index, line in enumerate(lines):
             audio = _tone(index, line) if voice == "tones" else _speech(root, line.words)
-            stem = _stem(index, line.at)
+            talkgroup = _talkgroup(line)
+            stem = _stem(index, line.at, talkgroup)
             day = root.joinpath(SYSTEM, str(line.at.year), str(line.at.month), str(line.at.day))
             day.mkdir(parents=True, exist_ok=True)
             # The audio before the JSON, so that a reader never finds a call whose
@@ -223,12 +231,14 @@ def write_calls(root: Path, lines: Sequence[Line], voice: Voice, *, unplaced: in
             if seconds is None:
                 raise AudioError("A generated call is no WAV file.")
             (day / f"{stem}.json").write_text(
-                json.dumps(_details(line.at, seconds)), encoding="utf-8"
+                json.dumps(_details(line.at, seconds, talkgroup)), encoding="utf-8"
             )
-            heard[hashlib.sha256(plain_wav(audio)).hexdigest()] = {
-                "number": line.number,
-                "form": dict(line.form),
-            }
+            digest = hashlib.sha256(plain_wav(audio)).hexdigest()
+            known = heard.setdefault(digest, {"number": line.number, "form": dict(line.form)})
+            if known["form"] != dict(line.form):
+                # The stand-in finds a call's form by its audio. Two calls that sound
+                # the same and say different things would be given one form.
+                raise AudioError("Two generated calls sound the same and say different things.")
         script = {
             "what": "Generated audio. No radio.",
             "voice": voice,
@@ -236,7 +246,11 @@ def write_calls(root: Path, lines: Sequence[Line], voice: Voice, *, unplaced: in
             "unplaced": unplaced,
             "heard": heard,
         }
-        (root / SCRIPT_FILE).write_text(json.dumps(script), encoding="utf-8")
+        # The script is written last and whole: it is what says the calls are all
+        # there, so a writing that was cut short is begun again and never read.
+        beside = root / (SCRIPT_FILE + ".part")
+        beside.write_text(json.dumps(script), encoding="utf-8")
+        os.replace(beside, root / SCRIPT_FILE)
     except (OSError, AudioError) as error:
         raise GenerateError("The generated calls could not be written.") from error
     return Written(calls=len(lines), voice=voice, unplaced=unplaced)
@@ -249,8 +263,8 @@ class Script:
     voice: Voice
     calls: int
     unplaced: int
-    # What each call says, and the record it was made from, by the digest of its
-    # audio as Ember is sent it.
+    # What each call says, and a record it was made from, by the digest of its
+    # audio as Ember is sent it. Calls that sound the same say the same.
     heard: Mapping[str, Mapping[str, Any]]
 
     def hearer(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -339,15 +353,19 @@ def _form(kind: str, status: str, **fields: Any) -> dict[str, Any]:
 
 def _words(form: Mapping[str, Any]) -> str:
     """A form as a dispatcher might say it, for a voice. Nothing is in the words
-    that is not in the form."""
+    that is not in the form, **and everything in the form is in the words**: two
+    forms that differ are said differently, so that calls which sound the same say
+    the same, and the stand-in, which finds a call's form by its audio, never gives
+    one call another's. So an arrival and a clearing name their kind of call, as a
+    real one would not."""
     units = ", ".join(_unit_words(unit) for unit in form["units"])
     kind = _KIND_WORDS.get(form["category"], "incident")
     if form["status"] == "on_scene":
-        return f"{units}, on scene."
+        return f"{units}, on scene at the {kind}."
     if form["status"] == "cleared":
-        return f"{units}, clear and available."
+        return f"{units}, clear of the {kind} and available."
     said = f"{units}. Respond to a {kind}"
-    if form["alarm"] is not None and form["alarm"] > 1:
+    if form["alarm"] is not None:
         said += f", alarm level {form['alarm']}"
     if form["street"] is not None:
         said += f". {form['block']} block of {_street_words(form['street'])}"
@@ -367,14 +385,18 @@ def _street_words(street: str) -> str:
     return " ".join([*words[:-1], _STREET_WORDS.get(words[-1], words[-1])])
 
 
-def _stem(index: int, at: datetime) -> str:
+def _talkgroup(line: Line) -> int:
+    return EMS_TALKGROUP if line.form["category"] == "medical" else TALKGROUP
+
+
+def _stem(index: int, at: datetime, talkgroup: int) -> str:
     at = at.astimezone(UTC)
     return (
-        f"{TALKGROUP}-{int(at.timestamp())}.{at.microsecond // 1000:03d}_{_FREQUENCY}-call_{index}"
+        f"{talkgroup}-{int(at.timestamp())}.{at.microsecond // 1000:03d}_{_FREQUENCY}-call_{index}"
     )
 
 
-def _details(at: datetime, seconds: float) -> dict[str, Any]:
+def _details(at: datetime, seconds: float, talkgroup: int) -> dict[str, Any]:
     """The JSON trunk-recorder would write for the call, as far as Beacon reads it."""
     start_ms = int(at.timestamp()) * 1000 + at.microsecond // 1000
     length_ms = round(seconds * 1000)
@@ -388,7 +410,7 @@ def _details(at: datetime, seconds: float) -> dict[str, Any]:
         "encrypted": 0,
         "call_length": round(seconds),
         "call_length_ms": length_ms,
-        "talkgroup": TALKGROUP,
+        "talkgroup": talkgroup,
         "talkgroup_tag": "Generated dispatch",
         "audio_type": "digital",
         "short_name": SYSTEM,

@@ -2,6 +2,7 @@
 run reads them from. The records are invented."""
 
 import base64
+import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,6 +14,7 @@ from beacon.ember import EmberClient, Storage
 from beacon.evidence import EvidenceStore
 from beacon.incident.places import Blocks
 from beacon.ingest.recordings import GENERATED_MARK, Directory, RecordedRadio
+from beacon.radio.audio import pcm_to_wav, plain_wav
 from beacon.radio.vocabulary import Known
 from beacon.scale import datasf, generate, lists
 from tests.scale_day import FELL_GOUGH, GEARY_17TH, HAYES_GOUGH, ROSTER, call, centerlines
@@ -84,8 +86,8 @@ def test_a_call_is_scripted_as_its_dispatch_its_arrival_and_its_clearing() -> No
         "300 block of Gough Street, cross of Hayes Street."
     )
     assert (arrived.words, cleared.words) == (
-        "Engine 36, on scene.",
-        "Engine 36, Truck 6, Battalion 2, clear and available.",
+        "Engine 36, on scene at the fire.",
+        "Engine 36, Truck 6, Battalion 2, clear of the fire and available.",
     )
 
 
@@ -133,6 +135,10 @@ def test_generated_calls_are_marked_and_read_as_a_stand_ins_by_the_radio_poller(
     assert (written / GENERATED_MARK).read_text().startswith("Generated audio. No radio.")
     day = written / "generated" / "2026" / "3" / "3"
     assert len(list(day.glob("*.wav"))) == len(list(day.glob("*.json"))) == 6
+    # The medical call's three are on a talkgroup of their own, which is heard as
+    # an EMS-only one.
+    assert len(list(day.glob(f"{generate.EMS_TALKGROUP}-*.wav"))) == 3
+    assert not list(written.glob("*.part"))
     shelf = Directory(written, generate.SYSTEM)
     assert shelf.generated is True
     script = generate.read_script(written)
@@ -141,7 +147,8 @@ def test_generated_calls_are_marked_and_read_as_a_stand_ins_by_the_radio_poller(
     poller = RecordedRadio(
         shelf,
         EmberClient.fake(Storage.under(tmp_path), script.hearer),
-        talkgroups=(generate.TALKGROUP,),
+        talkgroups=(generate.TALKGROUP, generate.EMS_TALKGROUP),
+        ems_talkgroups=(generate.EMS_TALKGROUP,),
         known=KNOWN,
         backlog=True,
     )
@@ -204,6 +211,48 @@ def test_the_stand_in_makes_out_nothing_in_audio_that_is_not_in_the_script(writt
         "block": None,
         "cross_street": None,
     }
+
+
+def test_calls_that_sound_the_same_say_the_same_so_a_medical_arrival_is_never_heard_as_a_fires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # One engine is first at a fire and, an hour on, first at a medical call.
+    fire = call("260620011", "Structure Fire", "08:00:00", HAYES_GOUGH, ("E36",),
+                on_scene="08:05:00", alarms="1")  # fmt: skip
+    medical = call("260620012", "Medical Incident", "09:00:00", FELL_GOUGH, ("E36",),
+                   on_scene="09:06:00")  # fmt: skip
+    script, _ = generate.script_of(records_of(fire, medical), BLOCKS)
+    arrivals = [line for line in script if line.form["status"] == "on_scene"]
+    assert [line.words for line in arrivals] == [
+        "Engine 36, on scene at the fire.",
+        "Engine 36, on scene at the medical.",
+    ]
+    # An alarm level of one is said, as a level of two is: a form with a level and
+    # one with none do not sound the same.
+    assert "alarm level 1" in script[0].words
+
+    # Speech is the same audio for the same words.
+    monkeypatch.setattr(generate, "can_speak", lambda: True)
+    monkeypatch.setattr(
+        generate,
+        "_speech",
+        lambda root, words: pcm_to_wav(hashlib.sha256(words.encode()).digest() * 1000),
+    )
+    root = tmp_path / "calls"
+    generate.write_calls(root, script, "speech")
+    hearer = generate.read_script(root).hearer
+    heard = []
+    for line in arrivals:
+        audio = base64.b64encode(plain_wav(generate._speech(root, line.words))).decode()
+        body = {"input": [{"content": [{"type": "input_audio", "input_audio": {"data": audio}}]}]}
+        heard.append(json.loads(hearer(body)["output"][0]["content"][0]["text"])["category"])
+    assert heard == ["fire", "medical"]
+
+    # Were two calls that say different things ever to sound the same, nothing is written.
+    monkeypatch.setattr(generate, "_speech", lambda root, words: pcm_to_wav(b"\x01\x00" * 16000))
+    with pytest.raises(generate.GenerateError, match="could not be written"):
+        generate.write_calls(tmp_path / "same", script, "speech")
+    assert not (tmp_path / "same" / generate.SCRIPT_FILE).exists()
 
 
 def test_generated_calls_are_written_only_into_a_directory_of_their_own(tmp_path: Path) -> None:

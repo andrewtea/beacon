@@ -12,7 +12,9 @@ kind in Beacon's own vocabulary, when it was received and dispatched, when the
 first unit was on scene and the last was available again, the streets of its
 intersection, DataSF's point for it, and its units. More than half the calls are
 medical, and for those the rules for EMS hold here as they do for radio: a medical
-call is "medical" with its crews, its intersection, and its times, and nothing else.
+call is "medical" with DataSF's number for the call (which is public, and is how a
+record is told from another), its crews, its intersection, and its times, and
+nothing else.
 So only the columns in `COLUMNS` are asked for at all: not the disposition, the
 priority, or the call type group, which say how a patient was, and nothing that
 DataSF does not publish is added. A record is kept in a run's own directory under
@@ -167,7 +169,7 @@ def read_records(rows: Iterable[Mapping[str, Any]]) -> tuple[list[Record], int]:
     unreadable = 0
     for row in rows:
         number = row.get("call_number")
-        if isinstance(number, str) and number.isdigit() and len(number) <= 12:
+        if isinstance(number, str) and _digits(number, 12):
             by_number.setdefault(number, []).append(row)
         else:
             unreadable += 1
@@ -280,7 +282,9 @@ def _alarms(rows: list[Mapping[str, Any]]) -> int | None:
     levels = []
     for row in rows:
         said = row.get("number_of_alarms")
-        if isinstance(said, str) and said.isdigit() and 1 <= int(said) <= MAX_ALARM:
+        # Two ASCII digits at the most: `str.isdigit` alone also passes characters
+        # `int` cannot read.
+        if isinstance(said, str) and _digits(said, 2) and 1 <= int(said) <= MAX_ALARM:
             levels.append(int(said))
     return max(levels, default=None)
 
@@ -296,11 +300,17 @@ def _time(said: object) -> datetime | None:
         return None
     try:
         local = datetime.fromisoformat(said)
-    except ValueError:
-        return None
-    if local.tzinfo is not None:
+        if local.tzinfo is None:
+            local = local.replace(tzinfo=LOCAL)
+        # A time at the edge of what a date can hold has no UTC to be put in.
         return local.astimezone(UTC)
-    return local.replace(tzinfo=LOCAL).astimezone(UTC)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _digits(said: str, most: int) -> bool:
+    """Whether a text is from one to `most` of the digits 0 to 9 and nothing else."""
+    return 0 < len(said) <= most and said.isascii() and said.isdigit()
 
 
 def _kept_time(said: object) -> datetime | None:

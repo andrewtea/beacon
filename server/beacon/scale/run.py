@@ -3,6 +3,7 @@
 A run lives under `data/scale/<name>/` (`Layout`), which Git ignores:
 
     run.json          what the run is: its day, what its audio is, and who hears it
+    ledger.json       which Ember ledger a paid run began to pay in (`pin_ledger`)
     records.json      DataSF's calls of the day, as Beacon keeps them (`datasf.Record`)
     lists/            streets.txt, units.txt, blocks.csv (`beacon.scale.lists`)
     calls/            generated calls, marked BEACON-GENERATED (`beacon.scale.generate`)
@@ -26,7 +27,11 @@ cost the ledger holds under one is never a mix of the two. A scope is counted in
 Ember ledger over every invocation and every run directory, and the two together are
 held to `RADIO_BUDGET_NANOUSD`, which a setting can lower and not raise: a run's
 scope gets that budget less what the other scope holds when the run starts
-(`radio_ember`). So do not make two paid runs at once.
+(`radio_ember`). That reading is safe because one invocation is made at a time
+under a data directory (`alone`), and because a paid run goes on only in the ledger
+it began to pay in (`pin_ledger`): both paying clients are made before anything is
+heard, so a ledger that is replaced part of the way stops the taps as it stops the
+hearing, and the run is then not gone on with.
 
 **Every call, a stand-in's too, is booked in the one Ember ledger** under the data
 directory, as the server's are: a run has no ledger of its own. A stand-in's rows
@@ -37,9 +42,11 @@ minutes, counted from the failure and kept in the run's evidence store, as the
 server's poller does. The same command given sooner stops at once and says so.
 """
 
+import contextlib
+import fcntl
 import json
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -83,6 +90,8 @@ Hearer = Literal["fake", "live"]
 Stopped = Literal["budget", "held", "ledger_replaced", "ember", "source", "store"]
 
 _CALLS_PER_POLL = 200
+# How long after a day's end its recorded calls are still heard.
+AFTER_DAY = timedelta(hours=2)
 
 
 class ScaleError(Exception):
@@ -109,6 +118,10 @@ class Layout:
     @property
     def settings(self) -> Path:
         return self.root / "run.json"
+
+    @property
+    def ledger(self) -> Path:
+        return self.root / "ledger.json"
 
     @property
     def records(self) -> Path:
@@ -148,9 +161,11 @@ class Settings:
     hearer: Hearer
     # For recordings: the recorder's system and the talkgroups that are heard. The
     # directory itself is named at each invocation and is not kept.
+    # Generated calls have two talkgroups, and the medical calls' is heard as an
+    # EMS-only one.
     system: str = generate.SYSTEM
-    talkgroups: tuple[int, ...] = (generate.TALKGROUP,)
-    ems_talkgroups: tuple[int, ...] = ()
+    talkgroups: tuple[int, ...] = (generate.TALKGROUP, generate.EMS_TALKGROUP)
+    ems_talkgroups: tuple[int, ...] = (generate.EMS_TALKGROUP,)
 
     @property
     def mode(self) -> Literal["mock", "live"]:
@@ -168,8 +183,90 @@ class Heard:
     # Why the hearing stopped before a pass ended, or None when one ended.
     stopped: Stopped | None
     # What the Ember ledger held under the run's hearing scope when the hearing
-    # ended, over every run paid under it. None when a stand-in heard the calls.
+    # ended, over every run paid under it. None when a stand-in heard the calls,
+    # and when the ledger is not the one the run began to pay in.
     spend: ScopeSpend | None = None
+    # The Ember ledger was replaced under the run: what was spent is not known.
+    ledger_lost: bool = False
+
+
+@contextlib.contextmanager
+def alone(env: Mapping[str, str]) -> Iterator[None]:
+    """Hold the one lock of the scale runs under a data directory, for as long as
+    an invocation lasts. One invocation is made at a time, a stand-in's too: two
+    paid ones would each read what the other's scope holds before either had spent,
+    and two of one name would write one run's files. The lock is the operating
+    system's, on an open file, so it is let go of when the process ends, however
+    it ends.
+
+    Raises ScaleError when another invocation holds it."""
+    directory = default_data_dir(env) / "scale"
+    directory.mkdir(parents=True, exist_ok=True)
+    with open(directory / ".lock", "a", encoding="utf-8") as file:
+        try:
+            fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise ScaleError(
+                "Another scale run is under way under this data directory. One is made "
+                "at a time: wait for it to end, then give the command again."
+            ) from None
+        yield
+
+
+LEDGER_REPLACED = (
+    "The Ember ledger is not the one this run began to pay in: it was replaced, so "
+    "what the run spent is not known from it. Compare Meta's Usage page with the "
+    "ledger before any more paid work. This run is not gone on with."
+)
+
+
+def pin_ledger(layout: Layout, generation: str) -> None:
+    """Keep which ledger file a paid run began to pay in, by its generation, when
+    the run is new, and refuse to go on in another. A run's caps are counted in the
+    ledger: in a ledger that was begun again they would be counted from nothing.
+    A ledger put back from an older copy by renaming has the same generation and
+    is not told apart here; the Ember client refuses that while it runs.
+
+    Raises ScaleError when the ledger is another, or was seen to be replaced."""
+    kept = _pinned(layout)
+    if kept is None:
+        _write(layout.ledger, {"generation": generation, "lost": False})
+    elif kept != generation:
+        raise ScaleError(LEDGER_REPLACED)
+
+
+def lose_ledger(layout: Layout) -> None:
+    """Record that the ledger was replaced under a paid run, so that the run is
+    not gone on with."""
+    _write(layout.ledger, {"generation": None, "lost": True})
+
+
+def _pinned(layout: Layout) -> str | None:
+    """The generation of the ledger a run pays in, or None for a run that has not
+    paid. Raises ScaleError for a run whose ledger was lost."""
+    try:
+        said = json.loads(layout.ledger.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        said = None
+    if (
+        not isinstance(said, dict)
+        or said.get("lost")
+        or not isinstance(said.get("generation"), str)
+    ):
+        raise ScaleError(LEDGER_REPLACED)
+    return said["generation"]
+
+
+def day_window(day: date) -> tuple[datetime, datetime]:
+    """The time a day's recorded calls are in: from the start of San Francisco's
+    day to `AFTER_DAY` after its end, in which the day's last calls are cleared.
+    The day is the city's civil one, which is 23 or 25 hours long twice a year."""
+    following = day + timedelta(days=1)
+    start = datetime(day.year, day.month, day.day, tzinfo=datasf.LOCAL)
+    end = datetime(following.year, following.month, following.day, tzinfo=datasf.LOCAL)
+    return start.astimezone(UTC), end.astimezone(UTC) + AFTER_DAY
 
 
 def begin(layout: Layout, asked: Settings) -> Settings:
@@ -231,10 +328,13 @@ def prepare(layout: Layout, settings: Settings, http: SourceHttp) -> list[datasf
     no calls, the lists come out empty, or the calls cannot be written."""
     day = date.fromisoformat(settings.day)
     if not layout.records.exists():
-        records, _ = datasf.read_records(datasf.fetch_day(http, day))
+        records, unreadable = datasf.read_records(datasf.fetch_day(http, day))
         if not records:
             raise ScaleError("DataSF lists no call for that day that Beacon can read.")
-        _write(layout.records, [record.as_data() for record in records])
+        _write(
+            layout.records,
+            {"unreadable": unreadable, "records": [record.as_data() for record in records]},
+        )
     records = read_records(layout)
     if not (layout.lists / lists.BLOCKS_FILE).exists():
         made = lists.lists_of(lists.fetch_centerlines(http), lists.fetch_roster(http, day))
@@ -253,9 +353,19 @@ def prepare(layout: Layout, settings: Settings, http: SourceHttp) -> list[datasf
 
 def read_records(layout: Layout) -> list[datasf.Record]:
     """The records a run kept. Raises ScaleError when they cannot be read."""
+    return read_day(layout)[0]
+
+
+def read_day(layout: Layout) -> tuple[list[datasf.Record], int]:
+    """The records a run kept, and how many calls of DataSF's answer could not be
+    read as one and so are in no count. Raises ScaleError when they cannot be read."""
     try:
-        return datasf.records_from_data(json.loads(layout.records.read_text(encoding="utf-8")))
-    except (OSError, ValueError):
+        said = json.loads(layout.records.read_text(encoding="utf-8"))
+        unreadable = said["unreadable"]
+        if isinstance(unreadable, bool) or not isinstance(unreadable, int) or unreadable < 0:
+            raise ValueError
+        return datasf.records_from_data(said["records"]), unreadable
+    except (OSError, ValueError, KeyError, TypeError):
         pass
     raise ScaleError("The run's records of DataSF's calls (records.json) cannot be read.")
 
@@ -306,7 +416,7 @@ def radio_ember(
             raise ScaleError(str(error)) from None
         return EmberClient.fake(Storage.under(default_data_dir(env)), script.hearer)
     label = hearing_scope(settings)
-    _budget(label, budget_nanousd, RADIO_BUDGET_NANOUSD)
+    check_budget(label, budget_nanousd, RADIO_BUDGET_NANOUSD)
     other = SPEECH_SCOPE if label == RADIO_SCOPE else RADIO_SCOPE
     held = read_scope_spend(Storage.under(default_data_dir(env)), other)
     left = budget_nanousd - (0 if held is None else held.spent_nanousd)
@@ -323,7 +433,8 @@ def hearing_scope(settings: Settings) -> str:
     return RADIO_SCOPE if settings.audio == "recorded" else SPEECH_SCOPE
 
 
-def _budget(label: str, budget_nanousd: int, most: int) -> None:
+def check_budget(label: str, budget_nanousd: int, most: int) -> None:
+    """Raises ScaleError for a budget that is nothing, or more than the plan's."""
     if not 0 < budget_nanousd <= most:
         raise ScaleError(
             f"The budget of {label} is more than nothing and at most ${most / 1e9:.2f}, "
@@ -342,7 +453,7 @@ def paid_ember(
     most `most`.
 
     Raises ScaleError when the budget is not one, or there is no live Ember."""
-    _budget(label, budget_nanousd, most)
+    check_budget(label, budget_nanousd, most)
     scope = SpendScope(label, budget_nanousd)
     ember = EmberClient.from_env(env, scope=scope) if make is None else make(scope)
     if ember.mode != "live":
@@ -369,18 +480,25 @@ def hear(
     the calls has ended or something stops it. `ember` is closed when it returns.
     Of a directory of recordings, only the calls of the run's day are heard: the
     ones whose files' names say they began on San Francisco's day, or in the two
-    hours after it, in which the day's last calls are cleared. `wall_clock` is the
-    time a hold after a failure is counted by: the real time, unless a test moves it.
+    hours after its end, in which the day's last calls are cleared (`day_window`).
+    `wall_clock` is the time a hold after a failure is counted by: the real time,
+    unless a test moves it.
 
-    Raises ScaleError when the calls' directory is not what the run is of."""
+    Raises ScaleError when the calls' directory is not what the run is of, and
+    when the day's last calls can still be recorded."""
     now = datetime.now(UTC) if now is None else now
     since = None
-    if settings.audio == "recorded":
-        day = date.fromisoformat(settings.day)
-        since = datetime(day.year, day.month, day.day, tzinfo=datasf.LOCAL).astimezone(UTC)
-        now = min(now, since + timedelta(hours=26))
     transcoder = None
     try:
+        if settings.audio == "recorded":
+            since, until = day_window(date.fromisoformat(settings.day))
+            if now < until:
+                # A pass that ended now would be taken for the whole day's.
+                raise ScaleError(
+                    "The day's last calls can still be recorded: a run over recordings "
+                    "is made from two hours after the end of San Francisco's day."
+                )
+            now = until
         root = layout.calls if settings.audio == "generated" else recordings
         if root is None:
             raise ScaleError("A run over recordings needs their directory: --recordings.")
@@ -425,7 +543,13 @@ def hear(
             raise ScaleError(str(error)) from None
         heard = _passes(poller, store, now)
         if ember.mode == "live":
-            heard = replace(heard, spend=ember.scope_spend(hearing_scope(settings)))
+            spend = ember.scope_spend(hearing_scope(settings))
+            pinned = _pinned(layout)
+            if heard.stopped == "ledger_replaced" or pinned not in (None, spend.generation):
+                # What the file at the ledger's path holds now is not what was spent.
+                heard = replace(heard, ledger_lost=True)
+            else:
+                heard = replace(heard, spend=spend)
         return heard
     finally:
         ember.close()

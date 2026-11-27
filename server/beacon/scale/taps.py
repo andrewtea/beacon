@@ -25,23 +25,43 @@ another `--taps` investigates only the taps that are new to it; an investigation
 the plan no longer holds stays in the file, paid for, and is not counted. Each
 investigation is held to the tap's own cap by the Ember client
 (`TAP_BUDGET_NANOUSD`, which `investigate_tap` passes with every call), and a paid
-replay pays under the scope `scale:taps`. When Ember refuses or fails, the replay
-stops there: nothing more is asked in this invocation.
+replay pays under the scope `scale:taps`; a tap is not begun, and so not claimed,
+when that scope has less left than one tap may cost.
+
+**When Ember refuses or fails, the replay stops there and leaves Ember alone**, as
+the server's desk does and by the same code (`beacon.ingest.paid.PaidDesk`): for ten
+minutes, or as long as Ember asked when that is longer, counted from the failure and
+kept in the investigations file, so that the command given again sooner asks
+nothing. Paid answers that are no form, three in a row, hold it the same way. A
+claim is stamped with one fixed moment (`_CLAIMED_AT`), because the investigations
+file deletes claims a day old by the stamp of a new one, and a run's claims are its
+account of what it paid for.
 """
 
 import hashlib
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
-from beacon.ember import EmberClient, InputTooLargeError
+from beacon.ember import (
+    BudgetExceededError,
+    EmberClient,
+    EmberClosedError,
+    EmberError,
+    InputTooLargeError,
+    LedgerReplacedError,
+)
 from beacon.evidence import EvidenceStore, Point
 from beacon.incident import Engine
 from beacon.incident.places import Blocks
-from beacon.investigate import Run, Runs, RunsError, investigate_tap
+from beacon.ingest.paid import Hold, PaidDesk, read_hold
+from beacon.ingest.runner import PollerHeldError
+from beacon.investigate import TAP_BUDGET_NANOUSD, Run, Runs, RunsError, investigate_tap
+from beacon.investigate.loop import Outcome, never_sent
 from beacon.investigate.tools import Scene
 from beacon.scale.datasf import Record
+from beacon.scale.run import TAPS_SCOPE
 
 AFTER_DISPATCH = timedelta(minutes=3)
 CLEAR_M = 1000.0
@@ -49,6 +69,19 @@ CLEAR_FOR = timedelta(minutes=60)
 # One tap in this many is placed away from every call.
 AWAY_EVERY = 5
 MAX_TAPS = 300
+# Why a replay stopped, from a closed list: it is leaving Ember alone after a
+# refusal or a failure (`held`); paid answers that were no form ran on (`unusable`);
+# its scope has less left than one tap may cost, or the spending stop refused
+# (`budget`); the Ember ledger was replaced under it (`ledger_replaced`); Ember
+# failed or was closed (`ember`); the investigations file could not be written
+# (`store`).
+Stopped = Literal["held", "unusable", "budget", "ledger_replaced", "ember", "store"]
+# The moment every claim of a replay is stamped with. The investigations file
+# deletes what was claimed more than a day before the moment a new claim is stamped
+# with, which is right for a person's tap and wrong for a run's account of what it
+# paid for: a run that is gone on with days later would find its claims gone and pay
+# again. With one stamp for all, none is ever older than another, and none is deleted.
+_CLAIMED_AT = datetime(2000, 1, 1, tzinfo=UTC)
 
 
 @dataclass(frozen=True)
@@ -69,10 +102,9 @@ class Replayed:
 
     # Investigations made in this invocation.
     made: int
-    # Why the replay stopped before every tap had been claimed, by the name of the
-    # class of Ember's error, `store` when the investigations file could not be
-    # written, or None when it did not stop.
-    stopped: str | None
+    # Why the replay stopped before every tap had been claimed, or None when it
+    # did not stop.
+    stopped: "Stopped | None"
 
 
 def plan(records: Sequence[Record], count: int) -> list[Replay]:
@@ -119,18 +151,41 @@ def replay(
     store: EvidenceStore,
     blocks: Blocks,
     runs: Runs,
+    *,
+    wall_clock: Callable[[], datetime] | None = None,
 ) -> Replayed:
-    """Investigate every replayed tap that nobody has claimed. `ember` is closed
-    when it returns."""
+    """Investigate every replayed tap that nobody has claimed, until something
+    stops it. `ember` is closed when it returns. `wall_clock` is the time a hold is
+    counted by: the real time, unless a test moves it."""
     engine = Engine(store, blocks)
     made = 0
-    stopped: str | None = None
+    stopped: Stopped | None = None
     try:
+        # What every desk that pays Ember keeps to (`beacon.ingest.paid`): the hold
+        # after a refusal or a failure, kept in the investigations file so that the
+        # command given again does not shorten it, and the count of paid answers
+        # that were no form.
+        desk = PaidDesk(
+            ember, poller="replay", items="taps", scope=TAPS_SCOPE, wall_clock=wall_clock
+        )
+        hold = Hold(*read_hold(runs.state()))
         for tap in replays:
             try:
-                if not runs.claim(tap.id, datetime.now(UTC)):
+                if runs.get(tap.id) is not None:
                     # Claimed before, by this run or one that was stopped: it is not
                     # paid for a second time, whether or not its run was kept.
+                    continue
+                try:
+                    desk.check(hold)
+                except PollerHeldError:
+                    stopped = "held"
+                    break
+                if _short(ember):
+                    # Not begun, and so not claimed: an investigation that its
+                    # scope could cut short part of the way is not started.
+                    stopped = "budget"
+                    break
+                if not runs.claim(tap.id, _CLAIMED_AT):
                     continue
                 scene = Scene(
                     tap_id=tap.id,
@@ -144,19 +199,56 @@ def replay(
                     media=_no_media,
                 )
                 investigation = investigate_tap(ember, scene)
-                runs.write(investigation.run)
+                run, failure = investigation.run, investigation.failure
+                if failure is not None and not run.calls and never_sent(failure):
+                    # Ember was asked nothing and nothing was paid: the tap was not
+                    # investigated, and is said not to have been. It stays claimed.
+                    run = replace(
+                        run, outcome=Outcome(status="unconfirmed", reason="not_investigated")
+                    )
+                ended: Stopped | None = None
+                if failure is not None:
+                    ended = _ended_by(failure)
+                    if not isinstance(failure, EmberClosedError | InputTooLargeError):
+                        desk.hold_after(failure, hold)
+                    elif isinstance(failure, InputTooLargeError):
+                        # A request too large to send is no news about Ember.
+                        ended = None
+                elif run.final is not None and (
+                    desk.count_answer(hold, usable=investigation.usable) is not None
+                ):
+                    ended = "unusable"
+                # The run and the hold together, as the server's desk writes them.
+                runs.write(run, state=hold.hold_state())
             except RunsError:
                 stopped = "store"
                 break
             made += 1
-            failure = investigation.failure
-            if failure is not None and not isinstance(failure, InputTooLargeError):
-                # Ember refused or failed. Nothing more is asked of it here.
-                stopped = type(failure).__name__
+            if ended is not None:
+                # Nothing more is asked of Ember in this invocation, or in the next
+                # one before the hold is over.
+                stopped = ended
                 break
     finally:
         ember.close()
     return Replayed(made=made, stopped=stopped)
+
+
+def _ended_by(failure: EmberError) -> Stopped:
+    if isinstance(failure, LedgerReplacedError):
+        return "ledger_replaced"
+    if isinstance(failure, BudgetExceededError):
+        return "budget"
+    return "ember"
+
+
+def _short(ember: EmberClient) -> bool:
+    """Whether a paying client's scope has less left than one tap may cost."""
+    scope = ember.scope
+    if ember.mode != "live" or scope is None:
+        return False
+    left = scope.budget_nanousd - ember.scope_spend(scope.label).spent_nanousd
+    return left < TAP_BUDGET_NANOUSD
 
 
 Standing = Literal["made", "claimed", "waiting"]
@@ -181,12 +273,14 @@ def kept(replays: Sequence[Replay], runs: Runs) -> list[tuple[Replay, Standing, 
 def _away_from_all(
     records: Sequence[Record], placed: Sequence[Record], at: datetime, index: int
 ) -> Point | None:
-    """A call's point that no call of the day is within `CLEAR_M` of for
-    `CLEAR_FOR` either side of `at`, looked for from a place in the list that
-    depends on `index` alone."""
+    """A call's point, rounded as a tap is, that no call of the day is within
+    `CLEAR_M` of for `CLEAR_FOR` either side of `at`, looked for from a place in the
+    list that depends on `index` alone."""
     for offset in range(len(placed)):
-        point = placed[(index * 7 + offset) % len(placed)].point
-        assert point is not None
+        given = placed[(index * 7 + offset) % len(placed)].point
+        assert given is not None
+        # The place the tap will be at, which rounding can move by tens of metres.
+        point = _rounded(given)
         if not any(
             other.point is not None
             and other.point.distance_m(point) <= CLEAR_M

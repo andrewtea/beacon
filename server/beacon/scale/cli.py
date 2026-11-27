@@ -16,9 +16,13 @@ was interrupted, is finished by running it again; nothing is paid for twice.
 
 Taps are replayed only once the hearing is complete: a tap that is investigated
 against half a day's evidence is claimed for good with the answer it got.
+
+One invocation is made at a time under a data directory (`run.alone`), and a paid
+run goes on only in the Ember ledger it began to pay in (`run.pin_ledger`).
 """
 
 import argparse
+import contextlib
 import os
 import sys
 from collections.abc import Mapping, Sequence
@@ -34,18 +38,26 @@ from beacon.ingest.recordings import SOURCE as RADIO_SOURCE
 from beacon.investigate import Runs, RunsError, stand_in_investigator
 from beacon.scale import datasf, generate, results, score, taps
 from beacon.scale.run import (
+    LEDGER_REPLACED,
+    RADIO_BUDGET_NANOUSD,
     TAPS_BUDGET_NANOUSD,
     TAPS_SCOPE,
     Layout,
     PaidClient,
     ScaleError,
     Settings,
+    alone,
     begin,
+    check_budget,
     hear,
+    hearing_scope,
+    lose_ledger,
     open_store,
     paid_ember,
+    pin_ledger,
     prepare,
     radio_ember,
+    read_day,
     read_lists,
 )
 
@@ -149,65 +161,109 @@ def _run(
         raise ScaleError("A budget is a dollar amount, such as 1.25.") from None
     if not 0 <= options.taps <= taps.MAX_TAPS:
         raise ScaleError(f"From 0 to {taps.MAX_TAPS} taps are replayed.")
+    live = settings.hearer == "live"
+    if live:
+        # Both caps, before anything is fetched, heard, or paid for.
+        check_budget(hearing_scope(settings), radio_budget, RADIO_BUDGET_NANOUSD)
+        check_budget(TAPS_SCOPE, taps_budget, TAPS_BUDGET_NANOUSD)
     layout = Layout.under(env, options.name)
-    settings = begin(layout, settings)
-    print(results.basis(settings), file=out)
-    records = prepare(layout, settings, http)
-    print(f"{len(records)} calls in DataSF's record of {settings.day}.", file=out)
-    known_blocks = read_lists(layout)[1]
-    store = open_store(layout, settings)
-    try:
-        ember = radio_ember(layout, settings, env, radio_budget, paid)
-        heard = hear(layout, settings, store, ember, env, recordings=options.recordings)
-        complete = (
-            heard.stopped is None and heard.last_pass is not None and heard.last_pass.unready == 0
-        )
-        replays = taps.plan(records, options.taps)
-        tap_runs = Runs(layout.taps, settings.mode)
-        taps_stopped: str | None = None
-        try:
-            if replays and complete:
-                tap_ember = (
+    with alone(env), contextlib.ExitStack() as opened:
+        radio: EmberClient | None = None
+        tap_ember: EmberClient | None = None
+        generation: str | None = None
+        # What the run is, first: a run that was begun as another is refused before
+        # a paying client is made for it.
+        settings = begin(layout, settings)
+        if live:
+            # Both paying clients are made now, on the ledger file as it is before
+            # anything is heard: a client refuses to pay once the file it was made on
+            # is replaced, so a ledger that is replaced between the hearing and the
+            # taps is not taken for one in which nothing was spent.
+            radio = opened.enter_context(
+                contextlib.closing(radio_ember(layout, settings, env, radio_budget, paid))
+            )
+            tap_ember = opened.enter_context(
+                contextlib.closing(
                     paid_ember(env, TAPS_SCOPE, taps_budget, TAPS_BUDGET_NANOUSD, paid)
-                    if settings.hearer == "live"
-                    else EmberClient.fake(
-                        Storage.under(default_data_dir(env)), stand_in_investigator
-                    )
                 )
-                taps_stopped = taps.replay(
-                    replays, tap_ember, store, known_blocks, tap_runs
-                ).stopped
-            elif replays:
-                print("No tap is replayed until every call has been heard.", file=out)
-            standing = taps.kept(replays, tap_runs) if complete else []
+            )
+            generation = radio.ledger_generation()
+            pin_ledger(layout, generation)
+        print(results.basis(settings), file=out)
+        records = prepare(layout, settings, http)
+        records, unreadable = read_day(layout)
+        print(f"{len(records)} calls in DataSF's record of {settings.day}.", file=out)
+        known_blocks = read_lists(layout)[1]
+        if radio is None or tap_ember is None:
+            # The stand-ins: one reads the generated calls' script, one investigates by rule.
+            radio = opened.enter_context(
+                contextlib.closing(radio_ember(layout, settings, env, radio_budget, None))
+            )
+            tap_ember = opened.enter_context(
+                contextlib.closing(
+                    EmberClient.fake(Storage.under(default_data_dir(env)), stand_in_investigator)
+                )
+            )
+        store = open_store(layout, settings)
+        try:
+            heard = hear(layout, settings, store, radio, env, recordings=options.recordings)
+            heard_complete = (
+                heard.stopped is None
+                and heard.last_pass is not None
+                and heard.last_pass.unready == 0
+            )
+            ledger_lost = heard.ledger_lost
+            replays = taps.plan(records, options.taps)
+            tap_runs = Runs(layout.taps, settings.mode)
+            taps_stopped: taps.Stopped | None = None
+            try:
+                if replays and heard_complete and not ledger_lost:
+                    taps_stopped = taps.replay(
+                        replays, tap_ember, store, known_blocks, tap_runs
+                    ).stopped
+                elif replays:
+                    print("No tap is replayed until every call has been heard.", file=out)
+                standing = taps.kept(replays, tap_runs) if heard_complete else []
+            finally:
+                tap_runs.close()
+            if generation is not None and (
+                taps_stopped == "ledger_replaced" or tap_ember.ledger_generation() != generation
+            ):
+                ledger_lost = True
+            if ledger_lost:
+                # Kept, so that the command given again is refused and pays nothing.
+                lose_ledger(layout)
+            reading = score.read_incidents(store, known_blocks, records)
+            script = generate.read_script(layout.calls) if settings.audio == "generated" else None
+            made = results.build(
+                options.name,
+                settings,
+                records,
+                unreadable=unreadable,
+                rows=store.count_by_source().get(RADIO_SOURCE, 0),
+                no_row=store.claimed_without_row(RADIO_SOURCE),
+                listed=None if script is None else script.calls,
+                unplaced=None if script is None else script.unplaced,
+                last_pass=heard.last_pass,
+                stopped=heard.stopped,
+                reading=reading,
+                matched=score.match(records, reading.incidents),
+                radio_spend=heard.spend,
+                ledger_lost=ledger_lost,
+                taps=standing,
+                taps_stopped=taps_stopped,
+            )
         finally:
-            tap_runs.close()
-        reading = score.read_incidents(store, known_blocks, records)
-        script = generate.read_script(layout.calls) if settings.audio == "generated" else None
-        made = results.build(
-            options.name,
-            settings,
-            records,
-            rows=store.count_by_source().get(RADIO_SOURCE, 0),
-            no_row=store.claimed_without_row(RADIO_SOURCE),
-            listed=None if script is None else script.calls,
-            unplaced=None if script is None else script.unplaced,
-            last_pass=heard.last_pass,
-            stopped=heard.stopped,
-            reading=reading,
-            matched=score.match(records, reading.incidents),
-            radio_spend=heard.spend,
-            taps=standing,
-            taps_stopped=taps_stopped,
-        )
-    finally:
-        store.close()
+            store.close()
     results.write(layout, made)
     print("", file=out)
     for line in results.lines(made):
         print(line, file=out)
     print("", file=out)
-    if not complete or taps_stopped is not None:
+    if ledger_lost:
+        print(LEDGER_REPLACED, file=out)
+        return 1
+    if not made["complete"]:
         print("The run is not finished. Give the same command again to go on with it.", file=out)
         return 1
     return 0

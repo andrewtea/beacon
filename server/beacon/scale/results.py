@@ -80,6 +80,28 @@ INCOMPLETE = (
     "The run is not complete: calls are still unheard or were not ready. The numbers "
     "below are of what was heard so far."
 )
+LEDGER_LOST = (
+    "The Ember ledger was replaced while the run was under way, so what the run "
+    "spent is not known from it and no cost of hearing is reported. Compare Meta's "
+    "Usage page with the ledger before any more paid work."
+)
+_TAPS_STOPPED = {
+    "held": (
+        "It is leaving Ember alone after a refusal or a failure: ten minutes, or as "
+        "long as Ember asked. Give the same command again after that."
+    ),
+    "unusable": (
+        "Ember's answers were not the form, several times in a row, each of them "
+        "paid for. It is leaving Ember alone for ten minutes."
+    ),
+    "budget": (
+        "Its spending scope has less left than one tap may cost, or the spending "
+        "stop refused. The taps that were not begun are not claimed."
+    ),
+    "ledger_replaced": "The Ember ledger was replaced under it.",
+    "ember": "A call to Ember failed. It is leaving Ember alone for ten minutes.",
+    "store": "The investigations file could not be written.",
+}
 PARTIAL_READING = "The incident engine left rows out of a reading, so an incident can lack calls."
 
 _STOPPED = {
@@ -133,6 +155,7 @@ def build(
     settings: Settings,
     records: Sequence[datasf.Record],
     *,
+    unreadable: int = 0,
     rows: int,
     no_row: int,
     listed: int | None,
@@ -142,6 +165,7 @@ def build(
     reading: Reading,
     matched: Matched,
     radio_spend: ScopeSpend | None,
+    ledger_lost: bool = False,
     taps: Sequence[tuple[Replay, Standing, Run | None]],
     taps_stopped: str | None,
     made_at: datetime | None = None,
@@ -150,30 +174,40 @@ def build(
     rows the run's store holds, `no_row` how many calls are claimed there with no
     row, and `listed` how many calls there are to hear, when that is known;
     `unplaced` is how many records the generator found no block for;
-    `last_pass` and `stopped` are how the latest hearing ended."""
+    `last_pass` and `stopped` are how the latest hearing ended, `unreadable` how
+    many calls of DataSF's answer could not be read, and `ledger_lost` whether the
+    Ember ledger was replaced under the run. `taps` is every planned tap with how it
+    stands, or nothing while the hearing is not complete."""
     live = settings.hearer == "live"
     generated = settings.audio == "generated"
-    complete = stopped is None and last_pass is not None and last_pass.unready == 0
+    heard_complete = stopped is None and last_pass is not None and last_pass.unready == 0
+    waiting = sum(state == "waiting" for _, state, _ in taps)
+    # A run is complete when every call was heard and every planned tap was put to
+    # the investigator: a replay that stopped is not, whatever the hearing came to.
+    complete = heard_complete and taps_stopped is None and waiting == 0 and not ledger_lost
     caveats = [NOT_CHECKED]
-    if not complete:
+    if not heard_complete:
         caveats.insert(0, INCOMPLETE)
     if stopped is not None:
         caveats.insert(1, _STOPPED.get(stopped, "The run stopped early."))
+    if ledger_lost:
+        caveats.append(LEDGER_LOST)
     if reading.partial:
         caveats.append(PARTIAL_READING)
     numbers = [
-        *_record_numbers(records),
+        *_record_numbers(records, unreadable),
         *_hearing_numbers(rows, no_row, listed, last_pass, live=live),
         *_match_numbers(records, reading, matched, generated=generated, live=live),
-        *_place_numbers(matched, generated=generated, unplaced=unplaced),
+        *_place_numbers(matched, generated=generated, live=live, unplaced=unplaced),
         *_time_numbers(matched, generated=generated),
-        *_cost_numbers(radio_spend, live=live, generated=generated),
+        *_cost_numbers(radio_spend, live=live, generated=generated, lost=ledger_lost),
         *_tap_numbers(taps, reading, matched, live=live, generated=generated),
     ]
-    if taps_stopped is not None:
+    if taps_stopped is not None or waiting:
         caveats.append(
-            "The replay of taps stopped early: Ember refused or failed, or the "
-            "investigations file could not be written."
+            f"The replay of taps is not complete: {waiting} planned taps have not been "
+            "put to the investigator. "
+            + _TAPS_STOPPED.get(taps_stopped or "", "The replay stopped early.")
         )
     return {
         "format": FORMAT,
@@ -186,6 +220,9 @@ def build(
         # Whether a stand-in had a part in the numbers: generated audio, a stand-in
         # for Ember, or both. Only recorded radio heard by Muse Ember is neither.
         "stand_in": generated or not live,
+        # Every call heard, and then the whole run: every planned tap put to the
+        # investigator as well, and the ledger the one the run began in.
+        "heard_complete": heard_complete,
         "complete": complete,
         "basis_text": basis(settings),
         "caveats": caveats,
@@ -233,18 +270,29 @@ def lines(results: dict[str, Any]) -> list[str]:
     return out
 
 
-def _record_numbers(records: Sequence[datasf.Record]) -> list[Number]:
+def _record_numbers(records: Sequence[datasf.Record], unreadable: int) -> list[Number]:
     medical = sum(record.medical for record in records)
     return [
         Number(
             "records",
-            "Calls DataSF lists",
+            "DataSF calls Beacon could read",
             len(records),
             "calls",
-            f"Calls the fire department was dispatched to on this day, by DataSF's record. "
-            f"{medical} of them are medical, of which Beacon keeps the crews, the "
-            "intersection, and the times, and nothing else.",
-        )
+            "Calls the fire department was dispatched to on this day, by DataSF's "
+            "record, that have a number, a type, and the times they were received and "
+            "dispatched. Every count and share below is of these. "
+            f"{medical} of them are medical, of which Beacon keeps DataSF's number for "
+            "the call, the crews, the intersection, and the times, and nothing else.",
+        ),
+        Number(
+            "records_unreadable",
+            "DataSF calls Beacon could not read",
+            unreadable,
+            "calls",
+            "Calls in DataSF's answer for the day that lack a number, a type, or the "
+            "time they were received or dispatched. They are in no count below, so "
+            "the calls above are not all the calls DataSF lists when this is not 0.",
+        ),
     ]
 
 
@@ -322,6 +370,7 @@ def _match_numbers(
     silent = []
     if generated:
         unheard = {record.number for record in records if not record.units}
+        found_by_chance = sum(pair.record.number in unheard for pair in matched.found)
         by_chance = sum(record.number in unheard for record in matched.merged)
         silent = [
             Number(
@@ -331,10 +380,11 @@ def _match_numbers(
                 "calls",
                 "DataSF calls that name no unit whose id is shaped as Beacon keeps one "
                 "(a type code and a number), so the generator made no call for them "
-                f"and none can have been found. {by_chance} of them are counted above "
-                "as taken to be inside another's incident, which for a call nobody "
-                "generated is chance: some incident was near it at the time. That is "
-                "how loose that count is.",
+                f"and nothing was heard of them. {found_by_chance} of them are counted "
+                f"above as found and {by_chance} as taken to be inside another's "
+                "incident, which for a call nobody generated is chance: an incident of "
+                "another call's was near it at the time. That is how loose both "
+                "counts are.",
             )
         ]
     wrong_kind = sum(not pair.same_kind for pair in matched.found)
@@ -351,9 +401,10 @@ def _match_numbers(
             "DataSF calls found",
             len(matched.found),
             "calls",
-            "DataSF calls for which Beacon has an incident of its own: of the same "
-            "medical-or-not kind, opened within the call's time, and naming one of its "
-            f"units or placed within {NEAR_M:.0f} m of it. {meaning}",
+            "DataSF calls that were paired with an incident of Beacon's, one to one: "
+            "of the same medical-or-not kind, opened within the call's time, and "
+            f"naming one of its units or placed within {NEAR_M:.0f} m of it. A pair "
+            f"is a fit by that rule, and nothing checks that it is right. {meaning}",
         ),
         Number(
             "found_share",
@@ -367,7 +418,8 @@ def _match_numbers(
             "DataSF calls taken to be inside another's incident",
             len(matched.merged),
             "calls",
-            "DataSF calls with no incident of their own, for which an incident that "
+            "DataSF calls with no incident of their own, for which an incident that is "
+            "another call's own, of the same medical-or-not kind, and "
             f"names one of their units or lies within {NEAR_M:.0f} m of them has a "
             "radio call in their time. That is taken to mean the call is inside "
             "another call's incident, where Beacon puts a second call at one block "
@@ -389,10 +441,11 @@ def _match_numbers(
             "Further incidents of a call already counted",
             len(matched.split),
             "incidents",
-            "Incidents that fit a DataSF call and are not that call's own: Beacon made "
-            "more than one incident of one call, as it does when a unit is heard from "
-            "after its incident has been quiet for 45 minutes. Such an incident often "
-            "has no place.",
+            "Incidents that fit a DataSF call by the rule and were paired with none, "
+            "because each call takes one. That is what is left when Beacon makes more "
+            "than one incident of one call, as it does when a unit is heard from after "
+            "its incident has been quiet for 45 minutes; an incident that merely fits "
+            "a call by its time and a unit or its place is counted the same.",
         ),
         Number(
             "extra",
@@ -413,18 +466,33 @@ def _match_numbers(
     ]
 
 
-def _place_numbers(matched: Matched, *, generated: bool, unplaced: int | None) -> list[Number]:
+def _place_numbers(
+    matched: Matched, *, generated: bool, live: bool, unplaced: int | None
+) -> list[Number]:
     away = sorted(pair.away_m for pair in matched.found if pair.away_m is not None)
-    if generated:
+    measured = (
+        "From the point of the incident a call was paired with to DataSF's point for "
+        "the call, over the pairs that have both."
+    )
+    if generated and not live:
         meaning = (
-            "Each generated call names the listed block nearest DataSF's point, so "
-            "this is how far that block's middle is from the intersection: a check of "
-            "the list of blocks, not a location error of Beacon's hearing."
+            f"{measured} Each generated call names the listed block nearest DataSF's "
+            "point, so for a pair that is right this is how far that block's middle is "
+            "from the intersection, and for one that is not it is the distance to "
+            "another call's block: a check of the list of blocks and of the pairing, "
+            "not a location error of Beacon's hearing."
+        )
+    elif generated:
+        meaning = (
+            f"{measured} Each call was generated to name the listed block nearest "
+            "DataSF's point, and the incident's point is of the block Muse Ember made "
+            "out, in a pair nothing checks. It is no location error on real radio."
         )
     else:
         meaning = (
-            "From the middle of the block Beacon heard, by the list of blocks, to the "
-            "intersection DataSF gives. Neither is finer than a block."
+            f"{measured} The incident's point is the middle of the block Beacon heard, "
+            "by the list of blocks, and DataSF's is an intersection: neither is finer "
+            "than a block, and nothing checks that a pair is right."
         )
     blockless = []
     if generated and unplaced is not None:
@@ -447,7 +515,7 @@ def _place_numbers(matched: Matched, *, generated: bool, unplaced: int | None) -
             "Found calls with a place to compare",
             len(away),
             "calls",
-            "Calls found whose incident has a point and whose DataSF record has one.",
+            "Pairs in which the incident has a point and the DataSF record has one.",
         ),
         Number(
             "place_median_m",
@@ -496,7 +564,19 @@ def _time_numbers(matched: Matched, *, generated: bool) -> list[Number]:
     ]
 
 
-def _cost_numbers(spend: ScopeSpend | None, *, live: bool, generated: bool) -> list[Number]:
+def _cost_numbers(
+    spend: ScopeSpend | None, *, live: bool, generated: bool, lost: bool
+) -> list[Number]:
+    if live and (lost or spend is None):
+        unknown = (
+            "Not known: the Ember ledger was replaced while the run was under way, so "
+            "what the file at its path holds is not what hearing cost. Meta's Usage "
+            "page has what was billed."
+        )
+        return [
+            Number("radio_cost_usd", "Cost of hearing", None, "USD", unknown),
+            Number("radio_cost_per_1000_usd", "Cost per 1,000 transmissions", None, "USD", unknown),
+        ]
     if not live or spend is None:
         nothing = (
             "Not measured: a stand-in heard the calls, nothing was paid, and no cost "
@@ -535,6 +615,12 @@ def _cost_numbers(spend: ScopeSpend | None, *, live: bool, generated: bool) -> l
     ]
 
 
+def _answered(run: Run) -> bool:
+    """Whether an investigation ran to an answer that was the form: it was not cut
+    short, Ember was asked, and what it said last could be read."""
+    return run.cut_short is None and run.outcome.reason not in ("no_answer", "not_investigated")
+
+
 def _tap_numbers(
     taps: Sequence[tuple[Replay, Standing, Run | None]],
     reading: Reading,
@@ -547,45 +633,68 @@ def _tap_numbers(
         return []
     who = "Muse Ember" if live else "a stand-in for Ember, by rule"
     runs = [(tap, run) for tap, _, run in taps if run is not None]
-    near = [(tap, run) for tap, run in runs if tap.near is not None]
-    away = [(tap, run) for tap, run in runs if tap.near is None]
+    lost = sum(state == "claimed" for _, state, _ in taps)
+    # Only an investigation that ran to an answer says anything about answers: one
+    # that was cut short is kept as "unconfirmed" and is no answer of anybody's.
+    answered = [(tap, run) for tap, run in runs if _answered(run)]
+    near = [(tap, run) for tap, run in answered if tap.near is not None]
+    away = [(tap, run) for tap, run in answered if tap.near is None]
     right = 0
     for tap, run in near:
         assert tap.near is not None
         wanted = matched.incident_of(tap.near)
-        answered = reading.kept_as.get(run.outcome.incident_id or "")
-        right += run.outcome.status == "incident" and wanted is not None and answered == wanted
+        given = reading.kept_as.get(run.outcome.incident_id or "")
+        right += run.outcome.status == "incident" and wanted is not None and given == wanted
     unconfirmed = sum(run.outcome.status == "unconfirmed" for _, run in away)
     on = "generated calls" if generated else "recorded radio"
     numbers = [
         Number(
             "taps",
-            "Replayed taps investigated",
-            len(runs),
+            "Replayed taps answered",
+            len(answered),
             "taps",
-            f"Of {len(taps)} planned. A replayed tap is a place and a moment of the day "
-            f"put to the investigator by a script, investigated by {who} against the "
-            "run's evidence as it stood then. No person tapped, and none is stored as a tap.",
+            f"Of {len(taps)} planned: those whose investigation ran to an answer that "
+            "was the form. A replayed tap is a place and a moment of the day put to "
+            f"the investigator by a script, investigated by {who} against the run's "
+            "evidence as it stood then. No person tapped, and none is stored as a tap.",
+        ),
+        Number(
+            "taps_unanswered",
+            "Replayed taps with no answer",
+            len(runs) - len(answered),
+            "taps",
+            "Taps whose investigation was cut short, was refused before anything was "
+            "asked, or ended in an answer that was not the form. They are kept as "
+            '"unconfirmed", are in none of the counts of answers below, and are not '
+            "investigated again.",
+        ),
+        Number(
+            "taps_lost",
+            "Replayed taps claimed with no run kept",
+            lost,
+            "taps",
+            "Taps that were claimed and have no run: the process ended between the "
+            "claim and the run. They are not investigated again, and what was paid "
+            "for them, if anything, is not known from the run's files.",
         ),
         Number(
             "taps_near_matched",
             "Taps at a call, answered with its incident",
             right,
             "taps",
-            f"Of {len(near)} taps placed at a DataSF call's point three minutes after "
-            "its dispatch: those the investigator matched to the incident Beacon has "
-            f"for that call, or the one that call is taken to be inside, on {on}. A "
-            "tap that was "
-            'answered "unconfirmed" is not '
-            "counted, whether or not that was the careful answer.",
+            f"Of {len(near)} answered taps placed at a DataSF call's point three "
+            "minutes after its dispatch: those the investigator matched to the "
+            "incident that call was paired with, or the one it is taken to be "
+            f"inside, on {on}. A tap that was answered "
+            '"unconfirmed" is not counted, whether or not that was the careful answer.',
         ),
         Number(
             "taps_away_unconfirmed",
             "Taps away from every call, answered unconfirmed",
             unconfirmed,
             "taps",
-            f"Of {len(away)} taps placed where DataSF lists no call within a kilometre "
-            'for an hour either side: those answered "unconfirmed".',
+            f"Of {len(away)} answered taps placed where DataSF lists no call within a "
+            'kilometre for an hour either side: those answered "unconfirmed".',
         ),
     ]
     if not live:
@@ -600,44 +709,57 @@ def _tap_numbers(
                 "tap_seconds_p95", "Time per investigation, 95th percentile", None, "s", nothing
             ),
         ]
-    costs = sorted(to_usd(sum(call.cost_nanousd for call in run.calls)) for _, run in runs)
-    seconds = sorted(sum(call.latency_ms for call in run.calls) / 1000 for _, run in runs)
-    requests = sorted(len(run.calls) for _, run in runs)
+
+    def cost(run: Run) -> float:
+        return to_usd(sum(call.cost_nanousd for call in run.calls))
+
+    each = sorted(cost(run) for _, run in answered)
+    seconds = sorted(sum(call.latency_ms for call in run.calls) / 1000 for _, run in answered)
+    requests = sorted(len(run.calls) for _, run in answered)
     unaccounted = sum(run.unaccounted for _, run in runs)
-    counted = (
-        f"Over the requests of each investigation that Ember answered, paid under "
-        f"{TAPS_SCOPE}. {unaccounted} requests ended in an error after they may have "
-        "been sent and are not in these sums. An investigation is held to "
-        f"${TAP_BUDGET_USD:.2f}."
+    missing = (
+        f"{unaccounted} requests ended in an error after they may have been sent, and "
+        f"{lost} taps were claimed with no run kept: what those cost is not in this "
+        "sum and is not known from the run's files."
     )
     return [
         *numbers,
-        Number("tap_cost_usd", "Cost per investigation, mean", _mean(costs, 6), "USD", counted),
+        Number(
+            "tap_cost_usd",
+            "Cost per answered investigation, mean",
+            _mean(each, 6),
+            "USD",
+            "Over the requests Ember answered in each investigation that ran to an "
+            f"answer, paid under {TAPS_SCOPE}. An investigation is held to "
+            f"${TAP_BUDGET_USD:.2f}.",
+        ),
         Number(
             "tap_cost_total_usd",
-            "Cost of the replayed taps",
-            round(sum(costs), 6),
+            "Cost of the replayed taps that is accounted for",
+            round(sum(cost(run) for _, run in runs), 6),
             "USD",
-            counted,
+            "Over the requests Ember answered in every investigation that was kept, "
+            f"answered or not, paid under {TAPS_SCOPE}. {missing}",
         ),
         Number(
             "tap_requests",
-            "Requests per investigation, mean",
+            "Requests per answered investigation, mean",
             _mean([float(count) for count in requests], 2),
             "requests",
-            "Requests to Muse Ember that answered, for each investigation.",
+            "Requests to Muse Ember that answered, for each investigation that ran to an answer.",
         ),
         Number(
             "tap_seconds_p50",
-            "Time per investigation, median",
+            "Time per answered investigation, median",
             _percentile(seconds, 50),
             "s",
-            "The time Ember took over an investigation's requests, added up. It leaves "
-            "out Beacon's own tools and the network between a phone and the server.",
+            "The time Ember took over the requests of an investigation that ran to an "
+            "answer, added up. It leaves out Beacon's own tools and the network "
+            "between a phone and the server.",
         ),
         Number(
             "tap_seconds_p95",
-            "Time per investigation, 95th percentile",
+            "Time per answered investigation, 95th percentile",
             _percentile(seconds, 95),
             "s",
             "The same, for the slowest twentieth.",

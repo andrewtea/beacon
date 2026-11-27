@@ -23,6 +23,7 @@ in the forms `BEACON_RADIO_STREETS_FILE`, `BEACON_RADIO_UNITS_FILE`, and
 
 import itertools
 import math
+import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -63,27 +64,34 @@ class Lists:
     blocks: tuple[tuple[str, int, float, float], ...]
 
     def write(self, directory: Path) -> None:
-        """Write the three files into `directory`, which is made when it is not there."""
+        """Write the three files into `directory`, which is made when it is not
+        there. Each is written whole or not at all, and the blocks last: a run takes
+        the blocks' file being there to mean that all three are."""
         directory.mkdir(parents=True, exist_ok=True)
         credit = (
             "# From DataSF, City and County of San Francisco, under the Open Data "
             "Commons Public Domain\n# Dedication and License. Made by Beacon's scale "
             "run (beacon.scale.lists); not checked by hand.\n"
         )
-        (directory / STREETS_FILE).write_text(
-            credit + "".join(f"{street}\n" for street in self.streets), encoding="utf-8"
+        _write_whole(
+            directory / STREETS_FILE, credit + "".join(f"{street}\n" for street in self.streets)
         )
-        (directory / UNITS_FILE).write_text(
-            credit + "".join(f"{unit}\n" for unit in self.units), encoding="utf-8"
-        )
-        (directory / BLOCKS_FILE).write_text(
+        _write_whole(directory / UNITS_FILE, credit + "".join(f"{unit}\n" for unit in self.units))
+        _write_whole(
+            directory / BLOCKS_FILE,
             credit
             + "# street, hundred block, latitude, longitude\n"
             + "".join(
                 f"{street},{block},{lat:.6f},{lon:.6f}\n" for street, block, lat, lon in self.blocks
             ),
-            encoding="utf-8",
         )
+
+
+def _write_whole(path: Path, text: str) -> None:
+    """Write a file to one beside it, which then takes its place."""
+    beside = path.with_name(path.name + ".part")
+    beside.write_text(text, encoding="utf-8")
+    os.replace(beside, path)
 
 
 def fetch_centerlines(http: SourceHttp) -> list[Mapping[str, Any]]:
