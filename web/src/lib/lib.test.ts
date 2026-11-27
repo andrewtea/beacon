@@ -8,10 +8,12 @@ import { recordClip } from './recorder.ts'
 import { href, parseRoute } from './router.ts'
 import {
   forgetTap,
+  isInventedTap,
   KEPT_MS,
   keepTap,
   keptTaps,
   pruneTaps,
+  resetTaps,
   subscribeTaps,
   sweepTaps,
   tapsSnapshot,
@@ -467,4 +469,109 @@ test('a recorder that will not start ends the recording and lets go of the micro
   expect(stop).toHaveBeenCalled()
   expect(closed).toHaveBeenCalled()
   expect(unhandled).not.toHaveBeenCalled()
+})
+
+test.each([
+  ['storage keeps it', false],
+  ['storage refuses it', true],
+])(
+  'a tap is known as an invented one only while the server answers for it, when %s',
+  (_name, refuses) => {
+    resetTaps()
+    const now = Date.parse('2026-11-26T12:00:00Z')
+    const refused = refuses
+      ? vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+          throw new DOMException('Full.', 'QuotaExceededError')
+        })
+      : null
+    const at = new Date(now).toISOString()
+    keepTap({ id: 'spot', at, photo: false, clip: false, invented: true }, now)
+    keepTap({ id: 'own', at, photo: false, clip: false }, now)
+
+    expect(stored().length).toBe(refuses ? 0 : 2)
+    expect(isInventedTap('spot', now)).toBe(true)
+    expect(isInventedTap('own', now)).toBe(false)
+    expect(isInventedTap('spot', now + KEPT_MS - 1)).toBe(true)
+    // Run out: not known, whether or not anything has swept it away.
+    expect(isInventedTap('spot', now + KEPT_MS)).toBe(false)
+    refused?.mockRestore()
+    resetTaps()
+  },
+)
+
+test('a tap that was forgotten is not known as an invented one, whoever forgot it', () => {
+  resetTaps()
+  const at = new Date().toISOString()
+  keepTap({ id: 'spot', at, photo: false, clip: false, invented: true })
+  keepTap({ id: 'other', at, photo: false, clip: false, invented: true })
+
+  forgetTap('spot')
+  expect(isInventedTap('spot')).toBe(false)
+  // Another tab forgot the other one: storage no longer has it.
+  window.localStorage.setItem('beacon.taps.v1', '[]')
+  expect(isInventedTap('other')).toBe(false)
+
+  // And one storage never took is forgotten from the page that held it.
+  const refused = vi
+    .spyOn(Storage.prototype, 'setItem')
+    .mockImplementation(() => {
+      throw new DOMException('Full.', 'QuotaExceededError')
+    })
+  keepTap({ id: 'unkept', at, photo: false, clip: false, invented: true })
+  expect(isInventedTap('unkept')).toBe(true)
+  forgetTap('unkept')
+  expect(isInventedTap('unkept')).toBe(false)
+  refused.mockRestore()
+  resetTaps()
+})
+
+test('the page holds no more taps storage refused than storage would have kept', () => {
+  resetTaps()
+  const refused = vi
+    .spyOn(Storage.prototype, 'setItem')
+    .mockImplementation(() => {
+      throw new DOMException('Full.', 'QuotaExceededError')
+    })
+  const at = new Date().toISOString()
+  for (let count = 0; count <= 20; count += 1)
+    keepTap({
+      id: `tap-${count}`,
+      at,
+      photo: false,
+      clip: false,
+      invented: true,
+    })
+
+  expect(isInventedTap('tap-20')).toBe(true)
+  expect(isInventedTap('tap-1')).toBe(true)
+  expect(isInventedTap('tap-0')).toBe(false)
+  refused.mockRestore()
+  resetTaps()
+})
+
+test('a tap storage refused is taken off what is known at the moment it runs out', () => {
+  resetTaps()
+  vi.useFakeTimers()
+  const now = Date.parse('2026-11-26T12:00:00Z')
+  vi.setSystemTime(now)
+  vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+    throw new DOMException('Full.', 'QuotaExceededError')
+  })
+  const at = new Date(now).toISOString()
+  keepTap({ id: 'spot', at, photo: false, clip: false, invented: true })
+  const stop = sweepTaps()
+  const told = vi.fn()
+  const unsubscribe = subscribeTaps(told)
+
+  vi.advanceTimersByTime(KEPT_MS - 1)
+  expect(told).not.toHaveBeenCalled()
+  expect(isInventedTap('spot')).toBe(true)
+  // Whoever shows the tap's view is told, and no longer finds it known.
+  vi.advanceTimersByTime(2)
+  expect(told).toHaveBeenCalled()
+  expect(isInventedTap('spot')).toBe(false)
+
+  unsubscribe()
+  stop()
+  resetTaps()
 })

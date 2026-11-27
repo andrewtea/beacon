@@ -18,6 +18,12 @@ export type KeptTap = {
   at: string
   photo: boolean
   clip: boolean
+  // True when the server that took it said it took it under the rule that it
+  // takes only the invented scenario's two places. A server that takes only
+  // those is asked for a tap only when this is true (`isInventedTap`): the id
+  // of any other tap is in no request to it. A tap kept before this was kept
+  // says nothing, and is taken for one sent from where somebody was.
+  invented?: boolean
 }
 
 const KEY = 'beacon.taps.v1'
@@ -44,7 +50,8 @@ function isKept(value: unknown): value is KeptTap {
     typeof tap.id === 'string' &&
     typeof tap.at === 'string' &&
     typeof tap.photo === 'boolean' &&
-    typeof tap.clip === 'boolean'
+    typeof tap.clip === 'boolean' &&
+    (tap.invented === undefined || typeof tap.invented === 'boolean')
   )
 }
 
@@ -94,7 +101,44 @@ export function keptTaps(now: number = Date.now()): KeptTap[] {
 
 export function keepTap(tap: KeptTap, now: number = Date.now()): void {
   const others = keptTaps(now).filter((kept) => kept.id !== tap.id)
-  write([tap, ...others].slice(0, MOST))
+  unkept = unkept.filter((kept) => kept.id !== tap.id)
+  if (write([tap, ...others].slice(0, MOST))) return
+  // With storage switched off or full, a tap's answer is still read from the
+  // page it was sent from, so the page keeps what storage would not: as many,
+  // and for as long.
+  unkept = [tap, ...current(unkept, now)].slice(0, MOST)
+  notify()
+}
+
+// The taps this page sent that storage would not keep. They are gone with the
+// page, and before that when a kept tap would be: `current` reads them too.
+let unkept: KeptTap[] = []
+
+/** Whether this device knows the tap to be one a server took under the rule
+ * that it takes only the invented scenario's two places, and still answers
+ * for: it is kept here so and has not run out. An id from anywhere else, a
+ * link somebody opened included, is not known to be, and neither is one that
+ * was forgotten, here or in another tab. */
+export function isInventedTap(id: string, now: number = Date.now()): boolean {
+  return current([...read(), ...unkept], now).some(
+    (tap) => tap.id === id && tap.invented === true,
+  )
+}
+
+/** Forget what this page knows that storage does not. For tests. */
+export function resetTaps(): void {
+  unkept = []
+  cache = null
+  shown = null
+}
+
+/** Drop the taps storage would not keep that have run out. Answers with
+ * whether there was one. */
+function pruneUnkept(now: number): boolean {
+  const kept = current(unkept, now)
+  const dropped = kept.length !== unkept.length
+  unkept = kept
+  return dropped
 }
 
 /** Delete from storage the taps the server no longer answers for. Answers with
@@ -131,8 +175,9 @@ export function sweepTaps(): () => void {
   const plan = () => {
     clearTimeout(timer)
     const now = Date.now()
-    // Only the taps that have not run out are waited for.
-    const end = firstEnd(current(read(), now))
+    // Only the taps that have not run out are waited for, those storage would
+    // not keep among them.
+    const end = firstEnd(current([...read(), ...unkept], now))
     // A millisecond past the end, so the tap has run out when the timer fires.
     if (Number.isFinite(end)) timer = setTimeout(sweep, end - now + 1)
   }
@@ -144,8 +189,11 @@ export function sweepTaps(): () => void {
     try {
       // A sweep that deletes something writes, and the write tells the
       // listeners. One that could not delete tells them itself: the list that
-      // is shown has changed all the same.
-      if (pruneTaps() === 'failed') notify()
+      // is shown has changed all the same. So does one that dropped only a
+      // tap storage never kept.
+      const dropped = pruneUnkept(Date.now())
+      const pruned = pruneTaps()
+      if (pruned === 'failed' || (dropped && pruned === 'nothing')) notify()
     } finally {
       sweeping = false
     }
@@ -168,7 +216,12 @@ export function sweepTaps(): () => void {
 
 /** Forget a tap: the person asked to, or the server no longer has it. */
 export function forgetTap(id: string): void {
-  write(read().filter((tap) => tap.id !== id))
+  const held = unkept.length
+  unkept = unkept.filter((tap) => tap.id !== id)
+  // Storage that refuses the write tells nobody, and what this page held
+  // apart from it has changed all the same.
+  if (!write(read().filter((tap) => tap.id !== id)) && unkept.length !== held)
+    notify()
 }
 
 /** Another tab of the app kept or forgot a tap, or storage was cleared (`key`

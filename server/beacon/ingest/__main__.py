@@ -4,7 +4,10 @@
     uv run python -m beacon.ingest --follow   # keep polling until interrupted
 
 With `BEACON_LIVE_SOURCES` unset this plays the mock scenario and touches no network.
-The server runs the same pollers itself, so use `--follow` only when it is not running.
+The server runs the same pollers itself, so this is for a data directory no server
+is polling for: one with no server, or one whose server was started without its
+pollers (`BEACON_INGEST=0`). Beside a server that runs the pollers it is refused:
+that server has the directory's stores alone (`beacon.datadir`).
 """
 
 import argparse
@@ -13,6 +16,8 @@ import logging
 import os
 import threading
 
+from beacon.datadir import DataLock, DataLockedError
+from beacon.ember.client import default_data_dir
 from beacon.ember.errors import EmberConfigError
 from beacon.evidence import EvidenceStoreError
 from beacon.ingest.setup import IngestConfigError, build
@@ -23,6 +28,19 @@ def main() -> None:
     parser.add_argument("--follow", action="store_true", help="keep polling until interrupted")
     options = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    try:
+        # Held from before the store is opened until it is closed, together with a
+        # server that runs no pollers and never beside one that does.
+        lock = DataLock(default_data_dir(os.environ), shared=True)
+    except (DataLockedError, EmberConfigError) as error:
+        raise SystemExit(str(error)) from error
+    try:
+        _poll(options.follow)
+    finally:
+        lock.close()
+
+
+def _poll(follow: bool) -> None:
     try:
         ingest = build(os.environ)
     except (IngestConfigError, EvidenceStoreError, EmberConfigError) as error:
@@ -37,7 +55,7 @@ def main() -> None:
             # Why a poll failed is in the log above.
             outcome = {True: "ok", False: "failed", None: "not polled"}[status.ok]
             print(f"  {status.name:<8} {counts.get(status.name, 0):>6} rows  {outcome}")
-        if options.follow:
+        if follow:
             with contextlib.suppress(KeyboardInterrupt):
                 ingest.run(threading.Event())
     finally:

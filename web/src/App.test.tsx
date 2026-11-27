@@ -6,14 +6,20 @@ import {
   waitFor,
   within,
 } from '@testing-library/react'
-import { afterEach, beforeEach, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, expect, onTestFinished, test, vi } from 'vitest'
 import App from './App.tsx'
 import { CrisisPanel } from './components/IncidentBody.tsx'
 import { IncidentCard } from './components/IncidentCard.tsx'
 import { Sources } from './components/Provenance.tsx'
 import { OPEN_MS } from './lib/cadence.ts'
 import { drawPhoto } from './lib/photo.ts'
-import { keepTap, keptTaps, sweepTaps } from './lib/tapStore.ts'
+import {
+  isInventedTap,
+  keepTap,
+  keptTaps,
+  resetTaps,
+  sweepTaps,
+} from './lib/tapStore.ts'
 import {
   FIRE_TAP,
   fireAnswer,
@@ -44,7 +50,7 @@ const fireRoutes = {
   [`GET /api/taps/${FIRE_TAP}/run`]: fireRun,
   [`GET /api/incidents/${FIRE_ID}`]: fireIncident,
 }
-const receipt = (id: string) => ({
+const receipt = (id: string, inventedOnly = false) => ({
   id,
   received_at: new Date().toISOString(),
   mode: 'mock',
@@ -52,10 +58,12 @@ const receipt = (id: string) => ({
   clip: false,
   media_kept_until: null,
   investigating: true,
+  invented_only: inventedOnly,
 })
 
 beforeEach(() => {
   window.localStorage.clear()
+  resetTaps()
   window.location.hash = ''
 })
 afterEach(() => vi.useRealTimers())
@@ -72,6 +80,335 @@ test('says that it runs on an invented scenario before anybody taps', async () =
 
   expect(await screen.findByText(INVENTED)).toBeInTheDocument()
   expect(screen.getByRole('button', { name: ASK })).toBeEnabled()
+})
+
+test('says, in the server’s sentence, that the invented scenario is told again and what becomes of taps', async () => {
+  const repeats =
+    'On this server the invented scenario is told again from its beginning when it is over.'
+  serve({ 'GET /api/health': { ...MOCK_HEALTH, repeats_text: repeats } })
+
+  render(<App />)
+
+  // Beside what says the scenario is invented, before anybody taps.
+  const banner = await screen.findByText(INVENTED)
+  expect(banner).toHaveTextContent(repeats)
+})
+
+const FRONT =
+  'On this server a tap is sent from one of two invented places, not from where you are.'
+const FRONT_MORE = 'The address a tap’s answer is read at holds the tap’s id.'
+const INVENTED_ONLY = {
+  ...MOCK_HEALTH,
+  input: 'invented',
+  front_text: FRONT,
+  front_more_text: FRONT_MORE,
+}
+
+test('says, in the server’s sentences, what a server behind an unchecked host takes and why', async () => {
+  serve({ 'GET /api/health': INVENTED_ONLY })
+
+  render(<App />)
+
+  // On the page a tap is sent from, before anybody taps, apart from what says
+  // the scenario is invented: it is about what a person sends, not the incidents.
+  expect(await screen.findByText(FRONT)).toBeInTheDocument()
+  expect(screen.getByText(INVENTED)).not.toHaveTextContent(FRONT)
+  // The rest is the server's too, and is there for whoever opens it.
+  expect(screen.getByText('More about this')).toBeInTheDocument()
+  expect(screen.getByText(FRONT_MORE)).toBeInTheDocument()
+})
+
+test('on a server that takes only the invented places, the button sends one of them and asks the phone nothing', async () => {
+  const asked = serve({
+    ...fireRoutes,
+    'GET /api/health': INVENTED_ONLY,
+    'POST /api/taps': () =>
+      Response.json(receipt(FIRE_TAP, true), { status: 201 }),
+  })
+  // A phone that would say where it is, to the metre, if it were asked.
+  const located = vi.fn((found: PositionCallback) =>
+    found({
+      coords: { latitude: 37.775123, longitude: -122.419876, accuracy: 8 },
+    } as GeolocationPosition),
+  )
+  vi.stubGlobal('navigator', {
+    ...navigator,
+    geolocation: { getCurrentPosition: located },
+  })
+  render(<App />)
+
+  await screen.findByText(FRONT)
+  // Nothing can be added to a tap, and nothing says a tap sends where you are.
+  expect(
+    screen.queryByRole('checkbox', { name: '5 seconds of sound' }),
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('button', { name: 'A photo' }),
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByText(/A tap sends where you are/),
+  ).not.toBeInTheDocument()
+  // The button says what it sends here.
+  expect(
+    screen.getByText(/the button sends a tap from an invented place/),
+  ).toHaveTextContent('Where you are is not asked for and not sent.')
+  click(screen.getByRole('button', { name: ASK }))
+
+  await screen.findByRole('heading', { level: 1, name: /Fire at/ })
+  const sent = asked.filter((request) => request.key === 'POST /api/taps')
+  expect(sent).toHaveLength(1)
+  // The invented place to the digit, and nothing else: no accuracy, no clip.
+  expect(sent[0].body).toEqual({ location: { lat: 37.776, lon: -122.424 } })
+  expect(located).not.toHaveBeenCalled()
+  // What the server said of the tap is kept with its id on the device.
+  expect(keptTaps()).toEqual([
+    expect.objectContaining({ id: FIRE_TAP, invented: true }),
+  ])
+  vi.unstubAllGlobals()
+})
+
+const hashOf = (view: string, id: string) =>
+  view === 'trace' ? `#/tap/${id}/trace` : `#/tap/${id}`
+const tapRequests = (asked: { key: string }[]) =>
+  asked.filter((request) => request.key.startsWith('GET /api/taps/'))
+
+test.each(['tap', 'trace'])(
+  'a %s is not asked for, and its id not sent, until the server has said what it takes',
+  async (view) => {
+    // Asking names the tap's id in the request's address. A link to an answer
+    // that is opened sends nothing until it is known whether this server is
+    // one the id may be sent to.
+    let health: (response: Response) => void = () => undefined
+    const asked = serve({
+      ...fireRoutes,
+      'GET /api/health': () =>
+        new Promise<Response>((resolve) => (health = resolve)),
+    })
+    window.location.hash = hashOf(view, FIRE_TAP)
+    render(<App />)
+
+    expect(
+      await screen.findByText(
+        'Beacon asks for this tap once it has heard from its server.',
+      ),
+    ).toBeInTheDocument()
+    expect(tapRequests(asked)).toEqual([])
+
+    // A server that does not say what it takes is not taken for one that
+    // takes a visitor's own.
+    const silent: Record<string, unknown> = { ...MOCK_HEALTH }
+    delete silent.input
+    await act(async () => health(Response.json(silent)))
+    await screen.findByText('Invented scenario')
+    expect(tapRequests(asked)).toEqual([])
+    expect(JSON.stringify(asked)).not.toContain(FIRE_TAP)
+  },
+)
+
+test.each(['tap', 'trace'])(
+  'a server that takes only the invented places is asked for no %s this device does not know it took so',
+  async (view) => {
+    // One this device sent from where somebody was, to a server that took
+    // that, and one a link names that this device never sent.
+    keepTap({
+      id: FIRE_TAP,
+      at: new Date().toISOString(),
+      photo: false,
+      clip: false,
+    })
+    const asked = serve({ ...fireRoutes, 'GET /api/health': INVENTED_ONLY })
+    for (const id of [FIRE_TAP, QUIET_TAP]) {
+      window.location.hash = hashOf(view, id)
+      const { unmount } = render(<App />)
+
+      expect(
+        await screen.findByRole('heading', {
+          name: 'This tap is not asked for here',
+        }),
+      ).toBeInTheDocument()
+      expect(screen.getByRole('status')).toHaveTextContent(
+        'Beacon does not ask this server for it.',
+      )
+      // Nothing is said of what was sent before: a view of this tap can have
+      // been open when the server changed what it takes.
+      expect(screen.getByRole('status')).not.toHaveTextContent(/was not sent/)
+      unmount()
+    }
+    expect(tapRequests(asked)).toEqual([])
+    expect(JSON.stringify(asked)).not.toContain(FIRE_TAP)
+    expect(JSON.stringify(asked)).not.toContain(QUIET_TAP)
+    // The tap is still kept on the device: another server may answer for it.
+    expect(keptTaps().map((tap) => tap.id)).toEqual([FIRE_TAP])
+  },
+)
+
+test('a server that takes only the invented places is asked for a tap this device knows it took so', async () => {
+  keepTap({
+    id: FIRE_TAP,
+    at: new Date().toISOString(),
+    photo: false,
+    clip: false,
+    invented: true,
+  })
+  const asked = serve({ ...fireRoutes, 'GET /api/health': INVENTED_ONLY })
+  window.location.hash = `#/tap/${FIRE_TAP}`
+  render(<App />)
+
+  await screen.findByRole('heading', { level: 1, name: /Fire at/ })
+  expect(tapRequests(asked).map((request) => request.key)).toContain(
+    `GET /api/taps/${FIRE_TAP}`,
+  )
+})
+
+test.each(['tap', 'trace'])(
+  'a %s the invented-only server no longer has stays said to be gone, and is not asked for again',
+  async (view) => {
+    // The story was told again: the server answers that it has no such tap,
+    // and the app forgets it. That the device no longer knows the tap does
+    // not take the answer away, or what the server says of why.
+    const repeats =
+      'On this server the invented scenario is told again from its beginning when it is over.'
+    keepTap({
+      id: FIRE_TAP,
+      at: new Date().toISOString(),
+      photo: false,
+      clip: false,
+      invented: true,
+    })
+    const gone = () =>
+      Response.json({ detail: 'There is no such tap.' }, { status: 404 })
+    const asked = serve({
+      'GET /api/health': { ...INVENTED_ONLY, repeats_text: repeats },
+      [`GET /api/taps/${FIRE_TAP}`]: gone,
+      [`GET /api/taps/${FIRE_TAP}/run`]: gone,
+    })
+    window.location.hash = hashOf(view, FIRE_TAP)
+    render(<App />)
+
+    await waitFor(() => expect(keptTaps()).toEqual([]))
+    expect(
+      await screen.findByRole('heading', { name: 'This tap is gone' }),
+    ).toBeInTheDocument()
+    await act(async () => undefined)
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Beacon does not have this tap. An answer is kept for 23 hours at most.',
+    )
+    expect(
+      screen.getByText(repeats, { selector: 'p.meta' }),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByRole('heading', { name: 'This tap is not asked for here' }),
+    ).not.toBeInTheDocument()
+    expect(document.body).not.toHaveTextContent(/was not sent/)
+    // Asked once, answered that it is gone, and not asked again.
+    expect(tapRequests(asked)).toHaveLength(1)
+  },
+)
+
+test('a tap that is gone is not asked for again, though storage would not forget it and the view is changed', async () => {
+  // The device goes on knowing the tap, because storage refuses the write
+  // that would forget it. The 404 is what holds: neither of the tap's views
+  // asks again, on this server or after it says it takes a visitor's own.
+  vi.useFakeTimers({ shouldAdvanceTime: true })
+  keepTap({
+    id: FIRE_TAP,
+    at: new Date().toISOString(),
+    photo: false,
+    clip: false,
+    invented: true,
+  })
+  const refused = vi
+    .spyOn(Storage.prototype, 'setItem')
+    .mockImplementation(() => {
+      throw new DOMException('Full.', 'QuotaExceededError')
+    })
+  // However the test ends: the tests after it need storage that writes.
+  onTestFinished(() => refused.mockRestore())
+  let takes = 'invented'
+  const said: string[] = []
+  let has = true
+  const gone = () =>
+    Response.json({ detail: 'There is no such tap.' }, { status: 404 })
+  const asked = serve({
+    'GET /api/health': () => {
+      said.push(takes)
+      return Response.json({ ...INVENTED_ONLY, input: takes })
+    },
+    [`GET /api/taps/${FIRE_TAP}`]: () =>
+      has ? Response.json(fireAnswer) : gone(),
+    [`GET /api/taps/${FIRE_TAP}/run`]: gone,
+    [`GET /api/incidents/${FIRE_ID}`]: fireIncident,
+  })
+  const goTo = (hash: string) =>
+    act(async () => {
+      window.location.hash = hash
+      window.dispatchEvent(new HashChangeEvent('hashchange'))
+    })
+  window.location.hash = `#/tap/${FIRE_TAP}`
+  render(<App />)
+  // An answer first, so that there is one the view could go on showing.
+  await screen.findByRole('heading', { level: 1, name: /Fire at/ })
+
+  has = false
+  await goTo(`#/tap/${FIRE_TAP}/trace`)
+  expect(
+    await screen.findByRole('heading', { name: 'This tap is gone' }),
+  ).toBeInTheDocument()
+  expect(isInventedTap(FIRE_TAP)).toBe(true)
+  const before = tapRequests(asked).length
+
+  await goTo(`#/tap/${FIRE_TAP}`)
+  await goTo(`#/tap/${FIRE_TAP}/trace`)
+  // The health is asked again, and now says the server takes a visitor's
+  // own, for which any tap may be asked for.
+  takes = 'own'
+  await act(() => vi.advanceTimersByTimeAsync(30_100))
+  expect(said.length).toBeGreaterThan(1)
+  expect(said.at(-1)).toBe('own')
+  await goTo(`#/tap/${FIRE_TAP}`)
+  await act(() => vi.advanceTimersByTimeAsync(2_000))
+
+  expect(
+    screen.getByRole('heading', { name: 'This tap is gone' }),
+  ).toBeInTheDocument()
+  expect(
+    screen.queryByRole('heading', { name: /Fire at/ }),
+  ).not.toBeInTheDocument()
+  expect(tapRequests(asked)).toHaveLength(before)
+})
+
+test('a server that takes a visitor’s own is asked for any tap, once it has said so', async () => {
+  const asked = serve(fireRoutes)
+  window.location.hash = `#/tap/${FIRE_TAP}`
+  render(<App />)
+
+  await screen.findByRole('heading', { level: 1, name: /Fire at/ })
+  // The health was asked before the tap was.
+  const keys = asked.map((request) => request.key)
+  expect(keys.indexOf('GET /api/health')).toBeLessThan(
+    keys.indexOf(`GET /api/taps/${FIRE_TAP}`),
+  )
+})
+
+test('a tap that is gone says the most an answer is kept, and on a server that tells its story again, that', async () => {
+  const repeats =
+    'On this server the invented scenario is told again from its beginning when it is over.'
+  serve({
+    'GET /api/health': { ...MOCK_HEALTH, repeats_text: repeats },
+    [`GET /api/taps/${FIRE_TAP}`]: () =>
+      Response.json({ detail: 'There is no such tap.' }, { status: 404 }),
+  })
+  window.location.hash = `#/tap/${FIRE_TAP}`
+
+  render(<App />)
+
+  // No promise that an answer is kept for 23 hours: that is the most.
+  expect(
+    await screen.findByText(
+      'Beacon does not have this tap. An answer is kept for 23 hours at most.',
+    ),
+  ).toBeInTheDocument()
+  expect(await screen.findByText(repeats)).toBeInTheDocument()
 })
 
 test('takes no tap until the server has said whether it runs on real sources', async () => {
@@ -98,6 +435,39 @@ test('takes no tap until the server has said whether it runs on real sources', a
   answer(Response.json(MOCK_HEALTH))
   expect(await screen.findByText(INVENTED)).toBeInTheDocument()
   expect(button).toBeEnabled()
+})
+
+test('takes no tap, and asks the phone nothing, from a server that has not said what it takes', async () => {
+  // Not said is not `own`: the server may be one that takes only the invented
+  // places, and a tap from where the phone is would be somebody's own.
+  const silent: Record<string, unknown> = { ...MOCK_HEALTH }
+  delete silent.input
+  const asked = serve({ 'GET /api/health': silent })
+  const located = vi.fn()
+  vi.stubGlobal('navigator', {
+    ...navigator,
+    geolocation: { getCurrentPosition: located },
+  })
+  render(<App />)
+
+  await screen.findByText(INVENTED)
+  expect(screen.getByRole('button', { name: ASK })).toBeDisabled()
+  expect(
+    screen.getByRole('button', {
+      name: 'Near the invented fire, Hayes Valley',
+    }),
+  ).toBeDisabled()
+  expect(
+    screen.getByRole('checkbox', { name: '5 seconds of sound' }),
+  ).toBeDisabled()
+  expect(
+    screen.getByText('Beacon takes a tap once it has heard from its server.'),
+  ).toBeInTheDocument()
+  expect(asked.filter((request) => request.key === 'POST /api/taps')).toEqual(
+    [],
+  )
+  expect(located).not.toHaveBeenCalled()
+  vi.unstubAllGlobals()
 })
 
 test('takes no tap from a server that could not say which mode it is in', async () => {
@@ -255,7 +625,7 @@ test('a tap that ran out is taken off the list at that moment, though storage wi
     })
   const stop = sweepTaps()
   try {
-    render(<Home mode="mock" />)
+    render(<Home mode="mock" input="own" />)
     const list = screen.getByRole('region', { name: 'Your taps' })
     expect(within(list).getAllByRole('link')).toHaveLength(1)
 

@@ -1,4 +1,5 @@
 import { ApiError, OTHER_MODE } from '../api/http.ts'
+import type { Input } from '../api/health.ts'
 import type { Mode } from '../api/incidents.ts'
 import {
   fetchPushInfo,
@@ -774,16 +775,24 @@ async function forgetHere(mode: Mode, step: Step): Promise<void> {
 
 const rounded = () => placesSnapshot().map(({ lat, lon }) => ({ lat, lon }))
 
+/** What the server said it takes from a visitor at the latest asking, read
+ * when it is called: `own`, `invented`, or null when the server has not said.
+ * The server is given an address and places only while this answers `own`. */
+export type Takes = () => Input | null
+
 /** Make the server's copy match what is wanted now, waiting for nothing past
  * `until`. Called under the lock. Throws `Overtaken` when notifications were
  * turned off while it waited for something: nothing more was given to the
  * server, and it is to be called again. */
-async function tell(mode: Mode, until: number): Promise<void> {
+async function tell(mode: Mode, until: number, takes: Takes): Promise<void> {
   const step: Step = (work) => within(until - Date.now(), work)
   // Asked after everything that is waited for on the way to giving the server
-  // an address: whether notifications are still wanted for this mode.
+  // an address: whether notifications are still wanted for this mode, and
+  // whether the server still says it takes an address of a visitor's own. The
+  // server can stop saying so while a telling waits, and the telling that is
+  // begun again then gives it nothing.
   const fence = () => {
-    if (readWanted().on !== mode) throw new Overtaken()
+    if (readWanted().on !== mode || takes() !== 'own') throw new Overtaken()
   }
   settle()
   // A choice made for one mode is not carried to the other.
@@ -802,12 +811,22 @@ async function tell(mode: Mode, until: number): Promise<void> {
     return
   }
   await forgetHere(mode, step)
+  const taken = takes()
+  if (taken === null) {
+    // The server has not said what it takes. It is given no address and no
+    // place, anew or again, and what it was given before is left as it is:
+    // the deleting above is all that is asked of it.
+    setTold(NOT_YET)
+    return
+  }
   const info = await step((signal) => fetchPushInfo(signal))
   if (info.mode !== mode) throw new OtherModeError()
-  fence()
+  if (readWanted().on !== mode) throw new Overtaken()
   const key = info.public_key
   const notice = info.notice
-  if (!info.enabled || key === null || notice === null) {
+  // A server that takes only the invented places takes no address, whatever
+  // it answers here.
+  if (taken !== 'own' || !info.enabled || key === null || notice === null) {
     // A server that sends none takes no address and no change of places, so
     // the copy an earlier one kept can no longer be made to match what is
     // wanted: a place removed since would stay in it. It is deleted, which
@@ -924,13 +943,15 @@ const UNANSWERED =
 const OVERTAKEN_MOST = 3
 
 /**
- * Make the server's copy match what is wanted on this device now. Answers with
+ * Make the server's copy match what is wanted on this device now, as far as
+ * the server takes it (`takes`): an address and places only for `own`.
+ * Deleting is asked for whatever it answers. Answers with
  * whether it does: false when the server could not be told or it is not known
  * that the browser let go of a subscription, which the status then says, and
  * which is worth trying again. Throws `OtherModeError` when the server is in
  * another mode than `mode`: nothing was kept or deleted by it.
  */
-export async function syncPush(mode: Mode): Promise<boolean> {
+export async function syncPush(mode: Mode, takes: Takes): Promise<boolean> {
   if (!pushSupported()) return true
   // Run with notifications off too: it asks the server nothing then, and finds
   // a subscription the browser still holds that nothing here has a note of.
@@ -941,7 +962,7 @@ export async function syncPush(mode: Mode): Promise<boolean> {
         try {
           // Each has its own time: the one begun after notifications were
           // turned off is the one that asks the server to delete.
-          return await tell(mode, Date.now() + SYNC_MS)
+          return await tell(mode, Date.now() + SYNC_MS, takes)
         } catch (error) {
           if (!(error instanceof Overtaken) || begun >= OVERTAKEN_MOST)
             throw error

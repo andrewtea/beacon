@@ -9,7 +9,7 @@ and repeats nothing: a saved place can be a home.
 import contextlib
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import Any
 
 from beacon.errors import raise_bare
@@ -62,33 +62,52 @@ def parse(body: bytes) -> Mapping[str, Any]:
     return found
 
 
-def read_places(sent: Any, bounds: Bounds = SAN_FRANCISCO) -> tuple[Point, ...]:
+def read_places(
+    sent: Any,
+    bounds: Bounds = SAN_FRANCISCO,
+    *,
+    only: Collection[Point] | None = None,
+    refusal: str = SHAPE,
+) -> tuple[Point, ...]:
     """The places of a request, in the order they were sent, each rounded to about
-    a block. Raises PlacesError for what is not one to `MAX_PLACES` places, and
-    for a place outside the area Beacon covers."""
-    points: list[Point] = []
+    a block.
+
+    With `only`, every place has to be one of those, to the digit as it was sent
+    and not as it would be rounded: a place a block from one of them is somebody's
+    own (`beacon.front`).
+
+    Raises PlacesError for what is not one to `MAX_PLACES` places, with 403 and
+    `refusal` for a place that is not one of `only`, and for a place outside the
+    area Beacon covers."""
+    sent_as: list[Point] = []
     if isinstance(sent, list) and 1 <= len(sent) <= MAX_PLACES:
         for place in sent:
             point = _point(place)
             if point is None:
-                points = []
+                sent_as = []
                 break
-            points.append(point)
-    if not points:
+            sent_as.append(point)
+    if not sent_as:
         raise_bare(PlacesError(422, SHAPE))
+    if only is not None and not all(point in only for point in sent_as):
+        raise_bare(PlacesError(403, refusal))
+    points = tuple(
+        Point(round(point.lat, DECIMALS), round(point.lon, DECIMALS)) for point in sent_as
+    )
     if not all(bounds.holds(point) for point in points):
         raise_bare(PlacesError(422, ELSEWHERE))
-    return tuple(points)
+    return points
 
 
 def _point(place: Any) -> Point | None:
+    """A place as it was sent, or None for what is not one."""
     if not (isinstance(place, Mapping) and place.keys() == _FIELDS):
         return None
     lat, lon = place["lat"], place["lon"]
     if not (_is_number(lat) and _is_number(lon)):
         return None
     try:
-        return Point(round(float(lat), DECIMALS), round(float(lon), DECIMALS))
+        return Point(float(lat), float(lon))
     except ValueError:
         # Not a latitude or a longitude. The error names the number, and is gone
         # before anything is raised.

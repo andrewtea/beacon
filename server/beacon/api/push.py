@@ -148,7 +148,7 @@ async def info(request: Request) -> PushInfo:
     return PushInfo(
         mode=engine.mode,
         enabled=vapid is not None,
-        text=None if vapid is not None else OFF,
+        text=None if vapid is not None else OFF if push is None else push.off_text,
         public_key=None if vapid is None else vapid.public_key,
         about_text=None if vapid is None else ABOUT,
         notice=None if notice is None else NoticeOut(title=notice.title, text=notice.text),
@@ -175,7 +175,7 @@ async def permit(request: Request) -> Permit:
     _shown(request)
     push: Push | None = getattr(request.app.state, "push", None)
     if push is None or not push.sends:
-        raise HTTPException(503, OFF)
+        raise HTTPException(503, OFF if push is None else push.off_text)
     sending = push
     return await _admitted(request, lambda body: _permit(sending, body))
 
@@ -199,7 +199,7 @@ async def subscribe(request: Request) -> Subscribed:
     _shown(request)
     push: Push | None = getattr(request.app.state, "push", None)
     if push is None or not push.sends:
-        raise HTTPException(503, OFF)
+        raise HTTPException(503, OFF if push is None else push.off_text)
     sending = push
     return await _admitted(request, lambda body: _subscribe(sending, body))
 

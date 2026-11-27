@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useLayoutEffect } from 'react'
 import type { Credit } from '../api/incidents.ts'
 import {
   type EmberCall,
@@ -265,16 +265,30 @@ function Finished({ run }: { run: TapRun }) {
   )
 }
 
-export function TraceView({ id }: { id: string }) {
+export function TraceView({
+  id,
+  repeatsText = null,
+  onGone,
+}: {
+  id: string
+  // As in `TapView`: why a run can be gone sooner than on another server, and
+  // who is told that it is.
+  repeatsText?: string | null
+  onGone?: () => void
+}) {
   const polled = usePolled(
     `run:${id}`,
     (signal) => fetchTapRun(id, signal),
     runCadence,
   )
   const gone = polled.error?.status === 404
-  useEffect(() => {
-    if (gone) forgetTap(id)
-  }, [gone, id])
+  // Before the page is drawn: whoever mounted the view shows that the tap is
+  // gone in this view's place, and it is said once.
+  useLayoutEffect(() => {
+    if (!gone) return
+    onGone?.()
+    forgetTap(id)
+  }, [gone, id, onGone])
   const run = polled.data
   return (
     <div className="view trace-view">
@@ -286,10 +300,11 @@ export function TraceView({ id }: { id: string }) {
       {polled.error !== null && (
         <p className="note problem" role="status">
           {gone
-            ? 'Beacon does not have this tap. A run is kept for 23 hours.'
+            ? 'Beacon does not have this tap. A run is kept for 23 hours at most.'
             : polled.error.message}
         </p>
       )}
+      {gone && repeatsText !== null && <p className="meta">{repeatsText}</p>}
       {run === null && polled.error === null && (
         <p className="meta" role="status">
           Reading the run…

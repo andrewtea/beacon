@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useLayoutEffect } from 'react'
 import { fetchTapAnswer, type TapAnswer } from '../api/taps.ts'
 import { Icon } from '../components/Icon.tsx'
 import { IncidentCard } from '../components/IncidentCard.tsx'
@@ -107,7 +107,38 @@ function Others({
   )
 }
 
-export function TapView({ id }: { id: string }) {
+/** What is said of a tap the server answered that it does not have, with
+ * nothing of the tap shown and nothing asked. `repeatsText` is the server's
+ * sentence about telling its story again, when it does: why a tap can be gone
+ * sooner than on another server. */
+export function TapGone({ repeatsText }: { repeatsText: string | null }) {
+  return (
+    <div className="view tap-view">
+      <h1>This tap is gone</h1>
+      <p role="status">
+        Beacon does not have this tap. An answer is kept for 23 hours at most.
+      </p>
+      {repeatsText !== null && <p className="meta">{repeatsText}</p>}
+      <a className="action" href={href.home}>
+        <Icon name="back" size={16} />
+        Back to the button
+      </a>
+    </div>
+  )
+}
+
+export function TapView({
+  id,
+  repeatsText = null,
+  onGone,
+}: {
+  id: string
+  // As in `TapGone`.
+  repeatsText?: string | null
+  // Told when the server answers that it does not have the tap, before the
+  // tap is forgotten: whoever mounted the view may take it away then.
+  onGone?: () => void
+}) {
   const polled = usePolled(
     `tap:${id}`,
     (signal) => fetchTapAnswer(id, signal),
@@ -115,12 +146,17 @@ export function TapView({ id }: { id: string }) {
   )
   const gone = polled.error?.status === 404
   // A tap the server no longer has is not kept on the device either.
-  useEffect(() => {
-    if (gone) forgetTap(id)
-  }, [gone, id])
+  // Before the page is drawn: whoever mounted the view shows that the tap is
+  // gone in this view's place, and it is said once.
+  useLayoutEffect(() => {
+    if (!gone) return
+    onGone?.()
+    forgetTap(id)
+  }, [gone, id, onGone])
 
   const answer = polled.data
   if (answer === null) {
+    if (gone) return <TapGone repeatsText={repeatsText} />
     return (
       <div className="view tap-view">
         {polled.error === null ? (
@@ -129,12 +165,8 @@ export function TapView({ id }: { id: string }) {
           </p>
         ) : (
           <>
-            <h1>{gone ? 'This tap is gone' : 'No answer yet'}</h1>
-            <p role="status">
-              {gone
-                ? 'Beacon does not have this tap. An answer is kept for 23 hours.'
-                : polled.error.message}
-            </p>
+            <h1>No answer yet</h1>
+            <p role="status">{polled.error.message}</p>
           </>
         )}
         <a className="action" href={href.home}>

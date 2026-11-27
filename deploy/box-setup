@@ -1,0 +1,100 @@
+#!/bin/sh
+# Sets a Box up, once, so that Beacon takes a photo with a tap. Run it on the Box as
+# its `user`, who has sudo; README, "Deploy", says how. It can be run again, and
+# changes nothing that is already as it should be.
+#
+# A photo is drawn again by ffmpeg, confined by bubblewrap, on a host that hands no
+# core dump to a collector (beacon/radio/audio.py says why). A new Box has neither
+# program, hands core dumps to Ubuntu's apport, and lets no unprivileged program
+# make the user namespace bubblewrap confines with. Without this the server runs
+# and refuses a tap's photo; nothing else needs it. Hearing recorded radio needs
+# the same three things.
+set -eu
+
+confines() {
+  # Whether bubblewrap may confine here: the one thing of these that fails quietly.
+  bwrap --unshare-all --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib \
+    --symlink usr/lib64 /lib64 /bin/true 2>/dev/null
+}
+
+if ! command -v ffmpeg >/dev/null || ! command -v bwrap >/dev/null; then
+  sudo apt-get update -q
+  sudo env DEBIAN_FRONTEND=noninteractive \
+    apt-get install -y -q --no-install-recommends ffmpeg bubblewrap
+fi
+
+# Core dumps go to no collector. apport sets the pattern to a pipe whenever it
+# starts, so it is turned off for good; the setting below is what holds at boot.
+case "$(cat /proc/sys/kernel/core_pattern)" in
+"|"* | "@"*)
+  if systemctl list-unit-files apport.service >/dev/null 2>&1; then
+    sudo systemctl disable --now apport.service
+    sudo sed -i 's/^enabled=1$/enabled=0/' /etc/default/apport
+  fi
+  printf '# Beacon: a core dump is handed to no collector (deploy/box-setup).\nkernel.core_pattern = core\n' |
+    sudo tee /etc/sysctl.d/60-beacon-core-pattern.conf >/dev/null
+  sudo /usr/sbin/sysctl -q -p /etc/sysctl.d/60-beacon-core-pattern.conf
+  ;;
+esac
+
+# bubblewrap, and no other program, may make a user namespace. Ubuntu's AppArmor
+# refuses that to an unprivileged program with no profile. Where bubblewrap can
+# confine already, whatever policy lets it is left alone. Where it cannot, the
+# profile below is added, which leaves the restriction on for everything else on
+# the Box, unless a policy for bubblewrap that is not this one is there: that is
+# somebody's decision and is not replaced, and this stops.
+profile=/etc/apparmor.d/bwrap
+if ! confines; then
+  # What a run that was cut short left behind, here or where an earlier version
+  # of this script wrote it.
+  sudo sh -c 'rm -f /etc/.beacon-bwrap.* /etc/apparmor.d/.beacon-bwrap.*'
+  # Written beside the directory AppArmor loads policies from, and not in it: on
+  # the same filesystem, so that it can be linked in, and nowhere it is loaded from.
+  new=$(sudo mktemp /etc/.beacon-bwrap.XXXXXX)
+  trap 'sudo rm -f "$new"' EXIT
+  sudo tee "$new" >/dev/null <<'PROFILE'
+# Beacon: lets bubblewrap make the user namespace it confines ffmpeg in
+# (deploy/box-setup). Nothing else is changed for it.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+
+  include if exists <local/bwrap>
+}
+PROFILE
+  sudo chmod 644 "$new"
+  if sudo test -e "$profile" || sudo test -L "$profile"; then
+    # Either this script's own profile, to the byte, from a run that was cut short
+    # after it was put in place and before it was loaded, which is loaded below;
+    # or somebody else's.
+    if sudo test -L "$profile" || ! sudo cmp -s "$new" "$profile"; then
+      echo "bubblewrap cannot confine here, and a policy for it that is not this" >&2
+      echo "script's is at $profile. It is not replaced." >&2
+      exit 1
+    fi
+  else
+    existing=$(sudo grep -rlsE '(^|[[:space:]])/usr/bin/bwrap([[:space:]]|$)' /etc/apparmor.d || true)
+    if [ -n "$existing" ]; then
+      echo "bubblewrap cannot confine here, and a policy for it is already in" >&2
+      echo "/etc/apparmor.d, which this script does not replace:" >&2
+      echo "$existing" >&2
+      exit 1
+    fi
+    # Read by AppArmor's own parser before it is put where it would be loaded from.
+    sudo apparmor_parser --skip-kernel-load "$new"
+    # A link is made only where no file is: a policy put there meanwhile is kept.
+    sudo ln "$new" "$profile"
+  fi
+  sudo apparmor_parser -r "$profile"
+  if ! confines; then
+    echo "The profile at $profile is loaded, and bubblewrap still cannot confine" >&2
+    echo "here. Photos stay off until it can." >&2
+    exit 1
+  fi
+fi
+
+echo "core_pattern: $(cat /proc/sys/kernel/core_pattern)"
+echo "Set up. Restart Beacon's service, or deploy again: a server that still takes"
+echo "no photos says so in its log when it starts."

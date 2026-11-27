@@ -81,6 +81,8 @@ export function locate(): Promise<Place> {
 
 // Places in the invented scenario, offered only while the server runs on it, so
 // that somebody who is not in San Francisco can see an answer.
+// They are also all a server takes that is reached through a host nobody has
+// checked (`input: 'invented'`), which holds the same two (`beacon.front.SPOTS`).
 export const MOCK_SPOTS: { name: string; place: Place }[] = [
   {
     name: 'Near the invented fire, Hayes Valley',
@@ -91,3 +93,10 @@ export const MOCK_SPOTS: { name: string; place: Place }[] = [
     place: { lat: 37.8, lon: -122.41 },
   },
 ]
+
+/** Whether a place is one of the invented scenario's two, to the digit. */
+export function isMockSpot(place: { lat: number; lon: number }): boolean {
+  return MOCK_SPOTS.some(
+    (spot) => spot.place.lat === place.lat && spot.place.lon === place.lon,
+  )
+}

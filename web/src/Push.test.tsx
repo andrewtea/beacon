@@ -25,6 +25,8 @@ import {
 import { type Asked, MOCK_HEALTH, serve } from './test/server.ts'
 
 const KEY = 'beacon.push.v2'
+// A server that said it takes a visitor's own, as `usePushSync` reads it.
+const OWN = () => 'own' as const
 const INFO = 'GET /api/push'
 const SUBSCRIBE = 'POST /api/push/subscribe'
 const UNSUBSCRIBE = 'POST /api/push/unsubscribe'
@@ -484,8 +486,8 @@ test('a telling tells the server whatever this tab told it before, because anoth
   browser({ permission: 'granted' })
   const asked = serve(routes())
 
-  expect(await syncPush('mock')).toBe(true)
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
 
   expect(of(asked, SUBSCRIBE).map((request) => request.body)).toEqual([
     { endpoint: ADDRESS, places: [FIRE], permit: permitNo(1) },
@@ -539,7 +541,7 @@ test('turning notifications off notes the address, lets go of it, and says it is
   expect(wanted()).toEqual(pending)
 
   answer = () => new Response(null, { status: 204 })
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
 
   await waitFor(() => expect(wanted()).toEqual(OFF))
   expect(
@@ -686,7 +688,7 @@ test('turning off has the server delete the address it was told, when the browse
   expect(await turnOff()).toBe('off')
 
   expect(wanted()).toEqual({ on: null, told: null, forget: [MOCK_SERVER.told] })
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
   expect(of(asked, UNSUBSCRIBE).map((request) => request.body)).toEqual([
     { endpoint: ADDRESS },
   ])
@@ -719,9 +721,9 @@ test('a browser that will not let go of its subscription is said to hold it, and
   expect(of(asked, UNSUBSCRIBE).at(-1)?.body).toEqual({ endpoint: ADDRESS })
   expect(pushSnapshot().held).toBe(true)
   // Worth trying again: the browser may let go the next time.
-  expect(await syncPush('mock')).toBe(false)
+  expect(await syncPush('mock', OWN)).toBe(false)
   device.letsGo = true
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
   expect(device.subscription('mock')).toBeNull()
   await waitFor(() => expect(screen.queryByText(/has not let go/)).toBeNull())
 })
@@ -734,7 +736,7 @@ test('a subscription the browser holds that this device has no note of is let go
   })
   const asked = serve(routes())
 
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
 
   expect(device.subscription('mock')).toBeNull()
   expect(of(asked, UNSUBSCRIBE).map((request) => request.body)).toEqual([
@@ -821,7 +823,7 @@ test('a subscription made for another key is let go of once its address is noted
   const asked = serve(routes({ [UNSUBSCRIBE]: () => answers() }))
 
   // The server is too busy to delete the old address: nothing is dropped.
-  expect(await syncPush('mock')).toBe(false)
+  expect(await syncPush('mock', OWN)).toBe(false)
 
   const old = { endpoint: `${ADDRESS}-old`, mode: 'mock' }
   expect(wanted()).toEqual({ on: 'mock', told: null, forget: [old] })
@@ -829,7 +831,7 @@ test('a subscription made for another key is let go of once its address is noted
   expect(pushSnapshot().problem).toBe('Beacon is busy. Try again.')
 
   answers = () => new Response(null, { status: 204 })
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
 
   expect(of(asked, UNSUBSCRIBE).at(-1)?.body).toEqual({
     endpoint: `${ADDRESS}-old`,
@@ -884,7 +886,7 @@ test('turning notifications on for the invented scenario is not carried to real 
   expect(screen.queryByText(/has answered that it deleted/)).toBeNull()
 
   // Shown the invented scenario's server again, the app has it delete.
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
   const [sent] = of(asked, UNSUBSCRIBE)
   expect(sent.body).toEqual({ endpoint: `${ADDRESS}-old` })
   expect(sent.headers['beacon-mode']).toBe('mock')
@@ -903,7 +905,7 @@ test('each mode has a service worker, a subscription, and words of its own', asy
     routes({ [INFO]: info({ mode: 'live', notice: liveNotice }) }),
   )
 
-  expect(await syncPush('live')).toBe(true)
+  expect(await syncPush('live', OWN)).toBe(true)
 
   expect(device.registered).toEqual([`${WORKER} ${scopeOf('live')}`])
   expect(device.events).toEqual(['keep the words live', 'subscribe live'])
@@ -931,7 +933,7 @@ test('a server in another mode than is shown is sent nothing, and the app asks w
   )
   expect(of(asked, SUBSCRIBE)).toEqual([])
   expect(device.events).toEqual([])
-  await expect(syncPush('mock')).rejects.toBeInstanceOf(OtherModeError)
+  await expect(syncPush('mock', OWN)).rejects.toBeInstanceOf(OtherModeError)
 })
 
 test('a server that says it is in another mode when asked to delete has deleted nothing', async () => {
@@ -947,7 +949,7 @@ test('a server that says it is in another mode when asked to delete has deleted 
     }),
   )
 
-  await expect(syncPush('mock')).rejects.toBeInstanceOf(OtherModeError)
+  await expect(syncPush('mock', OWN)).rejects.toBeInstanceOf(OtherModeError)
 
   expect(wanted()).toEqual({
     on: null,
@@ -1077,7 +1079,7 @@ test('a telling reads the places when its turn comes, so a place removed meanwhi
     () => new Promise<void>((resolve) => (release = resolve)),
   )
 
-  const telling = syncPush('mock')
+  const telling = syncPush('mock', OWN)
   // While this telling waits its turn, the place is removed.
   const [{ id }] = JSON.parse(
     window.localStorage.getItem('beacon.places.v1')!,
@@ -1106,7 +1108,7 @@ test('a place removed while the browser makes the subscription is not sent', asy
     await removePlace(places()[0].id)
   }
 
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
 
   expect(of(asked, SUBSCRIBE).map((request) => request.body)).toEqual([
     { endpoint: ADDRESS, places: [FAR], permit: permitNo(1) },
@@ -1120,7 +1122,7 @@ test('a place removed while the browser makes the subscription is not sent', asy
   device.whileSubscribing = async () => {
     await removePlace(places()[0].id)
   }
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
   expect(of(asked, SUBSCRIBE)).toHaveLength(1)
   expect(of(asked, UNSUBSCRIBE).map((request) => request.body)).toEqual([
     { endpoint: ADDRESS },
@@ -1153,7 +1155,7 @@ test('a server that sends none is asked to delete what an earlier one kept, so a
     routes({ [INFO]: () => Response.json(sends ? info() : off) }),
   )
 
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
 
   // Its copy cannot be made to match what is wanted, so it is deleted, which
   // such a server does. The choice and the browser's subscription stay.
@@ -1171,9 +1173,9 @@ test('a server that sends none is asked to delete what an earlier one kept, so a
     window.localStorage.getItem('beacon.places.v1')!,
   ) as { id: string }[]
   await removePlace(id)
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
   sends = true
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
 
   expect(of(asked, SUBSCRIBE).map((request) => request.body)).toEqual([
     { endpoint: `${ADDRESS}-old`, places: [FAR], permit: permitNo(1) },
@@ -1254,7 +1256,7 @@ test('a telling that was waiting for the server when notifications were turned o
     }),
   )
 
-  const telling = syncPush('mock')
+  const telling = syncPush('mock', OWN)
   await waitFor(() => expect(of(asked, INFO)).toHaveLength(1))
   expect(await turnOff()).toBe('off')
   expect(pushSnapshot().on).toBeNull()
@@ -1281,7 +1283,7 @@ test('a telling whose request gave the server the address as notifications were 
     }),
   )
 
-  const telling = syncPush('mock')
+  const telling = syncPush('mock', OWN)
   await waitFor(() => expect(of(asked, SUBSCRIBE)).toHaveLength(1))
   expect(await turnOff()).toBe('off')
   expect(device.subscription('mock')).toBeNull()
@@ -1307,7 +1309,7 @@ test('notifications turned off while the browser makes a subscription: the serve
     came = await turnOff()
   }
 
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
 
   expect(came).toBe('off')
   expect(of(asked, SUBSCRIBE)).toEqual([])
@@ -1345,7 +1347,7 @@ test('turning on that waited its turn while notifications were turned off turns 
 
   expect(await on).toBe('overtaken')
   expect(pushSnapshot().on).toBeNull()
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
   expect(of(asked, SUBSCRIBE)).toEqual([])
   // Pressed again after, it turns them on: an earlier turning off does not
   // hold for good.
@@ -1360,7 +1362,7 @@ test('a server that does not answer ends a telling after so long, with its reque
   const asked = serve(routes({ [INFO]: () => new Promise<Response>(() => {}) }))
   vi.useFakeTimers()
 
-  const telling = syncPush('mock')
+  const telling = syncPush('mock', OWN)
   await vi.advanceTimersByTimeAsync(SYNC_MS - 1000)
   expect(of(asked, INFO)).toHaveLength(1)
   expect(of(asked, INFO)[0].signal?.aborted).toBe(false)
@@ -1376,7 +1378,7 @@ test('a server that does not answer ends a telling after so long, with its reque
   expect(of(asked, SUBSCRIBE)).toEqual([])
 
   // And with another telling waiting on the same server, off is off at once.
-  const next = syncPush('mock')
+  const next = syncPush('mock', OWN)
   await vi.advanceTimersByTimeAsync(1000)
   expect(await turnOff()).toBe('off')
   expect(pushSnapshot().on).toBeNull()
@@ -1402,7 +1404,7 @@ test('turning off while the browser asks its leave to turn on holds: nothing is 
   expect(await turnOn('mock')).toBe('overtaken')
 
   expect(pushSnapshot().on).toBeNull()
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
   expect(of(asked, SUBSCRIBE)).toEqual([])
   expect(device.subscribe).not.toHaveBeenCalled()
 })
@@ -1439,7 +1441,7 @@ test('turning off after turning on took its last look holds too: what is written
   vi.restoreAllMocks()
   resetPush()
   expect(pushSnapshot().on).toBeNull()
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
   expect(of(asked, SUBSCRIBE)).toEqual([])
   expect(device.subscribe).not.toHaveBeenCalled()
   expect(pushSnapshot().on).toBeNull()
@@ -1467,7 +1469,7 @@ test('turning off in another tab as the address is noted down: where the places 
     }
   })
 
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
 
   expect(turnedOffThere).toBe(true)
   // The server was given no address and no place, by this telling or after.
@@ -1497,7 +1499,7 @@ test('a request to be notified that was never answered has its permit named when
   )
   vi.useFakeTimers()
   const cutOff = async () => {
-    const telling = syncPush('mock')
+    const telling = syncPush('mock', OWN)
     await vi.advanceTimersByTimeAsync(SYNC_MS)
     expect(await telling).toBe(false)
     expect(of(asked, SUBSCRIBE).at(-1)?.signal?.aborted).toBe(true)
@@ -1524,7 +1526,7 @@ test('a request to be notified that was never answered has its permit named when
   // Turned off: the deletion names the permit of the request that is out, and
   // the server takes it away in the write that deletes.
   expect(await turnOff()).toBe('off')
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
   expect(of(asked, UNSUBSCRIBE).map((request) => request.body)).toEqual([
     { endpoint: ADDRESS, permits: [permitNo(2)] },
   ])
@@ -1553,13 +1555,13 @@ test('a request to be notified that is answered, or refused for its permit, is n
   )
 
   // Refused for its permit: the server kept nothing of it and never will.
-  expect(await syncPush('mock')).toBe(false)
+  expect(await syncPush('mock', OWN)).toBe(false)
   expect(outWhenSent).toEqual([{ permit: permitNo(1), mode: 'mock' }])
   expect(out()).toEqual([])
   expect(pushSnapshot().problem).toBe(spent)
 
   refuse = false
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
   // The permit is noted before the request is sent, and gone once answered.
   expect(outWhenSent).toEqual([{ permit: permitNo(2), mode: 'mock' }])
   expect(out()).toEqual([])
@@ -1589,7 +1591,7 @@ test('a browser that never answers when asked to let go and to delete the words 
   device.saysAfter = BROWSER_MS / 2
   vi.useFakeTimers()
 
-  const telling = syncPush('mock')
+  const telling = syncPush('mock', OWN)
   await vi.advanceTimersByTimeAsync(BROWSER_MS - 100)
   expect(of(asked, UNSUBSCRIBE)).toEqual([])
   // One wait for all of it, not one for each thing the browser was asked.
@@ -1626,7 +1628,7 @@ test('kept words the browser never deletes keep neither the lock nor the deletio
   await vi.advanceTimersByTimeAsync(BROWSER_MS)
   // The browser let go of the subscription, which is what was asked of it.
   expect(await off).toBe('off')
-  const telling = syncPush('mock')
+  const telling = syncPush('mock', OWN)
   await vi.advanceTimersByTimeAsync(BROWSER_MS)
 
   expect(await telling).toBe(true)
@@ -1674,7 +1676,7 @@ test('a browser that cannot say what it holds is not said to hold nothing, and i
   expect(pushSnapshot()).toMatchObject({ on: null, held: true })
   // The server is asked to delete all the same, and the telling says there is
   // more to do.
-  expect(await syncPush('mock')).toBe(false)
+  expect(await syncPush('mock', OWN)).toBe(false)
   expect(of(asked, UNSUBSCRIBE).map((request) => request.body)).toEqual([
     { endpoint: `${ADDRESS}-old` },
   ])
@@ -1682,7 +1684,7 @@ test('a browser that cannot say what it holds is not said to hold nothing, and i
   expect(device.subscription('mock')).not.toBeNull()
 
   device.says = true
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
   expect(device.subscription('mock')).toBeNull()
   expect(pushSnapshot().held).toBe(false)
 })
@@ -1707,7 +1709,7 @@ test('with as many addresses unanswered as are kept, none is dropped and the ser
   const device = browser({ permission: 'granted' })
   const asked = serve(routes())
 
-  expect(await syncPush('mock')).toBe(false)
+  expect(await syncPush('mock', OWN)).toBe(false)
 
   expect(wanted()).toEqual({ on: 'mock', told: null, forget: waiting })
   expect(device.subscribe).not.toHaveBeenCalled()
@@ -1719,12 +1721,12 @@ test('with as many addresses unanswered as are kept, none is dropped and the ser
 
   // At the most that are kept, too: the address would be one more.
   keeping(waiting.slice(0, FORGET_MOST))
-  expect(await syncPush('mock')).toBe(false)
+  expect(await syncPush('mock', OWN)).toBe(false)
   expect(of(asked, SUBSCRIBE)).toEqual([])
 
   // With room for it, the server is given the address, and nothing is dropped.
   keeping(waiting.slice(0, FORGET_MOST - 1))
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
   expect(of(asked, SUBSCRIBE)).toHaveLength(1)
   expect(wanted()).toEqual({
     ...MOCK_SERVER,
@@ -1748,7 +1750,7 @@ test('every address a server is to delete is kept until that server answers, how
   const asked = serve(routes({ [UNSUBSCRIBE]: () => answers() }))
 
   expect(await turnOff()).toBe('off')
-  expect(await syncPush('mock')).toBe(false)
+  expect(await syncPush('mock', OWN)).toBe(false)
 
   // One more than are kept as a rule, and none was dropped for it.
   const all = [...waiting, MOCK_SERVER.told]
@@ -1757,7 +1759,7 @@ test('every address a server is to delete is kept until that server answers, how
 
   // Each is asked about, by its own server, and leaves only on its answer.
   answers = () => new Response(null, { status: 204 })
-  expect(await syncPush('mock')).toBe(true)
+  expect(await syncPush('mock', OWN)).toBe(true)
   expect(wanted()).toEqual({ on: null, told: null, forget: waiting })
   asked.length = 0
   serve(
@@ -1770,7 +1772,7 @@ test('every address a server is to delete is kept until that server answers, how
       },
     }),
   )
-  expect(await syncPush('live')).toBe(true)
+  expect(await syncPush('live', OWN)).toBe(true)
   expect(of(asked, UNSUBSCRIBE)).toHaveLength(FORGET_MOST)
   expect(wanted()).toEqual(OFF)
 })
@@ -1959,4 +1961,120 @@ test('the service worker reads the words from where the app keeps them, at the s
   expect(worker).toContain(`const NOTICE_URL = '${NOTICE_URL}'`)
   for (const mode of MODES)
     expect(worker).toContain(`SCOPE.endsWith('${scopeOf(mode)}')`)
+})
+
+// What a server answers that says which mode it is in and not what it takes.
+const SILENT_HEALTH: Record<string, unknown> = { ...MOCK_HEALTH }
+delete SILENT_HEALTH.input
+
+test('a server that has not said what it takes is given no address and no place, though notifications are on and it says it sends them', async () => {
+  await savePlace('Home', FIRE)
+  // On, with an address the server was told, and an earlier one it has yet to
+  // answer that it deleted.
+  window.localStorage.setItem(
+    KEY,
+    JSON.stringify({
+      on: 'mock',
+      // The address of the subscription the browser has.
+      told: { endpoint: `${ADDRESS}-old`, mode: 'mock' },
+      forget: [{ endpoint: `${ADDRESS}-gone`, mode: 'mock' }],
+    }),
+  )
+  browser({
+    permission: 'granted',
+    subscribed: { mode: 'mock', key: KEY_BYTES },
+  })
+  const asked = serve(routes({ 'GET /api/health': SILENT_HEALTH }))
+
+  render(<App />)
+
+  // What was to be deleted is still asked for: a deletion needs nothing of
+  // what the server takes.
+  await waitFor(() =>
+    expect(of(asked, UNSUBSCRIBE).map((request) => request.body)).toEqual([
+      { endpoint: `${ADDRESS}-gone` },
+    ]),
+  )
+  await screen.findByRole('button', { name: 'Turn notifications off' })
+  // Neither renewed nor given anew: no permit asked for, no address and no
+  // place sent, by the sync or by the page.
+  expect(of(asked, PERMIT)).toEqual([])
+  expect(of(asked, SUBSCRIBE)).toEqual([])
+  expect(of(asked, CHECK)).toEqual([])
+  expect(
+    asked.filter((request) =>
+      JSON.stringify(request.body ?? '').includes(String(FIRE.lat)),
+    ),
+  ).toEqual([])
+
+  // Turning off works as ever, and has the server delete what it was told.
+  await click(screen.getByRole('button', { name: 'Turn notifications off' }))
+  await waitFor(() => expect(wanted()).toEqual(OFF))
+  expect(of(asked, UNSUBSCRIBE).map((request) => request.body)).toEqual([
+    { endpoint: `${ADDRESS}-gone` },
+    { endpoint: `${ADDRESS}-old` },
+  ])
+  expect(of(asked, SUBSCRIBE)).toEqual([])
+  // And they are not offered again by a server that has not said it takes them.
+  expect(screen.queryByRole('button', { name: /notifications on/i })).toBeNull()
+})
+
+test('notifications are not offered by a server that has not said it takes a visitor’s own, though it says it sends them', async () => {
+  await savePlace('Home', FIRE)
+  const device = browser({ permission: 'granted' })
+  const asked = serve(routes({ 'GET /api/health': SILENT_HEALTH }))
+
+  render(<App />)
+
+  await screen.findByText('Invented scenario')
+  await waitFor(() => expect(of(asked, INFO).length).toBeGreaterThan(0))
+  expect(screen.queryByRole('button', { name: /notifications/i })).toBeNull()
+  expect(device.subscribe).not.toHaveBeenCalled()
+  expect(of(asked, PERMIT)).toEqual([])
+  expect(of(asked, SUBSCRIBE)).toEqual([])
+})
+
+test('a telling that is under way when the server stops saying it takes a visitor’s own gives it nothing', async () => {
+  await savePlace('Home', FIRE)
+  window.localStorage.setItem(KEY, turnedOn(null))
+  const device = browser({ permission: 'granted' })
+  const asked = serve(routes())
+  let takes: 'own' | null = 'own'
+  // The telling has read that the server takes an address, and is waiting for
+  // the browser, when the latest health no longer says so.
+  device.whileSubscribing = async () => {
+    takes = null
+  }
+
+  expect(await syncPush('mock', () => takes)).toBe(true)
+
+  expect(device.subscribe).toHaveBeenCalledTimes(1)
+  expect(of(asked, PERMIT)).toEqual([])
+  expect(of(asked, SUBSCRIBE)).toEqual([])
+  expect(JSON.stringify(asked)).not.toContain(String(FIRE.lat))
+  // Still wanted on this device: the server is given it once it says `own`.
+  expect(wanted()).toEqual({ on: 'mock', told: null, forget: [] })
+  takes = 'own'
+  expect(await syncPush('mock', () => takes)).toBe(true)
+  expect(of(asked, SUBSCRIBE)).toHaveLength(1)
+})
+
+test('a server that takes only the invented places is given no address whatever it says of notifications, and deletes the one it was told', async () => {
+  await savePlace('Home', FIRE)
+  window.localStorage.setItem(KEY, turnedOn(ADDRESS))
+  browser({
+    permission: 'granted',
+    subscribed: { mode: 'mock', key: KEY_BYTES },
+  })
+  // It answers that it sends notifications, which such a server does not.
+  const asked = serve(routes())
+
+  expect(await syncPush('mock', () => 'invented')).toBe(true)
+
+  expect(of(asked, PERMIT)).toEqual([])
+  expect(of(asked, SUBSCRIBE)).toEqual([])
+  expect(of(asked, UNSUBSCRIBE).map((request) => request.body)).toEqual([
+    { endpoint: ADDRESS },
+  ])
+  expect(JSON.stringify(asked)).not.toContain(String(FIRE.lat))
 })

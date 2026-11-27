@@ -7,14 +7,21 @@ import os
 from collections.abc import AsyncIterator, MutableMapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.responses import Response
+from starlette.routing import Match, Mount
+from starlette.staticfiles import StaticFiles
+from starlette.types import Scope
 
-from beacon import __version__
+from beacon import __version__, front
 from beacon.api import health, incidents, places, push, scale, sources, taps
+from beacon.datadir import DataLock
+from beacon.ember.client import default_data_dir
 from beacon.incident import Engine, open_engine
 from beacon.ingest import IngestConfigError, build
 from beacon.ingest.setup import PAID_SECONDS, STOP_SECONDS, Ingest
@@ -28,6 +35,10 @@ from beacon.taps import Taps, open_taps
 _REQUEST_PARTS = frozenset({"body", "query", "path", "header", "cookie"})
 
 INGEST_VARIABLE = "BEACON_INGEST"
+# The setting that names the directory of the built app (`web/dist`), which the
+# server then serves from its own origin, beside `/api`. Unset, it serves the API
+# alone, and something else serves the app.
+WEB_VARIABLE = "BEACON_WEB_DIR"
 # How often the photos and clips whose hour is over are deleted.
 SWEEP_SECONDS = 60.0
 # How often the incidents are looked over for one whose story is due.
@@ -234,6 +245,32 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             "made. Its core size limit of nothing keeps a crash from writing a core "
             "file, and this host hands cores to no collector."
         )
+    # Before the first store is opened, and until the last worker has stopped: this
+    # process has the data directory's stores, alone when it runs the pollers. A
+    # process that tells the invented story again (`beacon.serve`) holds the lock
+    # already, over every telling, and hands it over.
+    given: DataLock | None = getattr(app.state, "data_lock", None)
+    if given is not None and not (given.held and (given.exclusive or setting == "0")):
+        raise ServerSetupError("The lock this server was handed is not one it can run under.")
+    ours = None
+    if given is None:
+        ours = DataLock(default_data_dir(os.environ), shared=setting == "0")
+    try:
+        async with _running(app, setting):
+            yield
+    finally:
+        # Given up only when everything that was begun is known to have ended. A
+        # worker that did not stop in the time it was given may still have a store
+        # open, so the lock is then kept until the process is gone, which is when
+        # the operating system gives it up: nothing else opens a store under it.
+        if ours is not None and getattr(app.state, "stopped_whole", None) is not False:
+            ours.close()
+
+
+@asynccontextmanager
+async def _running(app: FastAPI, setting: str) -> AsyncIterator[None]:
+    """Everything a server opens and runs, begun in order and ended whatever
+    became of the beginning. `_lifespan` holds the stores' lock around it."""
     # The pollers first: a setting of theirs that is refused leaves no store behind.
     ingest = build(os.environ) if setting == "1" else None
     taps: Taps | None = None
@@ -256,6 +293,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # The incidents are read from the same evidence store the taps go to,
         # which is there whether or not this server runs the pollers.
         engine = open_engine(os.environ, taps.store)
+        if app.state.input == "invented" and engine.mode != "mock":
+            # Two invented places are of no use to a server on real sources, and
+            # it is not to take a visitor's own through a host nobody has checked.
+            raise ServerSetupError(front.NOT_WITH_A_REAL_SOURCE)
         app.state.incidents = engine
         # What Ember writes about an incident: a stand-in's on the mock store, and
         # on the live store written only under a budget somebody set.
@@ -296,6 +337,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             ingest.start()
         yield
     finally:
+        # Whether everything that was begun is known to have ended. It is said to
+        # have only at the very end, when every step below said so of its own.
+        app.state.stopped_whole = False
+        whole: list[bool] = []
         stop.set()
         # Before anything is waited for, nothing new that costs money is admitted:
         # not by the story desk, whose pass may be under way on a thread, not by the
@@ -314,23 +359,27 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 await sweeping
         finally:
             try:
-                await _stop_stories(stories, telling)
+                whole.append(await _stop_stories(stories, telling))
             finally:
                 try:
                     try:
                         # Before the investigations file is closed: a pass reads
                         # the decisions in it.
-                        await _stop_pushes(sending, pushing)
+                        whole.append(await _stop_pushes(sending, pushing))
                     finally:
                         # Before the taps are closed: a run reads a tap's photo
                         # and clip.
-                        await _stop_investigations(investigations, runs, sweeping_runs)
+                        whole.append(
+                            await _stop_investigations(investigations, runs, sweeping_runs)
+                        )
                 finally:
                     try:
                         if taps is not None:
                             taps.close()
                     finally:
-                        await stopping
+                        whole.append(await stopping)
+        # Reached only when no step raised: one that did leaves this unsaid.
+        app.state.stopped_whole = len(whole) == 4 and all(whole)
 
 
 def _close_paid(
@@ -350,20 +399,23 @@ def _close_paid(
             logger.error("Paid work could not be closed (%s).", type(error).__name__)
 
 
-async def _stop_stories(stories: StoryDesk | None, telling: asyncio.Task[None] | None) -> None:
+async def _stop_stories(stories: StoryDesk | None, telling: asyncio.Task[None] | None) -> bool:
     """Stop the story desk: wait for the story whose paid request is out, close the
-    stories file, and give the pass that was under way `STOP_SECONDS` to end."""
+    stories file, and give the pass that was under way `STOP_SECONDS` to end.
+    True when nothing of it was left running."""
     if stories is None:
-        return
+        return True
+    whole = True
     # Off the event loop. The desk was closed already, so nothing new is asked.
     if not await asyncio.to_thread(stories.stop, PAID_SECONDS):
+        whole = False
         logger.warning(
             "A story was still being made when the server shut down. If its paid "
             "Ember request was out, it can still be sent and paid for: it is in the "
             "Ember ledger, and the story is lost."
         )
     if telling is None:
-        return
+        return whole
     _done, pending = await asyncio.wait({telling}, timeout=STOP_SECONDS)
     if pending:
         # It can ask Ember nothing and write nothing: the desk and its file are
@@ -374,16 +426,19 @@ async def _stop_stories(stories: StoryDesk | None, telling: asyncio.Task[None] |
             "The pass that has stories made had not ended when the server shut down. "
             "It can ask Ember nothing more and write nothing."
         )
+        return False
+    return whole
 
 
 async def _stop_investigations(
     investigations: InvestigationDesk | None,
     runs: Runs | None,
     sweeping: asyncio.Task[None] | None,
-) -> None:
+) -> bool:
     """Stop the investigator: wait for the runs whose paid requests are out, end
     its threads, and close the investigations file, which is closed as well when
-    there is no investigator and it was only read."""
+    there is no investigator and it was only read. True when nothing of it was
+    left running."""
     try:
         # A sweep that is under way is finished, as the sweep of the taps' media is.
         if sweeping is not None:
@@ -392,7 +447,7 @@ async def _stop_investigations(
         if investigations is None and runs is not None:
             runs.close()
     if investigations is None:
-        return
+        return True
     # Off the event loop. The desk was closed already, so nothing new is asked.
     if not await asyncio.to_thread(investigations.stop, PAID_SECONDS):
         logger.warning(
@@ -401,37 +456,44 @@ async def _stop_investigations(
             "the Ember ledger, and the tap's answer says its investigation was cut "
             "short and that its totals may be incomplete."
         )
+        return False
+    return True
 
 
-async def _stop_pushes(sending: Push | None, pushing: asyncio.Task[None] | None) -> None:
+async def _stop_pushes(sending: Push | None, pushing: asyncio.Task[None] | None) -> bool:
     """Stop sending pushes: end the one that is out, keep no more subscriptions,
     and give the pass that was under way `STOP_SECONDS` to end. A push that was
     out when its answer was cut off is tried again by a later server, once its
     claim is old enough (`push.store.CLAIM_STALE`), whether or not the push
-    service had taken it: sending is best effort."""
+    service had taken it: sending is best effort. True when nothing of it was
+    left running."""
     if sending is None:
-        return
+        return True
     sending.close()
     if pushing is None:
-        return
+        return True
     _done, pending = await asyncio.wait({pushing}, timeout=STOP_SECONDS)
     if pending:
         # It can send nothing and write nothing: its client and its file are closed.
         pushing.cancel()
         await asyncio.wait({pushing}, timeout=STOP_SECONDS)
         logger.warning("The pass that sends pushes had not ended when the server shut down.")
+        return False
+    return True
 
 
-async def _stop_ingest(ingest: Ingest | None) -> None:
+async def _stop_ingest(ingest: Ingest | None) -> bool:
     """Stop the pollers. Off the event loop, and not returned from until they can
     ask no source and store no row: nothing of theirs outlives the server. It is
-    safe for pollers that were never started."""
+    safe for pollers that were never started. True when they stopped whole."""
     if ingest is not None and not await asyncio.to_thread(ingest.stop):
         logger.warning(
             "The pollers had not stopped when the server shut down. If a paid Ember "
             "request was out, it can still be sent and paid for: it is in the Ember "
             "ledger, and its row is lost."
         )
+        return False
+    return True
 
 
 async def _validation_error(_request: Request, error: RequestValidationError) -> JSONResponse:
@@ -447,6 +509,67 @@ async def _validation_error(_request: Request, error: RequestValidationError) ->
     return JSONResponse({"detail": detail}, status_code=422)
 
 
+class _Web(StaticFiles):
+    """The built app's files. A file under `assets/` has a digest of what it holds
+    in its name and is kept by a browser for good. Every other file (the page, the
+    service workers, the manifest) is asked about each time, so that a browser has
+    the app, and the worker that shows a notification, as they were last deployed."""
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        response = await super().get_response(path, scope)
+        kept = Path(path).parts[:1] == ("assets",) and response.status_code == 200
+        response.headers["Cache-Control"] = (
+            "public, max-age=31536000, immutable" if kept else "no-cache"
+        )
+        return response
+
+
+class _WebMount(Mount):
+    """Where the built app's files are served: every path that is not `/api` or
+    under it. A mount at `/` would otherwise match every request, and the router
+    answers with a full match before it looks at anything else, so a request to
+    `/api` that no route takes whole (another method, a trailing slash, a path
+    nobody has) would be answered as a file that is not there, and a file named
+    `api/...` in the directory would be served. Those requests are not this
+    mount's at all: the API answers them as it does with no app beside it."""
+
+    def matches(self, scope: Scope) -> tuple[Match, Scope]:
+        # The path as the router reads it: without whatever the app is served under.
+        path, under = scope.get("path", ""), scope.get("root_path", "")
+        if under and path.startswith(under + "/"):
+            path = path[len(under) :]
+        if path == "/api" or path.startswith("/api/"):
+            return Match.NONE, {}
+        return super().matches(scope)
+
+
+def _web_directory() -> Path | None:
+    """The directory of the built app that `BEACON_WEB_DIR` names, or None.
+
+    Raises ServerSetupError when it names no built app."""
+    named = os.environ.get(WEB_VARIABLE)
+    if not named:
+        return None
+    directory = Path(named)
+    if not (directory / "index.html").is_file():
+        raise ServerSetupError(
+            f"{WEB_VARIABLE} names no built app: there is no index.html in it. Build "
+            "the app (pnpm build in web/) and name web/dist."
+        )
+    return directory
+
+
+def _input() -> front.Input:
+    """What this server takes from a visitor, by `BEACON_FRONT_END` (`beacon.front`).
+
+    Raises ServerSetupError for a setting that is neither word."""
+    try:
+        return front.input_of(os.environ)
+    except front.FrontError as error:
+        refused = str(error)
+    raise ServerSetupError(refused)
+
+
 def create_app() -> FastAPI:
     # Every route lives under /api so the built PWA can be served from the same origin.
     app = FastAPI(
@@ -458,6 +581,11 @@ def create_app() -> FastAPI:
         # No OAuth flows, and the default callback route would sit outside /api.
         swagger_ui_oauth2_redirect_url=None,
         lifespan=_lifespan,
+        # A path with a slash too many is not sent on to the route's own address.
+        # The redirect would be made with the scheme this server sees, which behind
+        # a host that ends TLS is http, and a client that followed it would send
+        # the path, which for a tap's routes holds its id, in the clear.
+        redirect_slashes=False,
         # FastAPI traces requests by itself once OpenTelemetry is set up in the
         # process. The private routes are left out of it.
         telemetry={"exclude": _not_traced},
@@ -478,6 +606,14 @@ def create_app() -> FastAPI:
     app.include_router(scale.router, prefix="/api")
     app.include_router(sources.router, prefix="/api")
     app.include_router(taps.router, prefix="/api")
+    # Read when the app is made, so that a setting that is no word stops the server.
+    app.state.input = _input()
+    web = _web_directory()
+    if web is not None:
+        # After every route, and for no path under /api (`_WebMount`), so that
+        # nothing under /api is ever a file's. The app names its views in the URL's
+        # fragment, so only `/` is its page.
+        app.router.routes.append(_WebMount("/", app=_Web(directory=web, html=True), name="web"))
     return app
 
 

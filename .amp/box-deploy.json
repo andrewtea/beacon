@@ -1,0 +1,9 @@
+{
+  "targets": {
+    "default": {
+      "on": "andrewtea/beacon",
+      "name": "beacon-sf",
+      "branch": "main"
+    }
+  }
+}

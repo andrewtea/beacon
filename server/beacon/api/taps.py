@@ -66,6 +66,11 @@ class TapReceipt(BaseModel):
     # Whether the tap was handed to the investigator. Read the answer at
     # `GET /api/taps/{id}`: it is `pending` until the investigator has it.
     investigating: bool = False
+    # Whether the tap was taken under the rule that this server takes only the
+    # invented scenario's two places (`beacon.front`). The app keeps it with the
+    # tap's id: a server that takes only those is asked for no other tap, so
+    # that the id of a tap sent from where somebody was is in no request to it.
+    invented_only: bool = False
 
 
 class TapOut(BaseModel):
@@ -351,6 +356,7 @@ async def tap(request: Request) -> TapReceipt:
             clip=taken.clip,
             media_kept_until=taken.media_kept_until,
             investigating=investigating,
+            invented_only=taken.invented_only,
         )
     headers = None if refused.retry_after is None else {"Retry-After": str(refused.retry_after)}
     raise HTTPException(refused.status, str(refused), headers=headers)
@@ -390,7 +396,7 @@ def _tap_row(request: Request, tap_id: str) -> tuple[Taps, Evidence, Snapshot]:
     if taps is None or engine is None:
         raise HTTPException(503, "This server is not taking taps.")
     row = taps.store.find(SOURCE, tap_id) if is_tap_id(tap_id) else None
-    if row is None or row.kind != "tap" or row.point is None:
+    if row is None or row.kind != "tap" or row.point is None or not taps.answers_for(row):
         raise HTTPException(404, _NO_SUCH_TAP)
     snapshot = engine.snapshot()
     if snapshot.as_of - row.occurred_at > ANSWERED:

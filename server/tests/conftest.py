@@ -98,5 +98,9 @@ def offline_environment(
         "BEACON_INVESTIGATE_BUDGET_USD",
         "BEACON_PUSH",
         "BEACON_VAPID_SUBJECT",
+        "BEACON_SCALE_RUN",
+        "BEACON_WEB_DIR",
+        "BEACON_MOCK_REPEAT",
+        "BEACON_FRONT_END",
     ):
         monkeypatch.delenv(name, raising=False)

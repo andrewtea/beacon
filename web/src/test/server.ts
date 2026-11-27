@@ -42,4 +42,12 @@ export function serve(routes: Record<string, unknown>): Asked[] {
   return asked
 }
 
-export const MOCK_HEALTH = { status: 'ok', version: '1.2.3', mode: 'mock' }
+export const MOCK_HEALTH = {
+  status: 'ok',
+  version: '1.2.3',
+  mode: 'mock',
+  repeats_text: null,
+  input: 'own',
+  front_text: null,
+  front_more_text: null,
+}

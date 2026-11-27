@@ -97,8 +97,9 @@ test('a place is kept on the device under its name, and only where it is is sent
   await click(spot)
 
   // On the device: the name, tidied, and the place.
+  // And that it was saved with the invented place's own button.
   expect(stored()).toEqual([
-    { id: expect.any(String), name: 'My flat', ...FIRE },
+    { id: expect.any(String), name: 'My flat', ...FIRE, spot: true },
   ])
   // To the server: where it is, the mode that is shown, and nothing else.
   const section = (
@@ -119,6 +120,121 @@ test('a place is kept on the device under its name, and only where it is is sent
   ).toHaveAttribute('href', `#/incident/${fire.id}`)
   // The invented scenario's incident is labeled as that on its card.
   expect(within(section).getByText('Invented')).toBeInTheDocument()
+})
+
+test('a server that takes only the invented places is sent no place of a person’s own, and none is asked of the phone', async () => {
+  // A place saved when another server took it: somebody's own.
+  const OWN = { lat: 37.775, lon: -122.42 }
+  await savePlace('Home', OWN)
+  // And one saved from where somebody was, a block from the invented fire,
+  // when another server took that: it is kept at the invented place's own
+  // rounded position, and is somebody's own all the same.
+  await savePlace('My flat', { lat: 37.7761, lon: -122.4239 })
+  expect(stored()).toContainEqual({
+    id: expect.any(String),
+    name: 'My flat',
+    ...FIRE,
+  })
+  // Only this one was saved with the invented place's own button.
+  await savePlace('The fire', FIRE, true)
+  const asked = serve({
+    'GET /api/health': {
+      ...MOCK_HEALTH,
+      input: 'invented',
+      front_text:
+        'On this server a tap is sent from one of two invented places.',
+      front_more_text: 'The rest.',
+    },
+    [CHECK]: answer(nearFire),
+  })
+  render(<App />)
+
+  // Once the server has said what it takes, the invented place is asked about,
+  // and answered under its own name.
+  await screen.findByText(/This server is asked only about the two invented/)
+  const section = (
+    await screen.findByRole('heading', { name: 'The fire' })
+  ).closest('section')!
+  expect(await within(section).findByText(DISTANCE)).toBeInTheDocument()
+  const sent = asked.filter((request) => request.key === CHECK)
+  // One place, once: the flat at the same position is not a second.
+  expect(sent.map((request) => request.body)).toEqual([{ places: [FIRE] }])
+  expect(JSON.stringify(asked)).not.toContain('37.775')
+  // The other stays on the device, is said not to be sent, and can be removed.
+  expect(
+    screen.getByText(/This server is asked only about the two invented places/),
+  ).toHaveTextContent('Nothing of the places below is sent to it.')
+  for (const name of ['Home', 'My flat']) {
+    const kept = screen.getByRole('heading', { name }).closest('section')!
+    expect(within(kept).queryByText(DISTANCE)).not.toBeInTheDocument()
+    expect(
+      within(kept).getByRole('button', {
+        name: `Remove ${name} from this device`,
+      }),
+    ).toBeInTheDocument()
+  }
+  // Where the phone is cannot be saved here: only the two invented places can.
+  expect(
+    screen.queryByRole('button', { name: 'Save where I am now' }),
+  ).not.toBeInTheDocument()
+  expect(
+    screen.getByRole('button', {
+      name: 'Save “Across town, North Beach”',
+    }),
+  ).toBeInTheDocument()
+})
+
+test('the phone is not asked where it is until the server has said it takes that, or after it stopped saying', async () => {
+  // On a server that takes only the invented places, a place saved from where
+  // the phone is would be somebody's own. Until the server has said which it
+  // is, and whenever its latest answer failed, it is not known to be the other.
+  await savePlace('The fire', FIRE)
+  const located = vi.fn()
+  vi.stubGlobal('navigator', {
+    ...navigator,
+    geolocation: { getCurrentPosition: located },
+  })
+  let health: (response: Response) => void = () => undefined
+  const asked = serve({
+    'GET /api/health': () =>
+      new Promise<Response>((resolve) => (health = resolve)),
+    [CHECK]: answer(nearFire),
+  })
+  render(<App />)
+
+  // Before the server answers: the saved place is listed and can be removed,
+  // and nothing offers to save where the phone is.
+  expect(await screen.findByText('The fire')).toBeInTheDocument()
+  expect(
+    screen.getByText('A place can be saved once Beacon’s server has answered.'),
+  ).toBeInTheDocument()
+  expect(
+    screen.queryByRole('button', { name: 'Save where I am now' }),
+  ).not.toBeInTheDocument()
+  expect(
+    screen.getByRole('button', { name: 'Remove The fire from this device' }),
+  ).toBeInTheDocument()
+
+  // An answer that does not say what the server takes is not taken for `own`:
+  // nothing is offered, and nothing of a place is sent.
+  const silent: Record<string, unknown> = { ...MOCK_HEALTH }
+  delete silent.input
+  await act(async () => health(Response.json(silent)))
+  await screen.findByText('Invented scenario')
+  expect(
+    screen.queryByRole('button', { name: 'Save where I am now' }),
+  ).not.toBeInTheDocument()
+  expect(asked.filter((request) => request.key === CHECK)).toEqual([])
+  expect(located).not.toHaveBeenCalled()
+})
+
+test('a server that says it takes a visitor’s own place offers to save where the phone is', async () => {
+  serve({ 'GET /api/health': MOCK_HEALTH })
+  render(<App />)
+
+  expect(
+    await screen.findByRole('button', { name: 'Save where I am now' }),
+  ).toBeEnabled()
 })
 
 test('a place with nothing near it says so in the server’s sentence, which is no all-clear', async () => {
