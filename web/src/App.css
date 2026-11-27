@@ -1170,8 +1170,15 @@ button.quiet:hover {
   height: 100%;
 }
 
-.map-area {
-  fill: rgb(214 69 48 / 18%);
+/* An area's polygons are filled as one layer, so where two of them overlap is
+   no darker than the rest. */
+.map-area-fill {
+  fill: rgb(214 69 48);
+  opacity: 0.18;
+}
+
+.map-area-outline {
+  fill: none;
   stroke: #8f2415;
   stroke-width: 1.2;
   stroke-dasharray: 4 2.5;
@@ -1279,6 +1286,10 @@ button.quiet:hover {
 .map-credits .credit {
   color: #12304d;
   font-size: inherit;
+}
+
+.map-covering {
+  margin-top: 0.6rem;
 }
 
 .map-zoom {

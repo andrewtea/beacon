@@ -1,3 +1,4 @@
+import itertools
 import json
 from pathlib import Path
 from typing import Any
@@ -7,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from beacon.evidence import Point
 from beacon.incident import Engine, Incident
+from beacon.incident import build as incident_build
 from beacon.incident.build import CREDIT_511
 from beacon.incident.places import NO_BLOCKS
 from beacon.main import create_app
@@ -226,7 +228,7 @@ def test_the_area_of_an_alert_in_force_is_drawn_in_the_authoritys_words(rows: Ro
 
     (alert,) = of_kind(drawn(fire, rows.store.get), "alert_area")
 
-    (ring,) = alert.rings
+    ((ring,),) = alert.polygons
     assert len(ring) == 5
     assert ring[0] == ring[-1]
     # Around the fire, as the alert's own row has it: latitude and longitude the
@@ -277,7 +279,7 @@ def test_an_area_with_more_points_than_are_drawn_is_left_out_whole_and_says_so(
 
     (alert,) = of_kind(map_of(rows), "alert_area")
 
-    assert alert.rings == ()
+    assert alert.polygons == ()
     assert alert.note == (
         "Its area has more points than Beacon draws, so it is not drawn. The alert "
         "says which area it covers."
@@ -302,9 +304,54 @@ def test_an_area_is_drawn_with_its_holes(tmp_path: Path) -> None:
 
     (alert,) = of_kind(map_of(made), "alert_area")
 
-    assert [len(found) for found in alert.rings] == [5, 4]
-    assert alert.rings[1][0] == Point(37.771, -122.429)
+    # One polygon: its outline, and the hole in it.
+    (rings,) = alert.polygons
+    assert [len(found) for found in rings] == [5, 4]
+    assert rings[1][0] == Point(37.771, -122.429)
     assert alert.note is None
+
+
+def held(polygons: tuple[tuple[tuple[Point, ...], ...], ...], point: Point) -> bool:
+    """Whether an area as the map has it holds a point, read the way the route
+    says to draw it: inside the outline of some polygon, in none of its holes."""
+
+    def within(ring: tuple[Point, ...]) -> bool:
+        inside = False
+        for a, b in itertools.pairwise(ring):
+            if (a.lat > point.lat) != (b.lat > point.lat) and point.lon < a.lon + (
+                point.lat - a.lat
+            ) / (b.lat - a.lat) * (b.lon - a.lon):
+                inside = not inside
+        return inside
+
+    return any(
+        within(outline) and not any(within(hole) for hole in holes) for outline, *holes in polygons
+    )
+
+
+def test_the_same_rings_are_one_area_as_a_hole_and_another_as_two_polygons(tmp_path: Path) -> None:
+    # A place inside the smaller ring.
+    inner = Point(37.7712, -122.4285)
+    as_a_hole = {"type": "Polygon", "coordinates": [SQUARE, HOLE]}
+    as_two = {"type": "MultiPolygon", "coordinates": [[SQUARE], [HOLE]]}
+    drawn_as = {}
+    for name, geometry in (("hole", as_a_hole), ("two", as_two)):
+        made = Rows(mock_store(tmp_path / name))
+        made.radio(0, "fire", "working", units=("E36",), street="Hayes St", block=400)
+        made.alert(4, "shelter", geometry=geometry)
+        (alert,) = of_kind(map_of(made), "alert_area")
+        drawn_as[name] = alert.polygons
+
+    square, hole = (tuple(Point(lat, lon) for lon, lat in ring) for ring in (SQUARE, HOLE))
+    assert drawn_as["hole"] == ((square, hole),)
+    # Two polygons, kept apart: the second is not a hole in the first.
+    assert drawn_as["two"] == ((square,), (hole,))
+    # What is handed on holds the place exactly when the engine's reading does.
+    for name, geometry in (("hole", as_a_hole), ("two", as_two)):
+        for point in (inner, HAYES, Point(37.79, -122.41)):
+            assert held(drawn_as[name], point) == incident_build._inside(geometry, point)
+    assert not held(drawn_as["hole"], inner)
+    assert held(drawn_as["two"], inner)
 
 
 @pytest.mark.parametrize(
@@ -332,7 +379,7 @@ def test_an_area_with_a_hole_that_cannot_be_read_is_not_drawn_at_all_and_says_so
     (alert,) = of_kind(drawn(fire, made.store.get), "alert_area")
 
     # Not the square without its hole: that would show the hole as inside the area.
-    assert alert.rings == ()
+    assert alert.polygons == ()
     assert alert.note == (
         "Beacon could not read every part of this alert's area, so none of it is drawn: "
         "an area drawn in part can show a place as inside it that the alert leaves out. "
@@ -343,17 +390,17 @@ def test_an_area_with_a_hole_that_cannot_be_read_is_not_drawn_at_all_and_says_so
     assert [source.source for source in alert.sources] == ["nws"]
 
 
-def test_rings_are_read_whole_or_not_at_all() -> None:
+def test_polygons_are_read_whole_or_not_at_all() -> None:
     polygon = {"type": "Polygon", "coordinates": [SQUARE, HOLE]}
-    assert [len(found) for found in mapping._rings(polygon) or ()] == [5, 4]
+    assert [[len(ring) for ring in rings] for rings in mapping._polygons(polygon) or ()] == [[5, 4]]
 
     broken = [[-122.43, 37.77], [-122.42, 370.0], [-122.42, 37.78], [-122.43, 37.77]]
     two = {"type": "MultiPolygon", "coordinates": [[SQUARE], [HOLE]]}
-    assert [len(found) for found in mapping._rings(two) or ()] == [5, 4]
+    assert [[len(ring) for ring in rings] for rings in mapping._polygons(two) or ()] == [[5], [4]]
     # One polygon of several that cannot be read, and none is.
-    assert mapping._rings({"type": "MultiPolygon", "coordinates": [[SQUARE], [broken]]}) is None
-    assert mapping._rings({"type": "MultiPolygon", "coordinates": [[SQUARE], "x"]}) is None
-    assert mapping._rings({"type": "MultiPolygon", "coordinates": [[SQUARE], []]}) is None
+    assert mapping._polygons({"type": "MultiPolygon", "coordinates": [[SQUARE], [broken]]}) is None
+    assert mapping._polygons({"type": "MultiPolygon", "coordinates": [[SQUARE], "x"]}) is None
+    assert mapping._polygons({"type": "MultiPolygon", "coordinates": [[SQUARE], []]}) is None
     for nothing in (
         None,
         "x",
@@ -365,7 +412,7 @@ def test_rings_are_read_whole_or_not_at_all() -> None:
         {"type": "Polygon", "coordinates": [[[True, 37.77]] * 4]},
         {"type": "MultiPolygon", "coordinates": []},
     ):
-        assert mapping._rings(nothing) is None, nothing
+        assert mapping._polygons(nothing) is None, nothing
 
 
 # Taps and notices.
@@ -388,7 +435,7 @@ def test_nothing_of_a_tap_or_a_notice_is_drawn(rows: Rows) -> None:
         for point in (
             *([feature.point] if feature.point else []),
             *(seen.point for seen in feature.path),
-            *(point for ring in feature.rings for point in ring),
+            *(point for rings in feature.polygons for ring in rings for point in ring),
         )
     ]
     assert where not in everywhere
@@ -444,8 +491,9 @@ def test_the_map_of_an_incident_has_each_thing_with_its_words_its_confidence_and
     assert event["sources"][0]["credit"] == {"text": CREDIT_511.text, "url": CREDIT_511.url}
     assert len(aircraft["path"]) == 9
     assert set(aircraft["path"][0]) == {"lat", "lon", "at"}
-    assert len(alert["rings"][0]) == 5
-    assert (place["path"], place["rings"], alert["point"], aircraft["note"]) == ([], [], None, None)
+    assert [[len(ring) for ring in rings] for rings in alert["polygons"]] == [[5]]
+    assert (place["path"], place["polygons"], alert["point"]) == ([], [], None)
+    assert aircraft["note"] is None
     assert len(aircraft["sources"]) == 9
     assert (place["note"], alert["note"]) == (None, None)
     assert event["note"].startswith("Drawn at the middle of what 511 drew for the event")

@@ -313,8 +313,11 @@ class FeatureOut(BaseModel):
     point: PointOut | None
     # An aircraft is the positions it was seen at, oldest first.
     path: list[PositionOut]
-    # An alert's area is rings of points. A ring inside another is a hole in it.
-    rings: list[list[PointOut]]
+    # An alert's area is polygons, each a list of closed rings: its outline first,
+    # then the holes in it. A place is in the area when it is inside the outline
+    # of some polygon and in none of that polygon's holes. Draw each polygon with
+    # its own holes: all the rings read together by parity are another area.
+    polygons: list[list[list[PointOut]]]
     # What is not drawn of it, in a sentence: show it with `text`. Null otherwise.
     note: str | None
 
@@ -507,7 +510,10 @@ def _feature_out(feature: Feature) -> FeatureOut:
         path=[
             PositionOut(lat=seen.point.lat, lon=seen.point.lon, at=seen.at) for seen in feature.path
         ],
-        rings=[[PointOut.model_validate(point) for point in ring] for ring in feature.rings],
+        polygons=[
+            [[PointOut.model_validate(point) for point in ring] for ring in rings]
+            for rings in feature.polygons
+        ],
         note=feature.note,
     )
 

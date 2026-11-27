@@ -1,6 +1,14 @@
-import { useState } from 'react'
+import { useId, useState } from 'react'
 import type { Credit, Feature, Point } from '../api/incidents.ts'
-import { at, DISC, DOT, marksOf, SIZE } from '../lib/marks.ts'
+import {
+  at,
+  coversView,
+  DISC,
+  DOT,
+  type Mark,
+  marksOf,
+  SIZE,
+} from '../lib/marks.ts'
 import {
   DEFAULT_ZOOM,
   frameOf,
@@ -15,6 +23,10 @@ import { CreditLine } from './Provenance.tsx'
 // The picture says nothing by itself: every word about a thing, its confidence,
 // and its sources are in that list. Where a thing's dot and its number go is
 // `marksOf` (`lib/marks.ts`): the dot is the thing's own point and is not moved.
+//
+// The one sentence written here is about the picture and not the incident: that
+// an area holds all of the view, when none of its outline is in view to carry
+// its number (`coversView`).
 
 /** The credits the sources of what is drawn ask for, each once. */
 function creditsOf(features: Feature[]): Credit[] {
@@ -31,21 +43,81 @@ function creditsOf(features: Feature[]): Credit[] {
   return found
 }
 
+const outlineOf = (frame: MapFrame, ring: Point[]): string =>
+  ring
+    .map((point, index) => {
+      const { x, y } = at(frame, point)
+      return `${index === 0 ? 'M' : 'L'}${x.toFixed(2)} ${y.toFixed(2)}`
+    })
+    .join(' ') + ' Z'
+
+/** An alert's area. A place is in it when it is inside the outline of one of
+ * its polygons and in none of that polygon's holes, and that is what is
+ * filled: each polygon is its outline with its own holes taken out of it, by
+ * a mask. The rings are never put in one path and filled by parity, which
+ * would have a second polygon cut a hole in the first where they overlap, and
+ * two holes that overlap fill each other in. The polygons are filled as one
+ * layer, so a place that two of them hold is no darker than its neighbours. */
+function Area({ frame, feature }: { frame: MapFrame; feature: Feature }) {
+  // An id that is good in `url(#...)` whatever React makes of it.
+  const id = `area-${useId().replace(/[^A-Za-z0-9_-]/g, '')}`
+  return (
+    <g className="map-area">
+      <defs>
+        {feature.polygons.map(([outline, ...holes], index) => (
+          <mask
+            key={index}
+            id={`${id}-${index}`}
+            maskUnits="userSpaceOnUse"
+            x="0"
+            y="0"
+            width={SIZE}
+            height={SIZE}
+          >
+            <path
+              className="map-area-in"
+              d={outlineOf(frame, outline)}
+              fill="#fff"
+              fillRule="evenodd"
+            />
+            {holes.map((hole, inner) => (
+              <path
+                key={inner}
+                className="map-area-out"
+                d={outlineOf(frame, hole)}
+                fill="#000"
+                fillRule="evenodd"
+              />
+            ))}
+          </mask>
+        ))}
+      </defs>
+      <g className="map-area-fill">
+        {feature.polygons.map((_, index) => (
+          <rect
+            key={index}
+            width={SIZE}
+            height={SIZE}
+            mask={`url(#${id}-${index})`}
+          />
+        ))}
+      </g>
+      {feature.polygons.flatMap((rings, index) =>
+        rings.map((ring, inner) => (
+          <path
+            key={`${index}-${inner}`}
+            className="map-area-outline"
+            d={outlineOf(frame, ring)}
+          />
+        )),
+      )}
+    </g>
+  )
+}
+
 function Shape({ frame, feature }: { frame: MapFrame; feature: Feature }) {
-  if (feature.kind === 'alert_area') {
-    const outline = feature.rings
-      .map(
-        (ring) =>
-          ring
-            .map((point, index) => {
-              const { x, y } = at(frame, point)
-              return `${index === 0 ? 'M' : 'L'}${x.toFixed(2)} ${y.toFixed(2)}`
-            })
-            .join(' ') + ' Z',
-      )
-      .join(' ')
-    return <path className="map-area" d={outline} fillRule="evenodd" />
-  }
+  if (feature.kind === 'alert_area')
+    return <Area frame={frame} feature={feature} />
   if (feature.kind === 'aircraft') {
     const line = feature.path
       .map((seen) => {
@@ -82,6 +154,14 @@ export function MapCanvas({
   const frame = frameOf(centre, zoom, tiles)
   const level = ZOOMS.indexOf(zoom as (typeof ZOOMS)[number])
   const marks = marksOf(frame, features)
+  // A number that does not stand on the place it is about is joined to it.
+  const led = (mark: Mark | null): mark is Mark =>
+    mark !== null &&
+    (mark.number.x !== mark.anchor.x || mark.number.y !== mark.anchor.y)
+  // The areas that hold all of the view, by their numbers in the list.
+  const covering = features.flatMap((feature, index) =>
+    coversView(frame, feature) ? [index + 1] : [],
+  )
   const credits = creditsOf(features)
   return (
     <div className="map-wrap">
@@ -118,20 +198,19 @@ export function MapCanvas({
           ))}
           {marks.map(
             (mark, index) =>
-              mark !== null &&
-              mark.dot !== null && (
+              led(mark) && (
                 <g key={index}>
                   <line
                     className="map-leader-casing"
-                    x1={mark.dot.x.toFixed(2)}
-                    y1={mark.dot.y.toFixed(2)}
+                    x1={mark.anchor.x.toFixed(2)}
+                    y1={mark.anchor.y.toFixed(2)}
                     x2={mark.number.x.toFixed(2)}
                     y2={mark.number.y.toFixed(2)}
                   />
                   <line
                     className="map-leader"
-                    x1={mark.dot.x.toFixed(2)}
-                    y1={mark.dot.y.toFixed(2)}
+                    x1={mark.anchor.x.toFixed(2)}
+                    y1={mark.anchor.y.toFixed(2)}
                     x2={mark.number.x.toFixed(2)}
                     y2={mark.number.y.toFixed(2)}
                   />
@@ -141,12 +220,12 @@ export function MapCanvas({
           {marks.map(
             (mark, index) =>
               mark !== null &&
-              mark.dot !== null && (
+              mark.dot && (
                 <circle
                   key={index}
                   className="map-dot"
-                  cx={mark.dot.x.toFixed(2)}
-                  cy={mark.dot.y.toFixed(2)}
+                  cx={mark.anchor.x.toFixed(2)}
+                  cy={mark.anchor.y.toFixed(2)}
                   r={DOT}
                 />
               ),
@@ -195,6 +274,13 @@ export function MapCanvas({
           </p>
         )}
       </div>
+      {covering.map((number) => (
+        <p key={number} className="note map-covering">
+          The area numbered {number} in the list below holds all of this
+          picture: no part of its outline is in view, so it has no number on the
+          picture.
+        </p>
+      ))}
       <div
         className="map-zoom"
         role="group"

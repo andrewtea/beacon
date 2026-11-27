@@ -201,8 +201,10 @@ export type Feature = {
   point: Point | null
   // An aircraft is the positions it was seen at, oldest first.
   path: (Point & { at: string })[]
-  // An alert's area is rings of points. A ring inside another is a hole in it.
-  rings: Point[][]
+  // An alert's area is polygons, each a list of closed rings: its outline
+  // first, then the holes in it. A place is in the area when it is inside the
+  // outline of some polygon and in none of that polygon's holes.
+  polygons: Point[][][]
   // What is not drawn of it, in the server's sentence.
   note: string | null
 }

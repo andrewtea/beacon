@@ -21,7 +21,12 @@ timeline or as its place. The map adds where each is, and no claim of its own:
   that was issued for a whole zone, which has no drawn area. **An area is drawn
   whole or not at all**: with one ring that cannot be read, a hole included, none
   of it is drawn and the note says so, because an area without one of its holes
-  shows a place as inside it that the alert leaves out.
+  shows a place as inside it that the alert leaves out. An area is handed on as its
+  polygons, each with its own holes, and never as one list of rings: a place is in
+  the area when it is inside the outline of some polygon and in none of that
+  polygon's holes, which is how the engine reads it (`build._inside`), and a list of
+  rings read by parity would have a second polygon cut a hole in the first where
+  they overlap.
 
 Nothing of a tap is drawn: a tap's point is its sender's. A notice has no place and
 is not drawn. A medical response has no map (`NO_MAP_OF_MEDICAL`).
@@ -106,9 +111,10 @@ class Feature:
     point: Point | None = None
     # An `aircraft` is the positions it was seen at, oldest first.
     path: tuple[Position, ...] = ()
-    # An `alert_area` is rings of points: each ring is closed, and a ring inside
-    # another is a hole in it.
-    rings: tuple[tuple[Point, ...], ...] = ()
+    # An `alert_area` is polygons. Each is closed rings of points: its outline
+    # first, and then the holes in it. A place is in the area when it is inside
+    # the outline of some polygon and in none of that polygon's holes.
+    polygons: tuple[tuple[tuple[Point, ...], ...], ...] = ()
     # What is not drawn of it, or how roughly it is placed, in a sentence, or None.
     note: str | None = None
 
@@ -182,15 +188,20 @@ def drawn(incident: Incident, row: Callable[[int], Evidence | None]) -> tuple[Fe
             # engine has no such alert as applying to a place; this is for one
             # that came to be listed some other way.
             continue
-        rings = _rings(geometry)
-        if rings is None:
+        polygons = _polygons(geometry)
+        if polygons is None:
             note: str | None = _AREA_UNREADABLE
-        elif sum(len(ring) for ring in rings) > MAX_RING_POINTS:
+        elif sum(len(ring) for rings in polygons for ring in rings) > MAX_RING_POINTS:
             note = _AREA_TOO_LARGE
         else:
             note = None
         features.append(
-            _of_line("alert_area", line, rings=rings if note is None and rings else (), note=note)
+            _of_line(
+                "alert_area",
+                line,
+                polygons=polygons if note is None and polygons else (),
+                note=note,
+            )
         )
     return tuple(features)
 
@@ -245,31 +256,35 @@ def _row_of(entry: Entry, row: Callable[[int], Evidence | None], kind: str) -> E
     return None
 
 
-def _rings(geometry: Any) -> tuple[tuple[Point, ...], ...] | None:
-    """The rings of a GeoJSON polygon or multi-polygon, every one of them, or None
-    when any part of it cannot be read: a polygon that is not a list of rings, a
-    ring that is not closed or has fewer than four positions, a position that is
-    not one. Nothing is left out to make the rest fit. Only the two kinds the
-    engine reads an area from (`build._inside`) are read here."""
+def _polygons(geometry: Any) -> tuple[tuple[tuple[Point, ...], ...], ...] | None:
+    """The polygons of a GeoJSON polygon or multi-polygon, each as its rings (its
+    outline, then its holes), every one of them, or None when any part of it
+    cannot be read: a polygon that is not a list of rings, a ring that is not
+    closed or has fewer than four positions, a position that is not one. Nothing
+    is left out to make the rest fit, and the polygons are kept apart: which
+    polygon a ring is of says whether it is an outline or a hole. Only the two
+    kinds the engine reads an area from (`build._inside`) are read here."""
     if not isinstance(geometry, dict):
         return None
     kind, coordinates = geometry.get("type"), geometry.get("coordinates")
     if kind == "Polygon":
-        polygons = [coordinates]
+        given = [coordinates]
     elif kind == "MultiPolygon" and isinstance(coordinates, list) and coordinates:
-        polygons = coordinates
+        given = coordinates
     else:
         return None
-    rings: list[tuple[Point, ...]] = []
-    for polygon in polygons:
+    polygons: list[tuple[tuple[Point, ...], ...]] = []
+    for polygon in given:
         if not isinstance(polygon, list) or not polygon:
             return None
+        rings: list[tuple[Point, ...]] = []
         for ring in polygon:
             points = _ring(ring)
             if points is None:
                 return None
             rings.append(points)
-    return tuple(rings)
+        polygons.append(tuple(rings))
+    return tuple(polygons)
 
 
 def _ring(ring: Any) -> tuple[Point, ...] | None:

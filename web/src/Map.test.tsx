@@ -3,9 +3,15 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import App from './App.tsx'
 import type { Feature, MapAnswer, Source } from './api/incidents.ts'
 import { MapCanvas } from './components/MapCanvas.tsx'
-import { DISC, SIZE } from './lib/marks.ts'
+import { APART, coversView, DISC, marksOf, SIZE } from './lib/marks.ts'
 import { parseRoute } from './lib/router.ts'
-import { frameOf, gridOf, OSM_TILES, tilesFrom } from './lib/tiles.ts'
+import {
+  frameOf,
+  gridOf,
+  type MapFrame,
+  OSM_TILES,
+  tilesFrom,
+} from './lib/tiles.ts'
 import { fireIncident } from './test/fixtures.ts'
 import { MOCK_HEALTH, serve } from './test/server.ts'
 
@@ -45,7 +51,7 @@ const feature = (from: Partial<Feature>): Feature => ({
   sources: [source({})],
   point: null,
   path: [],
-  rings: [],
+  polygons: [],
   note: null,
   ...from,
 })
@@ -101,13 +107,15 @@ const features: Feature[] = [
         url: 'https://alerts.example/shelter',
       }),
     ],
-    rings: [
+    polygons: [
       [
-        { lat: 37.774, lon: -122.427 },
-        { lat: 37.774, lon: -122.42 },
-        { lat: 37.779, lon: -122.42 },
-        { lat: 37.779, lon: -122.427 },
-        { lat: 37.774, lon: -122.427 },
+        [
+          { lat: 37.774, lon: -122.427 },
+          { lat: 37.774, lon: -122.42 },
+          { lat: 37.779, lon: -122.42 },
+          { lat: 37.779, lon: -122.427 },
+          { lat: 37.774, lon: -122.427 },
+        ],
       ],
     ],
   }),
@@ -507,13 +515,15 @@ test('a thing’s dot is at its own point and only its number is moved, joined t
       )
   }
   // Each number of a thing with a point is joined to that thing's dot.
-  expect(spotsOf('.map-leader', 'x1', 'y1')).toEqual(dots)
-  expect(spotsOf('.map-leader', 'x2', 'y2')).toEqual(spots.slice(0, 3))
+  expect(spotsOf('.map-leader', 'x1', 'y1').slice(0, 3)).toEqual(dots)
+  expect(spotsOf('.map-leader', 'x2', 'y2').slice(0, 3)).toEqual(
+    spots.slice(0, 3),
+  )
   // An area is drawn with its outline closed, and an aircraft as a line
   // through where it was seen.
-  expect(document.querySelector('.map-area')?.getAttribute('d')).toMatch(
-    /^M[\d. ]+( L[\d. ]+){4} Z$/,
-  )
+  expect(
+    document.querySelector('.map-area-outline')?.getAttribute('d'),
+  ).toMatch(/^M[\d. ]+( L[\d. ]+){4} Z$/)
   expect(
     document.querySelector('.map-path')?.getAttribute('points')?.split(' '),
   ).toHaveLength(2)
@@ -548,6 +558,252 @@ test('things at one point near the edge keep their dots there, and their numbers
   }
   expect(spotsOf('.map-leader', 'x1', 'y1')).toEqual(dots)
   expect(spotsOf('.map-leader', 'x2', 'y2')).toEqual(spots)
+})
+
+// A frame whose positions are the picture's own units: `lon` across and `lat`
+// down, from 0 to 300.
+const UNITS: MapFrame = {
+  zoom: 15,
+  tiles: [],
+  project: (place) => ({ x: place.lon / SIZE, y: place.lat / SIZE }),
+}
+const ring = (...corners: [number, number][]) =>
+  [...corners, corners[0]].map(([x, y]) => ({ lat: y, lon: x }))
+const area = (...polygons: { lat: number; lon: number }[][][]) =>
+  feature({ kind: 'alert_area', polygons })
+// How far a spot is from the nearest stretch of a ring.
+const offOutline = (
+  spot: { x: number; y: number },
+  rings: { lat: number; lon: number }[][],
+) =>
+  Math.min(
+    ...rings.flatMap((corners) =>
+      corners.slice(1).map((b, index) => {
+        const a = corners[index]
+        const [dx, dy] = [b.lon - a.lon, b.lat - a.lat]
+        const along = Math.max(
+          0,
+          Math.min(
+            1,
+            ((spot.x - a.lon) * dx + (spot.y - a.lat) * dy) /
+              (dx * dx + dy * dy),
+          ),
+        )
+        return Math.hypot(
+          spot.x - (a.lon + along * dx),
+          spot.y - (a.lat + along * dy),
+        )
+      }),
+    ),
+  )
+const DIAMOND = ring([150, 70], [230, 150], [150, 230], [70, 150])
+
+test('an area’s number is about a point of its own outline, and stands on it or is joined to it', () => {
+  // A diamond: the corner of the box around it is on neither its outline nor
+  // its fill, and no number is put there.
+  const [alone] = marksOf(UNITS, [area([DIAMOND])])
+  expect(alone).not.toBeNull()
+  expect(alone!.dot).toBe(false)
+  expect(offOutline(alone!.anchor, [DIAMOND])).toBeLessThan(1e-9)
+  expect(alone!.number).toEqual(alone!.anchor)
+  expect(alone!.number).not.toEqual({ x: 70, y: 70 })
+
+  // Two areas with one outline: the second number gives way, and is joined to
+  // the outline it is about.
+  const [first, second] = marksOf(UNITS, [area([DIAMOND]), area([DIAMOND])])
+  expect(second!.anchor).toEqual(first!.anchor)
+  expect(offOutline(second!.anchor, [DIAMOND])).toBeLessThan(1e-9)
+  expect(
+    Math.hypot(
+      second!.number.x - first!.number.x,
+      second!.number.y - first!.number.y,
+    ),
+  ).toBeGreaterThanOrEqual(APART)
+
+  // A hole's edge is outline too: with the outer edge out of view, the number
+  // is on the hole's.
+  const far = ring([-500, -500], [800, -500], [800, 800], [-500, 800])
+  const hole = ring([100, 100], [200, 100], [200, 200], [100, 200])
+  const [holed] = marksOf(UNITS, [area([far, hole])])
+  expect(offOutline(holed!.anchor, [hole])).toBeLessThan(1e-9)
+  expect(coversView(UNITS, area([far, hole]))).toBe(false)
+
+  // An outline that is in view only at the picture's very edge: the anchor is
+  // on it, and the number stands whole inside, joined to it.
+  const sliver = ring([-50, 4], [350, 4], [350, -50], [-50, -50])
+  const [edge] = marksOf(UNITS, [area([sliver])])
+  expect(edge!.anchor.y).toBeCloseTo(4)
+  expect(edge!.number.y).toBeGreaterThanOrEqual(DISC)
+  expect(edge!.number).not.toEqual(edge!.anchor)
+})
+
+test('a number that is not on its area’s outline is drawn with a line to it, and one that is on it has none', () => {
+  // A diamond around the incident, in positions.
+  const diamond = [
+    { lat: HAYES.lat + 0.004, lon: HAYES.lon },
+    { lat: HAYES.lat, lon: HAYES.lon + 0.005 },
+    { lat: HAYES.lat - 0.004, lon: HAYES.lon },
+    { lat: HAYES.lat, lon: HAYES.lon - 0.005 },
+    { lat: HAYES.lat + 0.004, lon: HAYES.lon },
+  ]
+  const one = feature({ kind: 'alert_area', polygons: [[diamond]] })
+  const drawn = diamond.map(projected).map(({ x, y }) => ({ lat: y, lon: x }))
+  const view = canvas([one])
+  expect(numbers()).toHaveLength(1)
+  expect(offOutline(numbers()[0], [drawn])).toBeLessThan(0.02)
+  expect(document.querySelectorAll('.map-leader')).toHaveLength(0)
+  expect(document.querySelectorAll('.map-dot')).toHaveLength(0)
+  view.unmount()
+
+  canvas([one, one])
+  const [first, second] = numbers()
+  expect(offOutline(first, [drawn])).toBeLessThan(0.02)
+  expect(offOutline(second, [drawn])).toBeGreaterThan(DISC)
+  // The line starts on the outline and ends at the number.
+  const [start] = spotsOf('.map-leader', 'x1', 'y1')
+  expect(spotsOf('.map-leader', 'x1', 'y1')).toHaveLength(1)
+  expect(offOutline(start, [drawn])).toBeLessThan(0.02)
+  expect(spotsOf('.map-leader', 'x2', 'y2')).toEqual([second])
+  expect(document.querySelectorAll('.map-dot')).toHaveLength(0)
+})
+
+test('an area that holds the whole picture has no number on it, and the picture says which area that is', () => {
+  const far = ring([-500, -500], [800, -500], [800, 800], [-500, 800])
+  expect(coversView(UNITS, area([far]))).toBe(true)
+  expect(marksOf(UNITS, [area([far])])).toEqual([null])
+  // The picture is in a hole of it, or away from it: it does not hold it.
+  const hole = ring([-10, -10], [310, -10], [310, 310], [-10, 310])
+  expect(coversView(UNITS, area([far, hole]))).toBe(false)
+  expect(marksOf(UNITS, [area([far, hole])])).toEqual([null])
+  const away = ring([400, 400], [500, 400], [500, 500], [400, 500])
+  expect(coversView(UNITS, area([away]))).toBe(false)
+  // In the hole of one polygon and inside another: held.
+  const other = ring([-20, -20], [320, -20], [320, 320], [-20, 320])
+  expect(coversView(UNITS, area([far, hole], [other]))).toBe(true)
+  expect(coversView(UNITS, area([DIAMOND]))).toBe(false)
+  expect(coversView(UNITS, features[0])).toBe(false)
+
+  // On the picture: a county around the incident, listed second.
+  const county = feature({
+    kind: 'alert_area',
+    text: ALERT,
+    polygons: [
+      [
+        [
+          { lat: 37.6, lon: -122.6 },
+          { lat: 37.6, lon: -122.3 },
+          { lat: 37.9, lon: -122.3 },
+          { lat: 37.9, lon: -122.6 },
+          { lat: 37.6, lon: -122.6 },
+        ],
+      ],
+    ],
+  })
+  canvas([features[0], county])
+  expect(
+    [...document.querySelectorAll('.map-mark text')].map(
+      (mark) => mark.textContent,
+    ),
+  ).toEqual(['1'])
+  expect(
+    screen.getByText(
+      'The area numbered 2 in the list below holds all of this picture: no part of its outline is in view, so it has no number on the picture.',
+    ),
+  ).toBeInTheDocument()
+  // It is filled all the same.
+  expect(document.querySelectorAll('.map-area-fill rect')).toHaveLength(1)
+})
+
+test('an area whose outline is in view is not said to hold the picture', () => {
+  canvas(features)
+  expect(screen.queryByText(/holds all of this picture/)).toBeNull()
+})
+
+test('each polygon of an area is filled with its own holes taken out, and a second polygon is no hole in the first', () => {
+  const outer = features[3].polygons[0][0]
+  const inner = [
+    { lat: 37.775, lon: -122.426 },
+    { lat: 37.775, lon: -122.425 },
+    { lat: 37.776, lon: -122.425 },
+    { lat: 37.775, lon: -122.426 },
+  ]
+  const masks = () =>
+    [...document.querySelectorAll('.map-area mask')].map((mask) => ({
+      id: mask.id,
+      inside: mask.querySelectorAll('.map-area-in').length,
+      out: mask.querySelectorAll('.map-area-out').length,
+    }))
+  const fills = () =>
+    [...document.querySelectorAll('.map-area-fill rect')].map((fill) =>
+      fill.getAttribute('mask'),
+    )
+
+  // The smaller ring as a hole of the larger.
+  const holed = canvas([
+    feature({ kind: 'alert_area', polygons: [[outer, inner]] }),
+  ])
+  expect(masks().map(({ inside, out }) => [inside, out])).toEqual([[1, 1]])
+  expect(fills()).toEqual(masks().map(({ id }) => `url(#${id})`))
+  expect(document.querySelectorAll('.map-area-outline')).toHaveLength(2)
+  // No path holds two rings, to be filled by parity.
+  for (const path of document.querySelectorAll('.map-area path'))
+    expect(path.getAttribute('d')?.match(/M/g)).toHaveLength(1)
+  holed.unmount()
+
+  // The same two rings as two polygons: each is filled, and nothing is taken
+  // out of either.
+  canvas([feature({ kind: 'alert_area', polygons: [[outer], [inner]] })])
+  expect(masks().map(({ inside, out }) => [inside, out])).toEqual([
+    [1, 0],
+    [1, 0],
+  ])
+  expect(fills()).toEqual(masks().map(({ id }) => `url(#${id})`))
+  expect(new Set(fills()).size).toBe(2)
+  for (const { id } of masks()) expect(id).toMatch(/^[A-Za-z][A-Za-z0-9_-]*$/)
+})
+
+test('many things at one point in a corner each get a place of their own, wherever in the picture there is one', () => {
+  const corner = { lat: 2, lon: 298 }
+  const crowd = Array.from({ length: 15 }, () => feature({ point: corner }))
+
+  const marks = marksOf(UNITS, crowd)
+
+  expect(marks.every((mark) => mark !== null)).toBe(true)
+  for (const [index, mark] of marks.entries()) {
+    expect(mark!.anchor).toEqual({ x: 298, y: 2 })
+    for (const value of [mark!.number.x, mark!.number.y]) {
+      expect(value).toBeGreaterThanOrEqual(DISC)
+      expect(value).toBeLessThanOrEqual(SIZE - DISC)
+    }
+    for (const other of marks.slice(index + 1))
+      expect(
+        Math.hypot(
+          mark!.number.x - other!.number.x,
+          mark!.number.y - other!.number.y,
+        ),
+      ).toBeGreaterThanOrEqual(APART)
+  }
+
+  // As many as the picture has places for, and still no two on one another.
+  const full = marksOf(
+    UNITS,
+    Array.from({ length: 150 }, () => feature({ point: corner })),
+  )
+  const seen = new Set(
+    full.map((mark) => `${mark!.number.x} ${mark!.number.y}`),
+  )
+  expect(seen.size).toBe(150)
+  // Past that there is nowhere left, and a number stands on another rather
+  // than outside the picture.
+  const over = marksOf(
+    UNITS,
+    Array.from({ length: 400 }, () => feature({ point: corner })),
+  )
+  for (const mark of over)
+    for (const value of [mark!.number.x, mark!.number.y]) {
+      expect(value).toBeGreaterThanOrEqual(DISC)
+      expect(value).toBeLessThanOrEqual(SIZE - DISC)
+    }
 })
 
 test('a medical response has no map: the server’s sentence is shown and nothing else', async () => {
