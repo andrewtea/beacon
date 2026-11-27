@@ -81,8 +81,11 @@ NOT_A_PUSH_SERVICE = (
     "Firefox, and Safari, and this address is not one of theirs."
 )
 # Said to a device that gives its address with the id of other words than the
-# ones this server hands out now, or with none: it was told them by an earlier
-# server, and what it would show for a push is not what this one would have it say.
+# ones this server hands out now (any string that is not that id, the empty one
+# included): it was told them by an earlier server, and what it would show for a
+# push is not what this one would have it say. A request with no `notice`, or one
+# that is no string, is refused for its shape instead (422, `SUBSCRIBE_SHAPE`).
+# Neither keeps the address or uses the permit.
 WORDS_CHANGED = (
     "What a notification from this server says has changed since this device was "
     "told, so this request to be notified kept nothing. The app reads the words "
