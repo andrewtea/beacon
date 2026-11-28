@@ -28,7 +28,7 @@ The same invented fire has been told with **Muse Ember itself doing the model's 
 | What | Who did the model's work | What it shows, and what it does not |
 | --- | --- | --- |
 | The incident on the public deployment | A stand-in, by rule | That the app and the pipeline work with no key. Nothing of a model. |
-| The same incident on the filming server | Muse Ember: it heard each call (synthesized speech, and generated noise for the two in which nothing is said), read each invented PDF, picked each story's points, and investigated each tap | What Ember makes of clean, invented material, with real tokens, times, and costs. A tap's investigation took three or four requests and cost $0.00069 to $0.00133, seven times out of seven. Nothing of real radio. |
+| The same incident on the filming server | Muse Ember: it heard each call (synthesized speech, and generated noise for the two in which nothing is said), read each invented PDF, picked each story's points, and investigated each tap | What Ember makes of clean, invented material, with real tokens, times, and costs. A tap's investigation took three or four requests and cost about $0.0007 to about $0.0013 (the least was $0.000688, the most $0.001326), seven times out of seven. Nothing of real radio. |
 | A [scale run](#scale-run) of one whole day, 1,525 generated calls | A stand-in that looks each generated call up | That the pipeline keeps what it is given. No accuracy, no speed, no cost. |
 | A scale run of a sample: the first 100 calls of that day in DataSF's record, generated as speech, 288 transmissions | Muse Ember, paid | Cost and time on clean synthetic speech: $0.0345 to hear the 288, and for 34 taps a script replayed, $0.0005 and 3.1 requests an investigation on average, 4.5 s at the median. It is scored against the records the speech was generated from, so it is no measure of accuracy. |
 | The glossary of that sample | Muse Ember, one request | From a table of counts and no transcript, it proposed a kind of unit for five unit type codes nobody had written down, and all five agree with DataSF's unit types. A model can also simply know a fire department's codes. |
@@ -46,7 +46,7 @@ Every request to Muse Ember is booked in one ledger, which stops spending at $3.
 | The paid scale run of a sample: hearing, replayed taps, glossary | 395 | $0.053804 |
 | The invented fire, told by Muse Ember, with the calls made while that was built | 173 | $0.047458 |
 
-Each row is rounded by itself. One telling of the fire from its twelfth minute to its end, with two taps, cost $0.018256 in 50 requests (the ledger's requests 514 to 563). `python -m beacon.ember` writes the ledger's token trace and prints the live spend; the ledger is kept outside the repository, like every ledger.
+Each row is rounded by itself. One telling of the fire from its twelfth minute to its end, with two taps, cost $0.018256 in 50 requests (the ledger's requests 514 to 563). `python -m beacon.ember` writes the ledger's token trace and prints the live spend, and is given only a data directory that holds the ledger: in one with none it begins an empty ledger. The ledger is kept outside the repository, like every ledger.
 
 ## What was built during the hackathon
 

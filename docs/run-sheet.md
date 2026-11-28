@@ -11,9 +11,23 @@ This is for whoever films Beacon's demo video. For each scene it says what to op
 
 ## Before filming
 
-One telling of the story with Muse Ember is paid for, call by call. The first telling from minute 12 to the end, with two taps, cost $0.018 (50 requests). Each of the seven taps Muse Ember has investigated on the story cost between $0.00069 and $0.00133, in three or four requests.
+One telling of the story with Muse Ember is paid for, call by call. The first telling from minute 12 to the end, with two taps, cost $0.018 (50 requests). Each of the seven taps Muse Ember has investigated on the story cost between about $0.0007 and about $0.0013 (the least was $0.000688, the most $0.001326), in three or four requests.
 
-1. **Bring the server up.** In the Amp thread that holds the ledger, send: "Begin the filming server's story anew at minute 0." Or run this in that thread's Terminal, from a checkout of `main`:
+1. **Read what the ledger holds, and compare it with Meta's Usage page.** This opens the ledger so that it cannot be written to, makes nothing, and fails with "unable to open database file" when no ledger is at the path:
+
+   ```sh
+   python3 -I - /home/user/workspace/repo/.amp/in/orb-backup/paid-data/ember/ledger.sqlite3 <<'EOF'
+   import sqlite3, sys
+   ledger = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True)
+   count, nanousd = ledger.execute(
+       "select count(*), coalesce(sum(cost_nanousd), 0) from ember_calls where source = 'live'"
+   ).fetchone()
+   print(count, "live requests, $%.6f" % (nanousd / 1e9))
+   EOF
+   ```
+
+   On Nov 28, 2026 it printed 635 live requests and $0.118714. If it fails, or Meta's [Usage page](https://dev.meta.ai/usage) shows spend, for every model, that the ledger and `EMBER_SPENT_BEFORE_USD` together do not account for, stop: nothing is paid until that is settled. Do not use `python -m beacon.ember` for this look. It asks Muse Ember nothing, but it begins an empty ledger in a data directory that has none, which is the ledger `scripts/film` refuses to begin.
+2. **Bring the server up.** In the Amp thread that holds the ledger, send: "Begin the filming server's story anew at minute 0." Or run this in that thread's Terminal, from a checkout of `main`:
 
    ```sh
    BEACON_DATA_DIR=/home/user/workspace/repo/.amp/in/orb-backup/paid-data \
@@ -22,11 +36,11 @@ One telling of the story with Muse Ember is paid for, call by call. The first te
      scripts/film anew 0
    ```
 
-   **`EMBER_SPENT_BEFORE_USD` is left out of the command on purpose.** The script reads it from the environment, gives it no default, and is refused without it. It is what Meta's [Usage page](https://dev.meta.ai/usage) shows as spent against the credit, for every model, beyond what this ledger holds, and [nobody has reported reading that page](../README.md#the-spending-stop). Read it before filming and compare it with the ledger's live spend (scene 6's command prints it). The variable is `0` only when the page shows no more than the ledger. A project's orb has the project's value for it in its environment; when the page says otherwise, change that value where it is set, since the script does not start a server whose shell and orb disagree.
+   **`EMBER_SPENT_BEFORE_USD` is left out of the command on purpose.** The script reads it from the environment, gives it no default, and is refused without it. It is what Meta's [Usage page](https://dev.meta.ai/usage) shows as spent against the credit, for every model, beyond what this ledger holds, and [nobody has reported reading that page](../README.md#the-spending-stop). It is what step 1 compares. The variable is `0` only when the page shows no more than the ledger. A project's orb has the project's value for it in its environment; when the page says otherwise, change that value where it is set, since the script does not start a server whose shell and orb disagree.
 
    After its looks at the settings, which change nothing, the command stops the filming server, moves the last telling's store whole under `told/` in the data directory, builds the app, starts the server, and prints the portal's address and the clock time of every moment of the story. The last telling's evidence, stories, and investigations are kept as files. What the server had noted as sent to devices about that telling's incidents is forgotten; no device has given this server an address. `BEACON_DATA_DIR` is the one data directory that has been paid from: its ledger counts every earlier request. Do not point the command at another.
-2. **Open the portal's address on the phone**, signed in to Amp. It is HTTPS and opens for whoever can open the thread.
-3. **Read the clock times.** `scripts/film where`, with the same settings, prints them again and says which minute the story is in. The story runs by the clock, once, for 95 minutes, and cannot be held or moved: only `anew` begins it again, and each `anew` is paid for.
+3. **Open the portal's address on the phone**, signed in to Amp. It is HTTPS and opens for whoever can open the thread.
+4. **Read the clock times.** `scripts/film where`, with the same settings, prints them again and says which minute the story is in. The story runs by the clock, once, for 95 minutes, and cannot be held or moved: only `anew` begins it again, and each `anew` is paid for.
 
 The story's minutes, for a telling begun at minute 0:
 
@@ -51,7 +65,7 @@ The story's minutes, for a telling begun at minute 0:
 - **The story, from minute 6.** The second alarm gives it an alarm level and nine units, and the closure and the helicopter follow. In the two tellings that were watched the incident had no signal before the second alarm was heard, and neither tap sent before minute 6 turned crisis mode on. That is what Muse Ember heard those two times, and it can hear a call otherwise.
 - **Taps, at any minute.** Three taps from near an incident are a signal of their own, so once three have come, a decision can stand on that alone, whatever the story has said. Send one tap before minute 6, and a second only if the first has to be done again.
 
-If crisis mode is on before the order is on the page, the crisis scene cannot be filmed in that telling: begin the story anew.
+If crisis mode came on at an earlier tap, scene 4's tap does not turn it on: the decision that is kept is the earlier one, with the signals it cited then, which the panel lists under "What the decision rested on". To film crisis mode coming on, begin the story anew.
 
 ## The scenes
 
@@ -70,7 +84,7 @@ Times are the build plan's. What appears is quoted from the app.
 - **Appears:** "Looking into it" for four to fifteen seconds, then the card: "Fire at the 400 block of Hayes St", "Open in Beacon's record", "Invented", "The radio said: units on scene.", the units named on the radio (B2, E21, E36, T6), the first radio call's time, and under it "Medium confidence" and "Generated radio calls, synthesized speech and no radio, as Ember heard them". Scroll to "Why this incident" and the timeline: each line has its confidence and its source.
 - **Then:** the card asks again by itself, with no press. A change shows some time after its moment in the story, because Muse Ember hears the call first: the one time this was timed, the card said "The radio said: crews at work." 37 seconds after minute 4.2. After minute 6 it lists nine units and "Alarm level on the radio 2".
 - **Last shot, filmed after minute 91:** open the same answer again: under "Your taps" on the button's page, press the time of the tap. The card says "Closed in Beacon's record". (Seen on a stand-in's telling.)
-- **Say:** "This fire is invented, and its radio calls are synthesized speech. Muse Ember heard each call, and when I tap, it investigates and answers in seconds: what, which units were named on the radio, which block, with a source and a confidence on every line."
+- **Say:** "This fire is invented. The voices on its radio are synthesized; no real radio was used. Muse Ember heard each call, and when I tap, it investigates and answers in seconds: what, which units were named on the radio, which block, with a source and a confidence on every line."
 - **Say over the last shot:** "When the radio clears the call, Beacon's record of it closes."
 
 ### 3. The agent trace (0:55 to 1:15)
@@ -103,21 +117,15 @@ Times are the build plan's. What appears is quoted from the app.
 
 ### 6. Cost (2:40 to 3:00)
 
-- **Open:** the trace of scene 3 again, at its totals, or a terminal with the ledger's total:
-
-  ```sh
-  cd server && BEACON_DATA_DIR=/home/user/workspace/repo/.amp/in/orb-backup/paid-data \
-    uv run python -m beacon.ember
-  ```
-
-  It prints "Live spend", asks Muse Ember nothing, needs no key and no spending setting, and writes the token trace the submission needs (`ember/trace.jsonl` in the data directory). The live spend is what this ledger holds, and is the account's spend only if Meta's Usage page shows no more.
-- **Say:** "Everything Muse Ember has done for Beacon, every call heard, notice read, story, and investigation, has cost" and then the live spend the command printed. On Nov 28, 2026, after 625 requests, it was $0.115236. "Telling this fire once, from its twelfth minute to its end, cost under two cents."
+- **Open:** the trace of scene 3 again, at its totals, or a terminal with the ledger's total: the read-only look of "Before filming", step 1, which prints the ledger's live requests and their cost and writes nothing. That total is what this ledger holds, and is the account's spend only if Meta's Usage page shows no more.
+- **Not for the video:** the token trace the submission needs is written by `python -m beacon.ember` (`ember/trace.jsonl` in the data directory). Give it only the data directory whose ledger the read-only look has just shown: in a directory with no ledger it begins an empty one.
+- **Say:** "Everything Muse Ember has done for Beacon, every call heard, notice read, story, and investigation, has cost" and then the cost the look printed. On Nov 28, 2026, after 625 requests, it was $0.115236. "Telling this fire once, from its twelfth minute to its end, cost under two cents."
 
 ## When something differs
 
 - **Ember's hearing differs from telling to telling.** Of the same synthesized words it once heard "100 block" for "400 block". If a card shows something the story does not say, that is the model's hearing, shown as such: film it, or begin the story anew.
 - **The answer is "unconfirmed".** Read the sentence the page gives with it. It can be the investigator's reading (it found no incident near, or could not tell that the tap is about one), a match that code did not bear out, or no reading at all: no answer Beacon could use, or an investigation cut short. Film it as what it says, or tap once more, and mind the taps: three taps from near the incident are a signal by themselves, and from minute 6 any tap can turn crisis mode on.
 - **Crisis mode did not come on at the second tap.** It is Ember's decision and it can decide otherwise. Each of the three times a first tap from minute 6 on was tried, it turned it on. Tap again.
-- **Crisis mode is on before the evacuation order is on the page.** The decision that is kept is that first one, and it cites no order. Begin the story anew.
+- **Crisis mode came on at a tap before scene 4's.** The decision that is kept is that first one. "What the decision rested on", in the panel, lists the signals it cited as they were then: read them there, and do not tell them from what the page showed at the time, which asks the server by itself. To film crisis mode coming on, begin the story anew.
 - **The orb was paused.** The story went on by the clock. `scripts/film where` says where it is; `scripts/film anew 0` begins it again.
 - **`scripts/film` refuses or fails.** A refusal that comes of its looks at the settings says "Nothing was stopped, moved, or started", and that is so. `anew` can also fail after them: with the server stopped, with the store moved only in part (status 3, and the sentence says so), or with the store moved and the app not built or the server not started. Before another `anew`, see what is there: `scripts/film where` says whether a server answers. A move left in part is finished by giving the same `anew` again, and until then no server starts on the data directory. After a move that finished, `scripts/film up 0` starts the server on the new story without setting anything more aside. The script never begins a ledger and never changes a spending setting.
