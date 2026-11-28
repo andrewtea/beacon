@@ -232,9 +232,12 @@ def test_a_server_on_a_real_source_does_not_start_while_its_host_is_unchecked(
 def test_the_sentences_say_what_is_taken_and_claim_nothing_of_the_host() -> None:
     # What the host keeps is not known, so nothing says it keeps nothing.
     assert "nobody has checked" in front.INVENTED
+    # The line met before the first control says the same of the host, and no more.
+    assert front.INVENTED_LINE.startswith("Nobody has checked")
+    assert "writes down of a request" in front.INVENTED_LINE
     assert "two invented places" in front.INVENTED
     assert "may keep" in front.INVENTED_MORE
     assert "holds the tap's id" in front.INVENTED_MORE
-    for said in (front.INVENTED, front.INVENTED_MORE, front.PUSH_OFF):
+    for said in (front.INVENTED_LINE, front.INVENTED, front.INVENTED_MORE, front.PUSH_OFF):
         assert "keeps nothing" not in said
         assert "no record" not in said

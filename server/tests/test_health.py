@@ -24,6 +24,7 @@ def test_health_reports_ok_and_the_package_version() -> None:
         "media_text": None,
         "repeats_text": None,
         "input": "own",
+        "front_line_text": None,
         "front_text": None,
         "front_more_text": None,
     }
@@ -43,9 +44,14 @@ def test_a_server_behind_a_front_end_nobody_checked_says_what_it_takes_and_why(
 ) -> None:
     plain = TestClient(create_app()).get("/api/health").json()
     assert (plain["input"], plain["front_text"], plain["front_more_text"]) == ("own", None, None)
+    assert plain["front_line_text"] is None
     monkeypatch.setenv("BEACON_FRONT_END", "verified")
     checked = TestClient(create_app()).get("/api/health").json()
-    assert (checked["input"], checked["front_text"]) == ("own", None)
+    assert (checked["input"], checked["front_text"], checked["front_line_text"]) == (
+        "own",
+        None,
+        None,
+    )
 
     monkeypatch.setenv("BEACON_FRONT_END", "unverified")
     health = TestClient(create_app()).get("/api/health").json()
@@ -55,6 +61,8 @@ def test_a_server_behind_a_front_end_nobody_checked_says_what_it_takes_and_why(
         front.INVENTED,
         front.INVENTED_MORE,
     )
+    # The short of it, which the app puts ahead of the controls that send.
+    assert health["front_line_text"] == front.INVENTED_LINE
 
     # Neither word, the empty one included, stops the server: a deployment's
     # default is not emptied into a server that takes everything and says nothing.

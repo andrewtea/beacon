@@ -198,6 +198,46 @@ p {
   font-size: 0.85rem;
 }
 
+/* What the "Invented scenario" tag means, in a line, above a page's first
+   control. */
+.mock-line {
+  margin: 0 0 0.25rem;
+  color: var(--invented);
+  font-size: 0.85rem;
+  text-wrap: balance;
+}
+
+/* The server's short sentence about the host in front of it, beside that line. */
+.front-line {
+  margin: 0 0 0.25rem;
+  color: var(--text-soft);
+  font-size: 0.85rem;
+  text-wrap: balance;
+}
+
+/* What is said of this server: after the What's that? button on its page, and
+   after the controls that save a place on the places' page. */
+.about-server {
+  margin: 1.25rem 0;
+}
+
+.about-server h2 {
+  margin: 0 0 0.5rem;
+  color: var(--text-soft);
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.about-server > :last-child {
+  margin-bottom: 0;
+}
+
+.about-server .front-note {
+  margin: 0;
+}
+
 .confidence {
   display: inline-flex;
   align-items: center;
@@ -1495,11 +1535,18 @@ button.quiet:hover {
   color: var(--invented);
 }
 
+/* What the number is and is not, with it and under it: smaller and quieter
+   than the label and the value, which are what an eye looks for first. */
 .scale-text {
   grid-column: 1 / -1;
-  font-size: 0.9rem;
-  color: var(--text);
+  font-size: 0.82rem;
+  color: var(--text-soft);
   text-wrap: pretty;
+}
+
+.results-view .lede {
+  font-size: 1rem;
+  color: var(--text);
 }
 
 .scale-caveats {

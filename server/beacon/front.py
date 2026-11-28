@@ -44,8 +44,16 @@ Input = Literal["own", "invented"]
 # across town from it.
 SPOTS = (Point(37.776, -122.424), Point(37.8, -122.41))
 
-# What a visitor reads before they send anything, and the rest of it, which the
-# app shows when it is asked for.
+# What a visitor reads before they send anything: the short of it, which the app
+# puts ahead of the controls that send (the button, the control that saves a
+# place), so that it is met before a first tap, whose answer is then asked for at
+# an address that holds the tap's id. Then the whole sentence, which the app has
+# on the same page after those controls, and the rest of it, which the app shows
+# when it is asked for.
+INVENTED_LINE = (
+    "Nobody has checked what the hosting service this server is reached through "
+    "writes down of a request."
+)
 INVENTED = (
     "On this server a tap is sent from one of two invented places, not from where "
     "you are, and no sound, photo, place of your own, or notification address is "

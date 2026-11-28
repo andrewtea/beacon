@@ -1,5 +1,6 @@
 import {
   type FormEvent,
+  type ReactNode,
   useEffect,
   useRef,
   useState,
@@ -330,8 +331,12 @@ function AddPlace({
 export function PlacesView({
   mode,
   input,
+  about = null,
   onOtherMode,
 }: {
+  // What is said of this server (`AboutServer` in `App`), put under the places
+  // and the control that saves one.
+  about?: ReactNode
   // What the server said it takes from a visitor, or null when that is not
   // known, and then no place is sent and the phone is not asked where it is.
   // When it is only the invented scenario's two places, a saved place that is
@@ -393,6 +398,7 @@ export function PlacesView({
           </>
         ))}
       <AddPlace mode={mode} full={places.length >= MOST_PLACES} input={input} />
+      {about}
       <Notifications mode={mode} input={input} />
     </div>
   )

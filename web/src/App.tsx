@@ -91,6 +91,7 @@ function View({
   input,
   repeatsText,
   mediaText,
+  about,
   onOtherMode,
 }: {
   route: Route
@@ -98,6 +99,10 @@ function View({
   input: Input | null
   repeatsText: string | null
   mediaText: string | null
+  // What is said of this server on the pages a person sends something from
+  // (`AboutServer`): `Home` puts it after the button and what is added to a
+  // tap, `PlacesView` after the controls that save a place.
+  about: ReactNode
   onOtherMode: () => void
 }) {
   switch (route.view) {
@@ -107,6 +112,7 @@ function View({
           mode={mode}
           input={input}
           mediaText={mediaText}
+          about={about}
           onOtherMode={onOtherMode}
         />
       )
@@ -145,7 +151,14 @@ function View({
     case 'map':
       return <MapView key={route.id} id={route.id} />
     case 'places':
-      return <PlacesView mode={mode} input={input} onOtherMode={onOtherMode} />
+      return (
+        <PlacesView
+          mode={mode}
+          input={input}
+          about={about}
+          onOtherMode={onOtherMode}
+        />
+      )
     case 'results':
       return <ResultsView />
     case 'unknown':
@@ -159,6 +172,66 @@ function View({
         </div>
       )
   }
+}
+
+/**
+ * What is said of this server on the pages a person sends something from: that
+ * its scenario is invented, with the server's sentences about telling the story
+ * again and about who does the model's work on it, and the server's sentence
+ * about what it takes of a visitor and why. Each of those sentences is whole and
+ * is on the page without a press; the rest of the last one (`frontMore`) is one
+ * press away, as it was. `Home` puts this after the What's that? button, the
+ * button's own sentence, and what is added to a tap, and ahead of the two
+ * buttons that send a tap from an invented place; `PlacesView` puts it after
+ * the places and the controls that save one. What is ahead of the button and
+ * of those controls is the short of it: the lines `App` puts above the page.
+ * That is an order, and no promise about what one screen holds.
+ */
+function AboutServer({
+  mock,
+  repeatsText,
+  tellerText,
+  frontText,
+  frontMore,
+}: {
+  mock: boolean
+  repeatsText: string | null
+  tellerText: string | null
+  frontText: string | null
+  frontMore: string | null
+}) {
+  if (!mock && frontText === null) return null
+  return (
+    <section className="about-server" aria-labelledby="about-server-heading">
+      <h2 id="about-server-heading">About this server</h2>
+      {mock && (
+        <p className="mock-banner">
+          Beacon is running on an invented scenario, not real sources. The
+          incidents, alerts, and notices it shows are made up and are not a
+          record of anything that happened.
+          {/* On a server that tells the story again, the server's sentence
+              about that: a tap sent now is gone when it does. */}
+          {repeatsText !== null && <> {repeatsText}</>}
+          {/* Where a model works on the invented story, the server's
+              sentence about that: the story is made up all the same. */}
+          {tellerText !== null && <> {tellerText}</>}
+        </p>
+      )}
+      {/* On a server behind a host nobody has checked: the server's sentence
+          about what it takes and why. */}
+      {frontText !== null && (
+        <div className="note front-note">
+          <p>{frontText}</p>
+          {frontMore !== null && (
+            <details>
+              <summary>More about this</summary>
+              <p>{frontMore}</p>
+            </details>
+          )}
+        </div>
+      )}
+    </section>
+  )
 }
 
 export default function App() {
@@ -184,6 +257,11 @@ export default function App() {
   const input: Input | null =
     said === 'own' || said === 'invented' ? said : null
   const frontText = unreachable ? null : (health.data?.front_text ?? null)
+  // The short of it, which goes ahead of the controls that send. A server that
+  // has the sentence and not its short form is shown the sentence there.
+  const frontLine = unreachable
+    ? null
+    : (health.data?.front_line_text ?? frontText)
   const frontMore = unreachable ? null : (health.data?.front_more_text ?? null)
   // A tap the server no longer answers for is deleted from this device.
   useEffect(() => sweepTaps(), [])
@@ -191,6 +269,8 @@ export default function App() {
   // The server is kept told of what this device wants of notifications, as far
   // as it has said it takes that.
   usePushSync(mode, input, askAgain)
+  // The pages a person sends something from: the button's and the places'.
+  const sends = route.view === 'home' || route.view === 'places'
 
   return (
     <div className="app">
@@ -203,35 +283,21 @@ export default function App() {
           <span className="tag stand-in">Invented scenario</span>
         )}
       </header>
-      {mode === 'mock' &&
-        (route.view === 'home' || route.view === 'places') && (
-          <p className="mock-banner">
-            Beacon is running on an invented scenario, not real sources. The
-            incidents, alerts, and notices it shows are made up and are not a
-            record of anything that happened.
-            {/* On a server that tells the story again, the server's sentence
-                about that: a tap sent now is gone when it does. */}
-            {repeatsText !== null && <> {repeatsText}</>}
-            {/* Where a model works on the invented story, the server's
-                sentence about that: the story is made up all the same. */}
-            {tellerText !== null && <> {tellerText}</>}
-          </p>
-        )}
-      {/* On a server behind a host nobody has checked: the server's sentence
-          about what it takes and why, on the pages a person sends something
-          from. */}
-      {frontText !== null &&
-        (route.view === 'home' || route.view === 'places') && (
-          <div className="note front-note">
-            <p>{frontText}</p>
-            {frontMore !== null && (
-              <details>
-                <summary>More about this</summary>
-                <p>{frontMore}</p>
-              </details>
-            )}
-          </div>
-        )}
+      {/* What the tag above means, in a line, ahead of the controls of a page
+          a person sends something from. It is about what Beacon shows of the
+          city, not about a person's own taps and saved places, which are on
+          these pages too. The rest of what is said of this server is further
+          down the same page (`AboutServer`). */}
+      {mode === 'mock' && sends && (
+        <p className="mock-line">
+          The incidents, alerts, and notices here are made up.
+        </p>
+      )}
+      {/* On a server behind a host nobody has checked: the server's short
+          sentence about that, ahead of the controls that send. A first tap's
+          answer is asked for at an address that holds the tap's id, so this is
+          met before the button and not only after it. */}
+      {frontLine !== null && sends && <p className="front-line">{frontLine}</p>}
       {unreachable && (
         <p className="note problem" role="status">
           {health.error?.message}
@@ -244,6 +310,17 @@ export default function App() {
           input={input}
           repeatsText={repeatsText}
           mediaText={mediaText}
+          about={
+            sends ? (
+              <AboutServer
+                mock={mode === 'mock'}
+                repeatsText={repeatsText}
+                tellerText={tellerText}
+                frontText={frontText}
+                frontMore={frontMore}
+              />
+            ) : null
+          }
           onOtherMode={askAgain}
         />
       </main>

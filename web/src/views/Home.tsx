@@ -1,4 +1,10 @@
-import { useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
+import {
+  type ReactNode,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react'
 import { ApiError, OTHER_MODE } from '../api/http.ts'
 import type { Input } from '../api/health.ts'
 import type { Mode } from '../api/incidents.ts'
@@ -86,8 +92,12 @@ export function Home({
   mode,
   input,
   mediaText = null,
+  about = null,
   onOtherMode,
 }: {
+  // What is said of this server (`AboutServer` in `App`), put under the button
+  // and what is added to a tap, so that the button comes first.
+  about?: ReactNode
   // Where a clip or a photo added to a tap can be sent to Meta for a model to
   // say what is in it: the server's sentence about that, shown beside the
   // controls that add one, before one is added.
@@ -337,6 +347,8 @@ export function Home({
           </p>
         </>
       )}
+
+      {about}
 
       {mode === 'mock' && (
         <section className="panel mock-spots" aria-labelledby="spots-heading">
