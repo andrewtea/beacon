@@ -36,7 +36,8 @@ export type Health = {
   // pages a person sends from. Null on every other server.
   front_line_text: string | null
   // On such a server: the server's sentence that says what it takes and why,
-  // shown on the same pages, after those controls. Null on every other server.
+  // shown further down the same pages (`AboutServer`). Null on every other
+  // server.
   front_text: string | null
   // The rest of that, shown when it is asked for. Null whenever that one is.
   front_more_text: string | null

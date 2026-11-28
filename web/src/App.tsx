@@ -100,7 +100,8 @@ function View({
   repeatsText: string | null
   mediaText: string | null
   // What is said of this server on the pages a person sends something from
-  // (`AboutServer`), which each of those pages puts after its controls that send.
+  // (`AboutServer`): `Home` puts it after the button and what is added to a
+  // tap, `PlacesView` after the controls that save a place.
   about: ReactNode
   onOtherMode: () => void
 }) {
@@ -179,12 +180,12 @@ function View({
  * again and about who does the model's work on it, and the server's sentence
  * about what it takes of a visitor and why. Each of those sentences is whole and
  * is on the page without a press; the rest of the last one (`frontMore`) is one
- * press away, as it was. A page puts this after its controls that send
- * something (the button and what is added to a tap; the places and the control
- * that saves one), so that those come before it in the page's order. What is
- * ahead of those controls is the short of it: the lines `App` puts above the
- * page, and the button's own sentence. That is an order, and no promise about
- * what one screen holds.
+ * press away, as it was. `Home` puts this after the What's that? button, the
+ * button's own sentence, and what is added to a tap, and ahead of the two
+ * buttons that send a tap from an invented place; `PlacesView` puts it after
+ * the places and the controls that save one. What is ahead of the button and
+ * of those controls is the short of it: the lines `App` puts above the page.
+ * That is an order, and no promise about what one screen holds.
  */
 function AboutServer({
   mock,
@@ -285,8 +286,8 @@ export default function App() {
       {/* What the tag above means, in a line, ahead of the controls of a page
           a person sends something from. It is about what Beacon shows of the
           city, not about a person's own taps and saved places, which are on
-          these pages too. The rest of what is said of this server is on the
-          same page, after those controls (`AboutServer`). */}
+          these pages too. The rest of what is said of this server is further
+          down the same page (`AboutServer`). */}
       {mode === 'mock' && sends && (
         <p className="mock-line">
           The incidents, alerts, and notices here are made up.

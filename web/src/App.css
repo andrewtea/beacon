@@ -215,8 +215,8 @@ p {
   text-wrap: balance;
 }
 
-/* What is said of this server, after the controls that send something on a
-   page a person sends from. */
+/* What is said of this server: after the What's that? button on its page, and
+   after the controls that save a place on the places' page. */
 .about-server {
   margin: 1.25rem 0;
 }
