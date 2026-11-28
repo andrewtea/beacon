@@ -230,8 +230,9 @@ class Ledger:
                 self._opened = _generation(db)
                 self._identity = _identity(db_path)
             return
-        # Which file it is, from its name, before anything is opened: every
-        # connection is then to that file or to none (`_connect_existing`).
+        # What the file has to be seen to have, from its name, before anything is
+        # opened: every connection is then refused on an observed mismatch in
+        # generation, device, or inode (`_connect_existing`).
         named = FILE_NAME.fullmatch(only) is not None
         generation, _, where = only.partition(":")
         device, _, inode = where.partition(":")

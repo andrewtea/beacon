@@ -166,12 +166,15 @@ def check(env: Mapping[str, str], make: PaidClient | None = None) -> None:
 
 
 def pinned_ledger(env: Mapping[str, str]) -> str | None:
-    """The ledger file `BEACON_MOCK_EMBER_LEDGER` names, seen to be the one under
-    the data directory, or None when the setting is not there. The ledger is read
-    through a connection that cannot write, and nothing is made.
+    """The ledger file `BEACON_MOCK_EMBER_LEDGER` names, when the ledger under the
+    data directory is seen to have that generation, device, and inode, or None
+    when the setting is not there. The ledger is read through a connection that
+    cannot write, and nothing is made. A match is what was observed, and no proof
+    of which file was paid from (`beacon.ember.ledger`).
 
     Raises TellingConfigError when the setting is no ledger file's name, and when
-    the ledger that is there is another file or no ledger is there;
+    a mismatch is seen: the ledger that is there has another generation, device,
+    or inode, or no ledger is there;
     EmberConfigError for a relative `BEACON_DATA_DIR`."""
     if LEDGER_VARIABLE not in env:
         return None
@@ -234,8 +237,8 @@ def preflight(env: Mapping[str, str]) -> str | None:
             f"{MOCK_EMBER_VARIABLE}=live needs {SPENT_BEFORE_VARIABLE}: what Meta's Usage "
             "page showed as spent before the ledger began. It has no default."
         )
-    # A ledger that is named already is that one, or this is refused: never
-    # replaced by the one that happens to be there.
+    # A ledger that is named already is seen to match what is there, or this is
+    # refused: the name is never replaced by the one that happens to be there.
     named = pinned_ledger(env)
     if named is not None:
         return named
@@ -249,7 +252,8 @@ def paying(env: Mapping[str, str], label: str, make: PaidClient | None = None) -
     """A live Ember client that pays under the scope `label`, one of `SCOPES`.
 
     **A client that goes on with a named ledger begins none.** With
-    `BEACON_MOCK_EMBER_LEDGER` set, the client is made on that file or not at all
+    `BEACON_MOCK_EMBER_LEDGER` set, the client refuses an observed mismatch in
+    generation, device, or inode, and never begins a ledger
     (`EmberClient.from_env(only_ledger=...)`): the look `check` takes and the making
     of the client are two moments, and a ledger that went in between is not begun
     anew by the client, which would leave a new, empty ledger where the next look

@@ -36,9 +36,13 @@
 #                                  This script never reads, passes on, or prints it.
 # And with `live` the data directory has to hold a ledger that was begun
 # (ember/ledger.sqlite3): one begun anew would count none of what was spent. The
-# ledger file that is there when the script looks is named to the server, which
-# pays from that file or not at all, at every start (BEACON_MOCK_EMBER_LEDGER).
-# When this shell names one already, it has to be the one that is there.
+# ledger file that is there when the script looks is named to the server, by its
+# generation, device, and inode (BEACON_MOCK_EMBER_LEDGER): at every start the
+# server's clients refuse an observed mismatch in any of the three, and never
+# begin a ledger. That is no proof of which file was paid from: README "Showing
+# the story" says what it cannot tell, and a ledger is restored only with every
+# process that spends stopped and Meta's Usage page compared. When this shell
+# names one already, the script refuses one that does not match what is there.
 #   EMBER_STOP_USD                 when set, the stop the server keeps.
 #   FILM_PORT                      the port, 8010 unless set (1024 to 65535).
 #
@@ -106,7 +110,8 @@ serve() {
     [ -n "$ledger" ] || refuse "The filming server was not started: it was given no ledger file to pay from."
     export EMBER_SPENT_BEFORE_USD="$spent"
     [ -z "$stop" ] || export EMBER_STOP_USD="$stop"
-    # The server pays from the ledger that was looked at, or not at all.
+    # The server's clients refuse a ledger whose generation, device, or inode is
+    # seen to differ from the one that was looked at, and never begin a ledger.
     export REPLAY=0 BEACON_MOCK_EMBER=live BEACON_MOCK_EMBER_BUDGET_USD="$budget" BEACON_MOCK_EMBER_LEDGER="$ledger"
   else
     unset BEACON_MOCK_EMBER_LEDGER

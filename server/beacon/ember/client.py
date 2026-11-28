@@ -381,8 +381,9 @@ class EmberClient:
 
         `only_ledger` is for work that goes on paying from the ledger that was paid
         from before: the name of that ledger's file, as `ledger_file` gives it. The
-        client is then made only on that file, and begins no ledger, then or later
-        (`Ledger`).
+        client then refuses an observed mismatch in generation, device, or inode,
+        when it is made and each time it opens the ledger, and never begins a
+        ledger (`Ledger`, which says what that comparison does not show).
 
         `env` is where `REPLAY`, `MODEL_API_KEY`, and `BEACON_DATA_DIR` are read, by
         default the process's environment. The two spending settings are always read

@@ -11,9 +11,9 @@ class EmberConfigError(EmberError):
 
 class OtherLedgerError(EmberConfigError):
     """A client was to go on with the ledger file that was named to it, and what is
-    at the ledger's path is not that file: another ledger, a copy, something that
-    is no ledger, or nothing. No file was made and nothing was written. The text is
-    fixed."""
+    at the ledger's path was seen not to match it in generation, device, or inode:
+    another ledger, a copy on another inode, something that is no ledger, or
+    nothing. No file was made and nothing was written. The text is fixed."""
 
 
 class EmberRequestError(EmberError, ValueError):
