@@ -66,6 +66,7 @@ Everything in this repository, from its first commit on Nov 26, 2026, through re
 - [`docs/run-sheet.md`](docs/run-sheet.md): the demo video, scene by scene, with what is and is not shown.
 - [The app](#the-app), [the investigator](#the-investigator), [incidents](#incidents), and [the scale run](#scale-run), below.
 - [What Muse Ember has been asked](#what-muse-ember-has-been-asked): each request shape, what came back, and what the first answers showed to be wrong.
+- [`docs/DECISIONS.md`](docs/DECISIONS.md): the design decisions phase by phase, with what each rejected and what it costs, and the decisions that are still open.
 - [AGENTS.md](AGENTS.md): the rules the code keeps.
 
 The rest of this page is the working description of the repository.
