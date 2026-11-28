@@ -85,7 +85,7 @@ from typing import Literal
 
 from beacon.errors import raise_bare
 from beacon.evidence import Point
-from beacon.files import Mode, begin_file
+from beacon.files import Mode, begin_file, change_as_it_is
 
 # How long a subscription is kept after it was last renewed. The app renews it
 # when it is opened with notifications on, and when a place is saved or removed.
@@ -161,6 +161,16 @@ _EXPIRE = (
     _SCHEMA[0],
     _SCHEMA[1],
 )
+# Every shape this Beacon takes a subscriptions file in, the tables one has in any
+# of them, and the one no other of Beacon's files has: how a file is told from
+# another kind's without opening it for use.
+SHAPES = frozenset({_FORMAT, _WORDS_KEPT, *_EARLIER})
+TABLES = frozenset({"subscription", "sent", "permit", "meta"})
+OWN_TABLE = "subscription"
+# The shapes in which what was sent is forgotten as the file is (`forget_sent`).
+# A mock file of an earlier shape has what was sent deleted, with its
+# subscriptions, by whatever opens it next (`_EXPIRE`).
+FORGET_SHAPES = frozenset({_FORMAT})
 _UNKNOWN_SHAPE = (
     "The push subscriptions file is in a shape this Beacon does not know: a newer "
     "one wrote it. It is left as it is. Run a Beacon that knows the shape."
@@ -475,3 +485,30 @@ def _sweep(db: sqlite3.Connection, now: datetime) -> int:
 def _withdraw(db: sqlite3.Connection, permits: Collection[str]) -> None:
     for permit in dict.fromkeys(permits):
         db.execute("DELETE FROM permit WHERE id = ?", (permit,))
+
+
+def forget_sent(path: Path, mode: Mode) -> int | None:
+    """Delete what the subscriptions file at `path` keeps of every push that was
+    sent or tried, and nothing else: the subscriptions, their places, and the
+    permits stay. Returns how many rows went, or None, with nothing written, when
+    the file is not `mode`'s subscriptions in a shape of `FORGET_SHAPES`.
+
+    For when the invented story is begun anew (`beacon.serve.set_aside`): what
+    was sent is kept under an incident's id, and a story begun anew can give an
+    incident the id one had in the last telling, of which a device would then not
+    be notified. Sooner than `SENT_KEPT`, which is the most a row is kept.
+
+    **The file is changed as it is** (`beacon.files.change_as_it_is`), by whoever
+    holds the data directory's stores alone: it is not opened as `Subscriptions`
+    opens it, which makes a file this shape and, for a mock file of an earlier
+    one, deletes its subscriptions.
+
+    Raises sqlite3.Error when the file is not there or cannot be written to."""
+    return change_as_it_is(
+        path,
+        mode,
+        shapes=FORGET_SHAPES,
+        tables=TABLES,
+        own=OWN_TABLE,
+        statements=(("DELETE FROM sent", ()),),
+    )

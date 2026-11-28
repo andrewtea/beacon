@@ -33,6 +33,7 @@ from beacon.ember.errors import (
     EmberRequestError,
     InputTooLargeError,
     LedgerReplacedError,
+    OtherLedgerError,
     RateLimitHoldError,
     ReplayMissError,
 )
@@ -55,6 +56,7 @@ __all__ = [
     "InputTooLargeError",
     "LedgerCall",
     "LedgerReplacedError",
+    "OtherLedgerError",
     "Pacer",
     "RateLimitHoldError",
     "ReplayMissError",

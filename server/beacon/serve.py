@@ -52,6 +52,25 @@ server starts it again.
 
 It is for the invented scenario only: with `BEACON_LIVE_SOURCES` naming a source,
 or with the pollers off, `BEACON_MOCK_REPEAT=1` is refused.
+
+**`--set-aside` is how a story is begun anew by hand**, which is what somebody who
+shows the invented story to others needs, and the one way a telling Muse Ember was
+paid for makes room for another:
+
+    python -m beacon.serve --set-aside
+
+It moves the mock store's files (`MOCK_FILES`), whole, into a directory of their
+own under `told/` in the data directory, and ends: **it serves nothing**. Nothing
+is deleted, so the claims on what was paid for are kept, where they were made.
+The server that is started next finds no mock store and begins the story, at the
+minute `BEACON_MOCK_STORY_MINUTE` names. It is a command of its own, and no
+setting of the server's, because whatever keeps a server running starts it again,
+and a server that began the story anew each time it was started would have Muse
+Ember paid for a new telling at every restart. It runs under the same lock and
+the same looks at each file as `begin_again`, and refuses while a server has the
+stores. A telling begun after it is paid for like the first: what holds the cost
+of every telling together is the budget of each of the telling's scopes, which is
+over every telling in the one ledger.
 """
 
 import argparse
@@ -65,14 +84,21 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import closing, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, NoReturn, Protocol
 
 import uvicorn
 from fastapi import FastAPI
 
 from beacon import files
-from beacon.datadir import DataLock, DataLockedError
+from beacon.datadir import (
+    ASIDE,
+    ASIDE_NAME,
+    PENDING,
+    DataLock,
+    DataLockedError,
+    aside_pending,
+)
 from beacon.ember.client import default_data_dir
 from beacon.ember.errors import EmberConfigError
 from beacon.errors import raise_bare
@@ -82,11 +108,13 @@ from beacon.ingest.setup import (
     _AFTER_THE_STORY,
     _SCENARIO_STATE,
     MOCK_HEAD_START,
+    STORY_MINUTE_VARIABLE,
     IngestConfigError,
     live_sources,
     whose,
 )
 from beacon.investigate import store as investigations
+from beacon.push import store as push_store
 from beacon.scenario import DURATION
 from beacon.story import store as stories
 from beacon.taps.media import MediaLockedError, TapMedia
@@ -168,9 +196,7 @@ REPEATS_MEDIA = (
 _BESIDE = ("-wal", "-shm", "-journal")
 # The tables SQLite makes in a database by itself: the counter of rows' ids, and
 # what `ANALYZE` keeps for its planner. They are in a file of any kind.
-_SQLITES_OWN = frozenset(
-    {"sqlite_sequence", "sqlite_stat1", "sqlite_stat2", "sqlite_stat3", "sqlite_stat4"}
-)
+_SQLITES_OWN = files.SQLITES_OWN
 # How long SQLite is waited for when a file's log is emptied before it is deleted.
 _WAIT_SECONDS = 5.0
 
@@ -200,6 +226,13 @@ def repeats(env: Mapping[str, str]) -> bool:
         )
     if env.get(INGEST_VARIABLE, "1") != "1":
         raise ServeError(f"{REPEAT_VARIABLE}=1 needs the pollers, which play the story.")
+    if STORY_MINUTE_VARIABLE in env:
+        # What such a server says of itself (`REPEATS`) names how often the story
+        # begins, which is worked out from the twenty minutes.
+        raise ServeError(
+            f"{REPEAT_VARIABLE}=1 begins every telling twenty minutes into the story: "
+            f"{STORY_MINUTE_VARIABLE} is not set beside it."
+        )
     if teller_of(env) == "ember":
         # Every telling by Muse Ember is paid for, and what is deleted between two
         # tellings would be the claims on what was paid for.
@@ -229,7 +262,12 @@ def over_at(start: datetime) -> datetime:
 class NotTheMockStoresError(Exception):
     """What is where one of the mock store's files is kept was not seen to be
     that file: a link, another kind of store, a live store's, one a newer Beacon
-    wrote, or one that could not be read. The text is fixed."""
+    wrote, or one that could not be read. The text is fixed, and names only the
+    directory of that kind of store (`directory`)."""
+
+    def __init__(self, directory: str) -> None:
+        super().__init__(_NOT_THE_FILE.format(directory))
+        self.directory = directory
 
 
 _NOT_THE_FILE = (
@@ -308,8 +346,494 @@ def begin_again(env: Mapping[str, str], now: datetime, lock: DataLock) -> bool:
         held.close()
 
 
-def _own(data: Path, directory: str, name: str) -> Path | None:
+_NOT_SET_ASIDE = (
+    "What is kept as the mock store's under {}/ could not be seen to be that store's "
+    "own file: it is a link, it could not be read, or it does not say it is the mock "
+    "store's, in a shape and with the tables this Beacon knows. Nothing was moved. "
+    "Find out what is there."
+)
+_ASIDE_OPEN = (
+    "The mock store's files were not set aside: one of them is open somewhere, or "
+    "its log could not be emptied. Nothing was moved. Stop whatever has the data "
+    "directory's stores, and give the command again."
+)
+_ASIDE_NOWHERE = (
+    f"The mock store's files were not set aside: {ASIDE}/ under the data directory "
+    "is not a directory of its own that a new one can be made in and written to. "
+    "Nothing was moved."
+)
+_ASIDE_PARTLY = (
+    "The mock store's files were set aside only in part: a file could not be moved, "
+    "or the notifications that were sent about its incidents could not be forgotten. "
+    f"Each file of the store is where it was, under {ASIDE}/{{}}/ in the data "
+    "directory, or both. Nothing was deleted. No server of this Beacon, and nothing "
+    "else of it that opens a store, starts on this data directory until the move is "
+    "finished; do not run an older Beacon on it either, which does not know of the "
+    "move. Find out what stopped it, and give the command again: it goes on into "
+    "the same place."
+)
+_ASIDE_NOTE = (
+    f"A move of the mock store's files under {ASIDE}/ was begun and not finished, "
+    "and the note of where it was going does not name a directory this command "
+    "made there. Nothing was moved now, and nothing was deleted. No server, and "
+    "nothing else that opens a store, starts on this data directory until somebody "
+    f"has looked at what is under {ASIDE}/ and what is left under evidence/, story/, "
+    "and investigate/."
+)
+
+
+_ASIDE_EARLIER = (
+    "The investigations kept under investigate/ are in a shape an earlier Beacon "
+    "wrote, or the file was never written to. Where a store is set aside, its "
+    "investigations are deleted when their day is over only from a file in a shape "
+    "this Beacon deletes from as it is. Nothing was moved. Start a server on this "
+    "data directory once and stop it, which makes the file this shape, and give the "
+    "command again."
+)
+_ASIDE_UNCONFIRMED = (
+    "The move is finished, and the note of it was taken away. The disk did not "
+    "confirm that it kept that last step. Whatever opens a store on this data "
+    "directory next asks the disk again before it does, and does not start until "
+    "the disk has kept it. If the machine stops before then, the note can be there "
+    "again when it starts, with no store begun beside it, and this command, given "
+    "again, takes it away."
+)
+
+
+@dataclass(frozen=True)
+class SetAside:
+    """Where a mock store's files went, relative to the data directory."""
+
+    where: PurePath
+    # False when every file went and the note was taken away, and the disk then
+    # did not confirm that it kept the note's going. Nothing opens a store until
+    # it has (`beacon.datadir.aside_kept`, asked by whoever takes the lock).
+    confirmed: bool = True
+
+    def __str__(self) -> str:
+        return str(self.where)
+
+
+class PartlyAsideError(ServeError):
+    """A mock store's files were set aside only in part. The note of the move is
+    left (`beacon.datadir.PENDING`), so nothing opens a store until the command
+    is given again and finishes. The text is fixed."""
+
+
+def set_aside(env: Mapping[str, str], now: datetime, lock: DataLock) -> SetAside | None:
+    """Move the mock store's files out of the way, into a directory of their own
+    under `told/` in the data directory, so that the server that starts next
+    begins the story anew. Answers where they went, relative to the data
+    directory, and whether the disk confirmed the last step, or None, with nothing
+    changed, when there is no mock store.
+
+    **Nothing of the store is deleted**, a store Muse Ember worked on included:
+    its files hold the claims on what was paid for, and are kept as they are. The
+    story that begins next is another telling, with claims of its own, and is paid
+    for like the first. The investigations among them are deleted when their day
+    is over, where they now are, as they would have been where they were
+    (`beacon.investigate.aside`).
+
+    **Every file is given its name under `told/` before one is taken from where
+    it was.** A file is moved in two steps: a second name for it is made under
+    `told/` (a hard link), for every file, and only then are the names they had
+    removed, the evidence store's first. So from the moment a file is gone from
+    its place, every file of the store is under `told/`, whatever stops the move
+    and whatever runs next: a Beacon from before this command, which knows
+    nothing of the note below, can then remove a name and not the file, and its
+    own look at a file with two names refuses it (`_own`).
+
+    **A move that stops part of the way is finished before anything else runs.**
+    Where the files go is written down (`PENDING`) before the first name is made
+    and the note is taken away after the last step. While it is there `DataLock`
+    is refused to every server and command of this Beacon but this one, which
+    then goes on into the same place. Otherwise a server could begin a new story
+    beside the last one's stories and investigations.
+
+    **What was sent to devices about the last telling's incidents is forgotten**
+    (`beacon.push.store.forget_sent`), after the last file is moved and before
+    the note is taken away, and so never for a store that stays where it is; when
+    it cannot be, the move is unfinished like any other: a story begun anew can
+    give an incident the id one had before, and a device would then not be
+    notified of it. The subscriptions, their places, and the keys stay. The
+    subscriptions file is looked at, through a connection that cannot write,
+    before anything is moved, and is changed as it is: no table is made in it and
+    nothing of an earlier shape is dropped.
+
+    `lock` is the data directory's, held alone by the caller, who has no store
+    open. Every file that is there is looked at as `begin_again` looks, and every
+    log is emptied, before one is moved.
+
+    Raises ServeError, with nothing moved, for a file that was not seen to be the
+    mock store's own of its kind, for investigations in a shape that is not swept
+    as it is (`investigations.SWEPT_SHAPES`: what is set aside is still deleted
+    when its day is over, and only from such a file), for a file something has
+    open, when something has the taps' media, and when there is nowhere to move
+    them to; PartlyAsideError
+    when the move was begun and is not finished; and EmberConfigError for a
+    relative `BEACON_DATA_DIR`."""
+    data = default_data_dir(env)
+    if not (lock.held and lock.exclusive and lock.data == data):
+        raise ValueError("A store is set aside only by who holds the stores alone.")
+    # A move that was begun and not finished goes on into the place it was going to.
+    began = _move_begun(data)
+
+    def refusal(nothing_moved: str) -> ServeError:
+        """What is raised when the move cannot go on: of one that had begun, that
+        it is unfinished, whatever stopped it this time."""
+        if began is None:
+            return ServeError(nothing_moved)
+        return PartlyAsideError(_ASIDE_PARTLY.format(began.name))
+
+    there: list[Path] = []
+    forgets = earlier = False
+    refused: str | None = None
+    try:
+        for directory, name in MOCK_FILES:
+            # In a move that had begun, a file can have its second name already.
+            path = _own(data, directory, name, also=None if began is None else began / directory)
+            if path is not None:
+                _mock_stores(path)
+                there.append(path)
+                if directory == _INVESTIGATIONS and not _swept_as_it_is(path):
+                    earlier = True
+        forgets = _sent_kept(data)
+    except NotTheMockStoresError as error:
+        refused = error.directory
+    if refused is not None:
+        raise refusal(_NOT_SET_ASIDE.format(refused))
+    if earlier:
+        raise refusal(_ASIDE_EARLIER)
+    if not there and began is None:
+        return None
+    busy = False
+    try:
+        # The lock of whoever sweeps the taps' media (`python -m beacon.taps`).
+        held = TapMedia(data / "taps", "mock")
+    except MediaLockedError:
+        busy = True
+    if busy:
+        raise refusal(_ASIDE_OPEN)
+    try:
+        try:
+            # Every log is emptied before any file goes: one that is busy stops it all.
+            for path in there:
+                _settle(path)
+        except (StillOpenError, sqlite3.Error):
+            busy = True
+        if busy:
+            raise refusal(_ASIDE_OPEN)
+        aside = _a_place_aside(data, now) if began is None else began
+        if aside is None:
+            raise ServeError(_ASIDE_NOWHERE)
+        gone = 0
+        finished = False
+        try:
+            # The evidence store first: it is what says there is a story.
+            kinds = [(data / directory / name, aside / directory) for directory, name in MOCK_FILES]
+            kinds.reverse()
+            named: list[Path] = []
+            for path, to in kinds:
+                # Every kind, the ones with no file too: what SQLite kept beside a
+                # file that went in an earlier try goes after it.
+                for each in (path, *(path.with_name(path.name + suffix) for suffix in _BESIDE)):
+                    found = _seen(each)
+                    if found is None:
+                        continue
+                    _a_directory(to)
+                    there_already = _seen(to / each.name)
+                    if there_already is None:
+                        os.link(each, to / each.name, follow_symlinks=False)
+                    elif not os.path.samestat(found, there_already):
+                        # Never over a file that was moved before.
+                        raise FileExistsError
+                    named.append(each)
+            # Kept, by the disk too, before a name is taken away: each new name,
+            # and every directory above it up to the data directory, whose own
+            # listing is what holds `told/`.
+            for _, to in kinds:
+                if _seen(to) is not None:
+                    _kept(to)
+            _kept(aside)
+            _kept(data / ASIDE)
+            _kept(data)
+            for each in named:
+                os.unlink(each)
+                gone += 1
+            for path, _ in kinds:
+                if _seen(path.parent) is not None:
+                    _kept(path.parent)
+            # After the last file and before the note goes: what was sent is
+            # forgotten only for a store that was set aside, and a store is not
+            # set aside until it is.
+            if forgets and push_store.forget_sent(data / _PUSH[0] / _PUSH[1], "mock") is None:
+                raise _NotForgottenError
+            # The last thing: from here on a server starts again.
+            os.unlink(data / ASIDE / PENDING)
+            finished = True
+            _kept(data / ASIDE)
+        except (OSError, sqlite3.Error, _NotForgottenError):
+            busy = True
+        if finished:
+            # The note is gone. All that can have failed is the disk's word that
+            # it kept the note's going, which is not an unfinished move and is not
+            # said to be one. Whoever takes the stores' lock next asks the disk
+            # again and opens no store until it has that word (`DataLock`): a
+            # store begun without it could be found beside the note, come back,
+            # and this command could then not finish the move.
+            return SetAside(PurePath(ASIDE) / aside.name, confirmed=not busy)
+        if busy and began is None and gone == 0 and _unbegin(data, aside):
+            # Not one file went, and nothing is left of the try.
+            raise ServeError(_ASIDE_NOWHERE)
+        if busy:
+            # Outside the handler, so that nothing of a path is under the error.
+            raise PartlyAsideError(_ASIDE_PARTLY.format(aside.name))
+        raise AssertionError("A move ends finished, unbegun, or unfinished.")
+    finally:
+        held.close()
+
+
+_INVESTIGATIONS = "investigate"
+
+
+def _swept_as_it_is(path: Path) -> bool:
+    """Whether an investigations file `_mock_stores` passed is in a shape that
+    `beacon.investigate.aside` deletes from as it is. A file of an earlier shape,
+    and one nothing was written to, is not: set aside, what it holds would outlast
+    its day."""
+    said = None
+    with suppress(sqlite3.Error):
+        said = files.look(path)
+    return said is not None and said.shape in investigations.SWEPT_SHAPES
+
+
+class _NotForgottenError(Exception):
+    """The subscriptions file was not what it was seen to be before the move."""
+
+
+# The mock store's subscriptions file: not moved, and not one of `MOCK_FILES`.
+_PUSH = ("push", "mock.sqlite3")
+
+
+def _seen(path: Path) -> os.stat_result | None:
+    """What is at the path, itself and no link's end, or None when nothing is.
+
+    Raises OSError when it could not be looked at, which is not the same: a file
+    that could not be seen is not taken to be gone."""
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+
+
+def _a_directory(path: Path) -> None:
+    """Make the directory, or see that what is there is a directory of its own.
+
+    Raises OSError when it is not: a link there could be to anywhere."""
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            raise NotADirectoryError from None
+
+
+def _kept(directory: Path) -> None:
+    """Have the disk keep what the directory lists, so that a name made or
+    removed in it is not lost when the machine stops.
+
+    Raises OSError when it could not."""
+    listing = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(listing)
+    finally:
+        os.close(listing)
+
+
+def _unbegin(data: Path, aside: Path) -> bool:
+    """Take away what is left of a move of which no file went: the second names
+    it made, the directories, and the note. Says whether nothing of it is left.
+
+    A name under `aside` is removed only when the file still has the name it had,
+    seen to be the same file: never the only name of a file."""
+    try:
+        for directory, name in MOCK_FILES:
+            made = aside / directory
+            if _seen(made) is None:
+                continue
+            path = data / directory / name
+            for each in (path, *(path.with_name(name + suffix) for suffix in _BESIDE)):
+                second = _seen(made / each.name)
+                if second is None:
+                    continue
+                first = _seen(each)
+                if first is None or not os.path.samestat(first, second):
+                    return False
+                os.unlink(made / each.name)
+            made.rmdir()
+        os.unlink(aside.parent / PENDING)
+        aside.rmdir()
+    except OSError:
+        return False
+    return True
+
+
+def _sent_kept(data: Path) -> bool:
+    """Look at the mock store's subscriptions file, through a connection that
+    cannot write, and say whether it keeps what was sent in a way that is
+    forgotten when a store is set aside (`push_store.FORGET_SHAPES`).
+
+    False when there is no file, for one nothing was ever written to, and for one
+    of an earlier shape: whatever opens such a file next deletes what was sent
+    with its subscriptions, so there is nothing to forget here.
+
+    Raises NotTheMockStoresError when what is there is a link, could not be read,
+    or is not the mock store's subscriptions in a shape this Beacon knows:
+    nothing is moved beside a file that was not seen to be that."""
+    path = _own(data, *_PUSH)
+    if path is None:
+        return False
+    said = None
+    with suppress(sqlite3.Error):
+        said = files.look(path)
+    if said is not None:
+        if said.objects == 0 and said.shape == 0:
+            return False
+        if (
+            said.mode == "mock"
+            and said.shape in push_store.SHAPES
+            and push_store.OWN_TABLE in said.tables
+            and said.tables - files.SQLITES_OWN <= push_store.TABLES
+        ):
+            return said.shape in push_store.FORGET_SHAPES
+    raise_bare(NotTheMockStoresError(_PUSH[0]))
+
+
+# The most a note of a move holds: the name of a directory under `told/`.
+_NOTE_BYTES = 32
+
+
+def _move_begun(data: Path) -> Path | None:
+    """The directory an unfinished move was going into, or None when no move is
+    unfinished.
+
+    Raises PartlyAsideError when there is a note and it does not name a directory
+    this command made under `told/`: nothing is moved on the word of such a note,
+    and nothing else runs until somebody has looked. The note has to be a short
+    file of its own, and `told/` and the directory it names directories of their
+    own: no link is followed to any of them."""
+    if not aside_pending(data):
+        return None
+    name: str | None = None
+    with suppress(OSError, UnicodeDecodeError):
+        root = data / ASIDE
+        if stat.S_ISDIR(os.lstat(root).st_mode):
+            # Not waited for: a pipe of the name would never answer.
+            note = os.open(root / PENDING, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                found = os.fstat(note)
+                if (
+                    stat.S_ISREG(found.st_mode)
+                    and found.st_nlink == 1
+                    and found.st_size <= _NOTE_BYTES
+                ):
+                    said = os.read(note, _NOTE_BYTES + 1).decode("ascii")
+                    if ASIDE_NAME.fullmatch(said) and stat.S_ISDIR(os.lstat(root / said).st_mode):
+                        name = said
+            finally:
+                os.close(note)
+    if name is None:
+        raise PartlyAsideError(_ASIDE_NOTE)
+    return data / ASIDE / name
+
+
+def _a_place_aside(data: Path, now: datetime) -> Path | None:
+    """A new directory under `told/` for the files of one mock store, named for
+    the moment, with the note that a move into it has begun (`PENDING`), or None,
+    with neither left behind, when they could not be made: `told/` has to be a
+    directory of its own and no link, which could be to anywhere.
+
+    The note is written whole under another name and then given its own, so a
+    note is the name of the directory or is not there, whenever this is stopped;
+    and the disk has both the directory and the note before this answers."""
+    root = data / ASIDE
+    part = root / (PENDING + ".part")
+    made: Path | None = None
+    try:
+        _a_directory(root)
+        stem = now.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+        for name in (stem, *(f"{stem}-{count}" for count in range(2, 100))):
+            try:
+                (root / name).mkdir(mode=0o700)
+            except FileExistsError:
+                continue
+            made = root / name
+            break
+        if made is not None:
+            # What an earlier try that was stopped here left: never a note.
+            with suppress(FileNotFoundError):
+                os.unlink(part)
+            note = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                name = made.name.encode("ascii")
+                if os.write(note, name) != len(name):
+                    # A part of a name is no note, and is not given the note's name.
+                    raise OSError
+                os.fsync(note)
+            finally:
+                os.close(note)
+            # No note is there to be written over: a move that had begun is gone
+            # on with, and never begun again.
+            os.replace(part, root / PENDING)
+            # `told/` itself is an entry of the data directory's.
+            _kept(root)
+            _kept(data)
+            return made
+    except OSError:
+        pass
+    if made is not None:
+        # Nothing was moved: no note is left of a move that did not begin.
+        for left in (part, root / PENDING):
+            with suppress(OSError):
+                os.unlink(left)
+        with suppress(OSError):
+            made.rmdir()
+    return None
+
+
+def aside(env: Mapping[str, str], clock: Callable[[], datetime] | None = None) -> str:
+    """`python -m beacon.serve --set-aside`: set the mock store's files aside, and
+    say in a sentence what was done. It serves nothing.
+
+    Raises ServeError as `set_aside` does and for a server on real sources, which
+    has no story, DataLockedError when a server or another command has the data
+    directory's stores, and IngestConfigError as `live_sources` does."""
+    if live_sources(env):
+        raise ServeError(
+            "--set-aside is for the invented scenario: with a real source named, "
+            "there is no story to begin anew, and nothing is moved."
+        )
+    # The one command that runs while a move is unfinished: it finishes it.
+    lock = DataLock(default_data_dir(env), shared=False, finishing=True)
+    try:
+        went = set_aside(env, (datetime.now(UTC) if clock is None else clock()), lock)
+    finally:
+        lock.close()
+    if went is None:
+        return "There is no mock store under the data directory: nothing was moved."
+    moved = (
+        f"The mock store's files were moved to {went}/ under the data directory, as "
+        "they were. The server that is started next begins the invented story anew."
+    )
+    return moved if went.confirmed else f"{moved} {_ASIDE_UNCONFIRMED}"
+
+
+def _own(data: Path, directory: str, name: str, *, also: Path | None = None) -> Path | None:
     """The file of one of the mock store's kinds, or None when there is none.
+
+    `also` is for a move under `told/` that had begun (`set_aside`): the directory
+    there in which a file can already have its second name. A file with two names
+    is then its store's own when the other is the one of the same name in `also`,
+    seen to be the same file, and in no other case.
 
     Before SQLite opens anything: SQLite reads and writes the files it keeps
     beside a database as well (`_BESIDE`), and emptying a log writes to the log.
@@ -344,11 +868,23 @@ def _own(data: Path, directory: str, name: str) -> Path | None:
             # takes for a file that was seen to be and could not be deleted.
             linked = True
         else:
-            linked = not stat.S_ISREG(found.st_mode) or found.st_nlink != 1
+            linked = not stat.S_ISREG(found.st_mode) or (
+                found.st_nlink != 1 and not _second_name(found, also, each.name)
+            )
             there = there or each == path
     if linked:
-        raise_bare(NotTheMockStoresError(_NOT_THE_FILE.format(directory)))
+        raise_bare(NotTheMockStoresError(directory))
     return path if there else None
+
+
+def _second_name(found: os.stat_result, also: Path | None, name: str) -> bool:
+    """Whether a file with two names has its other one in `also`, under `name`."""
+    if also is None or found.st_nlink != 2:
+        return False
+    try:
+        return os.path.samestat(found, os.lstat(also / name))
+    except OSError:
+        return False
 
 
 def _mock_stores(path: Path) -> None:
@@ -376,7 +912,7 @@ def _mock_stores(path: Path) -> None:
             and said.tables - _SQLITES_OWN <= kind.tables
         ):
             return
-    raise_bare(NotTheMockStoresError(_NOT_THE_FILE.format(path.parent.name)))
+    raise_bare(NotTheMockStoresError(path.parent.name))
 
 
 def _settle(path: Path) -> None:
@@ -615,7 +1151,27 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
     parser = argparse.ArgumentParser(prog="python -m beacon.serve", description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=int(env.get("PORT") or 8000))
+    parser.add_argument(
+        "--set-aside",
+        action="store_true",
+        help=(
+            "move the mock store's files into a directory of their own under told/ "
+            "in the data directory, deleting nothing, and end without serving: the "
+            "server that is started next begins the invented story anew"
+        ),
+    )
     options = parser.parse_args(argv)
+    if options.set_aside:
+        try:
+            print(aside(env))
+        except PartlyAsideError as error:
+            # Its own sentence says what was moved and what has to be done.
+            print(str(error), file=sys.stderr)
+            return 3
+        except (ServeError, IngestConfigError, EmberConfigError, DataLockedError) as error:
+            print(f"Nothing was set aside. {error}", file=sys.stderr)
+            return 2
+        return 0
 
     def make_server(app: FastAPI) -> Any:
         return uvicorn_server(app, options.host, options.port)

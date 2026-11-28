@@ -9,6 +9,13 @@ class EmberConfigError(EmberError):
     """The environment asks for something the client cannot do, such as a live call with no key."""
 
 
+class OtherLedgerError(EmberConfigError):
+    """A client was to go on with the ledger file that was named to it, and what is
+    at the ledger's path was seen not to match it in generation, device, or inode:
+    another ledger, a copy on another inode, something that is no ledger, or
+    nothing. No file was made and nothing was written. The text is fixed."""
+
+
 class EmberRequestError(EmberError, ValueError):
     """The request breaks a client rule, such as a hosted tool or a missing output limit."""
 

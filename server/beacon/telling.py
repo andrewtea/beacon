@@ -39,14 +39,33 @@ worked on, nor Ember with a stand-in's, with the pollers or without them, and wh
 tells the story again by deleting the store refuses one that was paid for.
 """
 
+import os
+import sys
 from collections.abc import Callable, Mapping
 from typing import Literal
 
 from beacon.ember import EmberClient, SpendScope
-from beacon.ember.pricing import parse_usd
+from beacon.ember.client import Storage, default_data_dir
+from beacon.ember.errors import EmberConfigError, OtherLedgerError
+from beacon.ember.ledger import FILE_NAME, kept_file
+from beacon.ember.pricing import SPENT_BEFORE_VARIABLE, parse_usd, read_stop_settings
+from beacon.errors import raise_bare
 
 MOCK_EMBER_VARIABLE = "BEACON_MOCK_EMBER"
 BUDGET_VARIABLE = "BEACON_MOCK_EMBER_BUDGET_USD"
+# The ledger file a telling by Muse Ember pays from, by the name a client gives the
+# file it is open on (`EmberClient.ledger_file`: generation, device, inode). When
+# it is set, no paying client is made unless the ledger under the data directory
+# is there and is seen to have that generation, device, and inode, at every start
+# of a server: a client begins a ledger where it finds none, and a ledger begun
+# anew, or a copy put in its place, counts less than was spent. It only refuses,
+# and only a mismatch it observes. `python -m beacon.telling` prints the name of
+# the ledger that is there, for whoever starts a server to hand it on
+# (`scripts/film`). What it cannot tell is a ledger rolled back in place, or a
+# copy restored after the ledger was unlinked that was given its inode number:
+# restoring a ledger needs every process that spends stopped first, and the ledger
+# compared with Meta's Usage page (`beacon.ember.ledger`).
+LEDGER_VARIABLE = "BEACON_MOCK_EMBER_LEDGER"
 
 # Who does the model's work on the invented story.
 Teller = Literal["stand_in", "ember"]
@@ -136,23 +155,139 @@ def check(env: Mapping[str, str], make: PaidClient | None = None) -> None:
     anything is made**: a client, even one that only replays, makes the ledger's
     file, and a store that was opened for a telling is that telling's from then on.
 
-    Raises TellingConfigError when `REPLAY` is not 0 or there is no key. A test
-    that hands in what makes its clients (`make`) is asked for nothing here."""
+    Raises TellingConfigError when `REPLAY` is not 0 or there is no key, and when
+    `BEACON_MOCK_EMBER_LEDGER` names a ledger that is not the one under the data
+    directory (`pinned_ledger`); EmberConfigError for a relative `BEACON_DATA_DIR`.
+    A test that hands in what makes its clients (`make`) is asked only for the
+    ledger."""
     if make is None and (env.get("REPLAY", "1") != "0" or not env.get("MODEL_API_KEY")):
         raise TellingConfigError(_NO_LIVE_EMBER)
+    pinned_ledger(env)
+
+
+def pinned_ledger(env: Mapping[str, str]) -> str | None:
+    """The ledger file `BEACON_MOCK_EMBER_LEDGER` names, when the ledger under the
+    data directory is seen to have that generation, device, and inode, or None
+    when the setting is not there. The ledger is read through a connection that
+    cannot write, and nothing is made. A match is what was observed, and no proof
+    of which file was paid from (`beacon.ember.ledger`).
+
+    Raises TellingConfigError when the setting is no ledger file's name, and when
+    a mismatch is seen: the ledger that is there has another generation, device,
+    or inode, or no ledger is there;
+    EmberConfigError for a relative `BEACON_DATA_DIR`."""
+    if LEDGER_VARIABLE not in env:
+        return None
+    named = env[LEDGER_VARIABLE]
+    if FILE_NAME.fullmatch(named) is None:
+        raise TellingConfigError(
+            f"{LEDGER_VARIABLE} is the name of the ledger file that is paid from, as "
+            "`python -m beacon.telling` prints it."
+        )
+    if kept_file(Storage.under(default_data_dir(env)).ledger_db) != named:
+        raise TellingConfigError(OTHER_LEDGER)
+    return named
+
+
+OTHER_LEDGER = (
+    f"{LEDGER_VARIABLE} names the ledger file this telling is paid from, and what is "
+    "under the data directory (ember/ledger.sqlite3) is not that file: it is another "
+    "ledger, a copy that was put in its place, or no ledger. Nothing was paid for, "
+    "and no ledger was begun: one begun anew, or an older copy, would count less than "
+    "was spent. Find out what became of the ledger before a server is started here, "
+    "and compare Meta's Usage page with what the ledger held."
+)
+NO_LEDGER = (
+    f"{MOCK_EMBER_VARIABLE}=live is to go on paying from the ledger that was paid from "
+    "before, and no ledger that was begun is at ember/ledger.sqlite3 under the data "
+    "directory: nothing is there, or what is there is empty, a link, or no ledger. A "
+    "ledger begun anew would count nothing of what was spent."
+)
+
+
+def preflight(env: Mapping[str, str]) -> str | None:
+    """What can be seen, before anything is stopped, moved, or made, of whether a
+    server can be started on `env` to tell the invented story: who tells it, and,
+    for Muse Ember, that paid requests are asked for by name (`REPLAY=0`), that the
+    budget is one every scope takes, and that a ledger that was begun is under the
+    data directory, which is the one `BEACON_MOCK_EMBER_LEDGER` names when that is
+    set. Answers that ledger file's name, to be handed to the server as
+    `BEACON_MOCK_EMBER_LEDGER`, or None for a stand-in's telling.
+
+    The spending settings in `env` (`EMBER_SPENT_BEFORE_USD`, which has to be
+    there, and `EMBER_STOP_USD`) are read as the client reads them, so that one it
+    would refuse is refused here. **That is a look at what `env` holds, and not at
+    what the server will keep**: a client reads both from its own process's
+    environment, and the key too, which this does not look for. It makes nothing
+    and asks nobody.
+
+    Raises TellingConfigError when it cannot, and EmberConfigError for a relative
+    `BEACON_DATA_DIR` and for a spending setting that cannot be read."""
+    if teller_of(env) == "stand_in":
+        return None
+    if env.get("REPLAY") != "0":
+        raise TellingConfigError(
+            f"{MOCK_EMBER_VARIABLE}=live makes paid requests, which REPLAY=0 asks for. "
+            "Set REPLAY=0 beside it."
+        )
+    for label in SCOPES:
+        scope_of(env, label)
+    if read_stop_settings(env)[1] is None:
+        raise TellingConfigError(
+            f"{MOCK_EMBER_VARIABLE}=live needs {SPENT_BEFORE_VARIABLE}: what Meta's Usage "
+            "page showed as spent before the ledger began. It has no default."
+        )
+    # A ledger that is named already is seen to match what is there, or this is
+    # refused: the name is never replaced by the one that happens to be there.
+    named = pinned_ledger(env)
+    if named is not None:
+        return named
+    there = kept_file(Storage.under(default_data_dir(env)).ledger_db)
+    if there is None:
+        raise TellingConfigError(NO_LEDGER)
+    return there
 
 
 def paying(env: Mapping[str, str], label: str, make: PaidClient | None = None) -> EmberClient:
     """A live Ember client that pays under the scope `label`, one of `SCOPES`.
 
-    Raises TellingConfigError when the budget is not one or there is no live Ember,
-    and EmberConfigError as `EmberClient.from_env` does."""
+    **A client that goes on with a named ledger begins none.** With
+    `BEACON_MOCK_EMBER_LEDGER` set, the client refuses an observed mismatch in
+    generation, device, or inode, and never begins a ledger
+    (`EmberClient.from_env(only_ledger=...)`): the look `check` takes and the making
+    of the client are two moments, and a ledger that went in between is not begun
+    anew by the client, which would leave a new, empty ledger where the next look
+    finds one. Nor does such a client begin one later, when the file goes from
+    under it. A client a test's `make` made is looked at after it is made.
+
+    Raises TellingConfigError when the budget is not one, there is no live Ember,
+    or the ledger is not the one `BEACON_MOCK_EMBER_LEDGER` names, and
+    EmberConfigError as `EmberClient.from_env` does."""
     scope = scope_of(env, label)
     check(env, make)
-    ember = EmberClient.from_env(env, scope=scope) if make is None else make(scope)
-    if ember.mode != "live":
-        ember.close()
-        raise TellingConfigError(_NO_LIVE_EMBER)
+    named = env.get(LEDGER_VARIABLE)
+    ember = None
+    refusal = None
+    try:
+        ember = (
+            EmberClient.from_env(env, scope=scope, only_ledger=named)
+            if make is None
+            else make(scope)
+        )
+    except OtherLedgerError:
+        refusal = OTHER_LEDGER
+    if ember is not None:
+        if ember.mode != "live":
+            refusal = _NO_LIVE_EMBER
+        elif named is not None and ember.ledger_file() != named:
+            # The file the client is open on, which is the one it pays in from here on.
+            refusal = OTHER_LEDGER
+        if refusal is not None:
+            ember.close()
+    if refusal is not None:
+        # Outside the handler, so that nothing is under the sentence.
+        raise_bare(TellingConfigError(refusal))
+    assert ember is not None
     return ember
 
 
@@ -167,3 +302,24 @@ def other_teller(began: Teller, now: Teller) -> str:
     return OTHER_TELLER.format(
         began=_AS[began], now=_WITH[now], variable=MOCK_EMBER_VARIABLE, how=_HOW[began]
     )
+
+
+def main(env: Mapping[str, str], out: Callable[[str], None] = print) -> int:
+    """`python -m beacon.telling`: look before a server is started to tell the
+    invented story (`preflight`), and print the name of the ledger file a telling
+    by Muse Ember would pay from, or nothing for a stand-in's. It makes nothing."""
+    try:
+        ledger = preflight(env)
+    except (TellingConfigError, EmberConfigError) as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    if ledger is not None:
+        out(ledger)
+    return 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1:]:
+        print("python -m beacon.telling takes no arguments.", file=sys.stderr)
+        raise SystemExit(2)
+    raise SystemExit(main(os.environ))

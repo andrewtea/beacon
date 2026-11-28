@@ -21,10 +21,22 @@ from fastapi.testclient import TestClient
 
 import beacon.main
 from beacon import serve
-from beacon.datadir import LOCK_FILE, DataLock, DataLockedError
-from beacon.evidence import EvidenceStore, NewEvidence
+from beacon.datadir import (
+    LOCK_FILE,
+    PENDING,
+    AsideNotKeptError,
+    DataLock,
+    DataLockedError,
+    HalfAsideError,
+)
+from beacon.evidence import EvidenceStore, NewEvidence, Point
 from beacon.ingest.setup import MOCK_HEAD_START, IngestConfigError
+from beacon.investigate import Runs
+from beacon.investigate import aside as aside_module
+from beacon.investigate.aside import sweep_aside
 from beacon.main import create_app
+from beacon.push import store as push_store
+from beacon.push.store import Place, Subscriptions
 from beacon.story import Stories
 
 ENV_KEY = "BEACON_DATA_DIR"
@@ -511,6 +523,875 @@ def test_a_deletion_that_was_cut_short_is_finished_by_the_next_one(
     monkeypatch.setattr(serve, "_delete", delete)
     assert begin_again(over) is True
     assert not (data_dir() / "evidence" / "mock.sqlite3").exists()
+
+
+# Setting a store aside, so that a story is begun anew by hand.
+
+
+def plain() -> dict[str, str]:
+    """A server's environment with nothing that tells the story again."""
+    return {ENV_KEY: os.environ[ENV_KEY]}
+
+
+def set_aside(now: datetime) -> object:
+    # As the command holds the stores: alone, and let in while a move is unfinished.
+    lock = DataLock(data_dir(), shared=False, finishing=True)
+    try:
+        return serve.set_aside(plain(), now, lock)
+    finally:
+        lock.close()
+
+
+ASIDE_AT = datetime(2026, 12, 1, 18, 30, 5, tzinfo=UTC)
+ASIDE_IN = "told/20261201T183005Z"
+ADDRESS = "https://fcm.googleapis.com/fcm/send/dXY2zQ:APA91bH_-secretSecretSecret"
+SPOT = Point(37.776, -122.424)
+
+
+def test_a_store_set_aside_is_moved_whole_and_nothing_is_deleted() -> None:
+    served()
+    root = data_dir()
+    # What a server on real sources keeps, the ledger, and a device's subscription
+    # are not the story's, and stay where they are.
+    for directory in ("evidence", "investigate", "story"):
+        (root / directory / "live.sqlite3").write_bytes(b"a live store's")
+    before = kept()
+    mock = [f"{directory}/{name}" for directory, name in serve.MOCK_FILES]
+    assert set(mock) <= set(before)
+
+    assert str(set_aside(ASIDE_AT)) == ASIDE_IN
+
+    after = kept()
+    # Each file is where it was moved to, to the byte, and no longer where it was.
+    assert {name: after[f"{ASIDE_IN}/{name}"] for name in mock} == {
+        name: before[name] for name in mock
+    }
+    assert not any(name in after for name in mock)
+    assert {name: held for name, held in before.items() if name not in mock} == {
+        name: held for name, held in after.items() if not name.startswith("told/")
+    }
+    # It is still the store it was: its story can be read where it now is.
+    moved = EvidenceStore(root / ASIDE_IN / "evidence" / "mock.sqlite3", "mock")
+    try:
+        assert isinstance(moved.state("scenario")["start"], str)
+    finally:
+        moved.close()
+    # With no mock store there is nothing to set aside, and no directory is made.
+    assert set_aside(ASIDE_AT + timedelta(minutes=1)) is None
+    assert [path.name for path in (root / "told").iterdir()] == ["20261201T183005Z"]
+
+
+def test_nothing_is_made_for_asking_where_there_is_no_mock_store() -> None:
+    assert set_aside(ASIDE_AT) is None
+    assert files() == {}
+    assert not (data_dir() / "told").exists()
+
+
+def test_the_server_started_after_a_store_was_set_aside_begins_the_story_anew(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    over = served()
+    assert set_aside(ASIDE_AT) is not None
+
+    # At the minute it is told to, which a store whose story had begun would not.
+    monkeypatch.setenv("BEACON_MOCK_STORY_MINUTE", "77")
+    anew = served()
+
+    assert anew != over
+    assert anew - datetime.now(UTC) < serve.PLAYED_FOR - timedelta(minutes=76)
+    # Set aside at the same second, the second store gets a directory of its own.
+    assert str(set_aside(ASIDE_AT)) == ASIDE_IN + "-2"
+    assert {path.name for path in (data_dir() / "told").iterdir()} == {
+        "20261201T183005Z",
+        "20261201T183005Z-2",
+    }
+
+
+def test_a_store_muse_ember_worked_on_is_set_aside_as_it_is_and_never_deleted() -> None:
+    over = served()
+    root = data_dir()
+    store = EvidenceStore(root / "evidence" / "mock.sqlite3", "mock")
+    store.mark_paid()
+    store.close()
+    # A server that tells the story again refuses the store, whatever comes of it.
+    with pytest.raises(serve.ServeError, match="Nothing was deleted"):
+        begin_again(over)
+    before = kept()["evidence/mock.sqlite3"]
+
+    assert str(set_aside(ASIDE_AT)) == ASIDE_IN
+
+    # The claims on what was paid for are where the store is, and it still says
+    # whose it is.
+    assert kept()[f"{ASIDE_IN}/evidence/mock.sqlite3"] == before
+    moved = EvidenceStore(root / ASIDE_IN / "evidence" / "mock.sqlite3", "mock")
+    try:
+        assert moved.paid
+    finally:
+        moved.close()
+
+
+@pytest.mark.parametrize("how", ["the file", "a second name"])
+def test_a_link_to_another_stores_file_is_not_set_aside_in_its_place(how: str) -> None:
+    served()
+    folder = data_dir() / "investigate"
+    for each in folder.iterdir():
+        each.unlink()
+    if how == "the file":
+        (folder / "mock.sqlite3").symlink_to(push_file())
+    else:
+        os.link(push_file(), folder / "mock.sqlite3")
+    before = kept()
+
+    with pytest.raises(serve.ServeError, match=r"under investigate/ .* Nothing was moved"):
+        set_aside(ASIDE_AT)
+
+    assert kept() == before
+    assert not (data_dir() / "told").exists()
+
+
+def test_a_file_something_still_has_open_is_not_set_aside_and_neither_is_any_other(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(serve, "_WAIT_SECONDS", 0.05)
+    served()
+    path = data_dir() / "evidence" / "mock.sqlite3"
+    with closing(sqlite3.connect(path)) as reading, closing(sqlite3.connect(path)) as writing:
+        reading.execute("BEGIN")
+        reading.execute("SELECT count(*) FROM evidence").fetchall()
+        with writing:
+            writing.execute(
+                "INSERT INTO poller_state (name, state, updated_ms) VALUES ('since', '{}', 0)"
+            )
+
+        with pytest.raises(serve.ServeError, match=r"is open somewhere.* Nothing was moved"):
+            set_aside(ASIDE_AT)
+
+        assert {f"{d}/{n}" for d, n in serve.MOCK_FILES} <= set(files())
+        assert not (data_dir() / "told").exists()
+    assert set_aside(ASIDE_AT) is not None
+
+
+def test_there_has_to_be_a_directory_of_the_data_directorys_own_to_move_a_store_to(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    served()
+    elsewhere = tmp_path_factory.mktemp("elsewhere")
+    (data_dir() / "told").symlink_to(elsewhere, target_is_directory=True)
+    before = kept()
+
+    with pytest.raises(
+        serve.ServeError, match=r"is not a directory of its own.* Nothing was moved"
+    ):
+        set_aside(ASIDE_AT)
+
+    assert kept() == before
+    assert list(elsewhere.iterdir()) == []
+
+
+def _fails_on(
+    monkeypatch: pytest.MonkeyPatch, directory: str, step: str = "unlink"
+) -> Callable[[], None]:
+    """Have a step of the move fail for a file where the store keeps it, under
+    `directory`: giving it its second name (`link`), or taking away the name it
+    had (`unlink`). Answers what mends it."""
+    real = getattr(os, step)
+
+    def fails(path: Path, *more: object, **how: object) -> None:
+        if Path(path).parent == data_dir() / directory:
+            raise OSError("no")
+        real(path, *more, **how)
+
+    monkeypatch.setattr(serve.os, step, fails)
+    return lambda: monkeypatch.setattr(serve.os, step, real)
+
+
+def test_a_move_that_was_cut_short_keeps_everything_out_until_the_next_finishes_it(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    served()
+    mend = _fails_on(monkeypatch, "story")
+    with pytest.raises(serve.PartlyAsideError, match="only in part") as refused:
+        set_aside(ASIDE_AT)
+    assert "told/20261201T183005Z/" in str(refused.value)
+    assert "Nothing was deleted" in str(refused.value)
+    # Nothing of a path, or of the error that stopped it, is under the sentence.
+    assert refused.value.__context__ is None
+    assert not (data_dir() / "evidence" / "mock.sqlite3").exists()
+    left = [f"{d}/{n}" for d, n in serve.MOCK_FILES if d != "evidence"]
+    assert all(name in files() for name in left)
+    assert (data_dir() / "told" / PENDING).read_text() == "20261201T183005Z"
+    # Every file of the store has its name under told/ from before the first
+    # was taken from its place: the ones still in place are there too, as the
+    # same file. So a Beacon from before this command, which knows nothing of
+    # the note, takes away a name and never the file, and its own look at a file
+    # with two names refuses it.
+    for directory, name in serve.MOCK_FILES:
+        assert (data_dir() / ASIDE_IN / directory / name).is_file()
+    for name in left:
+        assert (data_dir() / name).samefile(data_dir() / ASIDE_IN / name)
+        with pytest.raises(serve.NotTheMockStoresError):
+            serve._own(data_dir(), *name.split("/"))
+
+    # The stories and the investigations that are left hold the claims on what was
+    # paid for. Nothing begins a story beside them, and nothing deletes them: no
+    # server, with the pollers or without, no poller, and no telling again.
+    before = files()
+    for shared in (False, True):
+        with pytest.raises(HalfAsideError, match="did not finish"):
+            DataLock(data_dir(), shared=shared)
+    with pytest.raises(HalfAsideError), TestClient(create_app()):
+        pass
+    assert serve.main([], env()) == 3
+    assert "did not finish" in capsys.readouterr().err
+    assert files() == before
+
+    # The command, while the file still cannot be moved, says the same and exits
+    # as a failure that is not "nothing was set aside".
+    assert serve.main(["--set-aside"], plain()) == 3
+    said = capsys.readouterr().err
+    assert said.startswith("The mock store's files were set aside only in part")
+    assert "Nothing was set aside" not in said
+    assert files() == before
+
+    # Given again, it moves what is left to the same place, a later moment or not,
+    # with what SQLite kept beside a file that went before.
+    stale = data_dir() / "evidence" / "mock.sqlite3-wal"
+    stale.write_bytes(b"")
+    mend()
+    assert str(set_aside(ASIDE_AT + timedelta(hours=1))) == ASIDE_IN
+    assert all(f"{ASIDE_IN}/{name}" in files() for name in left)
+    assert not any(name in files() for name in left)
+    assert not stale.exists()
+    assert (data_dir() / ASIDE_IN / "evidence" / stale.name).is_file()
+    assert not (data_dir() / "told" / PENDING).exists()
+    assert [path.name for path in (data_dir() / "told").iterdir()] == ["20261201T183005Z"]
+    with alone():
+        pass
+
+
+@pytest.mark.parametrize(
+    ("directory", "step"),
+    # The last file to be given its second name, and the first to leave its place.
+    [("investigate", "link"), ("evidence", "unlink")],
+)
+def test_a_move_of_which_no_file_went_leaves_nothing_behind_and_keeps_nobody_out(
+    monkeypatch: pytest.MonkeyPatch, directory: str, step: str
+) -> None:
+    served()
+    before = kept()
+    _fails_on(monkeypatch, directory, step)
+
+    with pytest.raises(serve.ServeError, match="Nothing was moved") as refused:
+        set_aside(ASIDE_AT)
+
+    assert not isinstance(refused.value, serve.PartlyAsideError)
+    assert kept() == before
+    assert list((data_dir() / "told").iterdir()) == []
+    # No file is left with a second name.
+    for kind, name in serve.MOCK_FILES:
+        assert (data_dir() / kind / name).stat().st_nlink == 1
+    with alone():
+        pass
+
+
+@pytest.mark.parametrize("note", ["", "../evidence", "20261201T183005Z", "x" * 4000])
+def test_a_note_that_names_no_directory_of_the_commands_own_moves_nothing(note: str) -> None:
+    # The last is of the right shape and names a directory that is not there.
+    served()
+    (data_dir() / "told").mkdir()
+    (data_dir() / "told" / PENDING).write_text(note)
+    before = kept()
+
+    with pytest.raises(serve.PartlyAsideError, match="does not name a directory"):
+        set_aside(ASIDE_AT)
+
+    assert kept() == before
+    with pytest.raises(HalfAsideError):
+        DataLock(data_dir(), shared=True)
+
+
+@pytest.mark.parametrize("how", ["a link", "a second name"])
+def test_a_note_that_is_not_a_file_of_its_own_is_not_read(
+    how: str, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    served()
+    (data_dir() / ASIDE_IN).mkdir(parents=True)
+    written = tmp_path_factory.mktemp("elsewhere") / "note"
+    written.write_text("20261201T183005Z")
+    note = data_dir() / "told" / PENDING
+    if how == "a link":
+        note.symlink_to(written)
+    else:
+        os.link(written, note)
+    before = kept()
+
+    with pytest.raises(serve.PartlyAsideError, match="does not name a directory"):
+        set_aside(ASIDE_AT)
+
+    assert kept() == before
+
+
+def test_a_move_is_not_gone_on_with_into_a_directory_that_is_a_link(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    served()
+    elsewhere = tmp_path_factory.mktemp("elsewhere")
+    (data_dir() / ASIDE_IN).mkdir(parents=True)
+    (data_dir() / ASIDE_IN / "evidence").symlink_to(elsewhere, target_is_directory=True)
+    (data_dir() / "told" / PENDING).write_text("20261201T183005Z")
+    before = kept()
+
+    with pytest.raises(serve.PartlyAsideError, match="only in part"):
+        set_aside(ASIDE_AT)
+
+    assert list(elsewhere.iterdir()) == []
+    assert kept() == before
+    with pytest.raises(HalfAsideError):
+        DataLock(data_dir(), shared=True)
+
+
+def test_a_note_is_written_whole_or_not_at_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    served()
+    before = kept()
+    # What a try that was stopped while it wrote its note left: no note.
+    (data_dir() / "told").mkdir()
+    (data_dir() / "told" / (PENDING + ".part")).write_text("2026")
+    with alone():
+        pass
+    replace = os.replace
+
+    def stopped(old: Path, new: Path) -> None:
+        raise OSError("no")
+
+    monkeypatch.setattr(serve.os, "replace", stopped)
+    with pytest.raises(serve.ServeError, match="Nothing was moved"):
+        set_aside(ASIDE_AT)
+    assert kept() == before
+    assert list((data_dir() / "told").iterdir()) == []
+
+    monkeypatch.setattr(serve.os, "replace", replace)
+    assert str(set_aside(ASIDE_AT)) == ASIDE_IN
+    assert [path.name for path in (data_dir() / "told").iterdir()] == ["20261201T183005Z"]
+
+
+def test_a_file_that_could_not_be_looked_at_is_not_taken_to_be_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Else the note would go with a file of the store still in its place.
+    served()
+    seen = serve._seen
+    story = data_dir() / "story" / "mock.sqlite3"
+
+    def unseen(path: Path) -> os.stat_result | None:
+        if path == story:
+            raise PermissionError("no")
+        return seen(path)
+
+    monkeypatch.setattr(serve, "_seen", unseen)
+    with pytest.raises(serve.ServeError, match="Nothing was moved"):
+        set_aside(ASIDE_AT)
+
+    assert story.is_file()
+    assert not (data_dir() / "told" / PENDING).exists()
+
+
+def test_a_note_that_is_a_pipe_is_refused_and_not_waited_for() -> None:
+    served()
+    (data_dir() / ASIDE_IN).mkdir(parents=True)
+    os.mkfifo(data_dir() / "told" / PENDING)
+    done: list[BaseException | None] = []
+
+    def give() -> None:
+        try:
+            set_aside(ASIDE_AT)
+        except BaseException as error:
+            done.append(error)
+        else:
+            done.append(None)
+
+    thread = threading.Thread(target=give, daemon=True)
+    thread.start()
+    thread.join(10)
+
+    assert not thread.is_alive()
+    assert isinstance(done[0], serve.PartlyAsideError)
+    assert "does not name a directory" in str(done[0])
+
+
+def test_a_note_of_which_only_a_part_was_written_is_never_given_the_notes_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    served()
+    before = kept()
+    write = os.write
+
+    def short(descriptor: int, data: bytes) -> int:
+        return write(descriptor, data[:4])
+
+    monkeypatch.setattr(serve.os, "write", short)
+    with pytest.raises(serve.ServeError, match="Nothing was moved"):
+        set_aside(ASIDE_AT)
+
+    assert kept() == before
+    assert list((data_dir() / "told").iterdir()) == []
+    with alone():
+        pass
+
+
+def test_the_disk_is_asked_to_keep_every_new_name_before_a_name_is_taken_away(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `told/` is an entry of the data directory's: its listing is kept too.
+    served()
+    steps: list[tuple[str, Path]] = []
+    keep, unlink = serve._kept, os.unlink
+
+    def kept_(directory: Path) -> None:
+        steps.append(("kept", directory))
+        keep(directory)
+
+    def unlink_(path: Path, *more: object, **how: object) -> None:
+        steps.append(("unlink", Path(path)))
+        unlink(path, *more, **how)
+
+    monkeypatch.setattr(serve, "_kept", kept_)
+    monkeypatch.setattr(serve.os, "unlink", unlink_)
+    assert set_aside(ASIDE_AT) is not None
+
+    first = next(
+        index
+        for index, (what, path) in enumerate(steps)
+        if what == "unlink" and path.name == "mock.sqlite3"
+    )
+    asked = [path for what, path in steps[:first] if what == "kept"]
+    told = data_dir() / "told"
+    assert {data_dir(), told, told / "20261201T183005Z"} <= set(asked)
+    assert {told / "20261201T183005Z" / kind for kind, _ in serve.MOCK_FILES} <= set(asked)
+
+
+def _told_is_not_kept(monkeypatch: pytest.MonkeyPatch) -> Callable[[], None]:
+    """Have the disk refuse to keep what `told/` lists once the note of a move is
+    gone from it, whoever asks. Answers what mends it."""
+    real = os.fsync
+    told = data_dir() / "told"
+
+    def fsync(descriptor: int) -> None:
+        if (
+            told.is_dir()
+            and os.path.samestat(os.fstat(descriptor), os.stat(told))
+            and not (told / PENDING).exists()
+        ):
+            raise OSError("no")
+        real(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    return lambda: monkeypatch.setattr(os, "fsync", real)
+
+
+def test_a_move_that_is_finished_is_not_said_to_be_unfinished_when_the_disk_does_not_confirm(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    served()
+    note = data_dir() / "told" / PENDING
+    mend = _told_is_not_kept(monkeypatch)
+
+    assert serve.main(["--set-aside"], plain()) == 0
+    said = capsys.readouterr()
+    assert "were moved to told/" in said.out
+    assert "The disk did not confirm that it kept that last step" in said.out
+    assert "asks the disk again before it does" in said.out
+    assert "only in part" not in said.out + said.err
+    # What it says is so: the note is gone, and nothing is left to move.
+    assert not note.exists()
+    assert not any(f"{d}/{n}" in files() for d, n in serve.MOCK_FILES)
+    mend()
+    with alone():
+        pass
+
+
+def test_no_store_is_begun_until_the_disk_has_kept_that_a_moves_note_is_gone(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The note's going is the last step of a move. A machine that stops before the
+    # disk has it can start with the note there again, and a store begun in
+    # between would be found beside it: another store than the one that was
+    # moved, with which the command could not finish the move.
+    served()
+    note = data_dir() / "told" / PENDING
+    mend = _told_is_not_kept(monkeypatch)
+    assert serve.main(["--set-aside"], plain()) == 0
+    capsys.readouterr()
+    before = files()
+
+    # So nobody opens a store while the disk does not say it kept `told/`: no
+    # server, with the pollers or without, and no telling again.
+    for shared in (False, True):
+        with pytest.raises(AsideNotKeptError, match="the disk did not confirm") as refused:
+            DataLock(data_dir(), shared=shared)
+        assert refused.value.__context__ is None
+    with pytest.raises(AsideNotKeptError), TestClient(create_app()):
+        pass
+    for started_with in (plain(), env()):
+        assert serve.main([], started_with) == 3
+        assert "the disk did not confirm" in capsys.readouterr().err
+    # No store was begun, and the lock was given back each time.
+    assert files() == before
+    assert not any(f"{d}/{n}" in before for d, n in serve.MOCK_FILES)
+
+    # The machine stops, and the note is there again when it starts. No store is
+    # beside it, so the command, given again, finishes: it takes the note away.
+    (went,) = (path.name for path in (data_dir() / "told").iterdir())
+    note.write_text(went)
+    with pytest.raises(HalfAsideError):
+        DataLock(data_dir(), shared=False)
+    mend()
+    assert serve.main(["--set-aside"], plain()) == 0
+    assert "The disk did not confirm" not in capsys.readouterr().out
+    assert not note.exists()
+    assert [path.name for path in (data_dir() / "told").iterdir()] == [went]
+
+    # Once the disk has kept it, a server begins the story anew.
+    asked: list[bool] = []
+    real = os.fsync
+
+    def fsync(descriptor: int) -> None:
+        asked.append(os.path.samestat(os.fstat(descriptor), os.stat(data_dir() / "told")))
+        real(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    with alone():
+        # Asked of `told/` by whoever takes the lock, before anything is opened.
+        assert asked == [True]
+    with TestClient(create_app()) as client:
+        assert client.get("/api/health").json()["mode"] == "mock"
+    assert (data_dir() / "evidence" / "mock.sqlite3").is_file()
+
+
+def test_a_data_directory_nothing_was_set_aside_in_asks_the_disk_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fsync(descriptor: int) -> None:
+        raise OSError("no")
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    with alone():
+        pass
+    # A `told` that is a file is no place anything was moved to.
+    (data_dir() / "told").write_bytes(b"")
+    with alone():
+        pass
+
+
+@pytest.mark.parametrize("shape", [0, 1])
+def test_investigations_in_a_shape_that_is_not_swept_as_it_is_are_not_set_aside(shape: int) -> None:
+    # Set aside, an expired run in such a file would never be deleted.
+    served()
+    file = data_dir() / "investigate" / "mock.sqlite3"
+    _claimed(file, "tap-old", ASIDE_AT - timedelta(days=3))
+    with closing(sqlite3.connect(file)) as db:
+        db.execute(f"PRAGMA user_version = {shape}")
+    before = kept()
+
+    with pytest.raises(serve.ServeError, match=r"a shape an earlier Beacon.*Nothing was moved"):
+        set_aside(ASIDE_AT)
+
+    assert kept() == before
+    assert not (data_dir() / "told").exists()
+    # A server makes the file this shape, as the sentence says, and then it goes.
+    served()
+    assert set_aside(ASIDE_AT) is not None
+
+
+def test_a_story_begun_anew_is_not_kept_from_a_device_by_what_the_last_telling_sent() -> None:
+    # An incident's id is made from its first call's start, to the second: two
+    # tellings that count their first minute from the same second share it.
+    served()
+    place = Place(SPOT, ASIDE_AT)
+    devices = Subscriptions(push_file(), "mock")
+    try:
+        devices.put(ADDRESS, [SPOT], ASIDE_AT)
+        permit = devices.permit(ASIDE_AT)
+        assert devices.claim(ADDRESS, "inc-1", place, ASIDE_AT) is True
+        devices.settle(ADDRESS, "inc-1", "sent")
+        assert devices.claim(ADDRESS, "inc-1", place, ASIDE_AT) is False
+    finally:
+        devices.close()
+
+    assert set_aside(ASIDE_AT) is not None
+
+    # The subscriptions file is not moved, and keeps the device and its permit.
+    assert not any(name.startswith(f"{ASIDE_IN}/push") for name in files())
+    devices = Subscriptions(push_file(), "mock")
+    try:
+        assert [kept.endpoint for kept in devices.all()] == [ADDRESS]
+        assert devices.claim(ADDRESS, "inc-1", place, ASIDE_AT) is True
+        assert devices.put(ADDRESS, [SPOT], ASIDE_AT, permit=permit) is not None
+    finally:
+        devices.close()
+
+
+def _sent_once(place: Place) -> None:
+    devices = Subscriptions(push_file(), "mock")
+    try:
+        devices.put(ADDRESS, [SPOT], ASIDE_AT)
+        assert devices.claim(ADDRESS, "inc-1", place, ASIDE_AT) is True
+    finally:
+        devices.close()
+
+
+def _claimed_again(place: Place) -> bool:
+    devices = Subscriptions(push_file(), "mock")
+    try:
+        return devices.claim(ADDRESS, "inc-1", place, ASIDE_AT)
+    finally:
+        devices.close()
+
+
+def test_what_was_sent_is_not_forgotten_when_a_store_is_not_set_aside(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The story goes on, and its incident would be sent to the device again.
+    served()
+    place = Place(SPOT, ASIDE_AT)
+    _sent_once(place)
+
+    # Nowhere to move to.
+    elsewhere = tmp_path_factory.mktemp("elsewhere")
+    (data_dir() / "told").symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(serve.ServeError, match="Nothing was moved"):
+        set_aside(ASIDE_AT)
+    assert _claimed_again(place) is False
+    (data_dir() / "told").unlink()
+
+    # A first file that does not go.
+    _fails_on(monkeypatch, "evidence")
+    with pytest.raises(serve.ServeError, match="Nothing was moved"):
+        set_aside(ASIDE_AT)
+    assert _claimed_again(place) is False
+
+
+@pytest.mark.parametrize("how", ["it could not be written to", "it is not what it was"])
+def test_a_move_is_not_finished_until_what_was_sent_is_forgotten(
+    monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    served()
+    place = Place(SPOT, ASIDE_AT)
+    _sent_once(place)
+    forget = push_store.forget_sent
+
+    def fails(path: Path, mode: str) -> int | None:
+        if how == "it could not be written to":
+            raise sqlite3.OperationalError("database is locked")
+        return None
+
+    monkeypatch.setattr(push_store, "forget_sent", fails)
+    with pytest.raises(serve.PartlyAsideError, match="could not be forgotten") as refused:
+        set_aside(ASIDE_AT)
+    assert refused.value.__context__ is None
+    # Every file went, and still no server starts: one would begin a story whose
+    # incident the device was already sent.
+    assert not any(f"{d}/{n}" in files() for d, n in serve.MOCK_FILES)
+    with pytest.raises(HalfAsideError):
+        DataLock(data_dir(), shared=False)
+
+    monkeypatch.setattr(push_store, "forget_sent", forget)
+    assert str(set_aside(ASIDE_AT)) == ASIDE_IN
+    assert _claimed_again(place) is True
+    with alone():
+        pass
+
+
+def _push_counts() -> tuple[int, int, int, int]:
+    """The subscriptions file's shape, and how many subscriptions, permits, and
+    rows of what was sent it holds, read without opening it for use."""
+    with closing(sqlite3.connect(f"file:{push_file()}?mode=ro", uri=True)) as db:
+        return (
+            db.execute("PRAGMA user_version").fetchone()[0],
+            db.execute("SELECT count(*) FROM subscription").fetchone()[0],
+            db.execute("SELECT count(*) FROM permit").fetchone()[0],
+            db.execute("SELECT count(*) FROM sent").fetchone()[0],
+        )
+
+
+def test_setting_a_store_aside_changes_a_subscriptions_file_as_it_is() -> None:
+    served()
+    place = Place(SPOT, ASIDE_AT)
+    _sent_once(place)
+    devices = Subscriptions(push_file(), "mock")
+    try:
+        assert devices.permit(ASIDE_AT) is not None
+    finally:
+        devices.close()
+    assert _push_counts() == (4, 1, 1, 1)
+
+    # A file of the shape before: whatever opens it for use deletes its
+    # subscriptions and its permits. Setting a store aside is not that, and
+    # leaves all of it, what was sent included, to whoever opens it next.
+    with closing(sqlite3.connect(push_file())) as db:
+        db.execute("PRAGMA user_version = 3")
+    assert set_aside(ASIDE_AT) is not None
+    assert _push_counts() == (3, 1, 1, 1)
+
+    # A file of this shape loses what was sent and nothing else.
+    with closing(sqlite3.connect(push_file())) as db:
+        db.execute("PRAGMA user_version = 4")
+    served()
+    assert set_aside(ASIDE_AT + timedelta(hours=1)) is not None
+    assert _push_counts() == (4, 1, 1, 0)
+
+
+@pytest.mark.parametrize("what", ["a newer shape", "another kind", "the live store's"])
+def test_no_store_is_set_aside_beside_a_subscriptions_file_that_is_not_seen_to_be_one(
+    what: str,
+) -> None:
+    served()
+    _sent_once(Place(SPOT, ASIDE_AT))
+    if what == "a newer shape":
+        with closing(sqlite3.connect(push_file())) as db:
+            db.execute("PRAGMA user_version = 99")
+    else:
+        for beside in ("", "-wal", "-shm"):
+            push_file().with_name(push_file().name + beside).unlink(missing_ok=True)
+        if what == "another kind":
+            # It says `mock` too, in a shape number a subscriptions file also has.
+            _claimed(push_file(), "tap-1", ASIDE_AT)
+        else:
+            Subscriptions(push_file(), "live").close()
+    before = kept()
+
+    with pytest.raises(serve.ServeError, match=r"under push/ could not be seen.*Nothing was moved"):
+        set_aside(ASIDE_AT)
+
+    assert kept() == before
+    assert not (data_dir() / "told").exists()
+
+
+def _claimed(file: Path, tap_id: str, at: datetime) -> None:
+    runs = Runs(file, "mock")
+    try:
+        assert runs.claim(tap_id, at) is True
+    finally:
+        runs.close()
+
+
+def _run_ids(file: Path) -> list[str]:
+    with closing(sqlite3.connect(file)) as db:
+        return [row[0] for row in db.execute("SELECT tap_id FROM run ORDER BY tap_id")]
+
+
+def test_the_investigations_of_a_store_that_was_set_aside_are_deleted_when_their_day_is_over(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    # A run holds a tap's id. Moving the file does not keep it past its day.
+    served()
+    _claimed(data_dir() / "investigate" / "mock.sqlite3", "tap-early", ASIDE_AT)
+    _claimed(data_dir() / "investigate" / "mock.sqlite3", "tap-late", ASIDE_AT + timedelta(hours=2))
+    assert set_aside(ASIDE_AT + timedelta(hours=3)) is not None
+    moved = data_dir() / ASIDE_IN.replace("183005", "213005") / "investigate" / "mock.sqlite3"
+    assert _run_ids(moved) == ["tap-early", "tap-late"]
+
+    assert sweep_aside(data_dir(), ASIDE_AT + timedelta(hours=23)) == (0, 0)
+    assert sweep_aside(data_dir(), ASIDE_AT + timedelta(hours=25)) == (1, 0)
+    assert _run_ids(moved) == ["tap-late"]
+
+    # A link under told/ could be to any file: it is not opened, and is counted.
+    elsewhere = tmp_path_factory.mktemp("elsewhere") / "mock.sqlite3"
+    _claimed(elsewhere, "tap-elsewhere", ASIDE_AT)
+    linked = data_dir() / "told" / "20261202T000000Z" / "investigate"
+    linked.mkdir(parents=True)
+    (linked / "mock.sqlite3").symlink_to(elsewhere)
+    # And a directory of no name the command gives is not looked into.
+    other = data_dir() / "told" / "mine" / "investigate"
+    other.mkdir(parents=True)
+    _claimed(other / "mock.sqlite3", "tap-mine", ASIDE_AT)
+
+    # And a file of another kind is not swept as investigations, though it says
+    # `mock` in a shape number an investigations file also has. No table is made
+    # in it.
+    another = data_dir() / "told" / "20261203T000000Z" / "investigate"
+    another.mkdir(parents=True)
+    Subscriptions(another / "mock.sqlite3", "mock").close()
+    # Nor is a store with no investigations a file that could not be swept.
+    (data_dir() / "told" / "20261204T000000Z" / "evidence").mkdir(parents=True)
+
+    assert sweep_aside(data_dir(), ASIDE_AT + timedelta(days=3)) == (1, 2)
+    assert _run_ids(moved) == []
+    assert _run_ids(elsewhere) == ["tap-elsewhere"]
+    assert _run_ids(other / "mock.sqlite3") == ["tap-mine"]
+    with closing(sqlite3.connect(another / "mock.sqlite3")) as db:
+        tables = {name for (name,) in db.execute("SELECT name FROM sqlite_master")}
+    assert "run" not in tables
+
+
+def test_an_archive_that_could_not_be_looked_at_is_counted_and_not_passed_over(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    served()
+    _claimed(data_dir() / "investigate" / "mock.sqlite3", "tap-early", ASIDE_AT)
+    assert set_aside(ASIDE_AT) is not None
+    moved = data_dir() / ASIDE_IN / "investigate" / "mock.sqlite3"
+    lstat = os.lstat
+
+    def unseen(path: Path) -> os.stat_result:
+        if Path(path) == moved:
+            raise PermissionError("no")
+        return lstat(path)
+
+    monkeypatch.setattr(aside_module.os, "lstat", unseen)
+    assert sweep_aside(data_dir(), ASIDE_AT + timedelta(days=3)) == (0, 1)
+    monkeypatch.setattr(aside_module.os, "lstat", lstat)
+    assert _run_ids(moved) == ["tap-early"]
+
+
+def test_a_server_sweeps_the_investigations_that_were_set_aside() -> None:
+    served()
+    long_ago = datetime.now(UTC) - timedelta(days=2)
+    _claimed(data_dir() / "investigate" / "mock.sqlite3", "tap-old", long_ago)
+    assert set_aside(ASIDE_AT) is not None
+    moved = data_dir() / ASIDE_IN / "investigate" / "mock.sqlite3"
+    assert _run_ids(moved) == ["tap-old"]
+
+    with TestClient(create_app()):
+        deadline = time.monotonic() + 5
+        while _run_ids(moved) and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+    assert _run_ids(moved) == []
+
+
+def test_the_command_sets_aside_and_serves_nothing_and_is_refused_under_a_server(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    served()
+    monkeypatch.setattr(serve, "run", lambda *_, **__: pytest.fail("It served."))
+    monkeypatch.setattr(serve, "uvicorn_server", lambda *_: pytest.fail("It served."))
+
+    # A server has the stores: nothing is moved under it.
+    with alone():
+        assert serve.main(["--set-aside"], plain()) == 2
+    assert capsys.readouterr().err.startswith("Nothing was set aside. ")
+    assert not (data_dir() / "told").exists()
+    # A server on real sources has no story to begin anew.
+    assert serve.main(["--set-aside"], plain() | {"BEACON_LIVE_SOURCES": "nws"}) == 2
+    assert "is for the invented scenario" in capsys.readouterr().err
+    assert not (data_dir() / "told").exists()
+
+    assert serve.main(["--set-aside"], plain()) == 0
+    said = capsys.readouterr().out
+    assert "were moved to told/" in said
+    assert "begins the invented story anew" in said
+    assert not (data_dir() / "evidence" / "mock.sqlite3").exists()
+    # The stores are given up: the server that is started next has them.
+    with alone():
+        pass
+    assert serve.main(["--set-aside"], plain()) == 0
+    assert "There is no mock store" in capsys.readouterr().out
+
+
+def test_a_server_that_tells_the_story_again_begins_it_at_the_twentieth_minute_only() -> None:
+    # What such a server says of how often the story begins is worked out from it.
+    with pytest.raises(serve.ServeError, match="BEACON_MOCK_STORY_MINUTE is not set beside it"):
+        serve.repeats(env() | {"BEACON_MOCK_STORY_MINUTE": "20"})
 
 
 @pytest.mark.parametrize(

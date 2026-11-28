@@ -1664,7 +1664,7 @@ def test_the_server_sweeps_the_investigations_whether_or_not_a_tap_comes(tmp_pat
 
     async def sweep_once() -> None:
         stop = asyncio.Event()
-        sweeping = asyncio.create_task(main_module._sweep_runs(runs, stop))
+        sweeping = asyncio.create_task(main_module._sweep_runs(runs, stop, tmp_path))
         for _ in range(250):
             if runs.get(TAP) is None:
                 break
@@ -1681,7 +1681,7 @@ def test_the_server_sweeps_the_investigations_whether_or_not_a_tap_comes(tmp_pat
     asyncio.run(main_module._stop_investigations(None, runs, None))
     with pytest.raises(RunsError, match="closed"):
         runs.sweep(datetime.now(UTC))
-    asyncio.run(asyncio.wait_for(main_module._sweep_runs(runs, asyncio.Event()), 5))
+    asyncio.run(asyncio.wait_for(main_module._sweep_runs(runs, asyncio.Event(), tmp_path), 5))
 
 
 def test_the_pollers_are_closed_to_paid_work_when_the_investigator_could_not_be(

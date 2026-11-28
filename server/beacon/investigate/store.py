@@ -71,6 +71,9 @@ _READABLE = frozenset({2, 3})
 # Every shape this Beacon takes an investigations file in: its own and the ones it
 # makes its own from. A file in any other is refused, and is nobody's to delete.
 SHAPES = frozenset({_FORMAT, *_EARLIER, *_READABLE})
+# The shapes whose rows `swept` deletes from as they are: this one, and the ones
+# it reads without a change.
+SWEPT_SHAPES = frozenset({_FORMAT, *_READABLE})
 # The tables an investigations file has, in every one of those shapes, and the one
 # no other of Beacon's files has: how a file is told from another kind's.
 TABLES = frozenset({"run", "crisis", "meta"})
@@ -296,10 +299,20 @@ def _stamp(moment: datetime) -> str:
     return moment.astimezone(UTC).strftime(_STAMP)
 
 
-def _sweep(db: sqlite3.Connection, now: datetime) -> int:
+def swept(now: datetime) -> tuple[tuple[str, tuple[str]], ...]:
+    """The statements that delete the runs and the decisions older than `KEPT`,
+    for a file in this shape or one read as it is (`SWEPT_SHAPES`): how `sweep`
+    deletes, and how a file that is not open for use is swept as it is
+    (`beacon.investigate.aside`)."""
     old = _stamp(now - KEPT)
-    runs = db.execute("DELETE FROM run WHERE claimed_at < ?", (old,)).rowcount
-    return runs + db.execute("DELETE FROM crisis WHERE decided_at < ?", (old,)).rowcount
+    return (
+        ("DELETE FROM run WHERE claimed_at < ?", (old,)),
+        ("DELETE FROM crisis WHERE decided_at < ?", (old,)),
+    )
+
+
+def _sweep(db: sqlite3.Connection, now: datetime) -> int:
+    return sum(db.execute(statement, values).rowcount for statement, values in swept(now))
 
 
 def _cited(kept: Mapping[str, Any]) -> Cited:

@@ -17,6 +17,7 @@ import time
 import traceback
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ from beacon.ember import (
     EmberRequestError,
     InputTooLargeError,
     LedgerReplacedError,
+    OtherLedgerError,
     Pacer,
     RateLimitHoldError,
     ReplayMissError,
@@ -619,6 +621,163 @@ def test_the_reservation_itself_refuses_a_ledger_that_was_replaced(storage: Stor
     # The ledger opened on the new file reserves in it.
     replacement.reserve(call, reserved_nanousd=20, budget_nanousd=100)
     assert replacement.spent_nanousd() == 20
+
+
+NO_LEDGER_FILE = "0" * 32 + ":1:1"
+
+
+def test_a_client_that_goes_on_with_a_named_ledger_begins_none(
+    storage: Storage, tmp_path: Path
+) -> None:
+    api = MetaApi()
+    # Nothing is there: no ledger is begun, and no directory for one.
+    with pytest.raises(OtherLedgerError, match="No ledger was begun") as refused:
+        api.client(storage, only_ledger=NO_LEDGER_FILE)
+    assert isinstance(refused.value, EmberConfigError)
+    assert refused.value.__context__ is None
+    assert list(tmp_path.iterdir()) == []
+
+    # An empty file, and one that is no database, stay as they are.
+    storage.ledger_db.parent.mkdir()
+    for held in (b"", b"not a ledger at all"):
+        storage.ledger_db.write_bytes(held)
+        with pytest.raises(OtherLedgerError):
+            api.client(storage, only_ledger=NO_LEDGER_FILE)
+        assert storage.ledger_db.read_bytes() == held
+    # Another database, with tables of its own, gets none of a ledger's.
+    storage.ledger_db.unlink()
+    with closing(sqlite3.connect(storage.ledger_db)) as other:
+        other.execute("CREATE TABLE theirs (x)")
+        other.commit()
+    with pytest.raises(OtherLedgerError):
+        api.client(storage, only_ledger=NO_LEDGER_FILE)
+    with closing(sqlite3.connect(storage.ledger_db)) as other:
+        assert [name for (name,) in other.execute("SELECT name FROM sqlite_master")] == ["theirs"]
+    storage.ledger_db.unlink()
+
+    # A ledger that is not the named one is not written to.
+    named = EmberClient.replay_only(storage).ledger_file()
+    held = storage.ledger_db.read_bytes()
+    for other_name in (NO_LEDGER_FILE, named.split(":")[0] + ":1:1"):
+        with pytest.raises(OtherLedgerError):
+            api.client(storage, only_ledger=other_name)
+    assert storage.ledger_db.read_bytes() == held
+    assert api.requests == []
+
+    # The one named: the client is on it, and pays in it.
+    ember = api.client(storage, only_ledger=named)
+    assert ember.ledger_file() == named
+    assert ask(ember).source == "live"
+    assert [row["source"] for row in ledger_rows(storage)] == ["live"]
+    assert not ember.ledger_replaced()
+
+
+def test_a_client_on_a_named_ledger_begins_none_when_its_ledger_goes(storage: Storage) -> None:
+    api = MetaApi()
+    named = EmberClient.replay_only(storage).ledger_file()
+    ember = api.client(storage, only_ledger=named)
+    paid = ask(ember)
+    made = len(api.requests)
+
+    storage.ledger_db.unlink()
+
+    # No paid call, no request, and nothing is put where the ledger was: a new,
+    # empty ledger there would be taken for the ledger by whoever looks next.
+    with pytest.raises(LedgerReplacedError, match="deleted or replaced") as refused:
+        ask(ember, input="Another request.")
+    assert refused.value.__context__ is None
+    assert len(api.requests) == made
+    assert ember.ledger_replaced()
+    assert ember.ledger_calls([paid.ledger_ref]) == []
+    # What spends nothing is not logged in a file of its own making either.
+    with pytest.raises(LedgerReplacedError):
+        ask(ember)
+    with pytest.raises(LedgerReplacedError):
+        ember.spent_usd()
+    assert not storage.ledger_db.exists()
+
+    # An empty file put there is no ledger, and stays empty.
+    storage.ledger_db.write_bytes(b"")
+    with pytest.raises(LedgerReplacedError):
+        ask(ember, input="Another request.")
+    assert ember.ledger_replaced()
+    assert storage.ledger_db.read_bytes() == b""
+    assert len(api.requests) == made
+
+
+def _rows(path: Path) -> list[tuple[Any, ...]]:
+    """A ledger file's calls, read through a connection that cannot write."""
+    with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as db:
+        return db.execute("SELECT id, source, status, cost_nanousd FROM ember_calls").fetchall()
+
+
+@pytest.mark.parametrize("put", ["another ledger", "a copy with its generation"])
+def test_a_client_on_a_named_ledger_reads_and_writes_no_other_ledger_put_in_its_place(
+    storage: Storage, tmp_path: Path, put: str
+) -> None:
+    api = MetaApi()
+    named = EmberClient.replay_only(storage).ledger_file()
+    # A copy of the ledger from before anything was paid for in it.
+    copy = tmp_path / "copy"
+    copy.write_bytes(storage.ledger_db.read_bytes())
+    ember = api.client(storage, only_ledger=named)
+    paid = ask(ember)
+    assert ember.spent_usd() > 0
+    made = len(api.requests)
+
+    # The ledger is moved away under the client, and a ledger that was begun is
+    # put where it was: a new one, or the copy from before the paid call.
+    away = tmp_path / "away"
+    away.mkdir()
+    for beside in storage.ledger_db.parent.glob("ledger.sqlite3*"):
+        beside.rename(away / beside.name)
+    if put == "a copy with its generation":
+        copy.rename(storage.ledger_db)
+    other = EmberClient.replay_only(storage).ledger_file()
+    assert other != named
+    assert (other.split(":")[0] == named.split(":")[0]) == (put == "a copy with its generation")
+    held = storage.ledger_db.read_bytes()
+    assert _rows(storage.ledger_db) == []
+
+    # Nothing is read from the other ledger as this client's: not what was spent,
+    # which there is nothing, and not a call's row.
+    assert ember.ledger_replaced()
+    for read in (ember.spent_usd, ember.ledger_generation, ember.export_trace):
+        with pytest.raises(LedgerReplacedError, match="deleted or replaced"):
+            read()
+    with pytest.raises(LedgerReplacedError):
+        ember.scope_spend("tap:1")
+    assert ember.ledger_calls([paid.ledger_ref]) == []
+    # And nothing is written to it: no paid call is reserved in it, and an answer
+    # that is replayed, which costs nothing, is not logged in it either.
+    with pytest.raises(LedgerReplacedError):
+        ask(ember, input="Another request.")
+    with pytest.raises(LedgerReplacedError):
+        ask(ember)
+    assert len(api.requests) == made
+    assert _rows(storage.ledger_db) == []
+    assert storage.ledger_db.read_bytes() == held
+    # The ledger that was paid in holds what it held.
+    assert [row[1:3] for row in _rows(away / "ledger.sqlite3")] == [("live", "ok")]
+
+
+def test_a_named_ledger_that_goes_while_a_paid_request_is_out_is_reported_and_none_is_begun(
+    storage: Storage,
+) -> None:
+    def create(_request: httpx2.Request) -> httpx2.Response:
+        for beside in storage.ledger_db.parent.glob("ledger.sqlite3*"):
+            beside.unlink()
+        return httpx2.Response(200, json=completed())
+
+    api = MetaApi(create=create)
+    named = EmberClient.replay_only(storage).ledger_file()
+    ember = api.client(storage, only_ledger=named)
+
+    with pytest.raises(LedgerReplacedError, match="may have been billed"):
+        ask(ember)
+
+    assert api.paths() == ["/v1/responses/input_tokens", "/v1/responses"]
+    assert not storage.ledger_db.exists()
 
 
 def test_once_the_ledger_reaches_the_stop_no_request_is_made_at_all(storage: Storage) -> None:
@@ -2019,7 +2178,12 @@ def test_the_environment_selects_replay_by_default_and_live_only_with_a_key(
     scope = SpendScope("tap:1", 1000)
     pacer = Pacer()
     EmberClient.from_env(live, storage=storage, scope=scope, pacer=pacer)
-    assert built == [(storage, {"api_key": "test-key", "pacer": pacer, "scope": scope})]
+    assert built == [
+        (storage, {"api_key": "test-key", "pacer": pacer, "scope": scope, "only_ledger": None})
+    ]
+    # The ledger a caller names is the one the live client is held to.
+    EmberClient.from_env(live, storage=storage, only_ledger=NO_LEDGER_FILE)
+    assert built[-1][1]["only_ledger"] == NO_LEDGER_FILE
 
 
 def test_a_stop_that_cannot_be_read_is_refused_in_replay_mode_too(

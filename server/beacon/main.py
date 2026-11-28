@@ -24,8 +24,17 @@ from beacon.datadir import DataLock
 from beacon.ember.client import default_data_dir
 from beacon.incident import Engine, open_engine
 from beacon.ingest import IngestConfigError, build
-from beacon.ingest.setup import PAID_SECONDS, STOP_SECONDS, Ingest, keep_teller
+from beacon.ingest.setup import (
+    NO_POLLERS_NO_STORY,
+    PAID_SECONDS,
+    STOP_SECONDS,
+    STORY_MINUTE_VARIABLE,
+    Ingest,
+    check_story_minute,
+    keep_teller,
+)
 from beacon.investigate import InvestigationDesk, Runs, RunsError, open_investigations
+from beacon.investigate.aside import sweep_aside
 from beacon.investigate.setup import MEDIA_SENT
 from beacon.places import Admission
 from beacon.push import Push, SubscriptionsError, open_push
@@ -149,11 +158,26 @@ async def _sweep_tap_media(taps: Taps, stop: asyncio.Event) -> None:
             await asyncio.wait_for(stop.wait(), SWEEP_SECONDS)
 
 
-async def _sweep_runs(runs: Runs, stop: asyncio.Event) -> None:
+async def _sweep_runs(runs: Runs, stop: asyncio.Event, data: Path) -> None:
     """Delete the investigations that are older than they are kept, now and every
     `SWEEP_SECONDS` after, until `stop` is set: they go when their day is over,
-    whether or not another tap comes."""
+    whether or not another tap comes. The same for the investigations of mock
+    stores that were set aside under `data` (`sweep_aside`), in whichever mode
+    this server runs: they are a day's too, wherever their file was moved."""
     while not stop.is_set():
+        try:
+            _, unswept = await asyncio.to_thread(sweep_aside, data, datetime.now(UTC))
+            if unswept:
+                logger.error(
+                    "The investigations of %d mock stores that were set aside could not "
+                    "be swept, so what they hold is not deleted when its day is over.",
+                    unswept,
+                )
+        except Exception as error:
+            logger.error(
+                "The investigations that were set aside could not be swept (%s).",
+                type(error).__name__,
+            )
         try:
             await asyncio.to_thread(runs.sweep, datetime.now(UTC))
         except RunsError:
@@ -280,6 +304,11 @@ async def _running(app: FastAPI, setting: str) -> AsyncIterator[None]:
             f"{MOCK_EMBER_VARIABLE}=live needs the pollers, which play the "
             f"invented story: it is refused with {INGEST_VARIABLE}=0."
         )
+    # Asked of every server, with its pollers or without: the minute a story
+    # begins at is for the invented scenario.
+    check_story_minute(os.environ)
+    if setting == "0" and STORY_MINUTE_VARIABLE in os.environ:
+        logger.warning(NO_POLLERS_NO_STORY)
     # The pollers first: a setting of theirs that is refused leaves no store behind.
     ingest = build(os.environ) if setting == "1" else None
     taps: Taps | None = None
@@ -339,7 +368,7 @@ async def _running(app: FastAPI, setting: str) -> AsyncIterator[None]:
             and app.state.input == "own"
             else None
         )
-        sweeping_runs = asyncio.create_task(_sweep_runs(runs, stop))
+        sweeping_runs = asyncio.create_task(_sweep_runs(runs, stop, default_data_dir(os.environ)))
         sweeping = asyncio.create_task(_sweep_tap_media(taps, stop))
         # Notifications, for the devices that asked for them: sent when a decision
         # that was made turned crisis mode on near a place a device named. It reads
@@ -537,11 +566,22 @@ async def _validation_error(_request: Request, error: RequestValidationError) ->
     return JSONResponse({"detail": detail}, status_code=422)
 
 
+# The header by which a page tells an Amp portal to inject nothing into it
+# (https://ampcode.com/docs/orbs: the review widget).
+NOTHING_ADDED = ("X-Amp-Review-Widget", "off")
+
+
 class _Web(StaticFiles):
     """The built app's files. A file under `assets/` has a digest of what it holds
     in its name and is kept by a browser for good. Every other file (the page, the
     service workers, the manifest) is asked about each time, so that a browser has
-    the app, and the worker that shows a notification, as they were last deployed."""
+    the app, and the worker that shows a notification, as they were last deployed.
+
+    **Every file asks that nothing be added to it on its way** (`NOTHING_ADDED`).
+    An Amp portal puts a script of its own, a button for comments on the page, into
+    an HTML page it passes on, unless the page's response says otherwise. Beacon's
+    page names a tap's id in its fragment, which is for its sender and no other
+    script to read, and the page is what a person is shown and what is filmed."""
 
     async def get_response(self, path: str, scope: Scope) -> Response:
         response = await super().get_response(path, scope)
@@ -549,6 +589,7 @@ class _Web(StaticFiles):
         response.headers["Cache-Control"] = (
             "public, max-age=31536000, immutable" if kept else "no-cache"
         )
+        response.headers[NOTHING_ADDED[0]] = NOTHING_ADDED[1]
         return response
 
 
