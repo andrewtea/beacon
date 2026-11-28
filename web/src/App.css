@@ -207,8 +207,16 @@ p {
   text-wrap: balance;
 }
 
-/* What is said of this server, under the first control of a page a person
-   sends something from. */
+/* The server's short sentence about the host in front of it, beside that line. */
+.front-line {
+  margin: 0 0 0.25rem;
+  color: var(--text-soft);
+  font-size: 0.85rem;
+  text-wrap: balance;
+}
+
+/* What is said of this server, after the controls that send something on a
+   page a person sends from. */
 .about-server {
   margin: 1.25rem 0;
 }

@@ -100,7 +100,7 @@ function View({
   repeatsText: string | null
   mediaText: string | null
   // What is said of this server on the pages a person sends something from
-  // (`AboutServer`), which each of those pages puts under its own first control.
+  // (`AboutServer`), which each of those pages puts after its controls that send.
   about: ReactNode
   onOtherMode: () => void
 }) {
@@ -177,10 +177,14 @@ function View({
  * What is said of this server on the pages a person sends something from: that
  * its scenario is invented, with the server's sentences about telling the story
  * again and about who does the model's work on it, and the server's sentence
- * about what it takes of a visitor and why. Every sentence is whole and is on
- * the page without a press. It is put under the page's first control, so that
- * the button is what a person meets first; the line above the control and the
- * sentence under the button say the short of it before anything is sent.
+ * about what it takes of a visitor and why. Each of those sentences is whole and
+ * is on the page without a press; the rest of the last one (`frontMore`) is one
+ * press away, as it was. A page puts this after its controls that send
+ * something (the button and what is added to a tap; the places and the control
+ * that saves one), so that those come before it in the page's order. What is
+ * ahead of those controls is the short of it: the lines `App` puts above the
+ * page, and the button's own sentence. That is an order, and no promise about
+ * what one screen holds.
  */
 function AboutServer({
   mock,
@@ -252,6 +256,11 @@ export default function App() {
   const input: Input | null =
     said === 'own' || said === 'invented' ? said : null
   const frontText = unreachable ? null : (health.data?.front_text ?? null)
+  // The short of it, which goes ahead of the controls that send. A server that
+  // has the sentence and not its short form is shown the sentence there.
+  const frontLine = unreachable
+    ? null
+    : (health.data?.front_line_text ?? frontText)
   const frontMore = unreachable ? null : (health.data?.front_more_text ?? null)
   // A tap the server no longer answers for is deleted from this device.
   useEffect(() => sweepTaps(), [])
@@ -273,15 +282,21 @@ export default function App() {
           <span className="tag stand-in">Invented scenario</span>
         )}
       </header>
-      {/* What the tag above means, in a line, before the first control of a
-          page a person sends something from. The rest of what is said of this
-          server is on the same page, under that control (`AboutServer`). */}
+      {/* What the tag above means, in a line, ahead of the controls of a page
+          a person sends something from. It is about what Beacon shows of the
+          city, not about a person's own taps and saved places, which are on
+          these pages too. The rest of what is said of this server is on the
+          same page, after those controls (`AboutServer`). */}
       {mode === 'mock' && sends && (
         <p className="mock-line">
-          Nothing Beacon shows here happened: the incidents, alerts, and notices
-          are made up.
+          The incidents, alerts, and notices here are made up.
         </p>
       )}
+      {/* On a server behind a host nobody has checked: the server's short
+          sentence about that, ahead of the controls that send. A first tap's
+          answer is asked for at an address that holds the tap's id, so this is
+          met before the button and not only after it. */}
+      {frontLine !== null && sends && <p className="front-line">{frontLine}</p>}
       {unreachable && (
         <p className="note problem" role="status">
           {health.error?.message}

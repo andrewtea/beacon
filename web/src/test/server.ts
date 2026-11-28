@@ -51,6 +51,7 @@ export const MOCK_HEALTH = {
   media_text: null,
   repeats_text: null,
   input: 'own',
+  front_line_text: null,
   front_text: null,
   front_more_text: null,
 }

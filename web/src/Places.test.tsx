@@ -122,12 +122,15 @@ test('a place is kept on the device under its name, and only where it is is sent
   expect(within(section).getByText('Invented')).toBeInTheDocument()
 })
 
-test('what is said of the server is on the places’ page, under the control that saves a place', async () => {
+test('what is said of the server is on the places’ page, after the control that saves a place, with the short of it before', async () => {
   const front = 'On this server a tap is sent from one of two invented places.'
+  const host =
+    'Nobody has checked what the hosting service this server is reached through writes down of a request.'
   serve({
     'GET /api/health': {
       ...MOCK_HEALTH,
       input: 'invented',
+      front_line_text: host,
       front_text: front,
       front_more_text: 'The rest.',
     },
@@ -140,18 +143,32 @@ test('what is said of the server is on the places’ page, under the control tha
     Boolean(
       first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING,
     )
-  // The page's own heading and its first control come first, after a line
-  // that says the scenario is invented.
-  const line = screen.getByText(/Nothing Beacon shows here happened/)
-  const heading = screen.getByRole('heading', { name: 'Your places' })
-  const save = screen.getByRole('heading', { name: 'Save a place' })
-  expect(follows(line, heading)).toBe(true)
-  expect(follows(save, about)).toBe(true)
-  // Whole, and without a press.
-  expect(within(about).getByText(front)).toBeInTheDocument()
+  // Ahead of the controls that save a place, which have the server asked about
+  // it: that the incidents are made up, and the server's short sentence about
+  // the host in front of it.
+  const line = screen.getByText(
+    'The incidents, alerts, and notices here are made up.',
+  )
+  const short = screen.getByText(host)
+  const save = screen.getByRole('button', {
+    name: 'Save “Near the invented fire, Hayes Valley”',
+  })
+  const last = screen.getByRole('button', {
+    name: 'Save “Across town, North Beach”',
+  })
+  expect(line).toBeVisible()
+  expect(short).toBeVisible()
+  expect(follows(line, save)).toBe(true)
+  expect(follows(short, save)).toBe(true)
+  expect(about).not.toContainElement(short)
+  // After those controls: the rest, whole, and without a press.
+  expect(follows(last, about)).toBe(true)
+  expect(within(about).getByText(front)).toBeVisible()
   expect(
     within(about).getByText(/running on an invented scenario/),
-  ).toBeInTheDocument()
+  ).toBeVisible()
+  // What is one press away, as it was.
+  expect(within(about).getByText('The rest.')).not.toBeVisible()
 })
 
 test('a server that takes only the invented places is sent no place of a person’s own, and none is asked of the phone', async () => {

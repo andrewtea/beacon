@@ -41,8 +41,12 @@ class Health(BaseModel):
     # (`BEACON_FRONT_END=unverified`). The app then asks for no place, sound, or
     # photo and sends none.
     input: front.Input = "own"
-    # On a server that takes only the invented places: a sentence that says so and
-    # why, shown on the pages a person sends something from. Null on every other.
+    # On a server that takes only the invented places: the short of why, in a
+    # sentence the app shows ahead of the controls that send something, on the
+    # pages a person sends from. Null on every other server.
+    front_line_text: str | None = None
+    # On such a server: a sentence that says what it takes and why, shown on the
+    # same pages, after those controls. Null on every other.
     front_text: str | None = None
     # The rest of that: what the host may keep, and what a tap's id in a request's
     # address lets its holder read. Shown when it is asked for, beside the
@@ -64,6 +68,7 @@ def health(request: Request) -> Health:
         media_text=getattr(request.app.state, "media_text", None),
         repeats_text=getattr(request.app.state, "repeats_text", None),
         input=takes,
+        front_line_text=front.INVENTED_LINE if takes == "invented" else None,
         front_text=front.INVENTED if takes == "invented" else None,
         front_more_text=front.INVENTED_MORE if takes == "invented" else None,
     )

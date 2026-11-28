@@ -31,9 +31,12 @@ export type Health = {
   // has seen keep the private routes out of its records. The app then asks for
   // no place, sound, or photo, and sends none.
   input: Input
-  // On a server that takes only the invented places: the server's sentence that
-  // says so and why, shown on the pages a person sends something from. Null on
-  // every other server.
+  // On a server that takes only the invented places: the short of why, in the
+  // server's sentence, shown ahead of the controls that send something on the
+  // pages a person sends from. Null on every other server.
+  front_line_text: string | null
+  // On such a server: the server's sentence that says what it takes and why,
+  // shown on the same pages, after those controls. Null on every other server.
   front_text: string | null
   // The rest of that, shown when it is asked for. Null whenever that one is.
   front_more_text: string | null

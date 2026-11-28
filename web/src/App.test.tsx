@@ -76,9 +76,13 @@ const click = (element: HTMLElement) => element.click()
 const FRONT =
   'On this server a tap is sent from one of two invented places, not from where you are.'
 const FRONT_MORE = 'The address a tap’s answer is read at holds the tap’s id.'
+const FRONT_LINE =
+  'Nobody has checked what the hosting service this server is reached through writes down of a request.'
+const MADE_UP = 'The incidents, alerts, and notices here are made up.'
 const INVENTED_ONLY = {
   ...MOCK_HEALTH,
   input: 'invented',
+  front_line_text: FRONT_LINE,
   front_text: FRONT,
   front_more_text: FRONT_MORE,
 }
@@ -92,7 +96,7 @@ test('says that it runs on an invented scenario before anybody taps', async () =
   expect(screen.getByRole('button', { name: ASK })).toBeEnabled()
 })
 
-test('the button comes first, with a line that says the scenario is invented above it and the rest under it', async () => {
+test('the button comes ahead of what is said of the server, with the short of it above the button', async () => {
   serve({ 'GET /api/health': INVENTED_ONLY })
 
   render(<App />)
@@ -103,14 +107,29 @@ test('the button comes first, with a line that says the scenario is invented abo
     Boolean(
       first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING,
     )
-  // What a person meets before the button: that nothing shown here happened.
-  const line = screen.getByText(/Nothing Beacon shows here happened/)
+  // What a person meets before the button: that the incidents are made up, and
+  // the server's short sentence about the host in front of it. A first tap's
+  // answer is asked for at an address that holds the tap's id.
+  const line = screen.getByText(MADE_UP)
+  const host = screen.getByText(FRONT_LINE)
+  expect(line).toBeVisible()
+  expect(host).toBeVisible()
   expect(follows(line, button)).toBe(true)
-  // Under the button, and on the page without a press: what says the scenario
+  expect(follows(host, button)).toBe(true)
+  expect(about).not.toContainElement(host)
+  // The line is about what Beacon shows of the city, and claims nothing of a
+  // person's own taps and saved places, which are on this page too.
+  expect(screen.queryByText(/Nothing Beacon shows here/)).toBeNull()
+  // After the button, and on the page without a press: what says the scenario
   // is invented, whole, and the server's sentence about what it takes.
   expect(follows(button, about)).toBe(true)
   expect(about).toContainElement(screen.getByText(INVENTED))
   expect(about).toContainElement(screen.getByText(FRONT))
+  expect(screen.getByText(INVENTED)).toBeVisible()
+  expect(screen.getByText(FRONT)).toBeVisible()
+  // The rest of the server's sentence is the one thing that is a press away.
+  expect(about).toContainElement(screen.getByText(FRONT_MORE))
+  expect(screen.getByText(FRONT_MORE)).not.toBeVisible()
   // Before the button's own sentence about what it sends is left behind.
   const sends = screen.getByText(
     /the button sends a tap from an invented place/,
@@ -123,6 +142,29 @@ test('the button comes first, with a line that says the scenario is invented abo
   expect(follows(about, spots)).toBe(true)
 })
 
+test('a server that takes a visitor’s own says nothing of an unchecked host, and one that has only the whole sentence shows that above the button', async () => {
+  // A mock server that takes where a person is: the line about the invented
+  // scenario, and no sentence about a host.
+  serve({ 'GET /api/health': MOCK_HEALTH })
+  const { unmount } = render(<App />)
+  expect(await screen.findByText(MADE_UP)).toBeVisible()
+  expect(screen.queryByText(/Nobody has checked/)).toBeNull()
+  unmount()
+
+  // A server from before the short sentence has the whole one: it is then what
+  // is met before the button, and nothing is left unsaid there.
+  serve({
+    'GET /api/health': { ...INVENTED_ONLY, front_line_text: undefined },
+  })
+  render(<App />)
+  const button = await screen.findByRole('button', { name: ASK })
+  const [above] = await screen.findAllByText(FRONT)
+  expect(above).toBeVisible()
+  expect(
+    above.compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING,
+  ).toBeTruthy()
+})
+
 test('on real sources nothing is said of an invented scenario, above the button or under it', async () => {
   serve({ 'GET /api/health': { ...MOCK_HEALTH, mode: 'live', teller: null } })
 
@@ -131,7 +173,7 @@ test('on real sources nothing is said of an invented scenario, above the button 
   await waitFor(() =>
     expect(screen.getByRole('button', { name: ASK })).toBeEnabled(),
   )
-  expect(screen.queryByText(/Nothing Beacon shows here happened/)).toBeNull()
+  expect(screen.queryByText(MADE_UP)).toBeNull()
   expect(screen.queryByRole('region', { name: 'About this server' })).toBeNull()
 })
 
